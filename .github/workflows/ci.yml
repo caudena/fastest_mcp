@@ -1,0 +1,143 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  hermetic-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.19.5"
+          otp-version: "28.4"
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      - name: Check formatting
+        run: mix format --check-formatted
+
+      - name: Run hermetic test suite
+        run: mix test --exclude external_auth --exclude conformance --exclude docs_examples
+
+  docs-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.19.5"
+          otp-version: "28.4"
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      - name: Build HexDocs
+        run: mix docs
+
+  package:
+    runs-on: ubuntu-latest
+    env:
+      HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.19.5"
+          otp-version: "28.4"
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      - name: Build Hex package
+        run: mix hex.build
+
+      - name: Verify Hex publish dry-run
+        if: ${{ env.HEX_API_KEY != '' }}
+        run: mix hex.publish --yes --dry-run
+
+      - name: Skip Hex publish dry-run
+        if: ${{ env.HEX_API_KEY == '' }}
+        run: echo "Skipping Hex publish --dry-run because HEX_API_KEY is not configured."
+
+  docs-examples:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.19.5"
+          otp-version: "28.4"
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      - name: Run docs example harness
+        run: mix test --only docs_examples --exclude external_auth --exclude conformance
+
+  clean-project-smoke:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.19.5"
+          otp-version: "28.4"
+
+      - name: Run clean project smoke test
+        run: ./scripts/clean_project_smoke.sh
+
+  conformance:
+    needs: hermetic-test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.19.5"
+          otp-version: "28.4"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      - name: Run MCP conformance lane
+        run: mix test --only conformance --exclude external_auth
+
+  external-auth:
+    if: ${{ vars.FASTEST_MCP_EXTERNAL_AUTH == 'true' || github.event_name == 'workflow_dispatch' }}
+    needs: [hermetic-test, conformance]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.19.5"
+          otp-version: "28.4"
+
+      - name: Install dependencies
+        run: mix deps.get
+
+      - name: Run credentials-backed auth provider suite
+        run: mix test --include external_auth
