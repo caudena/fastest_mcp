@@ -4,10 +4,11 @@ defmodule FastestMCP.MixProject do
   def project do
     [
       app: :fastest_mcp,
-      version: "0.1.0",
-      description: "BEAM-native MCP toolkit for Elixir applications",
-      source_url: "https://github.com/caudena/FastestMCP",
-      homepage_url: "https://github.com/caudena/FastestMCP",
+      version: "0.1.1",
+      description:
+        "Native Elixir rewrite of the Python FastMCP library, built the Erlang/OTP way",
+      source_url: "https://github.com/caudena/fastest_mcp",
+      homepage_url: "https://github.com/caudena/fastest_mcp",
       elixir: "~> 1.19",
       start_permanent: Mix.env() == :prod,
       elixirc_paths: elixirc_paths(Mix.env()),
@@ -47,11 +48,12 @@ defmodule FastestMCP.MixProject do
     [
       main: "readme",
       source_ref: "master",
-      source_url: "https://github.com/caudena/FastestMCP",
+      source_url: "https://github.com/caudena/fastest_mcp",
       assets: %{
         "docs/assets" => "."
       },
       extras: [
+        "CHANGELOG.md",
         "README.md",
         "docs/onboarding.md",
         "docs/why-fastest-mcp.md",
@@ -81,7 +83,7 @@ defmodule FastestMCP.MixProject do
         "docs/compatibility-and-scope.md"
       ],
       groups_for_extras: [
-        "Start Here": ["README.md", "docs/onboarding.md"],
+        "Start Here": ["README.md", "CHANGELOG.md", "docs/onboarding.md"],
         Explanation: ["docs/why-fastest-mcp.md", "docs/compatibility-and-scope.md"],
         Features: [
           "docs/components.md",
@@ -160,6 +162,7 @@ defmodule FastestMCP.MixProject do
       name: "fastest_mcp",
       files: [
         ".formatter.exs",
+        "CHANGELOG.md",
         "LICENSE",
         "README.md",
         "config",
@@ -169,7 +172,7 @@ defmodule FastestMCP.MixProject do
       ],
       licenses: ["Apache-2.0"],
       links: %{
-        "GitHub" => "https://github.com/caudena/FastestMCP"
+        "GitHub" => "https://github.com/caudena/fastest_mcp"
       }
     ]
   end
