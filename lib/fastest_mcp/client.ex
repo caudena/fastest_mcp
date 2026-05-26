@@ -1278,7 +1278,7 @@ defmodule FastestMCP.Client do
 
   defp normalize_target_statuses(opts) do
     case Keyword.get(opts, :status, Keyword.get(opts, :statuses)) do
-      nil -> MapSet.new(["completed", "failed", "cancelled"])
+      nil -> {:inactive, MapSet.new(["working", "submitted"])}
       value when is_binary(value) -> MapSet.new([value])
       value when is_atom(value) -> MapSet.new([to_string(value)])
       values when is_list(values) -> MapSet.new(Enum.map(values, &to_string/1))
@@ -1286,6 +1286,15 @@ defmodule FastestMCP.Client do
   end
 
   defp task_matches_target_status?(nil, _target_statuses), do: false
+
+  defp task_matches_target_status?(task, {:inactive, active_statuses}) do
+    status = task["status"] || task[:status]
+
+    case status do
+      nil -> false
+      status -> not MapSet.member?(active_statuses, to_string(status))
+    end
+  end
 
   defp task_matches_target_status?(task, target_statuses) do
     status = task["status"] || task[:status]

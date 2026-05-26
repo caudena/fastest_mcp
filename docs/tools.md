@@ -419,6 +419,22 @@ FastestMCP.call_tool("tool-results", "get_user_data", %{"user_id" => "42"})
 # => %{id: "42", name: "Alice", age: 30, active: true}
 ```
 
+Transport normalization also handles common JSON-safe Elixir shapes such as
+lists, tuples, dates, URIs, maps, `MapSet`, and finite enumerable structs such
+as ranges:
+
+```elixir
+FastestMCP.server("tool-results")
+|> FastestMCP.add_tool("ids", fn _arguments, _ctx -> 1..3 end)
+
+FastestMCP.call_tool("tool-results", "ids", %{})
+# => [1, 2, 3]
+```
+
+Return lists for streams or other lazy enumerables whose size is not known.
+FastestMCP does not automatically materialize arbitrary `Stream` values because
+they may be infinite.
+
 Over the wire, that becomes text plus `structuredContent`, so MCP clients can
 use both a readable representation and machine-readable structure.
 
@@ -484,8 +500,8 @@ server =
   end)
 ```
 
-That pattern is the Elixir equivalent of the Python helper types: the content
-contract stays explicit and transport-safe.
+That helper-type pattern keeps the content contract explicit and
+transport-safe.
 
 ## Error Handling
 
@@ -659,8 +675,8 @@ Supported values are:
 - `:ignore`
 - `:replace`
 
-The Elixir default remains `on_duplicate: :error`. That is intentionally
-stricter than the Python library's warn-and-replace default.
+The default remains `on_duplicate: :error`, so duplicate registration fails
+unless the server opts into a different policy.
 
 Example:
 
@@ -871,15 +887,14 @@ That notification path is session-aware:
 ## Current Compatibility Boundary
 
 - tool arguments are explicit maps
-- there is no Python-style decorator API
+- there is no decorator API
 - there is no automatic signature-to-schema inference from Elixir function
   parameters or types
 - explicit tool results are exposed through `FastestMCP.Tools.Result` rather
   than inferred return annotations
-- there is no automatic coercion into Python-style UUID, datetime, or path
-  objects; values stay JSON-native unless your handler converts them
-- duplicate handling defaults to `on_duplicate: :error`, not Python's warn
-  default
+- there is no automatic coercion into UUID, datetime, or path objects; values
+  stay JSON-native unless your handler converts them
+- duplicate handling defaults to `on_duplicate: :error`
 - session notifications only exist on transports with a live session event
   stream
 

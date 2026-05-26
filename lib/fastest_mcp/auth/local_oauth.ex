@@ -1,7 +1,7 @@
 defmodule FastestMCP.Auth.LocalOAuth do
   @moduledoc """
   In-process OAuth provider that protects MCP operations and mounts a local
-  authorization server surface for hermetic parity tests.
+  authorization server surface for tests, development, and embedded flows.
 
   It supports:
 
@@ -68,7 +68,7 @@ defmodule FastestMCP.Auth.LocalOAuth do
   @doc "Builds the protected-resource metadata exposed by this auth provider."
   def protected_resource_metadata(http_context, opts) do
     %{
-      resource: resource_url(http_context),
+      resource: resource_url(http_context, opts),
       authorization_servers: [authorization_server_issuer(http_context, opts)],
       scopes_supported: scopes_for_metadata(opts)
     }
@@ -1247,8 +1247,14 @@ defmodule FastestMCP.Auth.LocalOAuth do
     |> normalize_url()
   end
 
-  defp resource_url(http_context) do
-    join_url(http_context.base_url, http_context.mcp_base_path)
+  defp resource_url(http_context, opts) do
+    join_url(resource_base_url(http_context, opts), http_context.mcp_base_path)
+  end
+
+  defp resource_base_url(http_context, opts) do
+    opts
+    |> opt(:resource_base_url, http_context.base_url)
+    |> normalize_url()
   end
 
   defp jwt_issuer(http_context, opts) do
@@ -1259,7 +1265,7 @@ defmodule FastestMCP.Auth.LocalOAuth do
       signing_key ->
         JWTIssuer.new(
           issuer: metadata_issuer(http_context),
-          audience: resource_url(http_context),
+          audience: resource_url(http_context, opts),
           signing_key: normalize_jwt_signing_key(signing_key)
         )
     end

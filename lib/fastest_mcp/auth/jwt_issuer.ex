@@ -2,9 +2,8 @@ defmodule FastestMCP.Auth.JWTIssuer do
   @moduledoc """
   HS256 JWT token factory for the local OAuth server path.
 
-  This mirrors the Python replacement contract closely enough to issue minimal
-  reference-style access and refresh tokens while keeping verification logic
-  self-contained for tests and future runtime use.
+  Issues minimal reference-style access and refresh tokens while keeping
+  verification logic self-contained for tests and future runtime use.
   """
 
   alias Plug.Crypto.KeyGenerator

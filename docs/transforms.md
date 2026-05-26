@@ -125,8 +125,6 @@ name second.
 
 ## Tool-only Clients
 
-Some FastMCP docs describe tool-search and resource-to-tool transforms.
-
 FastestMCP v0.1 does not ship a public tool-search transform, but it does ship
 tool-injection middleware helpers for tool-only clients:
 

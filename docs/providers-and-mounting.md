@@ -172,10 +172,8 @@ See [Transforms](transforms.md) for the detailed patterns.
 
 ## What FastestMCP Does Not Ship Yet
 
-The FastMCP docs cover filesystem and proxy providers.
-
-FastestMCP v0.1 does not yet expose those as public built-ins. The current
-provider surface focuses on:
+FastestMCP v0.1 does not yet expose filesystem or proxy providers as public
+built-ins. The current provider surface focuses on:
 
 - mounted FastestMCP servers
 - explicit local providers

@@ -166,6 +166,27 @@ defmodule FastestMCP.MountedProviderTest do
     ])
   end
 
+  test "mounted wildcard resource templates preserve the wildcard path" do
+    parent_name =
+      "mounted-wildcard-" <> Integer.to_string(System.unique_integer([:positive]))
+
+    child =
+      FastestMCP.server("child-wildcard")
+      |> FastestMCP.add_resource_template("files://{path*}", fn %{"path" => path}, _ctx ->
+        "file:#{path}"
+      end)
+
+    parent =
+      FastestMCP.server(parent_name)
+      |> FastestMCP.mount(child, namespace: "child")
+
+    assert {:ok, _pid} = FastestMCP.start_server(parent)
+    on_exit(fn -> FastestMCP.stop_server(parent_name) end)
+
+    assert "file:alpha/beta/gamma.txt" ==
+             FastestMCP.read_resource(parent_name, "files://child/alpha/beta/gamma.txt")
+  end
+
   test "local components can override mounted tools with the same name" do
     parent_name =
       "mounted-local-override-" <> Integer.to_string(System.unique_integer([:positive]))

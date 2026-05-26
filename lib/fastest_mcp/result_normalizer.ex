@@ -174,9 +174,15 @@ defmodule FastestMCP.ResultNormalizer do
   end
 
   defp normalize_json_value(%_{} = value) do
-    value
-    |> Map.from_struct()
-    |> normalize_json_map()
+    case finite_enumerable_to_list(value) do
+      {:ok, list} ->
+        Enum.map(list, &normalize_json_value/1)
+
+      :error ->
+        value
+        |> Map.from_struct()
+        |> normalize_json_map()
+    end
   end
 
   defp normalize_json_value(value) when is_map(value), do: normalize_json_map(value)
@@ -204,6 +210,15 @@ defmodule FastestMCP.ResultNormalizer do
   end
 
   defp normalize_binary_field(value), do: normalize_json_value(value)
+
+  defp finite_enumerable_to_list(value) do
+    case Enumerable.count(value) do
+      {:ok, _count} -> {:ok, Enum.to_list(value)}
+      {:error, _module} -> :error
+    end
+  rescue
+    Protocol.UndefinedError -> :error
+  end
 
   defp stringify_content(value) do
     normalized = normalize_json_value(value)

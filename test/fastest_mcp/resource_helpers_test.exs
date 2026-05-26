@@ -43,6 +43,9 @@ defmodule FastestMCP.ResourceHelpersTest do
         end,
         annotations: %{cacheable: true}
       )
+      |> FastestMCP.add_resource("memo://json", fn _arguments, _ctx ->
+        %{ok: true, values: 1..3}
+      end)
       |> FastestMCP.add_resource_template(
         "memo://users/{id}",
         fn arguments, _ctx -> arguments end,
@@ -52,7 +55,7 @@ defmodule FastestMCP.ResourceHelpersTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    [resource] = FastestMCP.list_resources(server_name)
+    resource = Enum.find(FastestMCP.list_resources(server_name), &(&1.uri == "memo://bundle"))
     assert resource.annotations == %{cacheable: true}
 
     [template] = FastestMCP.list_resource_templates(server_name)
@@ -94,9 +97,23 @@ defmodule FastestMCP.ResourceHelpersTest do
              })
 
     assert %{
-             resources: [
-               %{"uri" => "memo://bundle", "annotations" => %{"cacheable" => true}}
-             ],
+             "contents" => [
+               %{
+                 "uri" => "memo://json",
+                 "text" => encoded_json
+               }
+             ]
+           } =
+             Engine.dispatch!(server_name, %Request{
+               method: "resources/read",
+               transport: :stdio,
+               payload: %{"uri" => "memo://json"}
+             })
+
+    assert Jason.decode!(encoded_json) == %{"ok" => true, "values" => [1, 2, 3]}
+
+    assert %{
+             resources: resources,
              resourceTemplates: [
                %{"uriTemplate" => "memo://users/{id}", "annotations" => %{"httpMethod" => "GET"}}
              ]
@@ -105,6 +122,13 @@ defmodule FastestMCP.ResourceHelpersTest do
                method: "resources/list",
                transport: :stdio
              })
+
+    assert Enum.any?(
+             resources,
+             &(&1["uri"] == "memo://bundle" and &1["annotations"] == %{"cacheable" => true})
+           )
+
+    assert Enum.any?(resources, &(&1["uri"] == "memo://json"))
   end
 
   test "file resources read text and binary content and normalize failures" do

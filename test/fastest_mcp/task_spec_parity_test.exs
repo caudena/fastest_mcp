@@ -32,6 +32,20 @@ defmodule FastestMCP.TaskSpecParityTest do
              auth: %{"client_id" => "beta-client"}
            }}
 
+        "Bearer gamma" ->
+          {:ok,
+           %Result{
+             principal: %{"sub" => "gamma-user"},
+             auth: %{"client_id" => "shared-client"}
+           }}
+
+        "Bearer delta" ->
+          {:ok,
+           %Result{
+             principal: %{"sub" => "delta-user"},
+             auth: %{"client_id" => "shared-client"}
+           }}
+
         _other ->
           {:error, %Error{code: :unauthorized, message: "missing credentials"}}
       end
@@ -186,6 +200,62 @@ defmodule FastestMCP.TaskSpecParityTest do
              session_id: "shared-session",
              auth: %{"client_id" => "beta-client"},
              principal: %{"sub" => "beta-user"}
+           ) == %{tasks: [], next_cursor: nil}
+  end
+
+  test "task ownership separates users that share an oauth client id" do
+    server_name =
+      "task-auth-client-sub-scope-" <> Integer.to_string(System.unique_integer([:positive]))
+
+    server =
+      FastestMCP.server(server_name)
+      |> FastestMCP.add_auth(SessionBoundAuth)
+      |> FastestMCP.add_tool("echo", fn %{"value" => value}, _ctx -> value end, task: true)
+
+    assert {:ok, _pid} = FastestMCP.start_server(server)
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+
+    create =
+      Engine.dispatch!(server_name, %Request{
+        method: "tools/call",
+        transport: :stdio,
+        session_id: "shared-client-session",
+        task_request: true,
+        payload: %{"name" => "echo", "arguments" => %{"value" => "gamma"}},
+        auth_input: %{"authorization" => "Bearer gamma"},
+        request_metadata: %{session_id_provided: true}
+      })
+
+    task_id = create.task.taskId
+
+    assert %{taskId: ^task_id} =
+             Engine.dispatch!(server_name, %Request{
+               method: "tasks/get",
+               transport: :stdio,
+               session_id: "shared-client-session",
+               payload: %{"taskId" => task_id},
+               auth_input: %{"authorization" => "Bearer gamma"},
+               request_metadata: %{session_id_provided: true}
+             })
+
+    wrong_subject_error =
+      assert_raise Error, fn ->
+        Engine.dispatch!(server_name, %Request{
+          method: "tasks/get",
+          transport: :stdio,
+          session_id: "shared-client-session",
+          payload: %{"taskId" => task_id},
+          auth_input: %{"authorization" => "Bearer delta"},
+          request_metadata: %{session_id_provided: true}
+        })
+      end
+
+    assert wrong_subject_error.code == :invalid_task_id
+
+    assert FastestMCP.list_tasks(server_name,
+             session_id: "shared-client-session",
+             auth: %{"client_id" => "shared-client"},
+             principal: %{"sub" => "delta-user"}
            ) == %{tasks: [], next_cursor: nil}
   end
 

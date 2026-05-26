@@ -505,8 +505,7 @@ session-stream behavior.
 
 ## Current Compatibility Boundary
 
-Compared with the FastMCP context docs, FastestMCP still makes a few deliberate
-choices:
+FastestMCP makes a few deliberate choices:
 
 - explicit handler `ctx` is the primary style
 - `Context.current/0` and `current!/0` are process-local convenience helpers,

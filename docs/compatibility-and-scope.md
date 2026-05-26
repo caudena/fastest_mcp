@@ -1,20 +1,19 @@
 # Compatibility and Scope
 
-FastestMCP tracks replacement-grade compatibility for the FastMCP server plane,
-plus the Elixir-native companion surfaces required to use that server plane
-cleanly from Elixir code.
+FastestMCP targets MCP server behavior plus the Elixir-native companion
+surfaces required to use that server plane cleanly from Elixir code.
 
-It is not a literal Python port. Compatibility is the default, but divergence
-is allowed when the Python contract would fight OTP, explicit failure
-semantics, or normal Elixir application structure.
+Compatibility is the default for protocol-visible behavior, but divergence is
+allowed when a convention would fight OTP, explicit failure semantics, or normal
+Elixir application structure.
 
 ## Compatibility Rules
 
 - compatibility is the default
 - divergence must be intentional, documented, and tested
-- deprecated Python surfaces are not revived just for parity
-- public Elixir APIs should stay idiomatic even when the underlying MCP
-  contract is Python-derived
+- deprecated surfaces are not revived without a current Elixir use case
+- public Elixir APIs should stay idiomatic while preserving the underlying MCP
+  contract
 - FastestMCP-specific wire extensions, such as `_meta.fastestmcp`, are part of
   the public transport contract and should stay consistent across transports
 
@@ -45,35 +44,32 @@ The active compatibility target includes:
 
 The following are intentionally outside the current milestone:
 
-- CLI parity
+- CLI tooling
 - cluster-aware runtime behavior
 - publishing automation after the first manual Hex release is proven
-- custom app or UI layer parity
-- deprecated Python compatibility behaviors
+- custom app or UI layer
+- deprecated compatibility behaviors
 
 ## Intentional Elixir-native Divergences
 
 - No standalone SSE transport. The supported HTTP transport is streamable HTTP
   only.
-- No Python-style signature rewriting or annotation-based dependency
-  injection. Elixir keeps explicit `%FastestMCP.Context{}` and
+- No signature rewriting or annotation-based dependency injection. Elixir keeps
+  explicit `%FastestMCP.Context{}` and
   `FastestMCP.add_dependency/3`.
-- Python-style convenience exists only as narrow helpers such as
-  `Context.current!/0`, `Context.request_context/1`, and `Context.client_id/1`.
-  Explicit handler `ctx` remains the primary style.
-- No Starlette-style route-list API as the primary seam. HTTP integration stays
-  Plug-first.
+- Convenience exists only as narrow helpers such as `Context.current!/0`,
+  `Context.request_context/1`, and `Context.client_id/1`. Explicit handler
+  `ctx` remains the primary style.
+- HTTP integration stays Plug-first.
 - No external component management REST API. Runtime mutation lives inside the
   supervised runtime through `FastestMCP.ComponentManager`.
-- Client ergonomics are session-first and GenServer-based instead of mirroring
-  Python convenience layers exactly.
+- Client ergonomics are session-first and GenServer-based.
 
 ## Reference Boundary
 
 The compatibility target remains server-focused. The newer Elixir-native
 companion surfaces, such as the connected client and component manager, are
-covered by native FastestMCP tests rather than by the original Python test
-inventory.
+covered by native FastestMCP tests.
 
 ## Current State
 
@@ -94,5 +90,5 @@ scope until documented otherwise.
 ## Why This Shape
 
 This page owns the explicit boundary. The rationale page explains the design
-philosophy, but this page is the contract for what FastestMCP aims to match,
-what it deliberately does not match, and what remains outside the first release.
+philosophy, but this page is the contract for what FastestMCP supports, what it
+deliberately does not support, and what remains outside the first release.

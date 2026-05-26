@@ -209,6 +209,57 @@ defmodule FastestMCP.AuthLocalOAuthTest do
            } = Jason.decode!(protected_resource_conn.resp_body)
   end
 
+  test "local oauth advertises resource_base_url and uses it for JWT audiences" do
+    server_name =
+      "local-oauth-resource-base-" <> Integer.to_string(System.unique_integer([:positive]))
+
+    assert {:ok, _pid} =
+             FastestMCP.start_server(
+               local_oauth_server(server_name,
+                 jwt_signing_key: "resource-secret",
+                 resource_base_url: "https://resource.example.com"
+               )
+             )
+
+    protected_resource_conn =
+      conn(:get, "/.well-known/oauth-protected-resource/mcp")
+      |> FastestMCP.Transport.StreamableHTTP.call(
+        server_name: server_name,
+        base_url: "https://auth.example.com"
+      )
+
+    assert protected_resource_conn.status == 200
+
+    assert %{
+             "resource" => "https://resource.example.com/mcp",
+             "authorization_servers" => ["https://auth.example.com"]
+           } = Jason.decode!(protected_resource_conn.resp_body)
+
+    client = register_client(server_name)
+
+    %{"access_token" => access_token, "refresh_token" => refresh_token} =
+      authorize_and_exchange(server_name, client, base_url: "https://auth.example.com")
+
+    signing_key =
+      JWTIssuer.derive_jwt_key(
+        low_entropy_material: "resource-secret",
+        salt: "fastestmcp-jwt-signing-key"
+      )
+
+    issuer =
+      JWTIssuer.new(
+        issuer: "https://auth.example.com",
+        audience: "https://resource.example.com/mcp",
+        signing_key: signing_key
+      )
+
+    assert %{"client_id" => client_id} = JWTIssuer.verify_token(issuer, access_token)
+    assert client_id == client["client_id"]
+
+    assert %{"client_id" => ^client_id, "token_use" => "refresh"} =
+             JWTIssuer.verify_token(issuer, refresh_token, expected_token_use: "refresh")
+  end
+
   test "local oauth can publish discovery at issuer_url while keeping operational endpoints at base_url" do
     server_name =
       "local-oauth-issuer-" <> Integer.to_string(System.unique_integer([:positive]))
@@ -1541,8 +1592,9 @@ defmodule FastestMCP.AuthLocalOAuthTest do
     Jason.decode!(conn.resp_body)
   end
 
-  defp authorize_and_exchange(server_name, client) do
+  defp authorize_and_exchange(server_name, client, opts \\ []) do
     code_verifier = "refresh-flow-verifier"
+    transport_opts = [server_name: server_name] ++ Keyword.take(opts, [:base_url])
 
     authorize_conn =
       conn(
@@ -1558,7 +1610,7 @@ defmodule FastestMCP.AuthLocalOAuthTest do
             "code_challenge_method" => "S256"
           })
       )
-      |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
+      |> FastestMCP.Transport.StreamableHTTP.call(transport_opts)
 
     [location] = get_resp_header(authorize_conn, "location")
     %URI{query: query} = URI.parse(location)
@@ -1578,7 +1630,7 @@ defmodule FastestMCP.AuthLocalOAuthTest do
         })
       )
       |> put_req_header("content-type", "application/x-www-form-urlencoded")
-      |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
+      |> FastestMCP.Transport.StreamableHTTP.call(transport_opts)
 
     assert token_conn.status == 200
     Jason.decode!(token_conn.resp_body)

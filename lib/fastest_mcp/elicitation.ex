@@ -38,6 +38,7 @@ defmodule FastestMCP.Elicitation do
   @doc "Builds an elicitation request."
   def request(message, response_type, opts \\ []) when is_binary(message) and message != "" do
     {requested_schema, validator} = normalize_response_type(response_type)
+    requested_schema = apply_response_metadata(requested_schema, response_type, opts)
 
     %{
       request_id: "elicit-" <> Integer.to_string(System.unique_integer([:positive])),
@@ -106,6 +107,28 @@ defmodule FastestMCP.Elicitation do
           "elicitation response type must be :string, :integer, :number, :boolean, :map, a schema map, or a validator function, got #{inspect(other)}"
   end
 
+  defp apply_response_metadata(schema, response_type, opts) do
+    metadata =
+      %{}
+      |> maybe_put("title", Keyword.get(opts, :response_title))
+      |> maybe_put("description", Keyword.get(opts, :response_description))
+
+    cond do
+      map_size(metadata) == 0 ->
+        schema
+
+      response_type in [:string, :integer, :number, :boolean] ->
+        Map.merge(schema, metadata)
+
+      is_map(response_type) ->
+        Map.merge(schema, metadata)
+
+      true ->
+        raise ArgumentError,
+              "elicitation response_title/response_description are only supported for scalar response schemas or explicit schema maps"
+    end
+  end
+
   defp validate_string(%{"value" => value}) when is_binary(value), do: {:ok, value}
   defp validate_string(%{value: value}) when is_binary(value), do: {:ok, value}
   defp validate_string(value) when is_binary(value), do: {:ok, value}
@@ -164,4 +187,8 @@ defmodule FastestMCP.Elicitation do
     raise ArgumentError,
           "elicitation timeout_ms must be a positive integer, got #{inspect(value)}"
   end
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, _key, ""), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 end

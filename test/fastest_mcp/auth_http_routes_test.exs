@@ -145,6 +145,51 @@ defmodule FastestMCP.AuthHTTPRoutesTest do
            } = Jason.decode!(metadata_conn.resp_body)
   end
 
+  test "remote oauth metadata advertises resource_base_url without moving metadata route" do
+    server_name =
+      "remote-oauth-resource-base-" <> Integer.to_string(System.unique_integer([:positive]))
+
+    server =
+      FastestMCP.server(server_name)
+      |> FastestMCP.add_auth(FastestMCP.Auth.RemoteOAuth,
+        token_verifier:
+          {FastestMCP.Auth.StaticToken, tokens: %{"valid-token" => %{client_id: "svc"}}},
+        authorization_servers: ["https://auth.example.com"],
+        required_scopes: ["tools:call"],
+        resource_base_url: "https://resource.example.com"
+      )
+      |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+
+    assert {:ok, _pid} = FastestMCP.start_server(server)
+
+    unauthorized_conn =
+      conn(:post, "/mcp/tools/call", Jason.encode!(%{"name" => "echo"}))
+      |> put_req_header("content-type", "application/json")
+      |> FastestMCP.Transport.StreamableHTTP.call(
+        server_name: server_name,
+        base_url: "https://auth.example.com"
+      )
+
+    assert unauthorized_conn.status == 401
+    [challenge] = get_resp_header(unauthorized_conn, "www-authenticate")
+    assert challenge =~ "https://auth.example.com/.well-known/oauth-protected-resource/mcp"
+
+    metadata_conn =
+      conn(:get, "/.well-known/oauth-protected-resource/mcp")
+      |> FastestMCP.Transport.StreamableHTTP.call(
+        server_name: server_name,
+        base_url: "https://auth.example.com"
+      )
+
+    assert metadata_conn.status == 200
+
+    assert %{
+             "resource" => "https://resource.example.com/mcp",
+             "authorization_servers" => ["https://auth.example.com"],
+             "scopes_supported" => ["tools:call"]
+           } = Jason.decode!(metadata_conn.resp_body)
+  end
+
   test "assent-backed authorize and callback routes are mounted through remote oauth auth" do
     server_name = "remote-oauth-flow-" <> Integer.to_string(System.unique_integer([:positive]))
 

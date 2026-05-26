@@ -36,7 +36,7 @@ defmodule FastestMCP.Auth.RemoteOAuth do
   @doc "Builds the protected-resource metadata exposed by this auth provider."
   def protected_resource_metadata(http_context, opts) do
     %{
-      resource: resource_url(http_context),
+      resource: resource_url(http_context, opts),
       authorization_servers:
         opts
         |> opt(:authorization_servers, [])
@@ -178,8 +178,14 @@ defmodule FastestMCP.Auth.RemoteOAuth do
     join_url(http_context.base_url, callback_path(opts))
   end
 
-  defp resource_url(http_context) do
-    join_url(http_context.base_url, http_context.mcp_base_path)
+  defp resource_url(http_context, opts) do
+    join_url(resource_base_url(http_context, opts), http_context.mcp_base_path)
+  end
+
+  defp resource_base_url(http_context, opts) do
+    opts
+    |> opt(:resource_base_url, http_context.base_url)
+    |> to_string()
   end
 
   defp random_state do
