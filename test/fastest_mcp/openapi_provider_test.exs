@@ -157,4 +157,108 @@ defmodule FastestMCP.OpenAPIProviderTest do
     assert_receive {:request, :post, "https://api.example.com/users", post_opts}, 1_000
     assert post_opts[:json] == %{"name" => "Nate", "email" => "nate@example.com"}
   end
+
+  test "server variable defaults are expanded when deriving base url" do
+    parent = self()
+    server_name = "openapi-server-vars-" <> Integer.to_string(System.unique_integer([:positive]))
+
+    spec = %{
+      "openapi" => "3.0.0",
+      "info" => %{"title" => "Variable API", "version" => "1.0.0"},
+      "servers" => [
+        %{
+          "url" => "https://{env}.example.com/{basePath}",
+          "variables" => %{
+            "env" => %{"default" => "staging"},
+            "basePath" => %{"default" => "v1"}
+          }
+        }
+      ],
+      "paths" => %{
+        "/ping" => %{
+          "get" => %{
+            "operationId" => "ping",
+            "responses" => %{"200" => %{"description" => "OK"}}
+          }
+        }
+      }
+    }
+
+    requester = fn method, url, opts ->
+      send(parent, {:request, method, url, opts})
+      {:ok, 200, [{"content-type", "application/json"}], Jason.encode!(%{"ok" => true})}
+    end
+
+    server = FastestMCP.from_openapi(spec, name: server_name, requester: requester)
+    assert {:ok, _pid} = FastestMCP.start_server(server)
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+
+    assert %{"ok" => true} == FastestMCP.call_tool(server_name, "ping", %{})
+
+    assert_receive {:request, :get, "https://staging.example.com/v1/ping", _opts}, 1_000
+  end
+
+  test "nullable openapi schemas are exposed as json schema unions" do
+    parent = self()
+    server_name = "openapi-nullable-" <> Integer.to_string(System.unique_integer([:positive]))
+
+    spec = %{
+      "openapi" => "3.0.0",
+      "info" => %{"title" => "Nullable API", "version" => "1.0.0"},
+      "servers" => [%{"url" => "https://nullable.example.com"}],
+      "paths" => %{
+        "/profiles" => %{
+          "post" => %{
+            "operationId" => "create_profile",
+            "requestBody" => %{
+              "content" => %{
+                "application/json" => %{
+                  "schema" => %{
+                    "type" => "object",
+                    "properties" => %{
+                      "nickname" => %{"type" => "string", "nullable" => true}
+                    }
+                  }
+                }
+              }
+            },
+            "responses" => %{
+              "200" => %{
+                "description" => "OK",
+                "content" => %{
+                  "application/json" => %{
+                    "schema" => %{
+                      "type" => "object",
+                      "properties" => %{
+                        "display_name" => %{"type" => "string", "nullable" => true}
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    requester = fn method, url, opts ->
+      send(parent, {:request, method, url, opts})
+      {:ok, 200, [{"content-type", "application/json"}], Jason.encode!(%{"ok" => true})}
+    end
+
+    server = FastestMCP.from_openapi(spec, name: server_name, requester: requester)
+    assert {:ok, _pid} = FastestMCP.start_server(server)
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+
+    [tool] = FastestMCP.list_tools(server_name)
+    assert tool.input_schema["properties"]["nickname"]["type"] == ["string", "null"]
+    assert tool.output_schema["properties"]["display_name"]["type"] == ["string", "null"]
+
+    assert %{"ok" => true} ==
+             FastestMCP.call_tool(server_name, "create_profile", %{"nickname" => nil})
+
+    assert_receive {:request, :post, "https://nullable.example.com/profiles", opts}, 1_000
+    assert opts[:json] == %{"nickname" => nil}
+  end
 end

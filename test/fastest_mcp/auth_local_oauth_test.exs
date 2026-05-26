@@ -971,6 +971,57 @@ defmodule FastestMCP.AuthLocalOAuthTest do
     assert %{"error" => "invalid_request"} = Jason.decode!(bypass_conn.resp_body)
   end
 
+  test "configured redirect allowlist overrides stored client patterns" do
+    server_name =
+      "local-oauth-pattern-override-" <> Integer.to_string(System.unique_integer([:positive]))
+
+    assert {:ok, _pid} =
+             FastestMCP.start_server(
+               local_oauth_server(server_name,
+                 allowed_client_redirect_uris: ["http://localhost:*"]
+               )
+             )
+
+    client =
+      register_client(server_name, %{
+        redirect_uris: ["http://localhost:4001/callback"],
+        allowed_redirect_uri_patterns: ["https://evil.example.com/*"]
+      })
+
+    assert client["allowed_redirect_uri_patterns"] == ["https://evil.example.com/*"]
+
+    evil_conn =
+      conn(
+        :get,
+        "/authorize?" <>
+          URI.encode_query(%{
+            "response_type" => "code",
+            "client_id" => client["client_id"],
+            "redirect_uri" => "https://evil.example.com/callback",
+            "state" => "evil-state"
+          })
+      )
+      |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
+
+    assert evil_conn.status == 400
+    assert %{"error" => "invalid_request"} = Jason.decode!(evil_conn.resp_body)
+
+    allowed_conn =
+      conn(
+        :get,
+        "/authorize?" <>
+          URI.encode_query(%{
+            "response_type" => "code",
+            "client_id" => client["client_id"],
+            "redirect_uri" => "http://localhost:43210/callback",
+            "state" => "allowed-state"
+          })
+      )
+      |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
+
+    assert allowed_conn.status == 302
+  end
+
   test "cimd clients allow wildcard localhost callback ports" do
     server_name =
       "local-oauth-cimd-wildcard-" <> Integer.to_string(System.unique_integer([:positive]))
@@ -1445,6 +1496,7 @@ defmodule FastestMCP.AuthLocalOAuthTest do
       |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
 
     assert protected_conn.status == 200
+    protected_body = Jason.decode!(protected_conn.resp_body)
 
     assert %{
              "structuredContent" => %{
@@ -1454,7 +1506,13 @@ defmodule FastestMCP.AuthLocalOAuthTest do
                  "upstream_access_token" => "gho_mock_token_upstream-code-123"
                }
              }
-           } = Jason.decode!(protected_conn.resp_body)
+           } = protected_body
+
+    assert get_in(protected_body, [
+             "structuredContent",
+             "auth",
+             "upstream_claims"
+           ]) == %{"login" => "octocat", "sub" => "github-user-123"}
   end
 
   defp register_client(server_name, overrides \\ %{}) do

@@ -235,6 +235,7 @@ defmodule FastestMCP.Providers.OpenAPI do
       schema:
         parameter
         |> Map.get("schema", %{"type" => "string"})
+        |> normalize_openapi_schema()
         |> maybe_put_map("description", parameter["description"]),
       required: !!parameter["required"],
       style: parameter["style"],
@@ -312,6 +313,7 @@ defmodule FastestMCP.Providers.OpenAPI do
         request_body
         |> resolve_refs()
         |> get_in(["content", "application/json", "schema"])
+        |> normalize_openapi_schema()
     end
   end
 
@@ -327,6 +329,7 @@ defmodule FastestMCP.Providers.OpenAPI do
           response
           |> resolve_refs()
           |> get_in(["content", "application/json", "schema"])
+          |> normalize_openapi_schema()
       end
     end)
   end
@@ -433,6 +436,7 @@ defmodule FastestMCP.Providers.OpenAPI do
 
   defp maybe_put_map(map, _key, []), do: map
   defp maybe_put_map(map, _key, nil), do: map
+  defp maybe_put_map(value, _key, _value) when not is_map(value), do: value
   defp maybe_put_map(map, key, value), do: Map.put(map, key, value)
 
   defp maybe_put(keyword, _key, nil), do: keyword
@@ -444,9 +448,61 @@ defmodule FastestMCP.Providers.OpenAPI do
     |> List.wrap()
     |> List.first()
     |> case do
-      %{"url" => url} -> url
+      %{"url" => url} = server -> expand_server_variables(url, Map.get(server, "variables", %{}))
       _other -> nil
     end
+  end
+
+  defp expand_server_variables(url, variables) do
+    Regex.replace(~r/\{([^}]+)\}/, to_string(url), fn _match, name ->
+      variables
+      |> Map.get(name, %{})
+      |> Map.get("default", "")
+      |> to_string()
+    end)
+  end
+
+  defp normalize_openapi_schema(nil), do: nil
+  defp normalize_openapi_schema(schema) when is_boolean(schema), do: schema
+
+  defp normalize_openapi_schema(schema) when is_list(schema) do
+    Enum.map(schema, &normalize_openapi_schema/1)
+  end
+
+  defp normalize_openapi_schema(schema) when is_map(schema) do
+    schema
+    |> Enum.into(%{}, fn {key, value} -> {key, normalize_openapi_schema(value)} end)
+    |> apply_nullable()
+  end
+
+  defp normalize_openapi_schema(value), do: value
+
+  defp apply_nullable(%{"nullable" => true} = schema) do
+    schema
+    |> Map.delete("nullable")
+    |> add_null_type()
+  end
+
+  defp apply_nullable(%{} = schema), do: Map.delete(schema, "nullable")
+
+  defp add_null_type(%{"type" => type} = schema) when is_binary(type) do
+    Map.put(schema, "type", Enum.uniq([type, "null"]))
+  end
+
+  defp add_null_type(%{"type" => types} = schema) when is_list(types) do
+    Map.put(schema, "type", Enum.uniq(types ++ ["null"]))
+  end
+
+  defp add_null_type(%{"oneOf" => schemas} = schema) when is_list(schemas) do
+    Map.put(schema, "oneOf", schemas ++ [%{"type" => "null"}])
+  end
+
+  defp add_null_type(%{"anyOf" => schemas} = schema) when is_list(schemas) do
+    Map.put(schema, "anyOf", schemas ++ [%{"type" => "null"}])
+  end
+
+  defp add_null_type(%{} = schema) do
+    %{"anyOf" => [schema, %{"type" => "null"}]}
   end
 
   defp resolve_refs(value), do: resolve_refs(value, stringify_keys(value))

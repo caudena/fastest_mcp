@@ -115,6 +115,12 @@ defmodule FastestMCP.ToolResultHelperTest do
       |> FastestMCP.add_tool("mirror", fn _arguments, _ctx ->
         ToolResult.new(nil, structured_content: %{message: "hi"})
       end)
+      |> FastestMCP.add_tool("explicit_success_mirror", fn _arguments, _ctx ->
+        ToolResult.new(nil, structured_content: %{message: "explicit"}, is_error: false)
+      end)
+      |> FastestMCP.add_tool("structured_error", fn _arguments, _ctx ->
+        ToolResult.new(nil, structured_content: %{reason: "boom"}, is_error: true)
+      end)
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
@@ -143,5 +149,12 @@ defmodule FastestMCP.ToolResultHelperTest do
            } = Client.call_tool(client, "report", %{})
 
     assert %{"message" => "hi"} = Client.call_tool(client, "mirror", %{})
+    assert %{"message" => "explicit"} = Client.call_tool(client, "explicit_success_mirror", %{})
+
+    assert %{
+             "content" => [%{"type" => "text"}],
+             "structuredContent" => %{"reason" => "boom"},
+             "isError" => true
+           } = Client.call_tool(client, "structured_error", %{})
   end
 end

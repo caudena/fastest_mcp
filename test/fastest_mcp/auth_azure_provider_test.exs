@@ -5,6 +5,7 @@ defmodule FastestMCP.AuthAzureProviderTest do
   import Plug.Test
 
   alias FastestMCP.Auth.Azure
+  alias FastestMCP.Auth.JWT
 
   defmodule FakeAzureStrategy do
     def authorize_url(config) do
@@ -192,6 +193,69 @@ defmodule FastestMCP.AuthAzureProviderTest do
            }) == ["api://my-api/read", "User.Read", "offline_access"]
   end
 
+  test "azure token verifier accepts client id and identifier uri audiences" do
+    {public_key, private_jwk} = rsa_key_pair()
+
+    verifier_opts =
+      %{
+        client_id: "test-client",
+        client_secret: "test-secret",
+        tenant_id: "my-tenant",
+        identifier_uri: "api://my-api",
+        required_scopes: ["read"]
+      }
+      |> Azure.token_verifier_options()
+      |> Map.put(:public_key, public_key)
+
+    assert verifier_opts.audience == ["test-client", "api://my-api"]
+
+    client_id_token =
+      sign_token(private_jwk, %{
+        "sub" => "azure-user",
+        "iss" => "https://login.microsoftonline.com/my-tenant/v2.0",
+        "aud" => "test-client",
+        "scp" => "read",
+        "exp" => System.os_time(:second) + 3600
+      })
+
+    identifier_uri_token =
+      sign_token(private_jwk, %{
+        "sub" => "azure-user",
+        "iss" => "https://login.microsoftonline.com/my-tenant/v2.0",
+        "aud" => "api://my-api",
+        "scp" => "read",
+        "exp" => System.os_time(:second) + 3600
+      })
+
+    wrong_audience_token =
+      sign_token(private_jwk, %{
+        "sub" => "azure-user",
+        "iss" => "https://login.microsoftonline.com/my-tenant/v2.0",
+        "aud" => "wrong-app-id",
+        "scp" => "read",
+        "exp" => System.os_time(:second) + 3600
+      })
+
+    assert {:ok, %{"sub" => "azure-user"}} = JWT.verify(client_id_token, verifier_opts)
+    assert {:ok, %{"sub" => "azure-user"}} = JWT.verify(identifier_uri_token, verifier_opts)
+
+    assert {:error, %FastestMCP.Error{code: :unauthorized}} =
+             JWT.verify(wrong_audience_token, verifier_opts)
+  end
+
+  test "azure token verifier preserves explicit audience override" do
+    verifier_opts =
+      Azure.token_verifier_options(%{
+        client_id: "test-client",
+        client_secret: "test-secret",
+        tenant_id: "my-tenant",
+        identifier_uri: "api://my-api",
+        audience: "custom-audience"
+      })
+
+    assert verifier_opts.audience == "custom-audience"
+  end
+
   defp authorize_and_approve(server_name, client, state, code_challenge, opts) do
     base_url = Keyword.fetch!(opts, :base_url)
 
@@ -273,5 +337,20 @@ defmodule FastestMCP.AuthAzureProviderTest do
     :sha256
     |> :crypto.hash(value)
     |> Base.url_encode64(padding: false)
+  end
+
+  defp rsa_key_pair do
+    jwk = JOSE.JWK.generate_key({:rsa, 2048})
+    {_, public_pem} = jwk |> JOSE.JWK.to_public() |> JOSE.JWK.to_pem()
+    {public_pem, jwk}
+  end
+
+  defp sign_token(jwk, claims) do
+    {_, token} =
+      jwk
+      |> JOSE.JWT.sign(%{"alg" => "RS256"}, claims)
+      |> JOSE.JWS.compact()
+
+    token
   end
 end

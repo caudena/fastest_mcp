@@ -69,7 +69,13 @@ defmodule FastestMCP.Middleware.ResponseLimiting do
 
   @doc "Truncates text into the normalized limited-result shape."
   def truncate_to_result(%__MODULE__{} = middleware, text) when is_binary(text) do
-    truncate_to_tool_result(text, middleware.max_size, middleware.truncation_suffix)
+    truncate_to_tool_result(text, middleware.max_size, middleware.truncation_suffix, %{})
+  end
+
+  @doc "Truncates text into the normalized limited-result shape while preserving metadata if it fits."
+  def truncate_to_result(%__MODULE__{} = middleware, text, metadata)
+      when is_binary(text) and is_map(metadata) do
+    truncate_to_tool_result(text, middleware.max_size, middleware.truncation_suffix, metadata)
   end
 
   defp maybe_limit_result(%__MODULE__{} = middleware, %Operation{} = operation, result) do
@@ -84,46 +90,60 @@ defmodule FastestMCP.Middleware.ResponseLimiting do
 
       result
       |> extract_text()
-      |> truncate_to_tool_result(middleware.max_size, middleware.truncation_suffix)
+      |> truncate_to_tool_result(
+        middleware.max_size,
+        middleware.truncation_suffix,
+        extract_metadata(result)
+      )
     end
   end
 
-  defp truncate_to_tool_result(text, max_size, suffix) do
+  defp truncate_to_tool_result(text, max_size, suffix, metadata) do
     suffix = to_string(suffix)
+    metadata = normalize_metadata(metadata)
 
     candidate =
-      build_truncated_text(text, suffix, max_size) ||
-        build_truncated_suffix(suffix, max_size) ||
-        ""
+      build_truncated_text(text, suffix, max_size, metadata) ||
+        build_truncated_suffix(suffix, max_size, metadata)
 
-    %{"content" => [%{"type" => "text", "text" => candidate}]}
+    cond do
+      is_binary(candidate) ->
+        limited_result(candidate, metadata)
+
+      map_size(metadata) > 0 ->
+        truncate_to_tool_result(text, max_size, suffix, %{})
+
+      true ->
+        limited_result("", %{})
+    end
   end
 
-  defp build_truncated_text(text, suffix, max_size) do
+  defp build_truncated_text(text, suffix, max_size, metadata) do
     bytes = byte_size(text)
 
-    if encoded_result_size(suffix) <= max_size do
-      search_prefix(text, suffix, max_size, 0, bytes, nil)
+    if encoded_result_size(suffix, metadata) <= max_size do
+      search_prefix(text, suffix, max_size, 0, bytes, nil, metadata)
     else
       nil
     end
   end
 
-  defp build_truncated_suffix(suffix, max_size) do
-    search_prefix(suffix, "", max_size, 0, byte_size(suffix), nil)
+  defp build_truncated_suffix(suffix, max_size, metadata) do
+    search_prefix(suffix, "", max_size, 0, byte_size(suffix), nil, metadata)
   end
 
-  defp search_prefix(_text, _suffix, _max_size, low, high, best) when low > high, do: best
+  defp search_prefix(_text, _suffix, _max_size, low, high, best, _metadata) when low > high,
+    do: best
 
-  defp search_prefix(text, suffix, max_size, low, high, best) do
+  defp search_prefix(text, suffix, max_size, low, high, best, metadata) do
     middle = div(low + high, 2)
     prefix = safe_utf8_prefix(text, middle)
     candidate = prefix <> suffix
 
-    if encoded_result_size(candidate) <= max_size do
-      search_prefix(text, suffix, max_size, middle + 1, high, candidate)
+    if encoded_result_size(candidate, metadata) <= max_size do
+      search_prefix(text, suffix, max_size, middle + 1, high, candidate, metadata)
     else
-      search_prefix(text, suffix, max_size, low, middle - 1, best)
+      search_prefix(text, suffix, max_size, low, middle - 1, best, metadata)
     end
   end
 
@@ -140,10 +160,15 @@ defmodule FastestMCP.Middleware.ResponseLimiting do
     end
   end
 
-  defp encoded_result_size(text) do
-    %{"content" => [%{"type" => "text", "text" => text}]}
+  defp encoded_result_size(text, metadata) do
+    text
+    |> limited_result(metadata)
     |> Jason.encode!()
     |> byte_size()
+  end
+
+  defp limited_result(text, metadata) do
+    Map.merge(%{"content" => [%{"type" => "text", "text" => text}]}, metadata)
   end
 
   defp extract_text(result) when is_binary(result), do: result
@@ -187,6 +212,23 @@ defmodule FastestMCP.Middleware.ResponseLimiting do
   defp fetch_content(result) do
     Map.get(result, :content, Map.get(result, "content"))
   end
+
+  defp extract_metadata(%{} = result) do
+    %{}
+    |> maybe_put_metadata("meta", Map.get(result, "meta", Map.get(result, :meta)))
+    |> maybe_put_metadata("_meta", Map.get(result, "_meta", Map.get(result, :_meta)))
+  end
+
+  defp extract_metadata(_result), do: %{}
+
+  defp normalize_metadata(metadata) when is_map(metadata) do
+    metadata
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+    |> Map.new(fn {key, value} -> {to_string(key), value} end)
+  end
+
+  defp maybe_put_metadata(metadata, _key, nil), do: metadata
+  defp maybe_put_metadata(metadata, key, value), do: Map.put(metadata, key, value)
 
   defp limit_tool?(%__MODULE__{tools: nil}, %Operation{method: "tools/call"}), do: true
 

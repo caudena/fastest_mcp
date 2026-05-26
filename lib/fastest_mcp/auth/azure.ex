@@ -64,8 +64,14 @@ defmodule FastestMCP.Auth.Azure do
           "id_token_signing_alg_values_supported" => ["RS256"]
         }
       )
-      |> Map.put_new(:audience, identifier_uri(normalized))
+      |> Map.put_new(:audience, default_audiences(normalized))
     )
+  end
+
+  defp default_audiences(opts) do
+    [Map.fetch!(opts, :client_id), identifier_uri(opts)]
+    |> Enum.map(&to_string/1)
+    |> Enum.uniq()
   end
 
   @doc "Normalizes the configured authority URL."

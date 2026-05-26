@@ -2736,14 +2736,12 @@ defmodule FastestMCP.Client do
   defp normalize_response(:task_result, result), do: result
 
   defp normalize_response(:tool_call, %{"task" => _task} = result), do: result
+  defp normalize_response(:tool_call, %{"isError" => true} = result), do: result
 
   defp normalize_response(:tool_call, %{"structuredContent" => structured} = result)
        when not is_nil(structured) do
     cond do
       Map.has_key?(result, "meta") ->
-        result
-
-      Map.has_key?(result, "isError") ->
         result
 
       tool_result_mirrors_structured_content?(result["content"], structured) ->

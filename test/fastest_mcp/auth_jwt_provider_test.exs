@@ -124,6 +124,37 @@ defmodule FastestMCP.AuthJWTProviderTest do
              FastestMCP.call_tool(server_name, "whoami", %{}, auth_input: %{"token" => token})
   end
 
+  test "jwt provider validates required claim values" do
+    {public_key, private_jwk} = rsa_key_pair()
+
+    valid_token =
+      sign_token(private_jwk, %{
+        "sub" => "user-123",
+        "client_id" => "expected-client",
+        "tenant" => "alpha",
+        "exp" => System.os_time(:second) + 3600
+      })
+
+    assert {:ok, %{"sub" => "user-123"}} =
+             FastestMCP.Auth.JWT.verify(valid_token,
+               public_key: public_key,
+               required_claims: %{:client_id => "expected-client", "tenant" => "alpha"}
+             )
+
+    mismatched_token =
+      sign_token(private_jwk, %{
+        "sub" => "user-123",
+        "client_id" => "wrong-client",
+        "exp" => System.os_time(:second) + 3600
+      })
+
+    assert {:error, %Error{code: :unauthorized}} =
+             FastestMCP.Auth.JWT.verify(mismatched_token,
+               public_key: public_key,
+               required_claims: %{"client_id" => "expected-client"}
+             )
+  end
+
   defp rsa_key_pair do
     jwk = JOSE.JWK.generate_key({:rsa, 2048})
     {_, public_pem} = jwk |> JOSE.JWK.to_public() |> JOSE.JWK.to_pem()

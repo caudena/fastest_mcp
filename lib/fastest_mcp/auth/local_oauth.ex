@@ -463,6 +463,7 @@ defmodule FastestMCP.Auth.LocalOAuth do
     provider = normalize_provider(Map.get(metadata, "provider", "local_oauth"))
     auth_metadata = normalize_map(Map.get(metadata, "auth", %{}))
     jwt_issuer = jwt_issuer(http_context, opts)
+    upstream_claims = upstream_claims_from_metadata(metadata)
 
     access_token =
       issue_access_token_value(
@@ -471,7 +472,7 @@ defmodule FastestMCP.Auth.LocalOAuth do
         scopes,
         access_token_id,
         access_token_expires_in(http_context),
-        upstream_claims_from_metadata(metadata)
+        upstream_claims
       )
 
     refresh_token =
@@ -481,28 +482,32 @@ defmodule FastestMCP.Auth.LocalOAuth do
         scopes,
         refresh_token_id,
         jwt_refresh_token_expires_in(http_context, opts),
-        upstream_claims_from_metadata(metadata)
+        upstream_claims
       )
 
-    access_record = %{
-      "client_id" => client["client_id"],
-      "scopes" => scopes,
-      "principal" => principal,
-      "refresh_token" => refresh_token,
-      "provider" => provider,
-      "auth" => auth_metadata,
-      "token_id" => access_token_id
-    }
+    access_record =
+      %{
+        "client_id" => client["client_id"],
+        "scopes" => scopes,
+        "principal" => principal,
+        "refresh_token" => refresh_token,
+        "provider" => provider,
+        "auth" => auth_metadata,
+        "token_id" => access_token_id
+      }
+      |> maybe_put("upstream_claims", upstream_claims)
 
-    refresh_record = %{
-      "client_id" => client["client_id"],
-      "scopes" => scopes,
-      "principal" => principal,
-      "access_token" => access_token,
-      "provider" => provider,
-      "auth" => auth_metadata,
-      "token_id" => refresh_token_id
-    }
+    refresh_record =
+      %{
+        "client_id" => client["client_id"],
+        "scopes" => scopes,
+        "principal" => principal,
+        "access_token" => access_token,
+        "provider" => provider,
+        "auth" => auth_metadata,
+        "token_id" => refresh_token_id
+      }
+      |> maybe_put("upstream_claims", upstream_claims)
 
     :ok =
       StateStore.put(
@@ -611,10 +616,22 @@ defmodule FastestMCP.Auth.LocalOAuth do
   defp fetch_client(http_context, opts, client_id) do
     case StateStore.get(client_store(http_context, opts), client_id) do
       {:ok, client} ->
-        {:ok, client}
+        apply_configured_redirect_patterns(client, opts)
 
       {:error, :not_found} ->
         maybe_fetch_cimd_client(http_context, opts, client_id)
+    end
+  end
+
+  defp apply_configured_redirect_patterns(client, opts) do
+    case opt(opts, :allowed_client_redirect_uris) do
+      nil ->
+        {:ok, client}
+
+      patterns ->
+        with {:ok, allowed_patterns} <- validate_redirect_uri_patterns(patterns) do
+          {:ok, Map.put(client, "allowed_redirect_uri_patterns", allowed_patterns)}
+        end
     end
   end
 
@@ -830,7 +847,12 @@ defmodule FastestMCP.Auth.LocalOAuth do
   defp build_auth_result(token, access_token) do
     scopes = normalize_scopes(access_token["scopes"])
     provider = normalize_provider(Map.get(access_token, "provider", "local_oauth"))
-    auth_metadata = normalize_map(Map.get(access_token, "auth", %{}))
+
+    auth_metadata =
+      access_token
+      |> Map.get("auth", %{})
+      |> normalize_map()
+      |> maybe_put_upstream_claims(Map.get(access_token, "upstream_claims"))
 
     %Result{
       principal:
@@ -1407,6 +1429,18 @@ defmodule FastestMCP.Auth.LocalOAuth do
     end
   end
 
+  defp maybe_put_upstream_claims(auth, nil), do: auth
+
+  defp maybe_put_upstream_claims(auth, upstream_claims) when is_map(upstream_claims) do
+    if Map.has_key?(auth, :upstream_claims) or Map.has_key?(auth, "upstream_claims") do
+      auth
+    else
+      Map.put(auth, :upstream_claims, upstream_claims)
+    end
+  end
+
+  defp maybe_put_upstream_claims(auth, _upstream_claims), do: auth
+
   defp normalize_jwt_signing_key(key) when is_binary(key) do
     case Base.url_decode64(key) do
       {:ok, decoded} when byte_size(decoded) == 32 ->
@@ -1933,6 +1967,7 @@ defmodule FastestMCP.Auth.LocalOAuth do
     |> maybe_put_metadata("principal", Map.get(record, "principal"))
     |> maybe_put_metadata("provider", Map.get(record, "provider"))
     |> maybe_put_metadata("auth", Map.get(record, "auth"))
+    |> maybe_put_metadata("upstream_claims", Map.get(record, "upstream_claims"))
   end
 
   defp upstream_principal(result) do

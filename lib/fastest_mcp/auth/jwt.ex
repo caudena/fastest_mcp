@@ -66,7 +66,8 @@ defmodule FastestMCP.Auth.JWT do
         with :ok <- validate_issuer(claims, opts),
              :ok <- validate_audience(claims, opts),
              :ok <- validate_expiration(claims),
-             :ok <- validate_not_before(claims) do
+             :ok <- validate_not_before(claims),
+             :ok <- validate_required_claims(claims, opts) do
           {:ok, claims}
         end
 
@@ -308,6 +309,22 @@ defmodule FastestMCP.Auth.JWT do
 
   defp validate_not_before(_claims), do: :ok
 
+  defp validate_required_claims(claims, opts) do
+    opts
+    |> opt(:required_claims, %{})
+    |> normalize_required_claims()
+    |> Enum.find(fn {claim, expected} ->
+      not claim_matches?(Map.get(claims, claim), expected)
+    end)
+    |> case do
+      nil ->
+        :ok
+
+      _missing_or_mismatched ->
+        {:error, %Error{code: :unauthorized, message: "invalid credentials"}}
+    end
+  end
+
   defp validate_required_scopes(scopes, opts) do
     required_scopes =
       opts
@@ -351,6 +368,38 @@ defmodule FastestMCP.Auth.JWT do
       {to_string(key), value}
     end)
   end
+
+  defp normalize_required_claims(nil), do: []
+
+  defp normalize_required_claims(claims) when is_map(claims) or is_list(claims) do
+    Enum.map(claims, fn {key, value} -> {to_string(key), value} end)
+  end
+
+  defp normalize_required_claims(_claims), do: []
+
+  defp claim_matches?(nil, _expected), do: false
+
+  defp claim_matches?(actual, expected) do
+    actual_values = List.wrap(actual)
+    expected_values = List.wrap(expected)
+
+    Enum.any?(expected_values, fn expected_value ->
+      Enum.any?(actual_values, &claim_value_matches?(&1, expected_value))
+    end)
+  end
+
+  defp claim_value_matches?(actual, expected) do
+    actual == expected or
+      (scalar_claim_value?(actual) and scalar_claim_value?(expected) and
+         to_string(actual) == to_string(expected))
+  end
+
+  defp scalar_claim_value?(value)
+       when is_binary(value) or is_integer(value) or is_float(value) or is_atom(value) or
+              is_boolean(value),
+       do: true
+
+  defp scalar_claim_value?(_value), do: false
 
   defp hs_algorithm?(algorithm), do: String.starts_with?(to_string(algorithm), "HS")
   defp pem_key?(value) when is_binary(value), do: String.contains?(value, "BEGIN ")

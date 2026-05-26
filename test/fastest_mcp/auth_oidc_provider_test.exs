@@ -319,6 +319,7 @@ defmodule FastestMCP.AuthOIDCProviderTest do
       |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
 
     assert protected_conn.status == 200
+    protected_body = Jason.decode!(protected_conn.resp_body)
 
     assert %{
              "structuredContent" => %{
@@ -333,7 +334,13 @@ defmodule FastestMCP.AuthOIDCProviderTest do
                  "upstream_id_token" => ^expected_id_token
                }
              }
-           } = Jason.decode!(protected_conn.resp_body)
+           } = protected_body
+
+    assert get_in(protected_body, [
+             "structuredContent",
+             "auth",
+             "upstream_claims"
+           ]) == %{"email" => "user@example.com", "sub" => "oidc-user-123"}
   end
 
   defp authorize_and_approve(server_name, client, state, code_challenge, opts) do

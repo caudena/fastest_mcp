@@ -120,6 +120,42 @@ defmodule FastestMCP.MiddlewareResponseLimitingTest do
     assert text =~ "[Response truncated"
   end
 
+  test "truncation preserves tool metadata when it fits" do
+    middleware = Middleware.response_limiting(max_size: 450)
+    operation = %Operation{method: "tools/call", target: "wrapped_tool"}
+
+    result =
+      ResponseLimiting.call(middleware, operation, fn _operation ->
+        %{
+          "content" => [%{"type" => "text", "text" => String.duplicate("x", 10_000)}],
+          "structuredContent" => %{"result" => Enum.to_list(1..100)},
+          "meta" => %{"fastestmcp" => %{"wrap_result" => true}}
+        }
+      end)
+
+    assert %{
+             "content" => [%{"type" => "text", "text" => text}],
+             "meta" => %{"fastestmcp" => %{"wrap_result" => true}}
+           } = result
+
+    assert text =~ "[Response truncated"
+    assert byte_size(Jason.encode!(result)) <= 450
+  end
+
+  test "truncation drops metadata when metadata alone cannot fit" do
+    middleware = Middleware.response_limiting(max_size: 160)
+
+    result =
+      ResponseLimiting.truncate_to_result(
+        middleware,
+        String.duplicate("x", 10_000),
+        %{"meta" => %{"large" => String.duplicate("m", 1_000)}}
+      )
+
+    refute Map.has_key?(result, "meta")
+    assert byte_size(Jason.encode!(result)) <= 160
+  end
+
   test "utf8 truncation preserves valid characters" do
     middleware = Middleware.response_limiting(max_size: 100)
 

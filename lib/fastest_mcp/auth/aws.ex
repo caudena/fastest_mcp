@@ -52,8 +52,19 @@ defmodule FastestMCP.Auth.AWS do
     |> Map.put_new(:aws_region, "eu-central-1")
     |> Map.put_new(:required_scopes, ["openid"])
     |> Map.put_new(:config_url, config_url(opts))
-    |> Map.put_new(:audience, Map.fetch!(opts, :client_id))
+    |> require_cognito_client_id_claim()
     |> put_callback_path()
+  end
+
+  defp require_cognito_client_id_claim(opts) do
+    required_claims =
+      opts
+      |> Map.get(:required_claims, %{})
+      |> Kernel.||(%{})
+      |> Map.new(fn {key, value} -> {to_string(key), value} end)
+      |> Map.put("client_id", Map.fetch!(opts, :client_id))
+
+    Map.put(opts, :required_claims, required_claims)
   end
 
   defp put_callback_path(opts) do

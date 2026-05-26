@@ -209,4 +209,38 @@ defmodule FastestMCP.InputValidationTest do
       FastestMCP.call_tool(server_name, "echo_value", %{"value" => 7})
     end
   end
+
+  test "boolean schemas and additionalProperties false are enforced" do
+    server_name =
+      "input-boolean-schema-" <> Integer.to_string(System.unique_integer([:positive]))
+
+    schema = %{
+      "type" => "object",
+      "properties" => %{
+        "anything" => true,
+        "blocked" => false
+      },
+      "additionalProperties" => false
+    }
+
+    server =
+      FastestMCP.server(server_name, strict_input_validation: true)
+      |> FastestMCP.add_tool("echo", fn args, _ctx -> args end, input_schema: schema)
+
+    assert {:ok, _pid} = FastestMCP.start_server(server)
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+
+    assert %{"anything" => %{"nested" => "value"}} ==
+             FastestMCP.call_tool(server_name, "echo", %{
+               "anything" => %{"nested" => "value"}
+             })
+
+    assert_raise Error, ~r/blocked does not match schema/, fn ->
+      FastestMCP.call_tool(server_name, "echo", %{"blocked" => "nope"})
+    end
+
+    assert_raise Error, ~r/extra is not allowed/, fn ->
+      FastestMCP.call_tool(server_name, "echo", %{"extra" => "nope"})
+    end
+  end
 end

@@ -119,6 +119,7 @@ defmodule FastestMCP.Auth.OIDC do
       issuer: Map.fetch!(configuration, "issuer"),
       algorithm: Map.get(opts, :algorithm, "RS256"),
       audience: verifier_audience(opts),
+      required_claims: Map.get(opts, :required_claims, %{}),
       required_scopes: verifier_required_scopes(opts),
       jwks_fetcher: Map.get(opts, :jwks_fetcher),
       http_client: Map.get(opts, :http_client),
