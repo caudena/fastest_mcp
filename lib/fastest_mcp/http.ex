@@ -134,6 +134,10 @@ defmodule FastestMCP.HTTP do
 
         {~c"application/x-www-form-urlencoded", body}
 
+      Keyword.has_key?(opts, :multipart) ->
+        {content_type, body} = multipart_body(Keyword.get(opts, :multipart, %{}))
+        {to_charlist(content_type), body}
+
       Keyword.has_key?(opts, :body) ->
         {
           opts |> Keyword.get(:content_type, "application/octet-stream") |> to_charlist(),
@@ -147,6 +151,98 @@ defmodule FastestMCP.HTTP do
 
   defp normalize_form(form) when is_map(form), do: form
   defp normalize_form(form) when is_list(form), do: Enum.into(form, %{})
+
+  defp multipart_body(parts) do
+    boundary =
+      18
+      |> :crypto.strong_rand_bytes()
+      |> Base.url_encode64(padding: false)
+
+    body =
+      parts
+      |> normalize_multipart_parts()
+      |> Enum.map_join("", &multipart_part(&1, boundary))
+      |> Kernel.<>("--#{boundary}--\r\n")
+
+    {"multipart/form-data; boundary=#{boundary}", body}
+  end
+
+  defp normalize_multipart_parts(parts) when is_map(parts), do: Map.to_list(parts)
+  defp normalize_multipart_parts(parts) when is_list(parts), do: parts
+
+  defp multipart_part({name, value}, boundary) do
+    {headers, content} = multipart_part_content(name, value)
+
+    [
+      "--",
+      boundary,
+      "\r\n",
+      Enum.map_join(headers, "", fn {key, header_value} -> "#{key}: #{header_value}\r\n" end),
+      "\r\n",
+      content,
+      "\r\n"
+    ]
+    |> IO.iodata_to_binary()
+  end
+
+  defp multipart_part_content(name, %{filename: filename, content: content} = part) do
+    content_type = Map.get(part, :content_type, Map.get(part, "content_type"))
+    multipart_file_content(name, filename, content, content_type)
+  end
+
+  defp multipart_part_content(name, %{"filename" => filename, "content" => content} = part) do
+    content_type = Map.get(part, "content_type", Map.get(part, :content_type))
+    multipart_file_content(name, filename, content, content_type)
+  end
+
+  defp multipart_part_content(name, {filename, content}) do
+    multipart_file_content(name, filename, content, nil)
+  end
+
+  defp multipart_part_content(name, {filename, content, content_type}) do
+    multipart_file_content(name, filename, content, content_type)
+  end
+
+  defp multipart_part_content(name, content) do
+    {[content_disposition(name)], scalar_to_multipart(content)}
+  end
+
+  defp multipart_file_content(name, filename, content, content_type) do
+    headers =
+      [content_disposition(name, filename)]
+      |> maybe_multipart_content_type(content_type)
+
+    {headers, scalar_to_multipart(content)}
+  end
+
+  defp content_disposition(name) do
+    {"content-disposition", ~s(form-data; name="#{escape_multipart_param(name)}")}
+  end
+
+  defp content_disposition(name, filename) do
+    {"content-disposition",
+     ~s(form-data; name="#{escape_multipart_param(name)}"; filename="#{escape_multipart_param(filename)}")}
+  end
+
+  defp maybe_multipart_content_type(headers, nil), do: headers
+  defp maybe_multipart_content_type(headers, ""), do: headers
+
+  defp maybe_multipart_content_type(headers, content_type) do
+    headers ++ [{"content-type", to_string(content_type)}]
+  end
+
+  defp scalar_to_multipart(value) when is_binary(value), do: value
+  defp scalar_to_multipart(value) when is_integer(value) or is_float(value), do: to_string(value)
+  defp scalar_to_multipart(value) when is_boolean(value), do: to_string(value)
+  defp scalar_to_multipart(nil), do: ""
+  defp scalar_to_multipart(value), do: Jason.encode!(value)
+
+  defp escape_multipart_param(value) do
+    value
+    |> to_string()
+    |> String.replace("\\", "\\\\")
+    |> String.replace("\"", "\\\"")
+  end
 
   defp maybe_put_ssl_options(options, %URI{scheme: "https"}) do
     ssl_opts =
@@ -203,6 +299,9 @@ defmodule FastestMCP.HTTP do
 
       Keyword.has_key?(opts, :form) ->
         put_content_type(headers, ~c"application/x-www-form-urlencoded")
+
+      Keyword.has_key?(opts, :multipart) ->
+        headers
 
       Keyword.has_key?(opts, :content_type) ->
         put_content_type(headers, to_charlist(to_string(Keyword.fetch!(opts, :content_type))))

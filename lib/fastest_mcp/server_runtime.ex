@@ -80,16 +80,16 @@ defmodule FastestMCP.ServerRuntime do
   def init({%Server{} = server, opts}) do
     Process.flag(:trap_exit, true)
 
-    with {:ok, lifespan_context, lifespan_cleanups} <- Lifespan.run_all(server, server.lifespans) do
-      {:ok, component_manager_pid} =
-        ComponentManager.start_link(server_name: server.name, on_duplicate: server.on_duplicate)
-
-      component_manager = ComponentManager.new(server.name, component_manager_pid)
-
-      server =
-        %{server | providers: server.providers ++ [Provider.new(component_manager)]}
-        |> materialize_server_runtime()
-
+    with {:ok, lifespan_context, lifespan_cleanups} <- Lifespan.run_all(server, server.lifespans),
+         {:ok, component_manager_pid} <-
+           ComponentManager.start_link(
+             server_name: server.name,
+             on_duplicate: server.on_duplicate
+           ),
+         component_manager = ComponentManager.new(server.name, component_manager_pid),
+         {:ok, server} <-
+           %{server | providers: server.providers ++ [Provider.new(component_manager)]}
+           |> materialize_server_runtime() do
       {:ok, session_state_store} = start_session_state_store(opts)
 
       {:ok, session_supervisor} =
@@ -199,6 +199,7 @@ defmodule FastestMCP.ServerRuntime do
   @impl true
   @doc "Cleans up module state on shutdown."
   def terminate(_reason, state) do
+    terminate_session_streams(state)
     shutdown_server_runtime(Map.get(state, :server))
     Lifespan.cleanup_all(Map.get(state, :lifespan_cleanups, []))
     Registry.unregister_server(state.server.name)
@@ -426,30 +427,67 @@ defmodule FastestMCP.ServerRuntime do
   end
 
   defp materialize_server_runtime(%Server{} = server) do
-    %{
-      server
-      | middleware: Enum.map(server.middleware, &Middleware.activate_runtime/1),
-        providers: Enum.map(server.providers, &materialize_provider_runtime/1)
-    }
+    with {:ok, providers} <- materialize_provider_runtimes(server.providers) do
+      {:ok,
+       %{
+         server
+         | middleware: Enum.map(server.middleware, &Middleware.activate_runtime/1),
+           providers: providers
+       }}
+    end
+  end
+
+  defp materialize_provider_runtimes(providers) do
+    Enum.reduce_while(providers, {:ok, []}, fn provider, {:ok, acc} ->
+      case materialize_provider_runtime(provider) do
+        {:ok, materialized} -> {:cont, {:ok, [materialized | acc]}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:ok, providers} -> {:ok, Enum.reverse(providers)}
+      other -> other
+    end
   end
 
   defp materialize_provider_runtime(%Provider{} = provider) do
-    %{provider | inner: materialize_provider_inner(provider.inner)}
+    with {:ok, inner} <- materialize_provider_inner(provider.inner) do
+      {:ok, %{provider | inner: inner}}
+    end
   end
 
-  defp materialize_provider_runtime(provider), do: provider
+  defp materialize_provider_runtime(provider), do: {:ok, provider}
 
   defp materialize_provider_inner(%MountedServer{} = provider) do
-    %{provider | server: materialize_server_runtime(provider.server)}
+    with {:ok, lifespan_context, lifespan_cleanups} <-
+           Lifespan.run_all(provider.server, provider.server.lifespans),
+         {:ok, server} <- materialize_server_runtime(provider.server) do
+      {:ok,
+       %{
+         provider
+         | server: server,
+           lifespan_context: lifespan_context,
+           lifespan_cleanups: lifespan_cleanups
+       }}
+    else
+      {:error, reason} ->
+        {:error, reason}
+    end
   end
 
   defp materialize_provider_inner(%module{} = provider) do
     if function_exported?(module, :activate_runtime, 1) do
-      module.activate_runtime(provider)
+      case module.activate_runtime(provider) do
+        {:ok, activated} -> {:ok, activated}
+        {:error, reason} -> {:error, reason}
+        activated -> {:ok, activated}
+      end
     else
-      provider
+      {:ok, provider}
     end
   end
+
+  defp materialize_provider_inner(provider), do: {:ok, provider}
 
   defp shutdown_server_runtime(nil), do: :ok
 
@@ -464,6 +502,7 @@ defmodule FastestMCP.ServerRuntime do
 
   defp shutdown_provider_runtime(%MountedServer{} = provider) do
     shutdown_server_runtime(provider.server)
+    Lifespan.cleanup_all(provider.lifespan_cleanups || [])
   end
 
   defp shutdown_provider_runtime(%module{} = provider) do
@@ -475,4 +514,21 @@ defmodule FastestMCP.ServerRuntime do
   end
 
   defp shutdown_provider_runtime(_provider), do: :ok
+
+  defp terminate_session_streams(%{session_stream_store: store}) when is_pid(store) do
+    store
+    |> StateStore.keys()
+    |> Enum.each(fn session_id ->
+      case StateStore.get(store, session_id) do
+        {:ok, %{owner: owner}} when is_pid(owner) ->
+          send(owner, :session_stream_replaced)
+          StateStore.delete(store, session_id)
+
+        _other ->
+          :ok
+      end
+    end)
+  end
+
+  defp terminate_session_streams(_state), do: :ok
 end

@@ -24,7 +24,14 @@ defmodule FastestMCP.Providers.MountedServer do
   alias FastestMCP.Server
   alias FastestMCP.Telemetry
 
-  defstruct [:server, :namespace, include_tags: MapSet.new(), exclude_tags: MapSet.new()]
+  defstruct [
+    :server,
+    :namespace,
+    lifespan_context: %{},
+    lifespan_cleanups: [],
+    include_tags: MapSet.new(),
+    exclude_tags: MapSet.new()
+  ]
 
   @doc "Builds a new value for this module from the supplied options."
   def new(%Server{} = server, opts \\ []) do
@@ -312,9 +319,7 @@ defmodule FastestMCP.Providers.MountedServer do
          arguments \\ nil,
          context \\ nil
        ) do
-    context =
-      provider.server
-      |> child_context(context || parent_operation.context)
+    context = child_context(provider, context || parent_operation.context)
 
     arguments = arguments || parent_operation.arguments
 
@@ -333,8 +338,12 @@ defmodule FastestMCP.Providers.MountedServer do
     }
   end
 
-  defp child_context(%Server{} = server, context) do
-    %{context | server_name: server.name}
+  defp child_context(%__MODULE__{} = provider, context) do
+    %{
+      context
+      | server_name: provider.server.name,
+        lifespan_context: provider.lifespan_context || %{}
+    }
   end
 
   defp child_lookup_operation(provider, %Operation{} = parent_operation, component_type, target) do
@@ -345,7 +354,7 @@ defmodule FastestMCP.Providers.MountedServer do
       target: target,
       version: parent_operation.version,
       audience: parent_operation.audience,
-      context: child_context(provider.server, parent_operation.context),
+      context: child_context(provider, parent_operation.context),
       transport: parent_operation.transport,
       call_supervisor: parent_operation.call_supervisor,
       arguments: parent_operation.arguments

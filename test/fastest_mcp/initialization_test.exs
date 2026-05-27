@@ -88,6 +88,23 @@ defmodule FastestMCP.InitializationTest do
     refute Map.has_key?(result["capabilities"], "completions")
   end
 
+  test "initialize exposes configured experimental capabilities" do
+    server_name =
+      "initialize-experimental-" <> Integer.to_string(System.unique_integer([:positive]))
+
+    server =
+      FastestMCP.server(server_name,
+        experimental_capabilities: %{feature_flags: %{alpha: true}}
+      )
+
+    assert {:ok, _pid} = FastestMCP.start_server(server)
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+
+    result = FastestMCP.initialize(server_name, %{})
+
+    assert get_in(result, ["capabilities", "experimental", "feature_flags", "alpha"]) == true
+  end
+
   test "initialize advertises completion when tools expose completion sources" do
     server_name =
       "initialize-tool-completion-" <> Integer.to_string(System.unique_integer([:positive]))

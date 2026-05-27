@@ -256,6 +256,42 @@ defmodule FastestMCP.AuthAzureProviderTest do
     assert verifier_opts.audience == "custom-audience"
   end
 
+  test "azure token verifier supports issuer override and B2C defaults" do
+    verifier_opts =
+      Azure.token_verifier_options(%{
+        client_id: "test-client",
+        client_secret: "test-secret",
+        tenant_id: "my-tenant",
+        token_issuer: "https://issuer.example.com"
+      })
+
+    assert verifier_opts.issuer == "https://issuer.example.com"
+
+    disabled_issuer_opts =
+      Azure.token_verifier_options(%{
+        client_id: "test-client",
+        client_secret: "test-secret",
+        tenant_id: "my-tenant",
+        token_issuer: nil
+      })
+
+    assert disabled_issuer_opts.issuer == nil
+
+    auth =
+      Azure.b2c(
+        tenant_name: "contoso",
+        policy_name: "B2C_1_signin",
+        client_id: "b2c-client",
+        client_secret: "b2c-secret"
+      )
+
+    assert auth.provider == FastestMCP.Auth.Azure
+    assert auth.options.tenant_id == "contoso.onmicrosoft.com/B2C_1_signin"
+    assert auth.options.base_authority == "https://contoso.b2clogin.com"
+    assert auth.options.identifier_uri == "https://contoso.onmicrosoft.com/b2c-client"
+    assert Map.fetch!(auth.options, :token_issuer) == nil
+  end
+
   defp authorize_and_approve(server_name, client, state, code_challenge, opts) do
     base_url = Keyword.fetch!(opts, :base_url)
 

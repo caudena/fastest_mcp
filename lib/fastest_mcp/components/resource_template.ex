@@ -38,16 +38,17 @@ defmodule FastestMCP.Components.ResourceTemplate do
     meta: %{}
   ]
 
-  @expression ~r{\{([+#./;?&]?)([a-zA-Z_][a-zA-Z0-9_]*\*?(?:,[a-zA-Z_][a-zA-Z0-9_]*\*?)*)\}}
+  @expression ~r{\{([+#./;?&]?)([a-zA-Z_][a-zA-Z0-9_-]*\*?(?:,[a-zA-Z_][a-zA-Z0-9_-]*\*?)*)\}}
 
   @doc "Compiles the given URI template into a matcher."
   def compile_matcher!(template) when is_binary(template) do
-    {source, variables, query_variables} = regex_source(template)
+    {source, variables, query_variables, query_variable_sources} = regex_source(template)
 
     {%{
        template: template,
        regex: Regex.compile!("^" <> source <> "$"),
-       query_variables: query_variables
+       query_variables: query_variables,
+       query_variable_sources: query_variable_sources
      }, variables, query_variables}
   end
 
@@ -57,7 +58,10 @@ defmodule FastestMCP.Components.ResourceTemplate do
   end
 
   @doc "Matches a concrete URI against a compiled matcher."
-  def match_compiled(%{regex: regex, query_variables: query_variables}, uri) do
+  def match_compiled(
+        %{regex: regex, query_variable_sources: query_variable_sources},
+        uri
+      ) do
     {path, query_params} = split_uri(uri)
 
     case Regex.named_captures(regex, path) do
@@ -70,8 +74,30 @@ defmodule FastestMCP.Components.ResourceTemplate do
             {key, URI.decode(value)}
           end)
 
-        Map.merge(captures, Map.take(query_params, query_variables))
+        query_captures =
+          query_variable_sources
+          |> Enum.reduce(%{}, fn {source_name, input_name}, acc ->
+            cond do
+              Map.has_key?(captures, input_name) ->
+                acc
+
+              Map.has_key?(query_params, source_name) ->
+                Map.put(acc, input_name, Map.fetch!(query_params, source_name))
+
+              true ->
+                acc
+            end
+          end)
+
+        Map.merge(query_captures, captures)
     end
+  end
+
+  def match_compiled(%{regex: regex, query_variables: query_variables}, uri) do
+    match_compiled(
+      %{regex: regex, query_variable_sources: Enum.map(query_variables, &{&1, &1})},
+      uri
+    )
   end
 
   defp split_uri(uri) do
@@ -105,7 +131,14 @@ defmodule FastestMCP.Components.ResourceTemplate do
       end)
 
     rest = String.slice(template, offset, String.length(template) - offset)
-    {source <> Regex.escape(rest), Enum.uniq(variables), Enum.uniq(query_variables)}
+    validate_variable_collisions!(variables ++ query_variables)
+
+    {
+      source <> Regex.escape(rest),
+      normalized_variable_names(variables),
+      normalized_variable_names(query_variables),
+      query_variable_sources(query_variables)
+    }
   end
 
   defp expression_fragment(operator, variables_source) do
@@ -113,28 +146,28 @@ defmodule FastestMCP.Components.ResourceTemplate do
 
     case operator do
       "" ->
-        {join_expression(varspecs, ",", :simple), Enum.map(varspecs, &elem(&1, 0)), []}
+        {join_expression(varspecs, ",", :simple), varspecs, []}
 
       "+" ->
-        {join_expression(varspecs, ",", :reserved), Enum.map(varspecs, &elem(&1, 0)), []}
+        {join_expression(varspecs, ",", :reserved), varspecs, []}
 
       "." ->
-        {"\\." <> join_expression(varspecs, "\\.", :label), Enum.map(varspecs, &elem(&1, 0)), []}
+        {"\\." <> join_expression(varspecs, "\\.", :label), varspecs, []}
 
       "/" ->
-        {"/" <> join_expression(varspecs, "/", :path), Enum.map(varspecs, &elem(&1, 0)), []}
+        {"/" <> join_expression(varspecs, "/", :path), varspecs, []}
 
       ";" ->
-        {";" <> join_matrix_expression(varspecs), Enum.map(varspecs, &elem(&1, 0)), []}
+        {";" <> join_matrix_expression(varspecs), varspecs, []}
 
       "?" ->
-        {"", [], Enum.map(varspecs, &elem(&1, 0))}
+        {"", [], varspecs}
 
       "&" ->
-        {"", [], Enum.map(varspecs, &elem(&1, 0))}
+        {"", [], varspecs}
 
       "#" ->
-        {"#" <> join_expression(varspecs, ",", :reserved), Enum.map(varspecs, &elem(&1, 0)), []}
+        {"#" <> join_expression(varspecs, ",", :reserved), varspecs, []}
 
       other ->
         raise ArgumentError, "unsupported resource-template operator #{inspect(other)}"
@@ -142,24 +175,53 @@ defmodule FastestMCP.Components.ResourceTemplate do
   end
 
   defp parse_varspec(spec) do
-    case String.ends_with?(spec, "*") do
-      true -> {String.trim_trailing(spec, "*"), true}
-      false -> {spec, false}
-    end
+    exploded? = String.ends_with?(spec, "*")
+    source_name = if exploded?, do: String.trim_trailing(spec, "*"), else: spec
+    {source_name, normalize_variable_name(source_name), exploded?}
   end
 
   defp join_expression(varspecs, separator, kind) do
-    Enum.map_join(varspecs, separator, fn {name, exploded?} ->
-      "(?<#{name}>#{value_pattern(kind, exploded?)})"
+    Enum.map_join(varspecs, separator, fn {_source_name, input_name, exploded?} ->
+      "(?<#{input_name}>#{value_pattern(kind, exploded?)})"
     end)
   end
 
   defp join_matrix_expression(varspecs) do
-    Enum.map_join(varspecs, ";", fn {name, exploded?} ->
-      escaped_name = Regex.escape(name)
-      "#{escaped_name}=(?<#{name}>#{value_pattern(:matrix, exploded?)})"
+    Enum.map_join(varspecs, ";", fn {source_name, input_name, exploded?} ->
+      escaped_name = Regex.escape(source_name)
+      "#{escaped_name}=(?<#{input_name}>#{value_pattern(:matrix, exploded?)})"
     end)
   end
+
+  defp validate_variable_collisions!(varspecs) do
+    varspecs
+    |> Enum.group_by(fn {_source_name, input_name, _exploded?} -> input_name end)
+    |> Enum.each(fn {input_name, grouped} ->
+      source_names =
+        grouped
+        |> Enum.map(fn {source_name, _input_name, _exploded?} -> source_name end)
+        |> Enum.uniq()
+
+      if length(source_names) > 1 do
+        raise ArgumentError,
+              "resource-template parameters #{inspect(source_names)} collide as #{inspect(input_name)}"
+      end
+    end)
+  end
+
+  defp normalized_variable_names(varspecs) do
+    varspecs
+    |> Enum.map(fn {_source_name, input_name, _exploded?} -> input_name end)
+    |> Enum.uniq()
+  end
+
+  defp query_variable_sources(varspecs) do
+    varspecs
+    |> Enum.map(fn {source_name, input_name, _exploded?} -> {source_name, input_name} end)
+    |> Enum.uniq()
+  end
+
+  defp normalize_variable_name(name), do: String.replace(name, "-", "_")
 
   defp value_pattern(:simple, false), do: "[^/?#&,]+"
   defp value_pattern(:simple, true), do: "[^?#]+"

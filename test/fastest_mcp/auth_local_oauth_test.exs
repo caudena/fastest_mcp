@@ -37,6 +37,34 @@ defmodule FastestMCP.AuthLocalOAuthTest do
     end
   end
 
+  defmodule ExpiringUpstreamStrategy do
+    def authorize_url(config) do
+      {:ok,
+       %{
+         url:
+           "https://upstream.example.com/authorize?" <>
+             URI.encode_query(%{
+               "client_id" => config[:client_id],
+               "redirect_uri" => config[:redirect_uri],
+               "state" => "expiring-upstream-state"
+             }),
+         session_params: %{"state" => "expiring-upstream-state"}
+       }}
+    end
+
+    def callback(_config, params) do
+      {:ok,
+       %{
+         "token" => %{
+           "access_token" => "upstream_access_" <> params["code"],
+           "refresh_token" => "upstream_refresh_" <> params["code"],
+           "refresh_expires_in" => 5
+         },
+         "user" => %{"sub" => "expiring-user"}
+       }}
+    end
+  end
+
   defp local_oauth_server(server_name, auth_opts \\ []) do
     auth_opts =
       Keyword.merge(
@@ -1369,6 +1397,162 @@ defmodule FastestMCP.AuthLocalOAuthTest do
     assert %{"error" => "invalid_request"} = Jason.decode!(restricted_conn.resp_body)
   end
 
+  test "allowed redirect uris reject raw and encoded dot path segments" do
+    server_name =
+      "local-oauth-dot-redirect-" <> Integer.to_string(System.unique_integer([:positive]))
+
+    assert {:ok, _pid} =
+             FastestMCP.start_server(
+               local_oauth_server(server_name,
+                 allowed_client_redirect_uris: ["http://localhost:*"]
+               )
+             )
+
+    client = register_client(server_name)
+
+    for redirect_uri <- [
+          "http://localhost:4001/../callback",
+          "http://localhost:4001/%2e%2e/callback"
+        ] do
+      authorize_conn =
+        conn(
+          :get,
+          "/authorize?" <>
+            URI.encode_query(%{
+              "response_type" => "code",
+              "client_id" => client["client_id"],
+              "redirect_uri" => redirect_uri
+            })
+        )
+        |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
+
+      assert authorize_conn.status == 400
+      assert %{"error" => "invalid_request"} = Jason.decode!(authorize_conn.resp_body)
+    end
+  end
+
+  test "empty allowed redirect uri list allows none" do
+    server_name =
+      "local-oauth-no-redirects-" <> Integer.to_string(System.unique_integer([:positive]))
+
+    assert {:ok, _pid} =
+             FastestMCP.start_server(
+               local_oauth_server(server_name, allowed_client_redirect_uris: [])
+             )
+
+    client = register_client(server_name)
+
+    authorize_conn =
+      conn(
+        :get,
+        "/authorize?" <>
+          URI.encode_query(%{
+            "response_type" => "code",
+            "client_id" => client["client_id"],
+            "redirect_uri" => "http://localhost:4001/callback"
+          })
+      )
+      |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
+
+    assert authorize_conn.status == 400
+
+    assert %{"error_description" => "redirect_uri does not match allowed patterns"} =
+             Jason.decode!(authorize_conn.resp_body)
+  end
+
+  test "oauth proxy synthesizes the upstream client id for authorization requests" do
+    server_name =
+      "local-oauth-synthetic-upstream-" <> Integer.to_string(System.unique_integer([:positive]))
+
+    assert {:ok, _pid} =
+             FastestMCP.start_server(
+               local_oauth_proxy_server(server_name,
+                 allowed_client_redirect_uris: ["http://localhost:*"]
+               )
+             )
+
+    authorize_conn =
+      conn(
+        :get,
+        "/authorize?" <>
+          URI.encode_query(%{
+            "response_type" => "code",
+            "client_id" => "github-client-id",
+            "redirect_uri" => "http://localhost:4001/callback",
+            "scope" => "tools:call"
+          })
+      )
+      |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
+
+    assert authorize_conn.status == 302
+    [location] = get_resp_header(authorize_conn, "location")
+    assert location =~ "/consent?txn_id="
+  end
+
+  test "remembered consent is signed and only reused for safe fetch-site requests" do
+    server_name =
+      "local-oauth-remember-" <> Integer.to_string(System.unique_integer([:positive]))
+
+    assert {:ok, _pid} =
+             FastestMCP.start_server(
+               local_oauth_server(server_name,
+                 consent: :remember,
+                 consent_cookie_secret: "remember-secret"
+               )
+             )
+
+    client = register_client(server_name)
+    {consent_path, query, txn_id} = authorize_to_consent(server_name, client)
+
+    consent_page_conn =
+      conn(:get, consent_path <> "?" <> query)
+      |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
+
+    [csrf_cookie_header | _] = get_resp_header(consent_page_conn, "set-cookie")
+    csrf_cookie = csrf_cookie_header |> String.split(";", parts: 2) |> hd()
+
+    [_, csrf_token] =
+      Regex.run(~r/name="csrf_token" value="([^"]+)"/, consent_page_conn.resp_body)
+
+    approve_conn =
+      conn(
+        :post,
+        "/consent",
+        URI.encode_query(%{"action" => "approve", "txn_id" => txn_id, "csrf_token" => csrf_token})
+      )
+      |> put_req_header("content-type", "application/x-www-form-urlencoded")
+      |> put_req_header("cookie", csrf_cookie)
+      |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
+
+    remember_cookie =
+      approve_conn
+      |> get_resp_header("set-cookie")
+      |> Enum.find(&String.starts_with?(&1, "MCP_APPROVED_CLIENTS="))
+      |> String.split(";", parts: 2)
+      |> hd()
+
+    {unsafe_path, unsafe_query, _unsafe_txn_id} = authorize_to_consent(server_name, client)
+
+    unsafe_conn =
+      conn(:get, unsafe_path <> "?" <> unsafe_query)
+      |> put_req_header("cookie", remember_cookie)
+      |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
+
+    assert unsafe_conn.status == 200
+
+    {safe_path, safe_query, _safe_txn_id} = authorize_to_consent(server_name, client)
+
+    safe_conn =
+      conn(:get, safe_path <> "?" <> safe_query)
+      |> put_req_header("cookie", remember_cookie)
+      |> put_req_header("sec-fetch-site", "same-origin")
+      |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
+
+    assert safe_conn.status == 302
+    [callback_location] = get_resp_header(safe_conn, "location")
+    assert URI.parse(callback_location).host == "localhost"
+  end
+
   test "oauth proxy approval redirects upstream with proxy callback uri" do
     server_name = "local-oauth-proxy-" <> Integer.to_string(System.unique_integer([:positive]))
 
@@ -1590,6 +1774,28 @@ defmodule FastestMCP.AuthLocalOAuthTest do
 
     assert conn.status == 201
     Jason.decode!(conn.resp_body)
+  end
+
+  defp authorize_to_consent(server_name, client) do
+    authorize_conn =
+      conn(
+        :get,
+        "/authorize?" <>
+          URI.encode_query(%{
+            "response_type" => "code",
+            "client_id" => client["client_id"],
+            "redirect_uri" => "http://localhost:4001/callback",
+            "state" => "remember-state",
+            "scope" => "tools:call"
+          })
+      )
+      |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
+
+    assert authorize_conn.status == 302
+    [consent_location] = get_resp_header(authorize_conn, "location")
+    %URI{path: consent_path, query: query} = URI.parse(consent_location)
+    %{"txn_id" => txn_id} = URI.decode_query(query)
+    {consent_path, query, txn_id}
   end
 
   defp authorize_and_exchange(server_name, client, opts \\ []) do

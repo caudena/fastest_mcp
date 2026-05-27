@@ -38,6 +38,7 @@ The active compatibility target includes:
 - session-state backend configuration through `FastestMCP.SessionStateStore`
 - unified `on_duplicate:` semantics for local server and runtime component registration
 - centralized protocol version and capability helpers
+- explicit experimental capability advertisement through server metadata
 - native regression coverage plus live HTTP and conformance lanes
 
 ## Explicitly Deferred

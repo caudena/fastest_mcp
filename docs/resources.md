@@ -74,6 +74,7 @@ FastestMCP.read_resource("resources", "weather://london/current")
 FastestMCP currently supports:
 
 - path placeholders such as `{id}`
+- hyphenated path placeholders such as `{user-id}`
 - wildcard path placeholders such as `{path*}`
 - optional query variables such as `{?format,limit}`
 - reserved expansions such as `{+path}`
@@ -122,6 +123,23 @@ server =
 FastestMCP.read_resource("template-wildcards", "repo://prefecthq/src/templates/release.md")
 # => %{"owner" => "prefecthq", "path" => "src/templates/release.md"}
 ```
+
+Hyphenated template names are normalized to underscore handler keys:
+
+```elixir
+server =
+  FastestMCP.server("template-hyphen")
+  |> FastestMCP.add_resource_template(
+    "users://{user-id}{?include-empty}",
+    fn %{"user_id" => user_id, "include_empty" => include_empty}, _ctx ->
+      %{user_id: user_id, include_empty: include_empty}
+    end
+  )
+```
+
+Blank query values are preserved. Path captures take precedence over query
+captures, and templates that would create a hyphen/underscore collision are
+rejected.
 
 ## Template Parameter Validation and Completion
 

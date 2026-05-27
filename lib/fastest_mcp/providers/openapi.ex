@@ -72,7 +72,7 @@ defmodule FastestMCP.Providers.OpenAPI do
 
   defp build_tool(provider, method, path, operation, path_parameters) do
     operation = stringify_keys(operation)
-    body_schema = request_body_schema(operation)
+    {body_schema, body_content_type} = request_body_schema(operation)
     parameter_bindings = build_parameter_bindings(path_parameters, operation, body_schema)
     input_schema = build_input_schema(parameter_bindings)
     output_schema = response_schema(operation)
@@ -88,6 +88,7 @@ defmodule FastestMCP.Providers.OpenAPI do
           path,
           parameter_bindings,
           arguments || %{},
+          body_content_type,
           output_schema
         )
       end,
@@ -97,7 +98,15 @@ defmodule FastestMCP.Providers.OpenAPI do
     )
   end
 
-  defp execute_operation(provider, method, path, bindings, arguments, _output_schema) do
+  defp execute_operation(
+         provider,
+         method,
+         path,
+         bindings,
+         arguments,
+         body_content_type,
+         _output_schema
+       ) do
     args = stringify_keys(arguments)
 
     {path, _used_path_keys} =
@@ -122,6 +131,7 @@ defmodule FastestMCP.Providers.OpenAPI do
       bindings
       |> Enum.filter(&(&1.location == :header))
       |> Enum.flat_map(&header_pairs(&1, args))
+      |> add_cookie_header(bindings, args)
 
     body =
       bindings
@@ -141,7 +151,7 @@ defmodule FastestMCP.Providers.OpenAPI do
       |> maybe_put(:requester, provider.requester)
       |> maybe_put(:headers, headers)
       |> maybe_put(:query, query)
-      |> maybe_put(:json, if(map_size(body) == 0, do: nil, else: body))
+      |> put_request_body(body, body_content_type)
 
     case HTTP.request(method, url, request_opts) do
       {:ok, status, response_headers, response_body} when status in 200..299 ->
@@ -307,13 +317,13 @@ defmodule FastestMCP.Providers.OpenAPI do
     |> Map.get("requestBody")
     |> case do
       nil ->
-        nil
+        {nil, nil}
 
       request_body ->
         request_body
         |> resolve_refs()
-        |> get_in(["content", "application/json", "schema"])
-        |> normalize_openapi_schema()
+        |> Map.get("content", %{})
+        |> schema_for_request_body_content()
     end
   end
 
@@ -328,10 +338,70 @@ defmodule FastestMCP.Providers.OpenAPI do
         response ->
           response
           |> resolve_refs()
-          |> get_in(["content", "application/json", "schema"])
-          |> normalize_openapi_schema()
+          |> Map.get("content", %{})
+          |> schema_for_json_content()
       end
     end)
+  end
+
+  defp schema_for_request_body_content(content) when is_map(content) do
+    case select_request_body_media(content) do
+      {content_type, media} ->
+        schema =
+          media
+          |> Map.get("schema")
+          |> normalize_openapi_schema()
+
+        {schema, content_type}
+
+      nil ->
+        {nil, nil}
+    end
+  end
+
+  defp schema_for_request_body_content(_content), do: {nil, nil}
+
+  defp schema_for_json_content(content) when is_map(content) do
+    content
+    |> Enum.find_value(fn {content_type, media} ->
+      if json_media_type?(content_type) do
+        media
+        |> Map.get("schema")
+        |> normalize_openapi_schema()
+      end
+    end)
+  end
+
+  defp schema_for_json_content(_content), do: nil
+
+  defp select_request_body_media(content) do
+    Enum.find_value(
+      [
+        &json_media_type?/1,
+        &(&1 == "application/x-www-form-urlencoded"),
+        &(&1 == "multipart/form-data")
+      ],
+      fn predicate ->
+        Enum.find_value(content, fn {content_type, media} ->
+          normalized = normalize_media_type(content_type)
+          if predicate.(normalized), do: {content_type, media}
+        end)
+      end
+    )
+  end
+
+  defp json_media_type?(content_type) do
+    normalized = normalize_media_type(content_type)
+    normalized == "application/json" or String.ends_with?(normalized, "+json")
+  end
+
+  defp normalize_media_type(content_type) do
+    content_type
+    |> to_string()
+    |> String.split(";", parts: 2)
+    |> hd()
+    |> String.trim()
+    |> String.downcase()
   end
 
   defp operation_name(method, path, operation) do
@@ -366,6 +436,63 @@ defmodule FastestMCP.Providers.OpenAPI do
     case Map.fetch(args, binding.input_name) do
       :error -> []
       {:ok, value} -> [{binding.source_name, to_string(value)}]
+    end
+  end
+
+  defp add_cookie_header(headers, bindings, args) do
+    cookies =
+      bindings
+      |> Enum.filter(&(&1.location == :cookie))
+      |> Enum.flat_map(&cookie_pairs(&1, args))
+
+    case cookies do
+      [] -> headers
+      pairs -> headers ++ [{"cookie", encode_cookie_header(pairs)}]
+    end
+  end
+
+  defp cookie_pairs(binding, args) do
+    case Map.fetch(args, binding.input_name) do
+      :error ->
+        []
+
+      {:ok, value} ->
+        encode_query_value(binding.source_name, value, binding.style, binding.explode)
+        |> Enum.map(fn {key, item} -> {key, to_string(item)} end)
+    end
+  end
+
+  defp encode_cookie_header(pairs) do
+    Enum.map_join(pairs, "; ", fn {key, value} ->
+      URI.encode_www_form(to_string(key)) <> "=" <> URI.encode_www_form(to_string(value))
+    end)
+  end
+
+  defp put_request_body(opts, body, nil) when map_size(body) == 0, do: opts
+
+  defp put_request_body(opts, body, _content_type) when map_size(body) == 0, do: opts
+
+  defp put_request_body(opts, body, content_type) do
+    cond do
+      is_nil(content_type) or json_media_type?(content_type) ->
+        opts
+        |> Keyword.put(:json, body)
+        |> maybe_put(:content_type, content_type)
+
+      normalize_media_type(content_type) == "application/x-www-form-urlencoded" ->
+        opts
+        |> Keyword.put(:form, body)
+        |> Keyword.put(:content_type, content_type)
+
+      normalize_media_type(content_type) == "multipart/form-data" ->
+        opts
+        |> Keyword.put(:multipart, body)
+        |> Keyword.put(:content_type, content_type)
+
+      true ->
+        opts
+        |> Keyword.put(:body, Jason.encode!(body))
+        |> Keyword.put(:content_type, content_type)
     end
   end
 
@@ -505,37 +632,55 @@ defmodule FastestMCP.Providers.OpenAPI do
     %{"anyOf" => [schema, %{"type" => "null"}]}
   end
 
-  defp resolve_refs(value), do: resolve_refs(value, stringify_keys(value))
+  defp resolve_refs(value), do: resolve_refs(value, stringify_keys(value), MapSet.new())
 
-  defp resolve_refs(value, spec) when is_map(value) do
+  defp resolve_refs(value, spec), do: resolve_refs(value, spec, MapSet.new())
+
+  defp resolve_refs(value, spec, visited) when is_map(value) do
     case Map.get(value, "$ref") do
-      "#/components/schemas/" <> name ->
-        merge_ref(get_in(spec, ["components", "schemas", name]), value, spec)
-
-      "#/components/parameters/" <> name ->
-        merge_ref(get_in(spec, ["components", "parameters", name]), value, spec)
+      ref when is_binary(ref) ->
+        resolve_ref_value(ref, value, spec, visited)
 
       _other ->
-        Enum.into(value, %{}, fn {key, child} -> {key, resolve_refs(child, spec)} end)
+        Enum.into(value, %{}, fn {key, child} -> {key, resolve_refs(child, spec, visited)} end)
     end
   end
 
-  defp resolve_refs(value, spec) when is_list(value) do
-    Enum.map(value, &resolve_refs(&1, spec))
+  defp resolve_refs(value, spec, visited) when is_list(value) do
+    Enum.map(value, &resolve_refs(&1, spec, visited))
   end
 
-  defp resolve_refs(value, _spec), do: value
+  defp resolve_refs(value, _spec, _visited), do: value
 
-  defp merge_ref(nil, value, spec) do
+  defp resolve_ref_value(ref, value, spec, visited) do
+    case ref do
+      "#/components/schemas/" <> name ->
+        merge_ref(ref, get_in(spec, ["components", "schemas", name]), value, spec, visited)
+
+      "#/components/parameters/" <> name ->
+        merge_ref(ref, get_in(spec, ["components", "parameters", name]), value, spec, visited)
+
+      _other ->
+        Enum.into(value, %{}, fn {key, child} -> {key, resolve_refs(child, spec, visited)} end)
+    end
+  end
+
+  defp merge_ref(ref, referenced, value, spec, visited) do
+    if MapSet.member?(visited, ref) do
+      value
+    else
+      do_merge_ref(ref, referenced, value, spec, MapSet.put(visited, ref))
+    end
+  end
+
+  defp do_merge_ref(_ref, nil, value, _spec, _visited) do
     value
-    |> Map.delete("$ref")
-    |> resolve_refs(spec)
   end
 
-  defp merge_ref(referenced, value, spec) do
+  defp do_merge_ref(_ref, referenced, value, spec, visited) do
     referenced
     |> stringify_keys()
-    |> resolve_refs(spec)
+    |> resolve_refs(spec, visited)
     |> Map.merge(Map.delete(value, "$ref"))
   end
 

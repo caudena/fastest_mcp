@@ -35,7 +35,7 @@ defmodule FastestMCP.Middleware.ErrorHandling do
           error_callback: callback() | nil,
           instance_id: reference(),
           runtime_id: reference() | nil,
-          logger: (String.t() -> any()),
+          logger: (Logger.level(), String.t() -> any()),
           middleware: (Operation.t(), (Operation.t() -> any()) -> any()),
           stats: pid() | nil,
           include_traceback: boolean(),
@@ -44,7 +44,7 @@ defmodule FastestMCP.Middleware.ErrorHandling do
 
   @doc "Builds a new value for this module from the supplied options."
   def new(opts \\ []) do
-    logger = Keyword.get(opts, :logger, &Logger.error/1)
+    logger = opts |> Keyword.get(:logger, &Logger.log/2) |> normalize_logger()
 
     middleware = %__MODULE__{
       error_callback: Keyword.get(opts, :error_callback),
@@ -171,7 +171,7 @@ defmodule FastestMCP.Middleware.ErrorHandling do
     end)
 
     message = log_message(middleware, error, operation, stacktrace)
-    middleware.logger.(message)
+    middleware.logger.(error_log_level(error), message)
 
     if middleware.error_callback do
       try do
@@ -179,10 +179,15 @@ defmodule FastestMCP.Middleware.ErrorHandling do
       rescue
         callback_error ->
           middleware.logger.(
+            :error,
             "Error in middleware error callback: #{Exception.message(callback_error)}"
           )
       end
     end
+  end
+
+  defp log_message(_middleware, %Error{} = error, operation, _stacktrace) do
+    "Error in #{operation.method || "unknown"}: #{exception_name(error)}: #{Exception.message(error)}"
   end
 
   defp log_message(%__MODULE__{include_traceback: true}, error, operation, stacktrace) do
@@ -195,6 +200,14 @@ defmodule FastestMCP.Middleware.ErrorHandling do
   defp log_message(_middleware, error, operation, _stacktrace) do
     "Error in #{operation.method || "unknown"}: #{exception_name(error)}: #{Exception.message(error)}"
   end
+
+  defp error_log_level(%Error{log_level: level}) when is_atom(level), do: level
+  defp error_log_level(_error), do: :error
+
+  defp normalize_logger(logger) when is_function(logger, 2), do: logger
+
+  defp normalize_logger(logger) when is_function(logger, 1),
+    do: fn _level, message -> logger.(message) end
 
   defp invalid_params_error(error) do
     %Error{

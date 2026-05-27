@@ -25,6 +25,7 @@ defmodule FastestMCP.Auth.RedirectURI do
   def matches_allowed_pattern?(redirect_uri, pattern)
       when is_binary(redirect_uri) and is_binary(pattern) do
     with {:ok, uri} <- parse_uri(redirect_uri),
+         false <- path_has_dot_segments?(uri.path),
          {:ok, parsed_pattern} <- parse_uri(pattern),
          {uri_host, uri_port} <- parse_host_port(uri.authority),
          {pattern_host, pattern_port} <- parse_host_port(parsed_pattern.authority),
@@ -165,6 +166,20 @@ defmodule FastestMCP.Auth.RedirectURI do
   defp normalize_path(nil), do: "/"
   defp normalize_path(""), do: "/"
   defp normalize_path(path), do: path
+
+  defp path_has_dot_segments?(path) when path in [nil, ""], do: false
+
+  defp path_has_dot_segments?(path) when is_binary(path) do
+    dot_segment_path?(path) or dot_segment_path?(URI.decode(path))
+  rescue
+    _ -> true
+  end
+
+  defp dot_segment_path?(path) do
+    path
+    |> String.split("/")
+    |> Enum.any?(&(&1 in [".", ".."]))
+  end
 
   defp effective_port(nil, "https"), do: "443"
   defp effective_port(nil, _scheme), do: "80"

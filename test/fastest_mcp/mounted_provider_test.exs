@@ -187,6 +187,42 @@ defmodule FastestMCP.MountedProviderTest do
              FastestMCP.read_resource(parent_name, "files://child/alpha/beta/gamma.txt")
   end
 
+  test "self-mounts are rejected and mounted lifespans are visible to child handlers" do
+    test_pid = self()
+    parent_name = "mounted-lifespan-" <> Integer.to_string(System.unique_integer([:positive]))
+
+    assert_raise ArgumentError, ~r/cannot mount/, fn ->
+      server = FastestMCP.server("self-mounted")
+      FastestMCP.mount(server, server)
+    end
+
+    child =
+      FastestMCP.server("lifespan-child")
+      |> FastestMCP.add_lifespan(fn _server ->
+        send(test_pid, :child_enter)
+        {%{"scope" => "child"}, fn -> send(test_pid, :child_exit) end}
+      end)
+      |> FastestMCP.add_tool("scope", fn _args, ctx -> ctx.lifespan_context end)
+
+    parent =
+      FastestMCP.server(parent_name)
+      |> FastestMCP.add_lifespan(fn _server ->
+        send(test_pid, :parent_enter)
+        {%{"scope" => "parent"}, fn -> send(test_pid, :parent_exit) end}
+      end)
+      |> FastestMCP.mount(child, namespace: "child")
+
+    assert {:ok, _pid} = FastestMCP.start_server(parent)
+    assert_receive :parent_enter, 1_000
+    assert_receive :child_enter, 1_000
+
+    assert %{"scope" => "child"} == FastestMCP.call_tool(parent_name, "child_scope", %{})
+
+    assert :ok = FastestMCP.stop_server(parent_name)
+    assert_receive :child_exit, 1_000
+    assert_receive :parent_exit, 1_000
+  end
+
   test "local components can override mounted tools with the same name" do
     parent_name =
       "mounted-local-override-" <> Integer.to_string(System.unique_integer([:positive]))

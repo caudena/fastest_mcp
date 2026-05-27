@@ -25,6 +25,7 @@ defmodule FastestMCP.Auth.Azure do
 
   @behaviour FastestMCP.Auth
 
+  alias FastestMCP.Auth
   alias FastestMCP.Auth.AssentFlow
   alias FastestMCP.Auth.LocalOAuth
 
@@ -49,23 +50,59 @@ defmodule FastestMCP.Auth.Azure do
   def token_verifier_options(opts) when is_map(opts) do
     normalized = normalize_opts(opts)
     base_url = upstream_base_url(normalized)
+    issuer = Map.get(normalized, :token_issuer, base_url)
 
-    FastestMCP.Auth.OIDC.token_verifier_options(
-      normalized
-      |> Map.put(
-        :openid_configuration,
-        %{
-          "issuer" => base_url,
-          "authorization_endpoint" => base_url <> "/authorize",
-          "token_endpoint" => base_url <> "/token",
-          "jwks_uri" => base_url <> "/discovery/v2.0/keys",
-          "response_types_supported" => ["code"],
-          "subject_types_supported" => ["public"],
-          "id_token_signing_alg_values_supported" => ["RS256"]
-        }
-      )
-      |> Map.put_new(:audience, default_audiences(normalized))
-    )
+    %{
+      jwks_uri: base_url <> "/discovery/v2.0/keys",
+      issuer: issuer,
+      algorithm: Map.get(normalized, :algorithm, "RS256"),
+      audience: Map.get(normalized, :audience, default_audiences(normalized)),
+      required_claims: Map.get(normalized, :required_claims, %{}),
+      required_scopes: Map.get(normalized, :required_scopes, []),
+      jwks_fetcher: Map.get(normalized, :jwks_fetcher),
+      http_client: Map.get(normalized, :http_client),
+      http_requester: Map.get(normalized, :http_requester),
+      ssrf_safe: Map.get(normalized, :ssrf_safe, true),
+      ssrf_resolver: Map.get(normalized, :ssrf_resolver),
+      ssrf_requester: Map.get(normalized, :ssrf_requester),
+      ssrf_max_size_bytes: Map.get(normalized, :ssrf_max_size_bytes, 5_120),
+      ssrf_overall_timeout_ms: Map.get(normalized, :ssrf_overall_timeout_ms, 30_000)
+    }
+  end
+
+  @doc "Builds a Microsoft Entra External ID / Azure AD B2C provider configuration."
+  def b2c(opts) when is_list(opts), do: opts |> Map.new() |> b2c()
+
+  def b2c(opts) when is_map(opts) do
+    tenant_name =
+      opts
+      |> Map.fetch!(:tenant_name)
+      |> to_string()
+      |> String.trim()
+
+    if String.contains?(tenant_name, ".onmicrosoft.com") do
+      raise ArgumentError, "tenant_name must not include .onmicrosoft.com"
+    end
+
+    policy_name = opts |> Map.fetch!(:policy_name) |> to_string()
+    client_id = Map.fetch!(opts, :client_id)
+
+    base_authority =
+      opts
+      |> Map.get(:custom_domain, "#{tenant_name}.b2clogin.com")
+      |> normalize_base_authority()
+
+    opts =
+      opts
+      |> Map.delete(:tenant_name)
+      |> Map.delete(:policy_name)
+      |> Map.delete(:custom_domain)
+      |> Map.put(:tenant_id, "#{tenant_name}.onmicrosoft.com/#{policy_name}")
+      |> Map.put(:base_authority, base_authority)
+      |> Map.put_new(:identifier_uri, "https://#{tenant_name}.onmicrosoft.com/#{client_id}")
+      |> Map.put_new(:token_issuer, nil)
+
+    Auth.new(__MODULE__, opts)
   end
 
   defp default_audiences(opts) do

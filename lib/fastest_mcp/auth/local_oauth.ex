@@ -34,6 +34,8 @@ defmodule FastestMCP.Auth.LocalOAuth do
   @pkce_methods ["plain", "S256"]
   @consent_csrf_cookie "FASTEST_MCP_OAUTH_CONSENT"
   @denied_clients_cookie "MCP_DENIED_CLIENTS"
+  @approved_clients_cookie "MCP_APPROVED_CLIENTS"
+  @default_fallback_refresh_token_expires_in 60 * 60 * 24 * 365
 
   @doc "Authenticates the incoming input and returns an updated context or an error."
   def authenticate(input, context, opts) do
@@ -139,26 +141,68 @@ defmodule FastestMCP.Auth.LocalOAuth do
   end
 
   defp handle_consent_page(conn, http_context, opts) do
+    conn = fetch_cookies(conn)
+
     with {:ok, txn_id} <- require_query_param(conn.query_params, "txn_id"),
          {:ok, transaction} <- get_authorization_transaction(http_context, txn_id),
          {:ok, csrf_token, transaction} <-
            ensure_transaction_csrf(http_context, txn_id, transaction) do
-      conn =
-        conn
-        |> put_resp_header("x-frame-options", "DENY")
-        |> put_resp_cookie(@consent_csrf_cookie, encode_consent_cookie(txn_id, csrf_token),
-          http_only: true,
-          same_site: "Lax",
-          secure: secure_cookie?(http_context),
-          path: consent_path(opts)
-        )
-        |> put_resp_content_type("text/html")
-        |> send_resp(200, render_consent_html(transaction, txn_id, csrf_token, opts))
+      case remembered_consent(conn, http_context, opts, transaction) do
+        :approved ->
+          handle_remembered_consent_redirect(
+            conn,
+            http_context,
+            opts,
+            "approve",
+            txn_id,
+            transaction
+          )
 
-      {:handled, conn}
+        :denied ->
+          handle_remembered_consent_redirect(
+            conn,
+            http_context,
+            opts,
+            "deny",
+            txn_id,
+            transaction
+          )
+
+        :unknown ->
+          conn =
+            conn
+            |> put_resp_header("x-frame-options", "DENY")
+            |> put_resp_cookie(@consent_csrf_cookie, encode_consent_cookie(txn_id, csrf_token),
+              http_only: true,
+              same_site: "Lax",
+              secure: secure_cookie?(http_context),
+              path: consent_path(opts)
+            )
+            |> put_resp_content_type("text/html")
+            |> send_resp(200, render_consent_html(transaction, txn_id, csrf_token, opts))
+
+          {:handled, conn}
+      end
     else
       {:oauth_error, status, payload, headers} ->
         {:handled, send_oauth_error(conn, status, payload, headers)}
+    end
+  end
+
+  defp handle_remembered_consent_redirect(conn, http_context, opts, action, txn_id, transaction) do
+    case consent_redirect(conn, http_context, opts, action, txn_id, transaction) do
+      {:ok, redirect_uri, conn} ->
+        {:handled,
+         conn
+         |> clear_consent_cookie(opts)
+         |> put_resp_header("location", redirect_uri)
+         |> send_resp(302, "")}
+
+      {:oauth_error, status, payload, headers} ->
+        {:handled, send_oauth_error(conn, status, payload, headers)}
+
+      {:error, %Error{} = error} ->
+        {:error, error}
     end
   end
 
@@ -407,6 +451,7 @@ defmodule FastestMCP.Auth.LocalOAuth do
     with {:ok, refresh_record} <-
            load_refresh_token(http_context, Map.get(params, "refresh_token")),
          :ok <- validate_refresh_token_client(refresh_record, client),
+         :ok <- validate_refresh_token_lifetime(refresh_record),
          {:ok, scopes} <- refresh_scopes(refresh_record, params),
          :ok <-
            revoke_refresh_and_access(
@@ -465,6 +510,9 @@ defmodule FastestMCP.Auth.LocalOAuth do
     jwt_issuer = jwt_issuer(http_context, opts)
     upstream_claims = upstream_claims_from_metadata(metadata)
 
+    {refresh_expires_in, refresh_ttl_ms, upstream_refresh_expires_at} =
+      refresh_token_lifetime(http_context, opts, metadata)
+
     access_token =
       issue_access_token_value(
         jwt_issuer,
@@ -481,7 +529,7 @@ defmodule FastestMCP.Auth.LocalOAuth do
         client,
         scopes,
         refresh_token_id,
-        jwt_refresh_token_expires_in(http_context, opts),
+        refresh_expires_in,
         upstream_claims
       )
 
@@ -496,6 +544,7 @@ defmodule FastestMCP.Auth.LocalOAuth do
         "token_id" => access_token_id
       }
       |> maybe_put("upstream_claims", upstream_claims)
+      |> maybe_put("upstream_refresh_expires_at", upstream_refresh_expires_at)
 
     refresh_record =
       %{
@@ -508,6 +557,7 @@ defmodule FastestMCP.Auth.LocalOAuth do
         "token_id" => refresh_token_id
       }
       |> maybe_put("upstream_claims", upstream_claims)
+      |> maybe_put("upstream_refresh_expires_at", upstream_refresh_expires_at)
 
     :ok =
       StateStore.put(
@@ -523,7 +573,7 @@ defmodule FastestMCP.Auth.LocalOAuth do
           refresh_token_store(http_context, opts),
           refresh_token,
           refresh_record,
-          refresh_token_ttl_ms(http_context)
+          refresh_ttl_ms
         )
     end
 
@@ -619,7 +669,7 @@ defmodule FastestMCP.Auth.LocalOAuth do
         apply_configured_redirect_patterns(client, opts)
 
       {:error, :not_found} ->
-        maybe_fetch_cimd_client(http_context, opts, client_id)
+        maybe_fetch_synthetic_upstream_client(http_context, opts, client_id)
     end
   end
 
@@ -692,7 +742,7 @@ defmodule FastestMCP.Auth.LocalOAuth do
           RedirectURI.validate_redirect_uri(redirect_uri, allowed_patterns) ->
         {:ok, redirect_uri}
 
-      allowed_patterns not in [nil, []] ->
+      not is_nil(allowed_patterns) ->
         oauth_error(:invalid_request, "redirect_uri does not match allowed patterns")
 
       oauth_proxy_enabled?(opts) and is_nil(allowed_patterns) ->
@@ -784,6 +834,20 @@ defmodule FastestMCP.Auth.LocalOAuth do
       :ok
     else
       oauth_error(:invalid_grant, "refresh token belongs to a different client")
+    end
+  end
+
+  defp validate_refresh_token_lifetime(refresh_record) do
+    case integer_value(Map.get(refresh_record, "upstream_refresh_expires_at")) do
+      nil ->
+        :ok
+
+      expires_at ->
+        if expires_at > System.os_time(:second) do
+          :ok
+        else
+          oauth_error(:invalid_grant, "refresh token is expired")
+        end
     end
   end
 
@@ -1314,6 +1378,78 @@ defmodule FastestMCP.Auth.LocalOAuth do
     end
   end
 
+  defp refresh_token_lifetime(http_context, opts, metadata) do
+    default_expires_in = jwt_refresh_token_expires_in(http_context, opts)
+    configured_ttl_ms = refresh_token_ttl_ms(http_context)
+
+    case proxy_refresh_lifetime(opts, metadata) do
+      nil ->
+        {default_expires_in, configured_ttl_ms, nil}
+
+      {expires_in, expires_at} ->
+        bounded_expires_in = bound_refresh_expires_in(http_context, opts, expires_in)
+        ttl_ms = bounded_expires_in * 1000
+
+        bounded_ttl_ms =
+          case configured_ttl_ms do
+            :infinity -> ttl_ms
+            ttl when is_integer(ttl) -> min(ttl, ttl_ms)
+          end
+
+        {bounded_expires_in, bounded_ttl_ms, expires_at}
+    end
+  end
+
+  defp proxy_refresh_lifetime(opts, metadata) do
+    if oauth_proxy_metadata?(metadata) do
+      now = System.os_time(:second)
+
+      expires_at =
+        cond do
+          expires_at = integer_value(Map.get(metadata, "upstream_refresh_expires_at")) ->
+            expires_at
+
+          expires_in = integer_value(Map.get(metadata, "upstream_refresh_expires_in")) ->
+            now + expires_in
+
+          true ->
+            now + fallback_refresh_token_expires_in(opts)
+        end
+
+      remaining = max(expires_at - now, 1)
+      {remaining, expires_at}
+    end
+  end
+
+  defp bound_refresh_expires_in(http_context, opts, expires_in) do
+    cond do
+      is_integer(refresh_token_ttl_ms(http_context)) ->
+        min(expires_in, jwt_refresh_token_expires_in(http_context, opts))
+
+      opt(opts, :jwt_refresh_token_expires_in) ->
+        min(expires_in, jwt_refresh_token_expires_in(http_context, opts))
+
+      true ->
+        expires_in
+    end
+  end
+
+  defp fallback_refresh_token_expires_in(opts) do
+    opts
+    |> opt(:fallback_refresh_token_expires_in, @default_fallback_refresh_token_expires_in)
+    |> integer_value()
+    |> case do
+      value when is_integer(value) and value > 0 -> value
+      _ -> @default_fallback_refresh_token_expires_in
+    end
+  end
+
+  defp oauth_proxy_metadata?(metadata) do
+    normalize_provider(Map.get(metadata, "provider")) == :oauth_proxy or
+      Map.has_key?(normalize_map(Map.get(metadata, "auth", %{})), "upstream_refresh_token") or
+      Map.has_key?(normalize_map(Map.get(metadata, "auth", %{})), "upstream_access_token")
+  end
+
   defp scopes_for_metadata(opts), do: supported_scopes(opts)
 
   defp supported_scopes(opts),
@@ -1594,7 +1730,7 @@ defmodule FastestMCP.Auth.LocalOAuth do
                session_params
              ),
            :ok <- delete_authorization_transaction(http_context, txn_id) do
-        {:ok, url, conn}
+        {:ok, url, put_remembered_consent(conn, http_context, opts, :approved, transaction)}
       end
     else
       with {:ok, code} <-
@@ -1611,19 +1747,13 @@ defmodule FastestMCP.Auth.LocalOAuth do
          build_redirect_uri(transaction["redirect_uri"], %{
            "code" => code,
            "state" => transaction["state"]
-         }), conn}
+         }), put_remembered_consent(conn, http_context, opts, :approved, transaction)}
       end
     end
   end
 
-  defp consent_redirect(conn, http_context, _opts, "deny", txn_id, transaction) do
-    conn =
-      put_resp_cookie(conn, @denied_clients_cookie, transaction["client_id"] || "unknown",
-        http_only: true,
-        same_site: "Lax",
-        secure: secure_cookie?(http_context),
-        path: "/"
-      )
+  defp consent_redirect(conn, http_context, opts, "deny", txn_id, transaction) do
+    conn = put_remembered_consent(conn, http_context, opts, :denied, transaction)
 
     with :ok <- delete_authorization_transaction(http_context, txn_id) do
       {:ok,
@@ -1641,6 +1771,151 @@ defmodule FastestMCP.Auth.LocalOAuth do
   defp clear_consent_cookie(conn, opts) do
     delete_resp_cookie(conn, @consent_csrf_cookie, path: consent_path(opts))
   end
+
+  defp remembered_consent(conn, http_context, opts, transaction) do
+    cond do
+      not remember_consent_enabled?(opts) ->
+        :unknown
+
+      not safe_fetch_site?(conn) ->
+        :unknown
+
+      signed_consent_cookie_contains?(
+        conn.cookies[@approved_clients_cookie],
+        http_context,
+        opts,
+        transaction
+      ) ->
+        :approved
+
+      signed_consent_cookie_contains?(
+        conn.cookies[@denied_clients_cookie],
+        http_context,
+        opts,
+        transaction
+      ) ->
+        :denied
+
+      true ->
+        :unknown
+    end
+  end
+
+  defp put_remembered_consent(conn, http_context, opts, decision, transaction) do
+    if remember_consent_enabled?(opts) do
+      cookie_name =
+        case decision do
+          :approved -> @approved_clients_cookie
+          :denied -> @denied_clients_cookie
+        end
+
+      put_signed_consent_cookie(conn, cookie_name, http_context, opts, transaction)
+    else
+      conn
+    end
+  end
+
+  defp signed_consent_cookie_contains?(nil, _http_context, _opts, _transaction), do: false
+
+  defp signed_consent_cookie_contains?(cookie, http_context, opts, transaction) do
+    with {:ok, payload} <- decode_signed_consent_cookie(cookie, http_context, opts) do
+      Enum.any?(Map.get(payload, "entries", []), &(&1 == consent_cookie_entry(transaction)))
+    else
+      _ -> false
+    end
+  end
+
+  defp put_signed_consent_cookie(conn, cookie_name, http_context, opts, transaction) do
+    entry = consent_cookie_entry(transaction)
+
+    entries =
+      conn.cookies
+      |> Map.get(cookie_name)
+      |> decode_signed_consent_cookie(http_context, opts)
+      |> case do
+        {:ok, payload} -> Map.get(payload, "entries", [])
+        _ -> []
+      end
+      |> Enum.reject(&(&1 == entry))
+      |> then(&[entry | &1])
+      |> Enum.take(50)
+
+    payload = %{"version" => 1, "entries" => entries}
+
+    put_resp_cookie(conn, cookie_name, encode_signed_consent_cookie(payload, http_context, opts),
+      http_only: true,
+      same_site: "Lax",
+      secure: secure_cookie?(http_context),
+      path: "/",
+      max_age: @default_fallback_refresh_token_expires_in
+    )
+  end
+
+  defp consent_cookie_entry(transaction) do
+    %{
+      "client_id" => transaction["client_id"],
+      "redirect_uri" => transaction["redirect_uri"],
+      "scope" => transaction["scopes"] |> normalize_scopes() |> scope_string()
+    }
+  end
+
+  defp decode_signed_consent_cookie(cookie, http_context, opts) when is_binary(cookie) do
+    with {:ok, decoded} <- Base.url_decode64(cookie, padding: false),
+         {:ok, envelope} <- Jason.decode(decoded),
+         %{"payload" => payload, "sig" => sig} <- envelope,
+         true <- secure_compare(sig, consent_cookie_signature(payload, http_context, opts)),
+         {:ok, payload} <- Jason.decode(payload),
+         true <- is_list(Map.get(payload, "entries", [])) do
+      {:ok, payload}
+    else
+      _ -> {:error, :invalid_cookie}
+    end
+  end
+
+  defp decode_signed_consent_cookie(_cookie, _http_context, _opts), do: {:error, :invalid_cookie}
+
+  defp encode_signed_consent_cookie(payload, http_context, opts) do
+    encoded_payload = Jason.encode!(payload)
+    sig = consent_cookie_signature(encoded_payload, http_context, opts)
+
+    %{"payload" => encoded_payload, "sig" => sig}
+    |> Jason.encode!()
+    |> Base.url_encode64(padding: false)
+  end
+
+  defp consent_cookie_signature(payload, http_context, opts) do
+    :hmac
+    |> :crypto.mac(:sha256, consent_cookie_secret(http_context, opts), payload)
+    |> Base.url_encode64(padding: false)
+  end
+
+  defp consent_cookie_secret(http_context, opts) do
+    material =
+      opt(opts, :consent_cookie_secret) ||
+        opt(opts, :jwt_signing_key) ||
+        "#{Map.get(http_context, :server_name, "fastestmcp")}:#{http_context.base_url}"
+
+    JWTIssuer.derive_jwt_key(
+      low_entropy_material: to_string(material),
+      salt: "fastestmcp-oauth-consent-cookie"
+    )
+  end
+
+  defp safe_fetch_site?(conn) do
+    conn
+    |> get_req_header("sec-fetch-site")
+    |> List.first()
+    |> case do
+      value when value in ["same-origin", "same-site", "none"] -> true
+      _ -> false
+    end
+  end
+
+  defp secure_compare(left, right) when is_binary(left) and is_binary(right) do
+    byte_size(left) == byte_size(right) and Plug.Crypto.secure_compare(left, right)
+  end
+
+  defp secure_compare(_left, _right), do: false
 
   defp render_consent_html(transaction, txn_id, csrf_token, opts) do
     client_label =
@@ -1741,7 +2016,8 @@ defmodule FastestMCP.Auth.LocalOAuth do
     URI.parse(http_context.base_url).scheme == "https"
   end
 
-  defp consent_enabled?(opts), do: opt(opts, :consent, false)
+  defp consent_enabled?(opts), do: opt(opts, :consent, false) in [true, :remember, "remember"]
+  defp remember_consent_enabled?(opts), do: opt(opts, :consent, false) in [:remember, "remember"]
   defp consent_path(opts), do: normalize_path(opt(opts, :consent_path, "/consent"))
   defp enable_cimd?(opts), do: opt(opts, :enable_cimd, true)
   defp oauth_proxy_enabled?(opts), do: not is_nil(opt(opts, :upstream_oauth_flow))
@@ -1751,6 +2027,45 @@ defmodule FastestMCP.Auth.LocalOAuth do
 
   defp transaction_key(txn_id), do: "txn:" <> txn_id
   defp upstream_transaction_key(state), do: "upstream:" <> state
+
+  defp maybe_fetch_synthetic_upstream_client(http_context, opts, client_id) do
+    if oauth_proxy_enabled?(opts) and client_id == upstream_client_id(opts) do
+      with {:ok, client} <- synthetic_upstream_client(client_id, opts) do
+        {:ok, client}
+      end
+    else
+      maybe_fetch_cimd_client(http_context, opts, client_id)
+    end
+  end
+
+  defp upstream_client_id(opts) do
+    case opt(opts, :upstream_oauth_flow) do
+      %AssentFlow{config: config} ->
+        config[:client_id] || config["client_id"]
+
+      _other ->
+        nil
+    end
+  end
+
+  defp synthetic_upstream_client(client_id, opts) do
+    with {:ok, allowed_redirect_uri_patterns} <-
+           validate_redirect_uri_patterns(opt(opts, :allowed_client_redirect_uris)) do
+      {:ok,
+       %{
+         "client_id" => client_id,
+         "client_secret" => nil,
+         "redirect_uris" => nil,
+         "grant_types" => @authorization_grant_types,
+         "response_types" => @response_types,
+         "token_endpoint_auth_method" => "none",
+         "allowed_redirect_uri_patterns" => allowed_redirect_uri_patterns,
+         "scope" => default_scope_string(opts),
+         "client_name" => client_id,
+         "upstream_client" => true
+       }}
+    end
+  end
 
   defp maybe_fetch_cimd_client(http_context, opts, client_id) do
     if enable_cimd?(opts) and CIMD.is_client_id?(client_id) do
@@ -1966,6 +2281,10 @@ defmodule FastestMCP.Auth.LocalOAuth do
       "principal" => upstream_principal(result),
       "auth" => auth
     }
+    |> maybe_put_metadata(
+      "upstream_refresh_expires_in",
+      integer_value(Map.get(token_response, "refresh_expires_in"))
+    )
   end
 
   defp metadata_from_token_record(record) do
@@ -1974,6 +2293,10 @@ defmodule FastestMCP.Auth.LocalOAuth do
     |> maybe_put_metadata("provider", Map.get(record, "provider"))
     |> maybe_put_metadata("auth", Map.get(record, "auth"))
     |> maybe_put_metadata("upstream_claims", Map.get(record, "upstream_claims"))
+    |> maybe_put_metadata(
+      "upstream_refresh_expires_at",
+      Map.get(record, "upstream_refresh_expires_at")
+    )
   end
 
   defp upstream_principal(result) do
@@ -2002,6 +2325,17 @@ defmodule FastestMCP.Auth.LocalOAuth do
 
   defp normalize_map(nil), do: %{}
   defp normalize_map(map) when is_map(map), do: map
+
+  defp integer_value(value) when is_integer(value), do: value
+
+  defp integer_value(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {integer, ""} -> integer
+      _ -> nil
+    end
+  end
+
+  defp integer_value(_value), do: nil
 
   defp maybe_put_metadata(metadata, _key, nil), do: metadata
   defp maybe_put_metadata(metadata, key, value), do: Map.put(metadata, key, value)

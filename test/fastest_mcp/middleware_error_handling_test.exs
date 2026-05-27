@@ -80,6 +80,30 @@ defmodule FastestMCP.MiddlewareErrorHandlingTest do
     assert %{"FastestMCP.Error:tools/call" => 1} = ErrorHandling.get_error_stats(middleware)
   end
 
+  test "FastestMCP errors log at their configured level without traceback" do
+    parent = self()
+
+    middleware =
+      Middleware.error_handling(
+        include_traceback: true,
+        logger: fn level, message -> send(parent, {:log, level, message}) end
+      )
+
+    on_exit(fn -> ErrorHandling.close(middleware) end)
+
+    operation = %Operation{method: "tools/call"}
+
+    assert_raise Error, fn ->
+      ErrorHandling.call(middleware, operation, fn _operation ->
+        raise Error, code: :forbidden, message: "soft deny", log_level: :warning
+      end)
+    end
+
+    assert_receive {:log, :warning, message}
+    assert message =~ "soft deny"
+    refute message =~ "** (FastestMCP.Error)"
+  end
+
   test "middleware structs can be attached directly to a server" do
     middleware = Middleware.error_handling()
     on_exit(fn -> ErrorHandling.close(middleware) end)

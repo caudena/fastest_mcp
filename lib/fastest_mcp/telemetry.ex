@@ -75,10 +75,11 @@ defmodule FastestMCP.Telemetry do
     Tracer.with_span "delegate " <> to_string(name),
                      %{
                        kind: :internal,
-                       attributes: %{
-                         "fastestmcp.provider.type" => provider_type,
-                         "fastestmcp.component.key" => to_string(component_key)
-                       }
+                       attributes:
+                         clean_attributes(%{
+                           "fastestmcp.provider.type" => provider_type,
+                           "fastestmcp.component.key" => to_string(component_key)
+                         })
                      } do
       fun.()
     end
@@ -91,7 +92,14 @@ defmodule FastestMCP.Telemetry do
 
   @doc "Records an exception on the current span."
   def record_error(exception, stacktrace, attrs \\ %{}) do
+    attrs = clean_attributes(attrs)
     Tracer.record_exception(exception, stacktrace, Map.to_list(attrs))
+
+    Tracer.set_attributes(
+      attrs
+      |> Map.put_new("error.type", exception_name(exception))
+    )
+
     Tracer.set_status(:error, Exception.message(exception))
     :ok
   end
@@ -128,6 +136,7 @@ defmodule FastestMCP.Telemetry do
   end
 
   @doc "Builds the span name for the given operation."
+  def span_name(%Operation{method: "resources/read"}), do: "resources/read"
   def span_name(%Operation{method: method, target: nil}), do: method
 
   def span_name(%Operation{method: method, target: target}),
@@ -139,7 +148,10 @@ defmodule FastestMCP.Telemetry do
       "rpc.system" => "mcp",
       "rpc.service" => operation.server_name,
       "rpc.method" => operation.method,
+      "gen_ai.system" => "mcp",
+      "gen_ai.operation.name" => operation.method,
       "mcp.method.name" => operation.method,
+      "mcp.server.name" => operation.server_name,
       "mcp.resource.uri" => resource_uri(operation),
       "mcp.session.id" => operation.context.session_id,
       "fastestmcp.server.name" => operation.server_name,
@@ -150,6 +162,13 @@ defmodule FastestMCP.Telemetry do
       "enduser.id" => enduser_id(operation.context),
       "enduser.scope" => enduser_scope(operation.context)
     }
+    |> clean_attributes()
+  end
+
+  defp exception_name(%module{}), do: module |> inspect() |> String.trim_leading("Elixir.")
+
+  defp clean_attributes(attrs) do
+    attrs
     |> Enum.reject(fn {_key, value} -> is_nil(value) end)
     |> Map.new()
   end
