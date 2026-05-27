@@ -34,13 +34,13 @@ defmodule FastestMCP.MountedHTTPRoutesTest do
 
     assert ready.status == 200
     assert leaf_ready.status == 200
-    assert Jason.decode!(ready.resp_body) == %{"status" => "child"}
-    assert Jason.decode!(leaf_ready.resp_body) == %{"status" => "leaf"}
+    assert JSON.decode!(ready.resp_body) == %{"status" => "child"}
+    assert JSON.decode!(leaf_ready.resp_body) == %{"status" => "leaf"}
   end
 
   defp json(conn, status, payload) do
     conn
     |> put_resp_content_type("application/json")
-    |> send_resp(status, Jason.encode!(payload))
+    |> send_resp(status, JSON.encode!(payload))
   end
 end

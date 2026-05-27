@@ -76,7 +76,8 @@ defmodule FastestMCP.InputValidationTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    profile = Jason.encode!(%{"name" => "Alice", "age" => "30", "email" => "alice@example.com"})
+    profile =
+      JSON.encode!(%{"name" => "Alice", "age" => "30", "email" => "alice@example.com"})
 
     assert "Alice:30:alice@example.com" ==
              FastestMCP.call_tool(server_name, "create_user", %{"profile" => profile})

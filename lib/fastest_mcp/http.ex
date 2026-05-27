@@ -17,7 +17,7 @@ defmodule FastestMCP.HTTP do
   def get_json(url, opts \\ []) when is_binary(url) do
     case request(:get, url, opts) do
       {:ok, status, _headers, body} when status == 200 ->
-        Jason.decode(body)
+        JSON.decode(body)
 
       {:ok, status, _headers, body} ->
         {:error, {:http_status, status, body}}
@@ -31,7 +31,7 @@ defmodule FastestMCP.HTTP do
   def post_form_json(url, form, opts \\ []) when is_binary(url) do
     case request(:post, url, Keyword.put(opts, :form, form)) do
       {:ok, status, headers, body} ->
-        with {:ok, decoded} <- Jason.decode(body) do
+        with {:ok, decoded} <- JSON.decode(body) do
           {:ok, status, headers, decoded}
         end
 
@@ -123,7 +123,7 @@ defmodule FastestMCP.HTTP do
   defp request_body(opts) do
     cond do
       Keyword.has_key?(opts, :json) ->
-        {~c"application/json", Jason.encode!(Keyword.get(opts, :json))}
+        {~c"application/json", JSON.encode!(Keyword.get(opts, :json))}
 
       Keyword.has_key?(opts, :form) ->
         body =
@@ -235,7 +235,7 @@ defmodule FastestMCP.HTTP do
   defp scalar_to_multipart(value) when is_integer(value) or is_float(value), do: to_string(value)
   defp scalar_to_multipart(value) when is_boolean(value), do: to_string(value)
   defp scalar_to_multipart(nil), do: ""
-  defp scalar_to_multipart(value), do: Jason.encode!(value)
+  defp scalar_to_multipart(value), do: JSON.encode!(value)
 
   defp escape_multipart_param(value) do
     value

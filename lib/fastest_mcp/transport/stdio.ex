@@ -53,7 +53,7 @@ defmodule FastestMCP.Transport.Stdio do
         |> String.trim()
         |> decode_request()
         |> then(&dispatch(server_name, &1, opts))
-        |> Jason.encode!()
+        |> JSON.encode!()
 
       IO.binwrite(output_device, response)
       IO.binwrite(output_device, "\n")
@@ -61,7 +61,7 @@ defmodule FastestMCP.Transport.Stdio do
   end
 
   defp decode_request(""), do: %{"method" => "noop"}
-  defp decode_request(line), do: Jason.decode!(line)
+  defp decode_request(line), do: JSON.decode!(line)
 
   defp fetch_server(server_name) do
     case ServerRuntime.fetch(server_name) do

@@ -228,7 +228,7 @@ defmodule FastestMCP.ResultNormalizer do
         normalized
 
       true ->
-        Jason.encode!(normalized)
+        JSON.encode!(normalized)
     end
   rescue
     _error -> inspect(normalized_fallback(value))

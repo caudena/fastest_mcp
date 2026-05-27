@@ -274,7 +274,7 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
           progress_token: progress_token(payload)
         }
         |> put_request_context(opts),
-      auth_input: %{"authorization" => headers["authorization"], "headers" => headers}
+      auth_input: auth_input(conn, headers, opts)
     }
   end
 
@@ -299,7 +299,7 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
           stateless_http: Keyword.fetch!(opts, :stateless_http)
         }
         |> put_request_context(opts),
-      auth_input: %{"authorization" => headers["authorization"], "headers" => headers}
+      auth_input: auth_input(conn, headers, opts)
     }
   end
 
@@ -332,7 +332,7 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
           stateless_http: stateless_http
         }
         |> put_request_context(opts),
-      auth_input: %{"authorization" => headers["authorization"], "headers" => headers}
+      auth_input: auth_input(conn, headers, opts)
     }
   end
 
@@ -342,9 +342,51 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
     [
       stateless_http: stateless_http,
       base_url: http_context.base_url,
-      mcp_base_path: http_context.mcp_base_path
+      mcp_base_path: http_context.mcp_base_path,
+      auth_assigns: Keyword.get(opts, :auth_assigns, false)
     ]
   end
+
+  defp auth_input(conn, headers, opts) do
+    %{"authorization" => headers["authorization"], "headers" => headers}
+    |> maybe_put("assigns", selected_auth_assigns(conn.assigns, Keyword.get(opts, :auth_assigns)))
+  end
+
+  defp selected_auth_assigns(_assigns, false), do: nil
+  defp selected_auth_assigns(_assigns, nil), do: nil
+
+  defp selected_auth_assigns(assigns, :all) when is_map(assigns) do
+    assigns
+    |> Enum.into(%{}, fn {key, value} -> {to_string(key), value} end)
+    |> non_empty_map()
+  end
+
+  defp selected_auth_assigns(assigns, keys) when is_map(assigns) and is_list(keys) do
+    keys
+    |> Enum.reduce(%{}, fn key, acc ->
+      string_key = to_string(key)
+
+      cond do
+        Map.has_key?(assigns, key) ->
+          Map.put(acc, string_key, Map.fetch!(assigns, key))
+
+        Map.has_key?(assigns, string_key) ->
+          Map.put(acc, string_key, Map.fetch!(assigns, string_key))
+
+        true ->
+          acc
+      end
+    end)
+    |> non_empty_map()
+  end
+
+  defp selected_auth_assigns(_assigns, other) do
+    raise ArgumentError,
+          "auth_assigns must be false, nil, :all, or a list of assign keys, got #{inspect(other)}"
+  end
+
+  defp non_empty_map(map) when map == %{}, do: nil
+  defp non_empty_map(map), do: map
 
   defp put_request_context(metadata, opts) do
     metadata
@@ -363,12 +405,12 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
             {:ok, %{}}
 
           {:ok, body, _conn} ->
-            case Jason.decode(body) do
+            case JSON.decode(body) do
               {:ok, decoded} ->
                 {:ok, decoded}
 
               {:error, error} ->
-                {:error, %Error{code: :bad_request, message: Exception.message(error)}}
+                {:error, %Error{code: :bad_request, message: json_decode_error_message(error)}}
             end
 
           {:more, _body, _conn} ->
@@ -385,6 +427,8 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
     do: {:ok, body_params}
 
   defp parsed_body_params(_conn), do: :unavailable
+
+  defp json_decode_error_message(error), do: "invalid JSON: #{inspect(error)}"
 
   defp normalize_base_path(path) do
     "/" <> String.trim(String.trim_leading(to_string(path), "/"), "/")
@@ -469,8 +513,8 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
 
   defp json_value(value) do
     value
-    |> Jason.encode!()
-    |> Jason.decode!()
+    |> JSON.encode!()
+    |> JSON.decode!()
   end
 
   defp maybe_put(map, _key, nil), do: map

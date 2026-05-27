@@ -160,7 +160,11 @@ defmodule FastestMCP.InitializationTest do
            } = stdio_response["result"]
 
     conn =
-      conn(:post, "/mcp/initialize", Jason.encode!(%{"clientInfo" => %{"name" => "http-client"}}))
+      conn(
+        :post,
+        "/mcp/initialize",
+        JSON.encode!(%{"clientInfo" => %{"name" => "http-client"}})
+      )
       |> put_req_header("content-type", "application/json")
       |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
 
@@ -170,7 +174,7 @@ defmodule FastestMCP.InitializationTest do
              "protocolVersion" => ^protocol_version,
              "serverInfo" => %{"name" => ^server_name, "version" => "9.9.9"},
              "instructions" => "Transport instructions"
-           } = Jason.decode!(conn.resp_body)
+           } = JSON.decode!(conn.resp_body)
 
     assert %{} == FastestMCP.ping(server_name)
   end

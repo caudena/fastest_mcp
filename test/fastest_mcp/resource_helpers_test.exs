@@ -110,7 +110,7 @@ defmodule FastestMCP.ResourceHelpersTest do
                payload: %{"uri" => "memo://json"}
              })
 
-    assert Jason.decode!(encoded_json) == %{"ok" => true, "values" => [1, 2, 3]}
+    assert JSON.decode!(encoded_json) == %{"ok" => true, "values" => [1, 2, 3]}
 
     assert %{
              resources: resources,
@@ -219,7 +219,7 @@ defmodule FastestMCP.ResourceHelpersTest do
                "relative_path" => "nested/beta.txt",
                "size_bytes" => 4
              }
-           ] = Jason.decode!(payload)
+           ] = JSON.decode!(payload)
 
     assert_raise ArgumentError, ~r/path must be absolute/, fn ->
       ResourceDirectory.new("relative-dir")
@@ -264,6 +264,6 @@ defmodule FastestMCP.ResourceHelpersTest do
              meta: %{count: 1, path: ^root, recursive: false}
            } = FastestMCP.read_resource(server_name, "dir://notes")
 
-    assert [%{"relative_path" => "notes.md"}] = Jason.decode!(payload)
+    assert [%{"relative_path" => "notes.md"}] = JSON.decode!(payload)
   end
 end

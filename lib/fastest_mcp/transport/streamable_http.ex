@@ -9,8 +9,6 @@ defmodule FastestMCP.Transport.StreamableHTTP do
 
   import Plug.Conn
 
-  alias FastestMCP.Auth
-  alias FastestMCP.Auth.StateStore
   alias FastestMCP.Context
   alias FastestMCP.Error
   alias FastestMCP.ErrorExposure
@@ -20,6 +18,7 @@ defmodule FastestMCP.Transport.StreamableHTTP do
   alias FastestMCP.Transport.HTTPApp
   alias FastestMCP.Transport.HTTPCommon
   alias FastestMCP.Transport.StreamableHTTPAdapter
+  alias FastestMCP.TTLStore
 
   @doc "Builds a child specification for supervising this module."
   def child_spec(opts) do
@@ -39,25 +38,16 @@ defmodule FastestMCP.Transport.StreamableHTTP do
         {:ok, runtime} ->
           http_context = HTTPCommon.http_context(conn, runtime, opts)
 
-          case Auth.http_dispatch(runtime.server.auth, conn, http_context) do
-            :pass ->
-              case dispatch(conn, runtime, opts) do
-                {:error, %FastestMCP.Transport.Request{} = request, %Error{} = error} ->
-                  {:error, request, public_error(error, runtime.server, request),
-                   runtime.server.auth, http_context}
-
-                {:error, %Error{} = error} ->
-                  {:error, public_error(error, runtime.server), runtime.server.auth, http_context}
-
-                other ->
-                  other
-              end
-
-            {:handled, handled_conn} ->
-              {:handled, handled_conn}
+          case dispatch(conn, runtime, opts) do
+            {:error, %FastestMCP.Transport.Request{} = request, %Error{} = error} ->
+              {:error, request, public_error(error, runtime.server, request), runtime.server.auth,
+               http_context}
 
             {:error, %Error{} = error} ->
               {:error, public_error(error, runtime.server), runtime.server.auth, http_context}
+
+            other ->
+              other
           end
 
         {:error, :not_found} ->
@@ -200,7 +190,7 @@ defmodule FastestMCP.Transport.StreamableHTTP do
            message: "streamable HTTP session deletion requires mcp-session-id"
          }}
 
-      match?({:ok, true}, StateStore.get(store, session_id)) ->
+      match?({:ok, true}, TTLStore.get(store, session_id)) ->
         {:error, %Error{code: :not_found, message: "unknown session #{inspect(session_id)}"}}
 
       true ->
@@ -210,7 +200,7 @@ defmodule FastestMCP.Transport.StreamableHTTP do
                session_id
              ) do
           :ok ->
-            :ok = StateStore.put(store, session_id, true)
+            :ok = TTLStore.put(store, session_id, true)
             {:empty, 204, []}
 
           {:error, :not_found} ->
@@ -457,7 +447,7 @@ defmodule FastestMCP.Transport.StreamableHTTP do
 
       {:client_bridge_request, waiter, client_request_id, message, store, session_id, timeout_ms} ->
         :ok =
-          StateStore.put(
+          TTLStore.put(
             store,
             client_request_id,
             %{waiter: waiter, session_id: session_id},
@@ -469,7 +459,7 @@ defmodule FastestMCP.Transport.StreamableHTTP do
             stream_loop(conn, runtime, request)
 
           {:error, reason} ->
-            :ok = StateStore.delete(store, client_request_id)
+            :ok = TTLStore.delete(store, client_request_id)
 
             send(
               waiter,
@@ -513,13 +503,13 @@ defmodule FastestMCP.Transport.StreamableHTTP do
     session_stream_store = Map.fetch!(runtime, :session_stream_store)
 
     previous_stream =
-      case StateStore.get(session_stream_store, request.session_id) do
+      case TTLStore.get(session_stream_store, request.session_id) do
         {:ok, value} -> value
         {:error, :not_found} -> nil
       end
 
     :ok =
-      StateStore.put(
+      TTLStore.put(
         session_stream_store,
         request.session_id,
         %{stream_id: stream_id, owner: self()},
@@ -622,10 +612,10 @@ defmodule FastestMCP.Transport.StreamableHTTP do
     store = Map.fetch!(runtime, :client_request_store)
 
     with id when not is_nil(id) <- request_id,
-         {:ok, %{waiter: waiter, session_id: expected_session_id}} <- StateStore.get(store, id),
+         {:ok, %{waiter: waiter, session_id: expected_session_id}} <- TTLStore.get(store, id),
          :ok <- validate_client_response_session(request, expected_session_id),
          response <- normalize_client_response(request.payload) do
-      :ok = StateStore.delete(store, id)
+      :ok = TTLStore.delete(store, id)
       send(waiter, {:client_bridge_response, to_string(id), response})
       {:empty, 202, []}
     else
@@ -679,7 +669,7 @@ defmodule FastestMCP.Transport.StreamableHTTP do
   end
 
   defp chunk_message(conn, message, event_id \\ nil) do
-    chunk(conn, sse_event(Jason.encode!(message), event_id))
+    chunk(conn, sse_event(JSON.encode!(message), event_id))
   end
 
   defp chunk_raw(conn, payload) do
@@ -712,7 +702,7 @@ defmodule FastestMCP.Transport.StreamableHTTP do
   defp session_stream_owner?(runtime, session_id, stream_id) do
     runtime
     |> Map.fetch!(:session_stream_store)
-    |> StateStore.get(session_id)
+    |> TTLStore.get(session_id)
     |> case do
       {:ok, %{stream_id: ^stream_id}} -> true
       _other -> false
@@ -722,8 +712,8 @@ defmodule FastestMCP.Transport.StreamableHTTP do
   defp clear_session_stream_owner(runtime, session_id, stream_id) do
     store = Map.fetch!(runtime, :session_stream_store)
 
-    case StateStore.get(store, session_id) do
-      {:ok, %{stream_id: ^stream_id}} -> StateStore.delete(store, session_id)
+    case TTLStore.get(store, session_id) do
+      {:ok, %{stream_id: ^stream_id}} -> TTLStore.delete(store, session_id)
       _other -> :ok
     end
   end

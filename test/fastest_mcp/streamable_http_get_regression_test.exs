@@ -32,7 +32,7 @@ defmodule FastestMCP.StreamableHTTPGetRegressionTest do
       conn(
         :post,
         "/mcp",
-        Jason.encode!(%{
+        JSON.encode!(%{
           "jsonrpc" => "2.0",
           "id" => 7,
           "method" => "tools/call",
@@ -51,6 +51,6 @@ defmodule FastestMCP.StreamableHTTPGetRegressionTest do
              "result" => %{
                "structuredContent" => %{"message" => "after-get"}
              }
-           } = Jason.decode!(call_response.resp_body)
+           } = JSON.decode!(call_response.resp_body)
   end
 end

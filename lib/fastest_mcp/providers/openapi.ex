@@ -491,7 +491,7 @@ defmodule FastestMCP.Providers.OpenAPI do
 
       true ->
         opts
-        |> Keyword.put(:body, Jason.encode!(body))
+        |> Keyword.put(:body, JSON.encode!(body))
         |> Keyword.put(:content_type, content_type)
     end
   end
@@ -539,7 +539,7 @@ defmodule FastestMCP.Providers.OpenAPI do
   end
 
   defp normalize_response_body(body) when is_binary(body) do
-    case Jason.decode(body) do
+    case JSON.decode(body) do
       {:ok, decoded} -> decoded
       {:error, _reason} -> body
     end

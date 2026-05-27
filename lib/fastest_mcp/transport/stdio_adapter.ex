@@ -102,8 +102,8 @@ defmodule FastestMCP.Transport.StdioAdapter do
 
   defp json_value(value) do
     value
-    |> Jason.encode!()
-    |> Jason.decode!()
+    |> JSON.encode!()
+    |> JSON.decode!()
   end
 
   defp maybe_put(map, _key, nil), do: map

@@ -380,7 +380,7 @@ defmodule FastestMCP.TaskBackend.Memory do
     |> maybe_put("sessionId", session_id)
     |> maybe_put("ownerFingerprint", owner_fingerprint)
     |> Map.put("after", Tuple.to_list(key))
-    |> Jason.encode!()
+    |> JSON.encode!()
     |> Base.url_encode64(padding: false)
   end
 
@@ -389,7 +389,8 @@ defmodule FastestMCP.TaskBackend.Memory do
   defp decode_cursor(cursor, session_id, owner_fingerprint)
        when is_binary(cursor) and cursor != "" do
     with {:ok, decoded} <- Base.url_decode64(cursor, padding: false),
-         {:ok, %{"scope" => scope, "after" => after_parts} = payload} <- Jason.decode(decoded),
+         {:ok, %{"scope" => scope, "after" => after_parts} = payload} <-
+           JSON.decode(decoded),
          {:ok, key} <-
            decode_cursor_key(scope, after_parts, payload, session_id, owner_fingerprint) do
       key

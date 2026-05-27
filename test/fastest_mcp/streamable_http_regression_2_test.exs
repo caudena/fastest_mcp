@@ -35,7 +35,7 @@ defmodule FastestMCP.StreamableHTTPRegression2Test do
       |> IO.iodata_to_binary()
 
     assert {400, body} = request(port, request)
-    assert %{"error" => %{"code" => "bad_request"}} = Jason.decode!(body)
+    assert %{"error" => %{"code" => "bad_request"}} = JSON.decode!(body)
   end
 
   defp request(port, payload) do

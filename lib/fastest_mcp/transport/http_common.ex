@@ -18,26 +18,19 @@ defmodule FastestMCP.Transport.HTTPCommon do
 
   @localhost_hosts MapSet.new(["localhost", "127.0.0.1", "::1", "[::1]"])
 
-  @doc "Builds the HTTP context map passed to auth providers and HTTP helpers."
+  @doc "Builds the HTTP context map passed to authenticators and HTTP helpers."
   def http_context(conn, runtime, opts) do
     %{
       base_url: base_url(conn, opts),
       mcp_base_path: normalize_base_path(Keyword.get(opts, :path, "/mcp")),
       server_name: server_name(runtime),
-      server_metadata: server_metadata(runtime),
-      oauth_state_store: Map.get(runtime, :oauth_state_store),
-      oauth_client_store: Map.get(runtime, :oauth_client_store),
-      oauth_authorization_code_store: Map.get(runtime, :oauth_authorization_code_store),
-      oauth_access_token_store: Map.get(runtime, :oauth_access_token_store),
-      oauth_refresh_token_store: Map.get(runtime, :oauth_refresh_token_store),
-      oauth_access_token_ttl_ms: Map.get(runtime, :oauth_access_token_ttl_ms),
-      oauth_refresh_token_ttl_ms: Map.get(runtime, :oauth_refresh_token_ttl_ms)
+      server_metadata: server_metadata(runtime)
     }
   end
 
   @doc "Sends a JSON HTTP response."
   def json(conn, status, payload) do
-    body = Jason.encode!(payload)
+    body = JSON.encode!(payload)
 
     conn
     |> put_resp_content_type("application/json")
@@ -62,7 +55,6 @@ defmodule FastestMCP.Transport.HTTPCommon do
 
     body =
       payload_override ||
-        Auth.oauth_http_error_payload(auth, error, http_context) ||
         %{error: %{code: error.code, message: error.message, details: error.details}}
 
     {status, headers, body}
@@ -93,15 +85,7 @@ defmodule FastestMCP.Transport.HTTPCommon do
     {401, [{"www-authenticate", Auth.www_authenticate(auth, error, http_context)}]}
   end
 
-  defp error_status_and_headers(%Error{code: :forbidden} = error, auth, http_context) do
-    case Auth.oauth_http_error_payload(auth, error, http_context) do
-      nil ->
-        {403, []}
-
-      _payload ->
-        {403, [{"www-authenticate", Auth.www_authenticate(auth, error, http_context)}]}
-    end
-  end
+  defp error_status_and_headers(%Error{code: :forbidden}, _auth, _http_context), do: {403, []}
 
   defp error_status_and_headers(%Error{code: :rate_limited} = error, _auth, _http_context) do
     headers =

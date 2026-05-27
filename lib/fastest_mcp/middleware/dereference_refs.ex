@@ -7,7 +7,7 @@ defmodule FastestMCP.Middleware.DereferenceRefs do
   untouched.
   """
 
-  alias FastestMCP.JSONSchema
+  alias JSONSchema
   alias FastestMCP.Operation
 
   defstruct [:middleware]

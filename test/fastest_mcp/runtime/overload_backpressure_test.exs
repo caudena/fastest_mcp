@@ -96,7 +96,11 @@ defmodule FastestMCP.Runtime.OverloadBackpressureTest do
     assert_receive {:entered, pid}, 1_000
 
     conn =
-      conn("POST", "/mcp/tools/call", Jason.encode!(%{"name" => "wait", "arguments" => %{}}))
+      conn(
+        "POST",
+        "/mcp/tools/call",
+        JSON.encode!(%{"name" => "wait", "arguments" => %{}})
+      )
       |> put_req_header("content-type", "application/json")
 
     response = StreamableHTTP.call(conn, server_name: server_name)
@@ -109,7 +113,7 @@ defmodule FastestMCP.Runtime.OverloadBackpressureTest do
                "code" => "overloaded",
                "details" => %{"resource" => "calls", "retry_after_seconds" => 1}
              }
-           } = Jason.decode!(response.resp_body)
+           } = JSON.decode!(response.resp_body)
 
     send(pid, :release)
     assert Task.await(task, 1_000) == :ok

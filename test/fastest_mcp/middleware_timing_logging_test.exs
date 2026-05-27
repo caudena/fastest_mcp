@@ -104,7 +104,7 @@ defmodule FastestMCP.MiddlewareTimingLoggingTest do
       })
 
     assert %{"event" => "request_start", "method" => "tools/call", "source" => "server"} =
-             Jason.decode!(message)
+             JSON.decode!(message)
   end
 
   test "logging middleware uses custom serializer and warns on serializer failure" do

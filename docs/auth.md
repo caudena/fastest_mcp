@@ -1,11 +1,121 @@
 # Auth
 
-Auth is declarative and provider-based.
+Auth is application-owned. FastestMCP keeps a small runtime contract that turns
+credentials or framework state into normalized request context:
 
-## Static Token Example
+- `ctx.principal`
+- `ctx.auth`
+- `ctx.capabilities`
+- `Context.client_id/1`
+
+Your application verifies sessions, tokens, cookies, or upstream identity using
+its normal stack. FastestMCP only needs the normalized result.
+
+## Function Auth
+
+Pass a function directly when auth is specific to the host application:
 
 ```elixir
-base_server(opts)
+FastestMCP.server("app")
+|> FastestMCP.add_auth(fn input, _ctx ->
+  case MyApp.Auth.verify_mcp_request(input) do
+    {:ok, user} ->
+      {:ok,
+       %{
+         principal: %{"sub" => to_string(user.id)},
+         auth: %{source: :app, user_id: user.id},
+         capabilities: MyApp.MCPScopes.for_user(user)
+       }}
+
+    :error ->
+      {:error, :unauthorized}
+  end
+end)
+```
+
+The function may have arity 2 or 3. Arity 3 receives the configured auth
+options as the third argument.
+
+## Module Auth
+
+Use the behaviour when you want a reusable authenticator module:
+
+```elixir
+defmodule MyApp.MCPAuth do
+  @behaviour FastestMCP.Auth
+
+  @impl true
+  def authenticate(input, _ctx, opts) do
+    with {:ok, user} <- MyApp.Auth.verify(input, opts) do
+      {:ok,
+       %FastestMCP.Auth.Result{
+         principal: %{"sub" => to_string(user.id)},
+         auth: %{source: :app, user_id: user.id},
+         capabilities: MyApp.MCPScopes.for_user(user)
+       }}
+    end
+  end
+end
+
+FastestMCP.server("app")
+|> FastestMCP.add_auth(MyApp.MCPAuth, audience: "mcp")
+```
+
+Auth errors should return `{:error, :unauthorized}`,
+`{:error, :forbidden}`, `{:error, {code, message}}`, or
+`{:error, %FastestMCP.Error{}}`.
+
+## Phoenix Assigns
+
+When the HTTP transport runs behind Plug or Phoenix authentication, copy selected
+`conn.assigns` into auth input with `auth_assigns:`. Assigns are available only
+to the auth function or module under `"assigns"`; they are not added to normal
+handler request metadata.
+
+```elixir
+pipeline :mcp do
+  plug :fetch_session
+  plug MyAppWeb.UserAuth, :fetch_current_user
+end
+
+scope "/" do
+  pipe_through :mcp
+
+  forward "/mcp", FastestMCP.Transport.HTTPApp,
+    server_name: MyApp.MCPServer,
+    path: "/mcp",
+    auth_assigns: [:current_user]
+end
+```
+
+`FastestMCP.Auth.from_assign/2` turns one assign into a normalized auth result:
+
+```elixir
+FastestMCP.server(MyApp.MCPServer)
+|> FastestMCP.add_auth(
+  FastestMCP.Auth.from_assign(:current_user,
+    principal: fn user -> %{"sub" => to_string(user.id)} end,
+    capabilities: fn user -> MyApp.MCPScopes.for_user(user) end,
+    auth: fn user -> %{source: :phoenix, user_id: user.id} end
+  )
+)
+```
+
+`auth_assigns:` accepts:
+
+- `false` or `nil` to copy no assigns
+- `[:current_user, :account]` to copy specific assigns
+- `:all` to copy every assign
+
+The default is `false`.
+
+## Static Token
+
+`FastestMCP.Auth.StaticToken` is kept for local development, integration tests,
+and hermetic tooling:
+
+```elixir
+FastestMCP.server("dev")
 |> FastestMCP.add_auth(FastestMCP.Auth.StaticToken,
   tokens: %{
     "dev-token" => %{
@@ -21,187 +131,43 @@ base_server(opts)
 end)
 ```
 
-## Built-in Surfaces
+Static tokens can be supplied as an HTTP bearer token, as `"authorization"` in
+direct `auth_input`, or as `"token"` in direct `auth_input`.
 
-FastestMCP ships auth building blocks for:
+## Component Authorization
 
-- static tokens
-- multi-provider auth
-- JWT and JWKS validation
-- RFC 7662 introspection
-- local and remote OAuth helpers
-- provider wrappers for common OAuth and OIDC vendors
-
-The built-in provider wrappers include OAuth proxy providers such as GitHub,
-Google, Auth0, Azure, AWS Cognito, Clerk, Discord, OIDC, OCI, and WorkOS, plus
-resource-server providers such as Descope, PropelAuth, Scalekit, Supabase,
-Keycloak, and WorkOS AuthKit.
-
-## OAuth Resource URLs
-
-OAuth providers expose RFC 9728 protected-resource metadata. By default, the
-advertised protected resource is built from the HTTP transport `base_url` plus
-the MCP mount path:
+Authentication identifies the caller. Component authorization decides which
+tools, resources, prompts, and templates the caller may see or call.
 
 ```elixir
-FastestMCP.Transport.StreamableHTTP.call(conn,
-  server_name: "protected",
-  base_url: "https://mcp.example.com",
-  path: "/mcp"
+FastestMCP.server("app")
+|> FastestMCP.add_tool("admin_report", &MyApp.Report.run/2,
+  auth: FastestMCP.Authorization.require_scopes(["admin:reports"])
 )
 ```
 
-That advertises:
+Authorization rules can also filter list results with tags:
+
+```elixir
+FastestMCP.Authorization.restrict_tag("internal")
+```
+
+## HTTP Behavior
+
+HTTP auth failures use plain bearer challenges:
 
 ```text
-https://mcp.example.com/mcp
+WWW-Authenticate: Bearer error="invalid_token", error_description="missing credentials"
 ```
 
-When OAuth endpoints and the protected MCP resource live under different public
-URLs, pass `resource_base_url:` to LocalOAuth or RemoteOAuth based providers:
-
-```elixir
-base_server(opts)
-|> FastestMCP.add_auth(FastestMCP.Auth.LocalOAuth,
-  resource_base_url: "https://api.example.com",
-  jwt_signing_key: System.fetch_env!("MCP_JWT_SIGNING_KEY"),
-  required_scopes: ["tools:call"]
-)
-```
-
-The OAuth metadata and token endpoints are still served from the transport
-`base_url`. The advertised `resource` and locally issued JWT audiences use
-`resource_base_url + mcp_base_path`.
-
-## Local OAuth Consent and Redirects
-
-`FastestMCP.Auth.LocalOAuth` can prompt for consent on every authorization
-request, skip consent, or remember previous approval and denial decisions:
-
-```elixir
-base_server(opts)
-|> FastestMCP.add_auth(FastestMCP.Auth.LocalOAuth,
-  consent: :remember,
-  jwt_signing_key: System.fetch_env!("MCP_JWT_SIGNING_KEY"),
-  allowed_client_redirect_uris: ["https://client.example.com/callback"],
-  supported_scopes: ["tools:call"]
-)
-```
-
-Remembered consent is stored in HMAC-signed cookies keyed by client id, redirect
-URI, and scope. Silent reuse is only accepted for safe browser navigation
-contexts where `Sec-Fetch-Site` is `same-origin`, `same-site`, or `none`.
-Set `consent: true` when every authorization request should prompt.
-
-Redirect URI allowlists are exact and conservative:
-
-- raw or decoded `.` and `..` path segments are rejected before matching
-- `allowed_client_redirect_uris: []` allows no redirect URI
-- `allowed_client_redirect_uris: nil` keeps the default provider behavior
-
-In OAuth proxy mode, a request whose `client_id` equals the configured upstream
-OAuth client id is treated as a public local client. It inherits the configured
-redirect allowlist and default scope so browser-based clients can use the local
-authorization surface without pre-registering a separate client.
-
-When the upstream provider returns `refresh_expires_in`, local refresh tokens
-are bounded by that absolute lifetime. If the provider omits it, LocalOAuth uses
-`fallback_refresh_token_expires_in:`; the default fallback is one year.
-
-## Keycloak
-
-`FastestMCP.Auth.Keycloak` verifies Keycloak access tokens as a resource server
-using the realm issuer and JWKS endpoint:
-
-```elixir
-base_server(opts)
-|> FastestMCP.add_auth(FastestMCP.Auth.Keycloak,
-  realm_url: "https://keycloak.example.com/realms/myrealm",
-  audience: "my-mcp-resource",
-  required_scopes: ["openid", "tools:call"]
-)
-```
-
-`required_scopes:` defaults to `["openid"]`. Pass `supported_scopes:` when the
-scopes clients should see in protected-resource metadata differ from the scopes
-enforced on tokens.
-
-## WorkOS
-
-FastestMCP has two WorkOS paths:
-
-- `FastestMCP.Auth.WorkOS` is the OAuth proxy provider. FastestMCP owns the
-  local OAuth surface and proxies users through WorkOS AuthKit.
-- `FastestMCP.Auth.WorkOSAuthKit` is the resource-server provider for
-  DCR-style clients. WorkOS owns the OAuth flow and FastestMCP verifies JWT
-  access tokens.
-
-Use AuthKit when WorkOS Dynamic Client Registration and Resource Indicators are
-enabled:
-
-```elixir
-base_server(opts)
-|> FastestMCP.add_auth(FastestMCP.Auth.WorkOSAuthKit,
-  authkit_domain: "https://your-app.authkit.app",
-  required_scopes: ["openid"]
-)
-```
-
-By default, `WorkOSAuthKit` binds JWT `aud` validation to the same resource URL
-advertised in protected-resource metadata. Configure that URL as a Resource
-Indicator in WorkOS. Pass `audience:` or `token_verifier:` only when you need to
-override the default verifier.
-
-## Azure, Azure B2C, and OCI
-
-`FastestMCP.Auth.Azure` accepts `token_issuer:` when the JWT issuer differs from
-the standard tenant authority. Pass `token_issuer: nil` to disable issuer
-validation for deployments where Azure emits policy-specific issuers.
-
-For Microsoft Entra External ID / Azure AD B2C, use the B2C factory:
-
-```elixir
-auth =
-  FastestMCP.Auth.Azure.b2c(
-    tenant_name: "contoso",
-    policy_name: "B2C_1_sign_in",
-    client_id: System.fetch_env!("AZURE_CLIENT_ID"),
-    client_secret: System.fetch_env!("AZURE_CLIENT_SECRET")
-  )
-
-base_server(opts)
-|> FastestMCP.add_auth(auth)
-```
-
-`FastestMCP.Auth.OCI` provides an Oracle Cloud Infrastructure OAuth wrapper over
-the OIDC proxy surface:
-
-```elixir
-base_server(opts)
-|> FastestMCP.add_auth(FastestMCP.Auth.OCI,
-  client_id: System.fetch_env!("OCI_CLIENT_ID"),
-  client_secret: System.fetch_env!("OCI_CLIENT_SECRET"),
-  config_url: "https://idcs.example.com/.well-known/openid-configuration",
-  oidc_scopes: ["openid", "profile"]
-)
-```
-
-OCI authorization requests include configured scopes. Token exchange leaves
-scope parameters to the provider defaults.
-
-## HTTP and Client Use
-
-Protected servers work with the same connected client:
-
-```elixir
-client =
-  FastestMCP.Client.connect!("http://127.0.0.1:4100/mcp",
-    access_token: System.fetch_env!("MCP_TOKEN")
-  )
-```
+FastestMCP does not serve OAuth discovery, authorization, token, callback, or
+protected-resource metadata routes. Applications that need those endpoints
+should expose them from their Plug or Phoenix application and pass normalized
+auth results into FastestMCP.
 
 ## Why This Shape
 
-Auth should be part of the same runtime contract as the rest of the server.
-FastestMCP normalizes provider results onto `FastestMCP.Context` so handlers,
-middleware, and transports all observe the same principal and capability data.
+Phoenix applications usually already own authentication, sessions, user loading,
+authorization policy, and audit metadata. Keeping FastestMCP auth as a small
+contract avoids a second identity stack while preserving consistent context for
+handlers, middleware, tasks, transports, and component visibility.

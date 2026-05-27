@@ -40,7 +40,7 @@ defmodule FastestMCP.ToolReturnTypeParityTest do
            } = FastestMCP.call_tool(server_name, "mixed_content", %{})
 
     assert Base.decode64!(encoded_image) == image_bytes
-    assert Jason.decode!(encoded_map) == %{"key" => "value"}
+    assert JSON.decode!(encoded_map) == %{"key" => "value"}
 
     assert ["apple", "banana", "cherry"] == FastestMCP.call_tool(server_name, "plain_list", %{})
   end

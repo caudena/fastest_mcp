@@ -61,7 +61,7 @@ defmodule FastestMCP.Resources.Content do
   end
 
   defp normalize_content(content, _opts) do
-    {Jason.encode!(normalize_json(content)), "application/json"}
+    {JSON.encode!(normalize_json(content)), "application/json"}
   end
 
   defp normalize_json(%DateTime{} = value), do: DateTime.to_iso8601(value)

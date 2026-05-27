@@ -79,7 +79,7 @@ defmodule FastestMCP.Middleware.ResponseLimiting do
   end
 
   defp maybe_limit_result(%__MODULE__{} = middleware, %Operation{} = operation, result) do
-    serialized = Jason.encode!(result)
+    serialized = JSON.encode!(result)
 
     if byte_size(serialized) <= middleware.max_size do
       result
@@ -163,7 +163,7 @@ defmodule FastestMCP.Middleware.ResponseLimiting do
   defp encoded_result_size(text, metadata) do
     text
     |> limited_result(metadata)
-    |> Jason.encode!()
+    |> JSON.encode!()
     |> byte_size()
   end
 
@@ -176,7 +176,7 @@ defmodule FastestMCP.Middleware.ResponseLimiting do
   defp extract_text(result) when is_map(result) do
     case fetch_content(result) do
       nil ->
-        Jason.encode!(result)
+        JSON.encode!(result)
 
       content ->
         blocks =
@@ -185,18 +185,18 @@ defmodule FastestMCP.Middleware.ResponseLimiting do
           |> Enum.map(&extract_text_block/1)
           |> Enum.reject(&is_nil/1)
 
-        if blocks == [], do: Jason.encode!(result), else: Enum.join(blocks, "\n\n")
+        if blocks == [], do: JSON.encode!(result), else: Enum.join(blocks, "\n\n")
     end
   end
 
   defp extract_text(result) when is_list(result) do
     case Enum.map(result, &extract_text_block/1) |> Enum.reject(&is_nil/1) do
-      [] -> Jason.encode!(result)
+      [] -> JSON.encode!(result)
       blocks -> Enum.join(blocks, "\n\n")
     end
   end
 
-  defp extract_text(result), do: Jason.encode!(result)
+  defp extract_text(result), do: JSON.encode!(result)
 
   defp extract_text_block(value) when is_binary(value), do: value
 

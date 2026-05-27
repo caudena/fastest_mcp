@@ -12,7 +12,7 @@ defmodule FastestMCP.OpenAPIProviderEdgeCasesTest do
       FastestMCP.from_openapi(spec,
         name: "openapi-empty-" <> Integer.to_string(System.unique_integer([:positive])),
         requester: fn _method, _url, _opts ->
-          {:ok, 200, [{"content-type", "application/json"}], Jason.encode!(%{})}
+          {:ok, 200, [{"content-type", "application/json"}], JSON.encode!(%{})}
         end
       )
 
@@ -64,7 +64,7 @@ defmodule FastestMCP.OpenAPIProviderEdgeCasesTest do
         name: server_name,
         requester: fn _method, _url, _opts ->
           {:ok, 404, [{"content-type", "application/json"}],
-           Jason.encode!(%{"detail" => "missing"})}
+           JSON.encode!(%{"detail" => "missing"})}
         end
       )
 
@@ -132,7 +132,7 @@ defmodule FastestMCP.OpenAPIProviderEdgeCasesTest do
 
     requester = fn method, url, opts ->
       send(parent, {:request, method, url, opts})
-      {:ok, 200, [{"content-type", "application/json"}], Jason.encode!(%{"ok" => true})}
+      {:ok, 200, [{"content-type", "application/json"}], JSON.encode!(%{"ok" => true})}
     end
 
     server = FastestMCP.from_openapi(spec, name: server_name, requester: requester)
@@ -199,7 +199,7 @@ defmodule FastestMCP.OpenAPIProviderEdgeCasesTest do
       FastestMCP.from_openapi(spec,
         name: "openapi-circular-" <> Integer.to_string(System.unique_integer([:positive])),
         requester: fn _method, _url, _opts ->
-          {:ok, 200, [{"content-type", "application/json"}], Jason.encode!(%{})}
+          {:ok, 200, [{"content-type", "application/json"}], JSON.encode!(%{})}
         end
       )
 

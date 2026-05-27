@@ -109,7 +109,9 @@ defmodule FastestMCP.SkillProviderTest do
              "helper"
            )
 
-    manifest = Jason.decode!(FastestMCP.read_resource(server_name, "skill://my-skill/_manifest"))
+    manifest =
+      JSON.decode!(FastestMCP.read_resource(server_name, "skill://my-skill/_manifest"))
+
     paths = MapSet.new(Enum.map(manifest["files"], & &1["path"]))
 
     assert manifest["skill"] == "my-skill"

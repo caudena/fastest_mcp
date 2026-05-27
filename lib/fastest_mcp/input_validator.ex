@@ -274,7 +274,7 @@ defmodule FastestMCP.InputValidator do
   end
 
   defp coerce_array(value, item_schema, false, path) when is_binary(value) do
-    case Jason.decode(value) do
+    case JSON.decode(value) do
       {:ok, decoded} when is_list(decoded) -> coerce_array(decoded, item_schema, false, path)
       _other -> validation_error(path, "must be an array")
     end
@@ -287,7 +287,7 @@ defmodule FastestMCP.InputValidator do
     do: {:ok, normalize_arguments(value)}
 
   defp coerce_object(value, false, _path) when is_binary(value) do
-    case Jason.decode(value) do
+    case JSON.decode(value) do
       {:ok, decoded} when is_map(decoded) -> {:ok, decoded}
       _other -> {:error, "must be an object"}
     end

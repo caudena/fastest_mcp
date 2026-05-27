@@ -1,13 +1,10 @@
-defmodule FastestMCP.Auth.StateStore do
+defmodule FastestMCP.TTLStore do
   @moduledoc """
-  TTL-aware store used for OAuth state, codes, tokens, and related auth artifacts.
+  Small TTL-aware in-memory store used by runtime transport internals.
 
-  This module is part of the shared authentication toolbox used by the
-  provider adapters. Validation, document fetching, caching, and crypto
-  rules live here so every auth integration follows the same behavior.
-
-  Most applications never call it directly unless they are extending the
-  auth stack or debugging provider-specific behavior.
+  The store is process-local and intentionally simple: callers can put, get,
+  take, delete, and list keys, with per-entry expiration driven by timers.
+  Most applications never call it directly.
   """
 
   use GenServer

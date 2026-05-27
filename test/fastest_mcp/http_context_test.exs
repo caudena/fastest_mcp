@@ -141,7 +141,7 @@ defmodule FastestMCP.HTTPContextTest do
       conn(
         :post,
         "/mcp/tools/call?demo=1",
-        Jason.encode!(%{"name" => "inspect_headers", "arguments" => %{}})
+        JSON.encode!(%{"name" => "inspect_headers", "arguments" => %{}})
       )
       |> put_req_header("content-type", "application/json")
       |> put_req_header("x-demo-header", "ABC")
@@ -167,7 +167,7 @@ defmodule FastestMCP.HTTPContextTest do
                  "x-demo-header" => "ABC"
                }
              }
-           } = Jason.decode!(conn.resp_body)
+           } = JSON.decode!(conn.resp_body)
   end
 
   defp http_request_payload(ctx) do

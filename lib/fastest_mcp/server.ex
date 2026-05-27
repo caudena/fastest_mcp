@@ -304,6 +304,8 @@ defmodule FastestMCP.Server do
   defp normalize_auth(nil), do: nil
   defp normalize_auth(%Auth{} = auth), do: Auth.new(auth)
   defp normalize_auth({provider, opts}), do: Auth.new(provider, opts)
+  defp normalize_auth(provider) when is_function(provider, 2), do: Auth.new(provider)
+  defp normalize_auth(provider) when is_function(provider, 3), do: Auth.new(provider)
   defp normalize_auth(provider) when is_atom(provider), do: Auth.new(provider)
   defp normalize_tasks(tasks), do: TaskConfig.new(tasks)
 

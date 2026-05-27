@@ -108,7 +108,7 @@ defmodule FastestMCP.ServerModuleTest do
              start_supervised({HTTPServer, http: [port: port, allowed_hosts: :localhost]})
 
     request_body =
-      Jason.encode!(%{
+      JSON.encode!(%{
         "jsonrpc" => "2.0",
         "id" => 7,
         "method" => "tools/call",
@@ -138,7 +138,7 @@ defmodule FastestMCP.ServerModuleTest do
              "jsonrpc" => "2.0",
              "id" => 7,
              "result" => %{"structuredContent" => %{"message" => "hello"}}
-           } = Jason.decode!(body)
+           } = JSON.decode!(body)
   end
 
   defp request(port, payload) do

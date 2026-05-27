@@ -15,14 +15,14 @@ defmodule FastestMCP.Pagination do
   @doc "Encodes an offset into an opaque cursor."
   def encode_cursor(offset) when is_integer(offset) and offset >= 0 do
     %{"offset" => offset}
-    |> Jason.encode!()
+    |> JSON.encode!()
     |> Base.url_encode64(padding: false)
   end
 
   @doc "Decodes an opaque cursor back into an offset."
   def decode_cursor(cursor) when is_binary(cursor) and cursor != "" do
     with {:ok, decoded} <- Base.url_decode64(cursor, padding: false),
-         {:ok, %{"offset" => offset}} <- Jason.decode(decoded),
+         {:ok, %{"offset" => offset}} <- JSON.decode(decoded),
          true <- is_integer(offset) and offset >= 0 do
       {:ok, offset}
     else

@@ -7,7 +7,6 @@ This matters because several features depend on stored state:
 
 - session data
 - background task state and progress
-- OAuth state and callback artifacts
 - response caching
 - session subscriptions and visibility rules
 
@@ -85,11 +84,15 @@ The split is intentional:
 
 ### Auth State
 
-OAuth and related auth helpers use local TTL stores for transient state such as:
+Auth is request-scoped. The runtime stores only the normalized auth result on the
+current context:
 
-- authorization state
-- callback artifacts
-- short-lived token or metadata lookups
+- `ctx.principal`
+- `ctx.auth`
+- `ctx.capabilities`
+
+Framework assigns copied with `auth_assigns:` are used only as auth input and
+are not persisted in runtime state.
 
 ### Response Cache
 
@@ -109,7 +112,7 @@ That split is deliberate:
 - session lifecycle still belongs to the runtime
 - session values can move behind a backend abstraction
 - task storage can move behind a backend abstraction
-- task orchestration, auth transients, and caches still stay runtime-owned
+- task orchestration and caches still stay runtime-owned
 
 ## What This Means Operationally
 
@@ -130,7 +133,6 @@ The following remain runtime-local in v0.1:
 
 - background task orchestration
 - middleware cache state
-- OAuth transient stores
 - session subscription tracking
 - session visibility rules
 
@@ -152,7 +154,6 @@ It is not a complete answer when you need:
 - multi-node shared task state
 - durable persisted task queues
 - distributed cache invalidation
-- shared OAuth state across server instances
 - distributed session visibility and subscription tracking
 
 Those are still outside the public v0.1 scope.
@@ -163,8 +164,8 @@ FastestMCP keeps runtime state close to the runtime first.
 
 The session-state backend seam exists because session values are the easiest
 piece to externalize cleanly without weakening the OTP ownership model. Task
-state, cache state, auth transients, and session lifecycle still benefit from
-staying local until there is a sharper distributed design to implement.
+state, cache state, and session lifecycle still benefit from staying local until
+there is a sharper distributed design to implement.
 
 ## Related Guides
 

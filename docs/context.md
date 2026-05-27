@@ -290,7 +290,7 @@ instance, not once per request.
 
 ## Auth State
 
-Auth providers write normalized auth results back onto the context:
+Authenticators write normalized auth results back onto the context:
 
 - `ctx.principal`
 - `ctx.auth`

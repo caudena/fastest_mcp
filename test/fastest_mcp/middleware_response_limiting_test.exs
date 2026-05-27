@@ -29,7 +29,7 @@ defmodule FastestMCP.MiddlewareResponseLimitingTest do
 
     assert %{"content" => [%{"type" => "text", "text" => text}]} = result
     assert text =~ "[Response truncated due to size limit]"
-    assert byte_size(Jason.encode!(result)) <= 500
+    assert byte_size(JSON.encode!(result)) <= 500
   end
 
   test "tool filtering limits only configured tools" do
@@ -139,7 +139,7 @@ defmodule FastestMCP.MiddlewareResponseLimitingTest do
            } = result
 
     assert text =~ "[Response truncated"
-    assert byte_size(Jason.encode!(result)) <= 450
+    assert byte_size(JSON.encode!(result)) <= 450
   end
 
   test "truncation drops metadata when metadata alone cannot fit" do
@@ -153,7 +153,7 @@ defmodule FastestMCP.MiddlewareResponseLimitingTest do
       )
 
     refute Map.has_key?(result, "meta")
-    assert byte_size(Jason.encode!(result)) <= 160
+    assert byte_size(JSON.encode!(result)) <= 160
   end
 
   test "utf8 truncation preserves valid characters" do
@@ -167,7 +167,7 @@ defmodule FastestMCP.MiddlewareResponseLimitingTest do
 
     assert %{"content" => [%{"text" => text}]} = result
     assert text |> String.valid?()
-    assert byte_size(Jason.encode!(result)) <= 100
+    assert byte_size(JSON.encode!(result)) <= 100
   end
 
   test "invalid max size raises" do
@@ -190,12 +190,16 @@ defmodule FastestMCP.MiddlewareResponseLimitingTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
 
     conn =
-      conn(:post, "/mcp/tools/call", Jason.encode!(%{"name" => "large", "arguments" => %{}}))
+      conn(
+        :post,
+        "/mcp/tools/call",
+        JSON.encode!(%{"name" => "large", "arguments" => %{}})
+      )
       |> put_req_header("content-type", "application/json")
       |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
 
     assert conn.status == 200
-    assert %{"content" => [%{"text" => text}]} = Jason.decode!(conn.resp_body)
+    assert %{"content" => [%{"text" => text}]} = JSON.decode!(conn.resp_body)
     assert text =~ "[Response truncated"
   end
 end

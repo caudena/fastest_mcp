@@ -97,7 +97,7 @@ FastestMCP keeps the public surface curated for the first Hex release.
 - `FastestMCP.Context`: explicit request, session, auth, and task context
 - `FastestMCP.RequestContext`: stable request snapshot derived from context
 - `FastestMCP.Client`: connected MCP client for streamable HTTP and stdio
-- `FastestMCP.Auth`: auth contract and shared provider wrapper
+- `FastestMCP.Auth`: auth contract and shared authenticator wrapper
 - `FastestMCP.Middleware`: built-in middleware constructors
 - `FastestMCP.Provider`: provider contract for mounted and dynamic surfaces
 - `FastestMCP.ComponentManager`: runtime mutation for live servers

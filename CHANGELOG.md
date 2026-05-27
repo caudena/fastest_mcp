@@ -4,11 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## 0.1.2 - 2026-05-27
 
-- add OAuth redirect hardening for raw and decoded dot segments, stricter empty
-  redirect allowlists, remembered consent cookies, synthetic public proxy
-  clients, and refresh-token lifetime bounding
-- add Azure token issuer overrides, Azure B2C provider factory support, and the
-  OCI OAuth provider wrapper
+- refocus auth around application-owned authenticators, keeping the normalized
+  `FastestMCP.Auth` contract, `FastestMCP.Auth.Result`,
+  `FastestMCP.Auth.StaticToken`, and component authorization
+- add function-based auth and `FastestMCP.Auth.from_assign/2` for Plug/Phoenix
+  integrations
+- add HTTP `auth_assigns:` support so selected `conn.assigns` can feed auth
+  input without exposing assigns through handler request metadata
+- remove bundled OAuth, JWT/JWKS, introspection, CIMD, and vendor auth provider
+  modules, and remove the `:assent` and `:jose` dependencies
+- remove the `:jason` dependency and use Elixir's native `JSON` module
+- keep default HTTP auth failures on plain bearer challenges and remove built-in
+  OAuth metadata/authorization/token route handling from core
 - improve OpenAPI-backed tools with JSON media-type variants, form and
   multipart request bodies, cookie parameters, server variable defaults, and
   circular schema reference protection
@@ -21,18 +28,17 @@ All notable changes to this project will be documented in this file.
 - update tracing and error logging with MCP/GenAI span attributes, stable
   resource span names, `error.type`, nil-attribute filtering, arity-2 loggers,
   and per-error log levels
-- document OAuth consent and provider options, OpenAPI request serialization,
+- document Phoenix-oriented auth, OpenAPI request serialization,
   resource-template matching, mounted lifespans, experimental capabilities,
   telemetry attributes, and error logging behavior
 - add task wait behavior for input-required states, auth-scoped task ownership,
-  OAuth protected-resource base URLs, and elicitation response metadata
-- add Keycloak and WorkOS AuthKit resource-server auth providers
+  and elicitation response metadata
 - improve handler result normalization for safe finite enumerable values
-- add regression coverage for OAuth metadata/JWT audiences, AuthKit audience
-  binding, task ownership, scalar elicitation, mounted wildcard resources, and
-  tool/resource return normalization
-- document the new auth providers, OAuth `resource_base_url`, task wait
-  behavior, elicitation response metadata, and finite enumerable normalization
+- add regression coverage for auth contracts, Phoenix assign auth, task
+  ownership, scalar elicitation, mounted wildcard resources, and tool/resource
+  return normalization
+- document auth assign bridging, task wait behavior, elicitation response
+  metadata, and finite enumerable normalization
 
 ## 0.1.1 - 2026-04-17
 

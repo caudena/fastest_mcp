@@ -292,9 +292,9 @@ Wrong session, wrong auth context, expired tasks, and nonexistent task ids all
 resolve to the same invalid-task response shape.
 
 When auth is present, the task auth fingerprint prefers `client_id|sub` so two
-users sharing the same OAuth client id do not see each other's tasks. If no
-subject is available, the runtime falls back to `client_id`, then `sub`, then a
-sanitized hashed identity.
+users sharing the same application client id do not see each other's tasks. If
+no subject is available, the runtime falls back to `client_id`, then `sub`, then
+a sanitized hashed identity.
 
 ## Runtime Notes
 
