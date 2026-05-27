@@ -75,7 +75,6 @@ defmodule FastestMCP.Context do
   """
 
   alias FastestMCP.Auth.Result
-  alias FastestMCP.Auth.StateStore
   alias FastestMCP.BackgroundTaskStore
   alias FastestMCP.ComponentVisibility
   alias FastestMCP.Elicitation
@@ -87,6 +86,7 @@ defmodule FastestMCP.Context do
   alias FastestMCP.Session
   alias FastestMCP.SessionSupervisor
   alias FastestMCP.TaskWire
+  alias FastestMCP.TTLStore
 
   @excluded_http_headers ["accept", "content-length", "content-type", "host"]
   @visibility_rules_key {:fastest_mcp, :visibility_rules}
@@ -782,7 +782,7 @@ defmodule FastestMCP.Context do
 
   defp ensure_session_not_terminated(store, :streamable_http, session_id, request_metadata) do
     if explicit_http_session?(request_metadata) do
-      case StateStore.get(store, session_id) do
+      case TTLStore.get(store, session_id) do
         {:ok, true} ->
           {:error, %Error{code: :not_found, message: "unknown session #{inspect(session_id)}"}}
 
@@ -908,7 +908,7 @@ defmodule FastestMCP.Context do
           details: %{reason: inspect(reason)}
     after
       timeout_ms ->
-        :ok = StateStore.delete(store, request_id)
+        :ok = TTLStore.delete(store, request_id)
 
         raise Error,
           code: :timeout,

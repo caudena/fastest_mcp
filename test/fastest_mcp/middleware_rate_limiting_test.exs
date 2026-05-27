@@ -118,7 +118,7 @@ defmodule FastestMCP.MiddlewareRateLimitingTest do
       conn(
         :post,
         "/mcp/tools/call",
-        Jason.encode!(%{"name" => "echo", "arguments" => %{"message" => "first"}})
+        JSON.encode!(%{"name" => "echo", "arguments" => %{"message" => "first"}})
       )
       |> put_req_header("content-type", "application/json")
       |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
@@ -129,7 +129,7 @@ defmodule FastestMCP.MiddlewareRateLimitingTest do
       conn(
         :post,
         "/mcp/tools/call",
-        Jason.encode!(%{"name" => "echo", "arguments" => %{"message" => "second"}})
+        JSON.encode!(%{"name" => "echo", "arguments" => %{"message" => "second"}})
       )
       |> put_req_header("content-type", "application/json")
       |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
@@ -137,7 +137,7 @@ defmodule FastestMCP.MiddlewareRateLimitingTest do
     assert second.status == 429
     assert get_resp_header(second, "retry-after") != []
 
-    assert %{"error" => %{"code" => "rate_limited"}} = Jason.decode!(second.resp_body)
+    assert %{"error" => %{"code" => "rate_limited"}} = JSON.decode!(second.resp_body)
   end
 
   test "reusing one limiter config across servers keeps runtime state isolated" do

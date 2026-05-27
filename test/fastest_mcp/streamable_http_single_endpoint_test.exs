@@ -22,7 +22,7 @@ defmodule FastestMCP.StreamableHTTPSingleEndpointTest do
       conn(
         :post,
         "/mcp",
-        Jason.encode!(%{
+        JSON.encode!(%{
           "jsonrpc" => "2.0",
           "id" => 7,
           "method" => "tools/call",
@@ -42,7 +42,7 @@ defmodule FastestMCP.StreamableHTTPSingleEndpointTest do
                "content" => [%{"type" => "text", "text" => "{\"message\":\"hi\"}"}],
                "structuredContent" => %{"message" => "hi"}
              }
-           } = Jason.decode!(response.resp_body)
+           } = JSON.decode!(response.resp_body)
   end
 
   test "streamable HTTP redirects trailing slash requests to the canonical MCP path" do
@@ -75,7 +75,7 @@ defmodule FastestMCP.StreamableHTTPSingleEndpointTest do
       conn(
         :post,
         "/mcp",
-        Jason.encode!(%{
+        JSON.encode!(%{
           "jsonrpc" => "2.0",
           "id" => 1,
           "method" => "initialize",
@@ -97,7 +97,7 @@ defmodule FastestMCP.StreamableHTTPSingleEndpointTest do
              "jsonrpc" => "2.0",
              "id" => 1,
              "result" => %{"protocolVersion" => ^protocol_version}
-           } = Jason.decode!(response.resp_body)
+           } = JSON.decode!(response.resp_body)
   end
 
   test "initialize ignores query-string session ids and only uses the session header" do
@@ -120,7 +120,7 @@ defmodule FastestMCP.StreamableHTTPSingleEndpointTest do
       conn(
         :post,
         "/mcp?session_id=spoofed-session",
-        Jason.encode!(%{
+        JSON.encode!(%{
           "jsonrpc" => "2.0",
           "id" => 1,
           "method" => "initialize",
@@ -148,13 +148,13 @@ defmodule FastestMCP.StreamableHTTPSingleEndpointTest do
              "error" => %{
                "message" => "streamable HTTP session deletion requires mcp-session-id"
              }
-           } = Jason.decode!(delete_response.resp_body)
+           } = JSON.decode!(delete_response.resp_body)
 
     reuse_response =
       conn(
         :post,
         "/mcp",
-        Jason.encode!(%{
+        JSON.encode!(%{
           "jsonrpc" => "2.0",
           "id" => 2,
           "method" => "tools/call",
@@ -181,7 +181,7 @@ defmodule FastestMCP.StreamableHTTPSingleEndpointTest do
       conn(
         :post,
         "/mcp",
-        Jason.encode!([
+        JSON.encode!([
           %{
             "jsonrpc" => "2.0",
             "id" => 1,
@@ -211,7 +211,7 @@ defmodule FastestMCP.StreamableHTTPSingleEndpointTest do
                "id" => 1,
                "result" => %{"protocolVersion" => ^protocol_version}
              }
-           ] = Jason.decode!(response.resp_body)
+           ] = JSON.decode!(response.resp_body)
   end
 
   test "stateless streamable HTTP rejects GET requests on the MCP base path" do
@@ -234,7 +234,7 @@ defmodule FastestMCP.StreamableHTTPSingleEndpointTest do
                "code" => "method_not_allowed",
                "message" => "stateless streamable HTTP does not support GET"
              }
-           } = Jason.decode!(response.resp_body)
+           } = JSON.decode!(response.resp_body)
   end
 
   test "DELETE /mcp terminates a session and rejects later reuse" do
@@ -255,7 +255,7 @@ defmodule FastestMCP.StreamableHTTPSingleEndpointTest do
       conn(
         :post,
         "/mcp",
-        Jason.encode!(%{
+        JSON.encode!(%{
           "jsonrpc" => "2.0",
           "id" => 1,
           "method" => "initialize",
@@ -282,7 +282,7 @@ defmodule FastestMCP.StreamableHTTPSingleEndpointTest do
       conn(
         :post,
         "/mcp",
-        Jason.encode!(%{
+        JSON.encode!(%{
           "jsonrpc" => "2.0",
           "id" => 2,
           "method" => "tools/call",
@@ -299,7 +299,7 @@ defmodule FastestMCP.StreamableHTTPSingleEndpointTest do
              "jsonrpc" => "2.0",
              "id" => 2,
              "error" => %{"message" => message}
-           } = Jason.decode!(reuse_response.resp_body)
+           } = JSON.decode!(reuse_response.resp_body)
 
     assert message =~ "unknown session"
   end

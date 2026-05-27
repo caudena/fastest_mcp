@@ -133,9 +133,19 @@ task =
 
 RemoteTask.status(task)
 RemoteTask.fetch(task)
-RemoteTask.wait(task, status: "completed")
+RemoteTask.wait(task)
 RemoteTask.result(task)
 RemoteTask.cancel(task)
+```
+
+By default, `RemoteTask.wait/2` returns when the task leaves active work states.
+That includes terminal states such as `"completed"` and `"failed"`, and also
+interactive states such as `"input_required"`. Pass `status:` or `statuses:`
+when you need to wait for a specific state:
+
+```elixir
+RemoteTask.wait(task, status: "completed")
+RemoteTask.wait(task, statuses: ["completed", "failed"])
 ```
 
 The same handle shape works for prompt and resource tasks:
@@ -234,13 +244,15 @@ client =
   FastestMCP.Client.connect!("http://127.0.0.1:4100/mcp",
     session_stream: false,
     elicitation_handler: fn "What is your name?", _params ->
-      {:accept, %{"value" => "Alice"}}
+      {:accept, "Alice"}
     end
   )
 ```
 
 then `RemoteTask.result(task)` can trigger that callback, open the session
 stream on demand, and return the resumed result after the relay finishes.
+Scalar elicitation handlers may return the raw scalar value or
+`%{"value" => value}`.
 
 `FastestMCP.Client.send_task_input/5` still exists as a FastestMCP extension,
 but `tasks/result` is the standard SEP-1686 flow.

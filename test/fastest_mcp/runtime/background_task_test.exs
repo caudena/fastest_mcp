@@ -6,6 +6,27 @@ defmodule FastestMCP.Runtime.BackgroundTaskTest do
   alias FastestMCP.Error
   alias FastestMCP.ServerRuntime
 
+  defmodule TokenAuth do
+    @behaviour FastestMCP.Auth
+
+    alias FastestMCP.Auth.Result
+    alias FastestMCP.Error
+
+    @impl true
+    def authenticate(%{"authorization" => "Bearer " <> token}, _context, _opts) do
+      {:ok,
+       %Result{
+         principal: %{"sub" => token},
+         auth: %{"client_id" => token, "token" => token},
+         capabilities: [token]
+       }}
+    end
+
+    def authenticate(_input, _context, _opts) do
+      {:error, %Error{code: :unauthorized, message: "missing credentials"}}
+    end
+  end
+
   test "task-enabled tool returns a handle, exposes background context, and stores progress" do
     parent = self()
     server_name = "background-task-" <> Integer.to_string(System.unique_integer([:positive]))
@@ -205,6 +226,90 @@ defmodule FastestMCP.Runtime.BackgroundTaskTest do
 
     send(first_pid, :release)
     assert FastestMCP.await_task(first, 1_000) == :ok
+  end
+
+  test "concurrent background tasks preserve isolated request and auth context" do
+    parent = self()
+    server_name = "background-context-" <> Integer.to_string(System.unique_integer([:positive]))
+
+    server =
+      FastestMCP.server(server_name)
+      |> FastestMCP.add_auth(TokenAuth)
+      |> FastestMCP.add_tool(
+        "capture",
+        fn %{"label" => label}, ctx ->
+          send(parent, {
+            :captured_context,
+            label,
+            self(),
+            ctx.principal,
+            ctx.auth,
+            ctx.capabilities,
+            ctx.request_metadata,
+            Context.access_token(ctx)
+          })
+
+          receive do
+            :release -> label
+          after
+            1_000 -> :timed_out
+          end
+        end,
+        task: true
+      )
+
+    assert {:ok, _pid} = FastestMCP.start_server(server)
+
+    alpha =
+      FastestMCP.call_tool(server_name, "capture", %{"label" => "alpha"},
+        task: true,
+        auth_input: %{"authorization" => "Bearer alpha"},
+        request_metadata: %{headers: %{"authorization" => "Bearer alpha"}, marker: "alpha"}
+      )
+
+    beta =
+      FastestMCP.call_tool(server_name, "capture", %{"label" => "beta"},
+        task: true,
+        auth_input: %{"authorization" => "Bearer beta"},
+        request_metadata: %{headers: %{"authorization" => "Bearer beta"}, marker: "beta"}
+      )
+
+    contexts =
+      for _ <- 1..2, into: %{} do
+        assert_receive {:captured_context, label, pid, principal, auth, capabilities,
+                        request_metadata, access_token},
+                       1_000
+
+        {label,
+         %{
+           pid: pid,
+           principal: principal,
+           auth: auth,
+           capabilities: capabilities,
+           request_metadata: request_metadata,
+           access_token: access_token
+         }}
+      end
+
+    assert contexts["alpha"].principal == %{"sub" => "alpha"}
+    assert contexts["alpha"].auth == %{"client_id" => "alpha", "token" => "alpha"}
+    assert contexts["alpha"].capabilities == ["alpha"]
+    assert contexts["alpha"].request_metadata.marker == "alpha"
+    assert contexts["alpha"].access_token == "alpha"
+
+    assert contexts["beta"].principal == %{"sub" => "beta"}
+    assert contexts["beta"].auth == %{"client_id" => "beta", "token" => "beta"}
+    assert contexts["beta"].capabilities == ["beta"]
+    assert contexts["beta"].request_metadata.marker == "beta"
+    assert contexts["beta"].access_token == "beta"
+
+    refute contexts["alpha"].pid == contexts["beta"].pid
+
+    send(contexts["alpha"].pid, :release)
+    send(contexts["beta"].pid, :release)
+
+    assert FastestMCP.await_task(alpha, 1_000) == "alpha"
+    assert FastestMCP.await_task(beta, 1_000) == "beta"
   end
 
   test "crashed background tasks are marked failed and surface the crash error" do

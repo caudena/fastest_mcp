@@ -40,7 +40,7 @@ defmodule FastestMCP.StreamableHTTPPhoenixIntegrationTest do
              "result" => %{
                "structuredContent" => %{"message" => "hi"}
              }
-           } = Jason.decode!(response.resp_body)
+           } = JSON.decode!(response.resp_body)
   end
 
   test "streamable HTTP infers the mounted path from script_name for forwarded plugs" do
@@ -61,7 +61,7 @@ defmodule FastestMCP.StreamableHTTPPhoenixIntegrationTest do
       conn(
         :post,
         "/internal/mcp",
-        Jason.encode!(%{
+        JSON.encode!(%{
           "jsonrpc" => "2.0",
           "id" => 8,
           "method" => "tools/call",
@@ -81,7 +81,7 @@ defmodule FastestMCP.StreamableHTTPPhoenixIntegrationTest do
              "result" => %{
                "structuredContent" => %{"message" => "mounted"}
              }
-           } = Jason.decode!(response.resp_body)
+           } = JSON.decode!(response.resp_body)
   end
 
   test "streamable HTTP accepts JSON-RPC batch payloads from Phoenix JSON parser body_params" do
@@ -100,7 +100,7 @@ defmodule FastestMCP.StreamableHTTPPhoenixIntegrationTest do
       conn(
         :post,
         "/mcp",
-        Jason.encode!([
+        JSON.encode!([
           %{
             "jsonrpc" => "2.0",
             "id" => 11,
@@ -117,7 +117,7 @@ defmodule FastestMCP.StreamableHTTPPhoenixIntegrationTest do
         Plug.Parsers.init(
           parsers: [:json],
           pass: ["application/json"],
-          json_decoder: Jason
+          json_decoder: JSON
         )
       )
 
@@ -135,6 +135,6 @@ defmodule FastestMCP.StreamableHTTPPhoenixIntegrationTest do
                "id" => 11,
                "result" => %{"protocolVersion" => ^protocol_version}
              }
-           ] = Jason.decode!(response.resp_body)
+           ] = JSON.decode!(response.resp_body)
   end
 end

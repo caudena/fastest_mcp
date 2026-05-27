@@ -345,7 +345,7 @@ defmodule FastestMCP.ErrorExposureTest do
   end
 
   defp legacy_http(server_name, path, params, headers \\ []) do
-    conn(:post, path, Jason.encode!(params))
+    conn(:post, path, JSON.encode!(params))
     |> put_req_header("content-type", "application/json")
     |> put_headers(headers)
     |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
@@ -357,7 +357,7 @@ defmodule FastestMCP.ErrorExposureTest do
     end)
   end
 
-  defp json_body(conn), do: Jason.decode!(conn.resp_body)
+  defp json_body(conn), do: JSON.decode!(conn.resp_body)
 
   defp subscribe_to_task_events(server_name) do
     assert {:ok, runtime} = ServerRuntime.fetch(server_name)

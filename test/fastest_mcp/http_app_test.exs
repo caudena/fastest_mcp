@@ -26,7 +26,7 @@ defmodule FastestMCP.HTTPAppTest do
 
     assert response.status == 200
     assert get_resp_header(response, "x-custom-header") == ["test-value"]
-    assert Jason.decode!(response.resp_body) == %{"message" => "Hello, world!"}
+    assert JSON.decode!(response.resp_body) == %{"message" => "Hello, world!"}
   end
 
   test "http app middleware can modify request state for custom routes" do
@@ -50,7 +50,10 @@ defmodule FastestMCP.HTTPAppTest do
     response = conn(:get, "/test") |> app.()
 
     assert response.status == 200
-    assert Jason.decode!(response.resp_body) == %{"state" => %{"modified_by" => "middleware"}}
+
+    assert JSON.decode!(response.resp_body) == %{
+             "state" => %{"modified_by" => "middleware"}
+           }
   end
 
   test "http app middleware also wraps MCP transport routes" do
@@ -74,7 +77,11 @@ defmodule FastestMCP.HTTPAppTest do
       )
 
     response =
-      conn(:post, "/mcp/tools/call", Jason.encode!(%{"name" => "echo", "arguments" => %{}}))
+      conn(
+        :post,
+        "/mcp/tools/call",
+        JSON.encode!(%{"name" => "echo", "arguments" => %{}})
+      )
       |> put_req_header("content-type", "application/json")
       |> app.()
 
@@ -84,7 +91,7 @@ defmodule FastestMCP.HTTPAppTest do
     assert %{
              "content" => [%{"type" => "text", "text" => "{}"}],
              "structuredContent" => %{}
-           } = Jason.decode!(response.resp_body)
+           } = JSON.decode!(response.resp_body)
   end
 
   test "http app forwards stateless streamable HTTP options to the transport" do
@@ -105,7 +112,7 @@ defmodule FastestMCP.HTTPAppTest do
       conn(
         :post,
         "/mcp",
-        Jason.encode!(%{
+        JSON.encode!(%{
           "jsonrpc" => "2.0",
           "id" => 9,
           "method" => "tools/call",
@@ -124,7 +131,7 @@ defmodule FastestMCP.HTTPAppTest do
                "content" => [%{"type" => "text", "text" => "{\"message\":\"hi\"}"}],
                "structuredContent" => %{"message" => "hi"}
              }
-           } = Jason.decode!(post_response.resp_body)
+           } = JSON.decode!(post_response.resp_body)
   end
 
   test "http app can reject non-local host and origin headers when allowed_hosts is configured" do
@@ -137,7 +144,7 @@ defmodule FastestMCP.HTTPAppTest do
       conn(
         :post,
         "/mcp",
-        Jason.encode!(%{
+        JSON.encode!(%{
           "jsonrpc" => "2.0",
           "id" => 1,
           "method" => "initialize",
@@ -155,7 +162,7 @@ defmodule FastestMCP.HTTPAppTest do
       conn(
         :post,
         "/mcp",
-        Jason.encode!(%{
+        JSON.encode!(%{
           "jsonrpc" => "2.0",
           "id" => 2,
           "method" => "initialize",
@@ -203,6 +210,6 @@ defmodule FastestMCP.HTTPAppTest do
   defp json(conn, status, payload) do
     conn
     |> put_resp_content_type("application/json")
-    |> send_resp(status, Jason.encode!(payload))
+    |> send_resp(status, JSON.encode!(payload))
   end
 end

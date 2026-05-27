@@ -27,9 +27,10 @@ defmodule FastestMCP.StreamableHTTPRegression1Test do
                "GET /mcp/tools HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
              )
 
-    assert %{"tools" => [%{"name" => "echo"}]} = Jason.decode!(body)
+    assert %{"tools" => [%{"name" => "echo"}]} = JSON.decode!(body)
 
-    request_body = Jason.encode!(%{"name" => "echo", "arguments" => %{"message" => "hi"}})
+    request_body =
+      JSON.encode!(%{"name" => "echo", "arguments" => %{"message" => "hi"}})
 
     request =
       [
@@ -46,7 +47,7 @@ defmodule FastestMCP.StreamableHTTPRegression1Test do
 
     assert {200, call_body} = request(port, request)
 
-    assert %{"structuredContent" => %{"message" => "hi"}} = Jason.decode!(call_body)
+    assert %{"structuredContent" => %{"message" => "hi"}} = JSON.decode!(call_body)
   end
 
   defp request(port, payload) do

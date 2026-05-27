@@ -10,14 +10,15 @@ defmodule FastestMCP.Error do
   module indirectly through higher-level APIs rather than calling it first.
   """
 
-  defexception [:message, :code, details: %{}, meta: nil, exposure: nil]
+  defexception [:message, :code, details: %{}, meta: nil, exposure: nil, log_level: :error]
 
   @type t :: %__MODULE__{
           message: String.t(),
           code: atom(),
           details: map(),
           meta: map() | nil,
-          exposure: map() | nil
+          exposure: map() | nil,
+          log_level: Logger.level()
         }
 
   def with_meta(%__MODULE__{} = error, nil), do: error

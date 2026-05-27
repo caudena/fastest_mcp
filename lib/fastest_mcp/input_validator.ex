@@ -47,6 +47,10 @@ defmodule FastestMCP.InputValidator do
 
   @doc "Validates input data against the supplied JSON Schema."
   def validate_schema(nil, arguments, _strict?, _path), do: arguments
+  def validate_schema(true, value, _strict?, _path), do: value
+
+  def validate_schema(false, _value, _strict?, path),
+    do: validation_error(path, "does not match schema")
 
   def validate_schema(schema, value, strict?, path) when is_map(schema) do
     schema = normalize_schema(schema)
@@ -81,6 +85,7 @@ defmodule FastestMCP.InputValidator do
 
     properties = Map.get(schema, "properties", %{})
     required = Map.get(schema, "required", [])
+    additional_properties = Map.get(schema, "additionalProperties", true)
 
     Enum.each(required, fn key ->
       if not Map.has_key?(value, key) do
@@ -92,14 +97,33 @@ defmodule FastestMCP.InputValidator do
       string_key = to_string(key)
 
       normalized =
-        case Map.get(properties, string_key) do
-          nil -> item
-          subschema -> validate_schema(subschema, item, strict?, path ++ [string_key])
+        case Map.fetch(properties, string_key) do
+          {:ok, subschema} ->
+            validate_schema(subschema, item, strict?, path ++ [string_key])
+
+          :error ->
+            validate_additional_property(
+              additional_properties,
+              item,
+              strict?,
+              path ++ [string_key]
+            )
         end
 
       Map.put(acc, string_key, normalized)
     end)
   end
+
+  defp validate_additional_property(false, _item, _strict?, path) do
+    validation_error(path, "is not allowed")
+  end
+
+  defp validate_additional_property(subschema, item, strict?, path)
+       when is_map(subschema) or is_boolean(subschema) do
+    validate_schema(subschema, item, strict?, path)
+  end
+
+  defp validate_additional_property(_subschema, item, _strict?, _path), do: item
 
   defp validate_value(schema, value, strict?, path) do
     type = Map.get(schema, "type")
@@ -250,7 +274,7 @@ defmodule FastestMCP.InputValidator do
   end
 
   defp coerce_array(value, item_schema, false, path) when is_binary(value) do
-    case Jason.decode(value) do
+    case JSON.decode(value) do
       {:ok, decoded} when is_list(decoded) -> coerce_array(decoded, item_schema, false, path)
       _other -> validation_error(path, "must be an array")
     end
@@ -263,7 +287,7 @@ defmodule FastestMCP.InputValidator do
     do: {:ok, normalize_arguments(value)}
 
   defp coerce_object(value, false, _path) when is_binary(value) do
-    case Jason.decode(value) do
+    case JSON.decode(value) do
       {:ok, decoded} when is_map(decoded) -> {:ok, decoded}
       _other -> {:error, "must be an object"}
     end

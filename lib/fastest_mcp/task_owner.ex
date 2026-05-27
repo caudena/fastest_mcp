@@ -15,7 +15,7 @@ defmodule FastestMCP.TaskOwner do
 
   def from_context(%Context{} = context) do
     if auth_context_present?(context) do
-      auth_client_id(context) || hashed_identity(context.principal, context.auth)
+      auth_fingerprint(context) || hashed_identity(context.principal, context.auth)
     end
   end
 
@@ -23,7 +23,7 @@ defmodule FastestMCP.TaskOwner do
     auth = normalize_optional_map(auth)
 
     if not is_nil(principal) or map_size(auth) > 0 do
-      auth_client_id_from_values(principal, auth) || hashed_identity(principal, auth)
+      auth_fingerprint_from_values(principal, auth) || hashed_identity(principal, auth)
     end
   end
 
@@ -31,18 +31,35 @@ defmodule FastestMCP.TaskOwner do
     not is_nil(context.principal) or map_size(normalize_optional_map(context.auth)) > 0
   end
 
-  defp auth_client_id(%Context{} = context) do
-    auth_client_id_from_values(context.principal, context.auth)
+  defp auth_fingerprint(%Context{} = context) do
+    auth_fingerprint_from_values(context.principal, context.auth)
+  end
+
+  defp auth_fingerprint_from_values(principal, auth) do
+    auth = normalize_optional_map(auth)
+    client_id = auth_client_id_from_values(principal, auth)
+    subject = auth_subject_from_values(principal, auth)
+
+    cond do
+      present?(client_id) and present?(subject) -> "#{client_id}|#{subject}"
+      present?(client_id) -> to_string(client_id)
+      present?(subject) -> to_string(subject)
+      true -> nil
+    end
   end
 
   defp auth_client_id_from_values(principal, auth) do
-    auth = normalize_optional_map(auth)
-
     map_value(auth, :client_id) ||
       map_value(auth, :clientId) ||
       map_value(principal, :client_id) ||
-      map_value(principal, :clientId) ||
-      map_value(principal, :sub)
+      map_value(principal, :clientId)
+  end
+
+  defp auth_subject_from_values(principal, auth) do
+    map_value(auth, :sub) ||
+      map_value(auth, :subject) ||
+      map_value(principal, :sub) ||
+      map_value(principal, :subject)
   end
 
   defp hashed_identity(principal, auth) do
@@ -121,4 +138,6 @@ defmodule FastestMCP.TaskOwner do
   end
 
   defp map_value(_value, _key), do: nil
+
+  defp present?(value), do: not is_nil(value) and to_string(value) != ""
 end

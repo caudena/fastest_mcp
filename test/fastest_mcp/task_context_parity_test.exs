@@ -1,7 +1,6 @@
 defmodule FastestMCP.TaskContextParityTest do
   use ExUnit.Case, async: false
 
-  alias FastestMCP.Auth.Debug
   alias FastestMCP.BackgroundTask
   alias FastestMCP.Context
 
@@ -51,11 +50,18 @@ defmodule FastestMCP.TaskContextParityTest do
 
     server =
       FastestMCP.server(server_name)
-      |> FastestMCP.add_auth(Debug,
-        validate: &(&1 == "alpha"),
-        client_id: "alpha-client",
-        principal: %{"sub" => "alpha-user"}
-      )
+      |> FastestMCP.add_auth(fn
+        %{"authorization" => "Bearer alpha"}, _ctx ->
+          {:ok,
+           %{
+             principal: %{"sub" => "alpha-user"},
+             auth: %{client_id: "alpha-client"},
+             capabilities: []
+           }}
+
+        _input, _ctx ->
+          {:error, :unauthorized}
+      end)
       |> FastestMCP.add_tool("echo", fn _args, _ctx -> :ok end, task: true)
 
     assert {:ok, _pid} = FastestMCP.start_server(server)

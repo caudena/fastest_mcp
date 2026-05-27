@@ -4,7 +4,7 @@ FastestMCP keeps dependency injection explicit and request-scoped.
 
 This solves a specific problem: handlers often need access to application
 services such as repositories, HTTP clients, clocks, or per-request resource
-handles, but hiding those values behind rewritten function signatures or
+handles, but hiding those values behind generated function signatures or
 process-wide globals makes cleanup and failure handling harder to reason about.
 
 With FastestMCP, dependencies live on the server definition, are resolved from
@@ -172,7 +172,7 @@ it belongs to the conversation, prefer [Context](context.md) session state.
 
 ## Why This Shape
 
-FastMCP-style dependency injection is useful, but FastestMCP keeps it explicit.
+Dependency injection is useful, but FastestMCP keeps it explicit.
 
 Dependencies are declared on the server, resolved from the context, cached for
 the current operation, and cleaned up automatically. That preserves the useful

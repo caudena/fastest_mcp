@@ -57,6 +57,43 @@ defmodule FastestMCP.TaskElicitationTest do
     assert FastestMCP.await_task(handle, 1_000) == "Hello, Alice!"
   end
 
+  test "scalar elicitation schemas include response metadata and accept raw scalar input" do
+    server_name =
+      "task-elicit-scalar-metadata-" <> Integer.to_string(System.unique_integer([:positive]))
+
+    server =
+      FastestMCP.server(server_name)
+      |> FastestMCP.add_tool(
+        "ask_name",
+        fn _args, ctx ->
+          case Context.elicit(ctx, "What is your name?", :string,
+                 response_title: "Name",
+                 response_description: "The display name to use"
+               ) do
+            %Accepted{data: name} -> "Hello, #{name}!"
+            %Declined{} -> "User declined"
+            %Cancelled{} -> "Cancelled"
+          end
+        end,
+        task: true
+      )
+
+    assert {:ok, _pid} = FastestMCP.start_server(server)
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+
+    handle = FastestMCP.call_tool(server_name, "ask_name", %{}, task: true)
+    :ok = wait_for_input_required(server_name, handle.task_id)
+
+    assert %{
+             "type" => "string",
+             "title" => "Name",
+             "description" => "The display name to use"
+           } = FastestMCP.fetch_task(handle).elicitation.requested_schema
+
+    _ = FastestMCP.send_task_input(server_name, handle.task_id, :accept, "Alice")
+    assert FastestMCP.await_task(handle, 1_000) == "Hello, Alice!"
+  end
+
   test "tasks/sendInput works through the shared task protocol and enforces session scope" do
     server_name = "task-elicit-protocol-" <> Integer.to_string(System.unique_integer([:positive]))
 

@@ -133,7 +133,7 @@ defmodule FastestMCP.OpenAPIProviderFeaturesTest do
 
     requester = fn method, url, opts ->
       send(parent, {:request, method, url, opts})
-      {:ok, 200, [{"content-type", "application/json"}], Jason.encode!(%{"ok" => true})}
+      {:ok, 200, [{"content-type", "application/json"}], JSON.encode!(%{"ok" => true})}
     end
 
     server = FastestMCP.from_openapi(feature_spec(), name: server_name, requester: requester)

@@ -78,4 +78,43 @@ defmodule FastestMCP.ResourceTemplateQueryParamsTest do
     assert %{"limit" => "10", "page" => "2", "q" => "mcp"} ==
              FastestMCP.read_resource(server_name, "search://items?q=mcp&limit=10&page=2")
   end
+
+  test "hyphenated params normalize to underscores and preserve blank query values" do
+    server_name =
+      "resource-template-hyphen-" <> Integer.to_string(System.unique_integer([:positive]))
+
+    server =
+      FastestMCP.server(server_name)
+      |> FastestMCP.add_resource_template(
+        "data://{user-id}{?include-details}",
+        fn arguments, _ctx -> arguments end
+      )
+
+    assert {:ok, _pid} = FastestMCP.start_server(server)
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+
+    assert %{"user_id" => "42", "include_details" => ""} ==
+             FastestMCP.read_resource(server_name, "data://42?include-details=")
+  end
+
+  test "query captures do not clobber path captures and hyphen collisions are rejected" do
+    server_name =
+      "resource-template-precedence-" <> Integer.to_string(System.unique_integer([:positive]))
+
+    server =
+      FastestMCP.server(server_name)
+      |> FastestMCP.add_resource_template("data://{id}{?id}", fn arguments, _ctx ->
+        arguments
+      end)
+
+    assert {:ok, _pid} = FastestMCP.start_server(server)
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+
+    assert %{"id" => "path"} == FastestMCP.read_resource(server_name, "data://path?id=query")
+
+    assert_raise ArgumentError, ~r/collide/, fn ->
+      FastestMCP.server("resource-template-collision")
+      |> FastestMCP.add_resource_template("data://{user-id}/{user_id}", fn args, _ctx -> args end)
+    end
+  end
 end

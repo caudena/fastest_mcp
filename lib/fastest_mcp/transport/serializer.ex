@@ -241,7 +241,7 @@ defmodule FastestMCP.Transport.Serializer do
   end
 
   defp resource_body(_mime_type, value) do
-    %{"text" => Jason.encode!(normalize_json(value))}
+    %{"text" => JSON.encode!(normalize_json(value))}
   end
 
   defp resource_content(uri, default_mime_type, %ResourceContent{} = content) do
@@ -363,7 +363,7 @@ defmodule FastestMCP.Transport.Serializer do
     if is_binary(normalized) do
       normalized
     else
-      Jason.encode!(normalized)
+      JSON.encode!(normalized)
     end
   end
 

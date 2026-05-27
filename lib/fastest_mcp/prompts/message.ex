@@ -81,14 +81,14 @@ defmodule FastestMCP.Prompts.Message do
         Map.new(content)
 
       true ->
-        %{type: "text", text: Jason.encode!(normalize_json(content))}
+        %{type: "text", text: JSON.encode!(normalize_json(content))}
     end
   end
 
   defp normalize_content(content) when is_binary(content), do: %{type: "text", text: content}
 
   defp normalize_content(content) do
-    %{type: "text", text: Jason.encode!(normalize_json(content))}
+    %{type: "text", text: JSON.encode!(normalize_json(content))}
   end
 
   defp normalize_json(%DateTime{} = value), do: DateTime.to_iso8601(value)

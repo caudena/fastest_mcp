@@ -94,7 +94,10 @@ defmodule FastestMCP.InteractTest do
       |> FastestMCP.add_tool(
         "ask_name",
         fn _arguments, ctx ->
-          case Interact.text(ctx, "What is your name?") do
+          case Interact.text(ctx, "What is your name?",
+                 response_title: "Name Form",
+                 response_description: "Collects the display name"
+               ) do
             {:ok, name} -> name
             :declined -> "declined"
             :cancelled -> "cancelled"
@@ -130,6 +133,8 @@ defmodule FastestMCP.InteractTest do
 
     assert %{
              "type" => "object",
+             "title" => "Name Form",
+             "description" => "Collects the display name",
              "properties" => %{"value" => %{"type" => "string"}},
              "required" => ["value"]
            } = FastestMCP.fetch_task(ask_name).elicitation.requested_schema

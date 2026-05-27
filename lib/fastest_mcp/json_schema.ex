@@ -1,4 +1,4 @@
-defmodule FastestMCP.JSONSchema do
+defmodule JSONSchema do
   @moduledoc """
   Helpers for small JSON Schema operations such as reference detection and dereferencing.
 

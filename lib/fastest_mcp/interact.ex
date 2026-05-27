@@ -95,7 +95,7 @@ defmodule FastestMCP.Interact do
 
   defp elicitation_opts(opts) do
     opts
-    |> Keyword.take([:timeout_ms])
+    |> Keyword.take([:timeout_ms, :response_title, :response_description])
   end
 
   defp normalize_schema(%{} = schema) do

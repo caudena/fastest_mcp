@@ -54,11 +54,13 @@ defmodule FastestMCP.ServerTracingTest do
     assert "profile for 123" == FastestMCP.read_resource(server_name, "users://123/profile")
 
     spans = TraceTestHelper.drain_spans()
-    span = TraceTestHelper.find_span!(spans, "resources/read users://123/profile")
+    span = TraceTestHelper.find_span!(spans, "resources/read")
     attrs = TraceTestHelper.span_attributes(span)
 
     assert TraceTestHelper.span_kind(span) == :server
     assert attrs["mcp.method.name"] == "resources/read"
+    assert attrs["gen_ai.system"] == "mcp"
+    assert attrs["gen_ai.operation.name"] == "resources/read"
     assert attrs["mcp.resource.uri"] == "users://123/profile"
     assert attrs["rpc.method"] == "resources/read"
     assert attrs["fastestmcp.component.type"] == "resource_template"
@@ -81,8 +83,10 @@ defmodule FastestMCP.ServerTracingTest do
 
     spans = TraceTestHelper.drain_spans()
     span = TraceTestHelper.find_span!(spans, "tools/call explode")
+    attrs = TraceTestHelper.span_attributes(span)
 
     assert TraceTestHelper.span_status_code(span) == :error
+    assert attrs["error.type"] == "FastestMCP.Error"
   end
 
   test "authenticated operations include auth attributes and continue an incoming trace" do

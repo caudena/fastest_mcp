@@ -41,13 +41,13 @@ defmodule FastestMCP.ClientCallbackTaskTest do
       case {conn.method, conn.request_path} do
         {"POST", "/mcp"} ->
           {:ok, body, conn} = read_body(conn)
-          payload = if(body == "", do: %{}, else: Jason.decode!(body))
+          payload = if(body == "", do: %{}, else: JSON.decode!(body))
           send(test_pid, {:fake_callback_server_post, payload})
 
           case payload do
             %{"method" => "initialize", "id" => id} ->
               response =
-                Jason.encode!(%{
+                JSON.encode!(%{
                   "jsonrpc" => "2.0",
                   "id" => id,
                   "result" => %{
@@ -90,7 +90,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
     defp stream_loop(conn, state) do
       receive do
         {:push_event, payload} ->
-          case chunk(conn, "event: message\ndata: " <> Jason.encode!(payload) <> "\n\n") do
+          case chunk(conn, "event: message\ndata: " <> JSON.encode!(payload) <> "\n\n") do
             {:ok, conn} -> stream_loop(conn, state)
             {:error, _reason} -> conn
           end

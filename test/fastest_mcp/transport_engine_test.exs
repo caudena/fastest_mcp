@@ -193,7 +193,7 @@ defmodule FastestMCP.TransportEngineTest do
       conn(
         :post,
         "/mcp",
-        Jason.encode!(%{
+        JSON.encode!(%{
           "jsonrpc" => "2.0",
           "id" => 1,
           "method" => "tools/call",
@@ -227,7 +227,7 @@ defmodule FastestMCP.TransportEngineTest do
       conn(
         :post,
         "/mcp",
-        Jason.encode!(%{
+        JSON.encode!(%{
           "jsonrpc" => "2.0",
           "id" => 2,
           "method" => "ping"
@@ -244,7 +244,7 @@ defmodule FastestMCP.TransportEngineTest do
       conn(
         :post,
         "/mcp?session_id=query-session",
-        Jason.encode!(%{
+        JSON.encode!(%{
           "jsonrpc" => "2.0",
           "id" => 3,
           "method" => "tools/call",

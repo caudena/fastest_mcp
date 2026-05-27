@@ -16,6 +16,7 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
   import Plug.Conn
 
   alias FastestMCP.Error
+  alias FastestMCP.Transport.HTTPCommon
   alias FastestMCP.Transport.Request
 
   @impl true
@@ -29,19 +30,20 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
       normalize_base_path(Keyword.get(opts, :path) || forwarded_base_path(conn) || "/mcp")
 
     stateless_http = stateless_http?(opts)
+    request_opts = request_context_opts(conn, opts, base_path, stateless_http)
 
     case route(conn.method, conn.request_path, base_path, stateless_http) do
       {:ok, {:legacy, method, :get}} ->
-        {:ok, build_request(conn, method, %{}, stateless_http: stateless_http)}
+        {:ok, build_request(conn, method, %{}, request_opts)}
 
       {:ok, {:legacy, method, :post}} ->
         with {:ok, payload} <- read_json(conn) do
-          {:ok, build_request(conn, method, payload, stateless_http: stateless_http)}
+          {:ok, build_request(conn, method, payload, request_opts)}
         end
 
       {:ok, :jsonrpc_post} ->
         with {:ok, payload} <- read_json(conn) do
-          build_jsonrpc_messages(conn, payload, stateless_http: stateless_http)
+          build_jsonrpc_messages(conn, payload, request_opts)
         end
 
       {:redirect, status, target_path} ->
@@ -54,10 +56,10 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
         {:response, status, payload, headers}
 
       {:ok, :session_get} ->
-        {:ok, build_get_request(conn, stateless_http)}
+        {:ok, build_get_request(conn, request_opts)}
 
       {:ok, :session_delete} ->
-        {:ok, build_delete_request(conn, stateless_http)}
+        {:ok, build_delete_request(conn, request_opts)}
     end
   end
 
@@ -260,21 +262,23 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
       task_request: task_request,
       task_ttl_ms: task_ttl_ms,
       payload: Map.new(payload),
-      request_metadata: %{
-        headers: headers,
-        method: conn.method,
-        path: conn.request_path,
-        query_params: conn.query_params,
-        session_id: session_id,
-        session_id_provided: session_id_provided,
-        stateless_http: Keyword.get(opts, :stateless_http, false),
-        progress_token: progress_token(payload)
-      },
-      auth_input: %{"authorization" => headers["authorization"], "headers" => headers}
+      request_metadata:
+        %{
+          headers: headers,
+          method: conn.method,
+          path: conn.request_path,
+          query_params: conn.query_params,
+          session_id: session_id,
+          session_id_provided: session_id_provided,
+          stateless_http: Keyword.fetch!(opts, :stateless_http),
+          progress_token: progress_token(payload)
+        }
+        |> put_request_context(opts),
+      auth_input: auth_input(conn, headers, opts)
     }
   end
 
-  defp build_delete_request(conn, stateless_http) do
+  defp build_delete_request(conn, opts) do
     headers = Map.new(conn.req_headers)
     session_id = headers["mcp-session-id"] || headers["x-fastestmcp-session"]
 
@@ -284,22 +288,25 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
       session_id: session_id,
       protocol: :native,
       payload: %{},
-      request_metadata: %{
-        headers: headers,
-        method: conn.method,
-        path: conn.request_path,
-        query_params: conn.query_params,
-        session_id: session_id,
-        session_id_provided: not is_nil(session_id),
-        stateless_http: stateless_http
-      },
-      auth_input: %{"authorization" => headers["authorization"], "headers" => headers}
+      request_metadata:
+        %{
+          headers: headers,
+          method: conn.method,
+          path: conn.request_path,
+          query_params: conn.query_params,
+          session_id: session_id,
+          session_id_provided: not is_nil(session_id),
+          stateless_http: Keyword.fetch!(opts, :stateless_http)
+        }
+        |> put_request_context(opts),
+      auth_input: auth_input(conn, headers, opts)
     }
   end
 
-  defp build_get_request(conn, stateless_http) do
+  defp build_get_request(conn, opts) do
     headers = Map.new(conn.req_headers)
     provided_session_id = headers["mcp-session-id"] || headers["x-fastestmcp-session"]
+    stateless_http = Keyword.fetch!(opts, :stateless_http)
 
     {session_id, session_id_provided} =
       if stateless_http do
@@ -314,17 +321,77 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
       session_id: session_id,
       protocol: :native,
       payload: %{},
-      request_metadata: %{
-        headers: headers,
-        method: conn.method,
-        path: conn.request_path,
-        query_params: conn.query_params,
-        session_id: session_id,
-        session_id_provided: session_id_provided,
-        stateless_http: stateless_http
-      },
-      auth_input: %{"authorization" => headers["authorization"], "headers" => headers}
+      request_metadata:
+        %{
+          headers: headers,
+          method: conn.method,
+          path: conn.request_path,
+          query_params: conn.query_params,
+          session_id: session_id,
+          session_id_provided: session_id_provided,
+          stateless_http: stateless_http
+        }
+        |> put_request_context(opts),
+      auth_input: auth_input(conn, headers, opts)
     }
+  end
+
+  defp request_context_opts(conn, opts, base_path, stateless_http) do
+    http_context = HTTPCommon.http_context(conn, %{}, Keyword.put(opts, :path, base_path))
+
+    [
+      stateless_http: stateless_http,
+      base_url: http_context.base_url,
+      mcp_base_path: http_context.mcp_base_path,
+      auth_assigns: Keyword.get(opts, :auth_assigns, false)
+    ]
+  end
+
+  defp auth_input(conn, headers, opts) do
+    %{"authorization" => headers["authorization"], "headers" => headers}
+    |> maybe_put("assigns", selected_auth_assigns(conn.assigns, Keyword.get(opts, :auth_assigns)))
+  end
+
+  defp selected_auth_assigns(_assigns, false), do: nil
+  defp selected_auth_assigns(_assigns, nil), do: nil
+
+  defp selected_auth_assigns(assigns, :all) when is_map(assigns) do
+    assigns
+    |> Enum.into(%{}, fn {key, value} -> {to_string(key), value} end)
+    |> non_empty_map()
+  end
+
+  defp selected_auth_assigns(assigns, keys) when is_map(assigns) and is_list(keys) do
+    keys
+    |> Enum.reduce(%{}, fn key, acc ->
+      string_key = to_string(key)
+
+      cond do
+        Map.has_key?(assigns, key) ->
+          Map.put(acc, string_key, Map.fetch!(assigns, key))
+
+        Map.has_key?(assigns, string_key) ->
+          Map.put(acc, string_key, Map.fetch!(assigns, string_key))
+
+        true ->
+          acc
+      end
+    end)
+    |> non_empty_map()
+  end
+
+  defp selected_auth_assigns(_assigns, other) do
+    raise ArgumentError,
+          "auth_assigns must be false, nil, :all, or a list of assign keys, got #{inspect(other)}"
+  end
+
+  defp non_empty_map(map) when map == %{}, do: nil
+  defp non_empty_map(map), do: map
+
+  defp put_request_context(metadata, opts) do
+    metadata
+    |> Map.put(:base_url, Keyword.fetch!(opts, :base_url))
+    |> Map.put(:mcp_base_path, Keyword.fetch!(opts, :mcp_base_path))
   end
 
   defp read_json(conn) do
@@ -338,12 +405,12 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
             {:ok, %{}}
 
           {:ok, body, _conn} ->
-            case Jason.decode(body) do
+            case JSON.decode(body) do
               {:ok, decoded} ->
                 {:ok, decoded}
 
               {:error, error} ->
-                {:error, %Error{code: :bad_request, message: Exception.message(error)}}
+                {:error, %Error{code: :bad_request, message: json_decode_error_message(error)}}
             end
 
           {:more, _body, _conn} ->
@@ -360,6 +427,8 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
     do: {:ok, body_params}
 
   defp parsed_body_params(_conn), do: :unavailable
+
+  defp json_decode_error_message(error), do: "invalid JSON: #{inspect(error)}"
 
   defp normalize_base_path(path) do
     "/" <> String.trim(String.trim_leading(to_string(path), "/"), "/")
@@ -444,8 +513,8 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
 
   defp json_value(value) do
     value
-    |> Jason.encode!()
-    |> Jason.decode!()
+    |> JSON.encode!()
+    |> JSON.decode!()
   end
 
   defp maybe_put(map, _key, nil), do: map

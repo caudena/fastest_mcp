@@ -118,7 +118,7 @@ defmodule FastestMCP.Middleware.Logging do
 
   @doc "Formats the final log message."
   def format_message(%__MODULE__{structured_logging: true}, message) do
-    Jason.encode!(message)
+    JSON.encode!(message)
   end
 
   def format_message(%__MODULE__{}, message) do
@@ -141,7 +141,7 @@ defmodule FastestMCP.Middleware.Logging do
         nil
 
       is_nil(middleware.payload_serializer) ->
-        Jason.encode!(payload)
+        JSON.encode!(payload)
 
       true ->
         try do
@@ -153,7 +153,7 @@ defmodule FastestMCP.Middleware.Logging do
               "Failed to serialize payload due to #{Exception.message(error)}: #{operation.method}."
             )
 
-            Jason.encode!(payload)
+            JSON.encode!(payload)
         end
     end
   end

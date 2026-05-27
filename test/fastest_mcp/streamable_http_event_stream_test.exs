@@ -28,7 +28,7 @@ defmodule FastestMCP.StreamableHTTPEventStreamTest do
     {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
 
     request_body =
-      Jason.encode!(%{
+      JSON.encode!(%{
         "jsonrpc" => "2.0",
         "id" => 7,
         "method" => "tools/call",
@@ -116,7 +116,7 @@ defmodule FastestMCP.StreamableHTTPEventStreamTest do
       assert Map.get(response.headers, "mcp-session-id") == "task-stream-session"
 
       request_body =
-        Jason.encode!(%{
+        JSON.encode!(%{
           "jsonrpc" => "2.0",
           "id" => 9,
           "method" => "tools/call",
@@ -147,7 +147,7 @@ defmodule FastestMCP.StreamableHTTPEventStreamTest do
                "jsonrpc" => "2.0",
                "id" => 9,
                "result" => %{"task" => %{"taskId" => task_id, "status" => "working"}}
-             } = Jason.decode!(task_response.body)
+             } = JSON.decode!(task_response.body)
 
       assert_receive {:session_stream_task_started, "task-stream-session", task_pid}, 1_000
 
@@ -223,7 +223,7 @@ defmodule FastestMCP.StreamableHTTPEventStreamTest do
         assert Map.get(session_response.headers, "content-type") == "text/event-stream"
 
         create_body =
-          Jason.encode!(%{
+          JSON.encode!(%{
             "name" => "ask_name",
             "arguments" => %{},
             "task" => true
@@ -249,10 +249,10 @@ defmodule FastestMCP.StreamableHTTPEventStreamTest do
 
         assert create_response.status == 200
 
-        assert %{"task" => %{"taskId" => task_id}} = Jason.decode!(create_response.body)
+        assert %{"task" => %{"taskId" => task_id}} = JSON.decode!(create_response.body)
         assert_receive {:legacy_task_result_started, "legacy-task-result-session"}, 1_000
 
-        result_body = Jason.encode!(%{"taskId" => task_id})
+        result_body = JSON.encode!(%{"taskId" => task_id})
 
         {:ok, result_socket, result_response, result_stream_state} =
           open_stream(
@@ -290,7 +290,7 @@ defmodule FastestMCP.StreamableHTTPEventStreamTest do
           [_, relay_request_id] = Regex.run(~r/"id":"([^"]+)"/, relay_stream)
 
           callback_body =
-            Jason.encode!(%{
+            JSON.encode!(%{
               "jsonrpc" => "2.0",
               "id" => relay_request_id,
               "result" => %{

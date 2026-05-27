@@ -28,6 +28,19 @@ end
 `base_server/1` keeps the builder DSL intact while making the module name the
 server identity automatically.
 
+If you need to advertise protocol extension capabilities during
+initialization, pass `experimental_capabilities:` when constructing the server:
+
+```elixir
+FastestMCP.server("capability-demo",
+  experimental_capabilities: %{
+    "acme.widgets" => %{"version" => 1}
+  }
+)
+```
+
+The map is exposed under initialize capabilities as `"experimental"`.
+
 ## 2. Start it under your supervision tree
 
 ```elixir

@@ -67,7 +67,7 @@ defmodule FastestMCP.Providers.Skills.Common do
 
   @doc "Builds the JSON manifest payload for a loaded skill."
   def manifest_json(%SkillInfo{} = skill_info) do
-    Jason.encode!(%{
+    JSON.encode!(%{
       "skill" => skill_info.name,
       "files" =>
         Enum.map(skill_info.files, fn file ->

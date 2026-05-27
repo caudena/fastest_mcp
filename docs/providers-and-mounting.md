@@ -45,6 +45,11 @@ Mounted components participate in normal:
 - prompt rendering
 
 Use `namespace:` whenever the child may overlap with parent component names.
+Mounting a server into itself is rejected.
+
+Mounted servers enter their own lifespans when the parent runtime starts. Child
+handlers receive the mounted server's `ctx.lifespan_context`, and shutdown runs
+mounted cleanup before parent cleanup.
 
 ## Mount Filtering
 
@@ -104,6 +109,18 @@ FastestMCP.list_tools("petstore")
 Under the hood, FastestMCP maps OpenAPI operations to tools, builds schemas
 from parameters and request bodies, and routes calls through its shared HTTP
 helper.
+
+OpenAPI-backed tools serialize common HTTP request shapes:
+
+- JSON and vendor JSON media types such as `application/problem+json`
+- `application/x-www-form-urlencoded`
+- `multipart/form-data`
+- cookie parameters through the `Cookie` header
+
+Server URL variables are expanded from their declared defaults when a provider
+base URL is derived from the document. Component `$ref` resolution tracks
+visited references, so circular schemas are left as references instead of
+recursing indefinitely.
 
 ## Skills Providers
 
@@ -172,10 +189,8 @@ See [Transforms](transforms.md) for the detailed patterns.
 
 ## What FastestMCP Does Not Ship Yet
 
-The FastMCP docs cover filesystem and proxy providers.
-
-FastestMCP v0.1 does not yet expose those as public built-ins. The current
-provider surface focuses on:
+FastestMCP v0.1 does not yet expose filesystem or proxy providers as public
+built-ins. The current provider surface focuses on:
 
 - mounted FastestMCP servers
 - explicit local providers

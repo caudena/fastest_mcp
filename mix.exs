@@ -4,9 +4,9 @@ defmodule FastestMCP.MixProject do
   def project do
     [
       app: :fastest_mcp,
-      version: "0.1.1",
+      version: "0.1.2",
       description:
-        "Native Elixir rewrite of the Python FastMCP library, built the Erlang/OTP way",
+        "BEAM-native MCP toolkit for supervised Elixir servers, clients, auth, and transports",
       source_url: "https://github.com/caudena/fastest_mcp",
       homepage_url: "https://github.com/caudena/fastest_mcp",
       elixir: "~> 1.19",
@@ -30,11 +30,8 @@ defmodule FastestMCP.MixProject do
 
   defp deps do
     [
-      {:assent, "~> 0.3"},
       {:bandit, "~> 1.5"},
       {:ex_doc, "~> 0.40", only: :dev, runtime: false},
-      {:jason, "~> 1.4"},
-      {:jose, "~> 1.11"},
       {:opentelemetry, "~> 1.6", only: :test},
       {:opentelemetry_api, "~> 1.5"},
       {:plug, "~> 1.16"},

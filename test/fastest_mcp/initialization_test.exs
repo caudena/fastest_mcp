@@ -88,6 +88,23 @@ defmodule FastestMCP.InitializationTest do
     refute Map.has_key?(result["capabilities"], "completions")
   end
 
+  test "initialize exposes configured experimental capabilities" do
+    server_name =
+      "initialize-experimental-" <> Integer.to_string(System.unique_integer([:positive]))
+
+    server =
+      FastestMCP.server(server_name,
+        experimental_capabilities: %{feature_flags: %{alpha: true}}
+      )
+
+    assert {:ok, _pid} = FastestMCP.start_server(server)
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+
+    result = FastestMCP.initialize(server_name, %{})
+
+    assert get_in(result, ["capabilities", "experimental", "feature_flags", "alpha"]) == true
+  end
+
   test "initialize advertises completion when tools expose completion sources" do
     server_name =
       "initialize-tool-completion-" <> Integer.to_string(System.unique_integer([:positive]))
@@ -143,7 +160,11 @@ defmodule FastestMCP.InitializationTest do
            } = stdio_response["result"]
 
     conn =
-      conn(:post, "/mcp/initialize", Jason.encode!(%{"clientInfo" => %{"name" => "http-client"}}))
+      conn(
+        :post,
+        "/mcp/initialize",
+        JSON.encode!(%{"clientInfo" => %{"name" => "http-client"}})
+      )
       |> put_req_header("content-type", "application/json")
       |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
 
@@ -153,7 +174,7 @@ defmodule FastestMCP.InitializationTest do
              "protocolVersion" => ^protocol_version,
              "serverInfo" => %{"name" => ^server_name, "version" => "9.9.9"},
              "instructions" => "Transport instructions"
-           } = Jason.decode!(conn.resp_body)
+           } = JSON.decode!(conn.resp_body)
 
     assert %{} == FastestMCP.ping(server_name)
   end

@@ -411,7 +411,7 @@ defmodule FastestMCP.ClientHTTPTest do
           send(test_pid, {:elicitation_handler_called, message, params})
           assert message == "What is your name?"
           assert params["requestedSchema"] == %{"type" => "string"}
-          {:accept, %{"value" => "Alice"}}
+          {:accept, "Alice"}
         end
       )
 
@@ -608,6 +608,9 @@ defmodule FastestMCP.ClientHTTPTest do
     assert %{"taskId" => ^task_id} = RemoteTask.status(task)
 
     assert wait_for_task_status(client, task_id, "input_required") == :ok
+
+    assert %{"taskId" => ^task_id, "status" => "input_required"} =
+             RemoteTask.wait(task)
 
     assert %{"taskId" => ^task_id, "status" => "input_required"} =
              RemoteTask.wait(task, status: "input_required")

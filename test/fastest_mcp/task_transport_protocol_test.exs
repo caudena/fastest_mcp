@@ -312,7 +312,7 @@ defmodule FastestMCP.TaskTransportProtocolTest do
       conn(
         :post,
         "/mcp/tools/call",
-        Jason.encode!(%{
+        JSON.encode!(%{
           "name" => "echo",
           "arguments" => %{"value" => "hi"},
           "task" => %{"ttl" => 30_000}
@@ -327,23 +327,23 @@ defmodule FastestMCP.TaskTransportProtocolTest do
     %{
       "task" => %{"taskId" => task_id, "ttl" => 30_000, "pollInterval" => 125},
       "_meta" => %{"io.modelcontextprotocol/related-task" => %{"taskId" => task_id}}
-    } = Jason.decode!(create_conn.resp_body)
+    } = JSON.decode!(create_conn.resp_body)
 
     status_conn =
-      conn(:post, "/mcp/tasks/get", Jason.encode!(%{"taskId" => task_id}))
+      conn(:post, "/mcp/tasks/get", JSON.encode!(%{"taskId" => task_id}))
       |> put_req_header("content-type", "application/json")
       |> put_req_header("x-fastestmcp-session", "http-task-session")
       |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
 
     assert status_conn.status == 200
 
-    %{"taskId" => ^task_id, "status" => status} = Jason.decode!(status_conn.resp_body)
+    %{"taskId" => ^task_id, "status" => status} = JSON.decode!(status_conn.resp_body)
     assert status in ["working", "completed"]
 
     wait_for_http_task_completion(server_name, "http-task-session", task_id)
 
     result_conn =
-      conn(:post, "/mcp/tasks/result", Jason.encode!(%{"taskId" => task_id}))
+      conn(:post, "/mcp/tasks/result", JSON.encode!(%{"taskId" => task_id}))
       |> put_req_header("content-type", "application/json")
       |> put_req_header("x-fastestmcp-session", "http-task-session")
       |> put_req_header("accept", "application/json")
@@ -354,7 +354,7 @@ defmodule FastestMCP.TaskTransportProtocolTest do
     assert %{
              "structuredContent" => %{"echo" => "hi"},
              "_meta" => %{"io.modelcontextprotocol/related-task" => %{"taskId" => ^task_id}}
-           } = Jason.decode!(result_conn.resp_body)
+           } = JSON.decode!(result_conn.resp_body)
   end
 
   test "JSON-RPC tasks/result failures include related-task metadata" do
@@ -411,7 +411,7 @@ defmodule FastestMCP.TaskTransportProtocolTest do
              "id" => 1,
              "error" => %{"code" => -32602, "message" => "boom"},
              "_meta" => %{"io.modelcontextprotocol/related-task" => %{"taskId" => ^task_id}}
-           } = Jason.decode!(response.resp_body)
+           } = JSON.decode!(response.resp_body)
   end
 
   test "stdio tasks/result failures include related-task metadata" do
@@ -470,14 +470,14 @@ defmodule FastestMCP.TaskTransportProtocolTest do
 
   defp do_wait_for_http_task_completion(server_name, session_id, task_id, deadline) do
     status_conn =
-      conn(:post, "/mcp/tasks/get", Jason.encode!(%{"taskId" => task_id}))
+      conn(:post, "/mcp/tasks/get", JSON.encode!(%{"taskId" => task_id}))
       |> put_req_header("content-type", "application/json")
       |> put_req_header("x-fastestmcp-session", session_id)
       |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
 
     assert status_conn.status == 200
 
-    case Jason.decode!(status_conn.resp_body) do
+    case JSON.decode!(status_conn.resp_body) do
       %{"status" => "completed"} ->
         :ok
 

@@ -1,6 +1,6 @@
 defmodule FastestMCP.Auth.StaticToken do
   @moduledoc """
-  Hermetic bearer-token auth provider for server-side parity and local testing.
+  Hermetic bearer-token authenticator for server-side and local testing.
 
   Tokens are configured declaratively as a map keyed by raw token value:
 

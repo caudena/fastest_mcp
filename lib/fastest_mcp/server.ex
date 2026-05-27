@@ -125,7 +125,11 @@ defmodule FastestMCP.Server do
       strict_input_validation: Keyword.get(opts, :strict_input_validation, false),
       mask_error_details: Keyword.get(opts, :mask_error_details, false),
       on_duplicate: normalize_on_duplicate(Keyword.get(opts, :on_duplicate, :error)),
-      metadata: Map.new(Keyword.get(opts, :metadata, %{})),
+      metadata:
+        opts
+        |> Keyword.get(:metadata, %{})
+        |> Map.new()
+        |> put_experimental_capabilities(Keyword.get(opts, :experimental_capabilities)),
       http_routes: [],
       tasks: normalize_tasks(Keyword.get(opts, :tasks, false)),
       dependencies: normalize_dependencies(Keyword.get(opts, :dependencies, %{})),
@@ -237,6 +241,10 @@ defmodule FastestMCP.Server do
 
   @doc "Mounts another server or provider-backed definition."
   def mount(%__MODULE__{} = server, %__MODULE__{} = mounted_server, opts \\ []) do
+    if server.name == mounted_server.name do
+      raise ArgumentError, "cannot mount a server into itself"
+    end
+
     add_provider(server, MountedServerProvider.new(mounted_server, opts))
   end
 
@@ -257,9 +265,47 @@ defmodule FastestMCP.Server do
   defp normalize_name(name) when is_atom(name), do: Atom.to_string(name)
   defp normalize_name(name) when is_binary(name), do: name
 
+  defp put_experimental_capabilities(metadata, nil), do: metadata
+
+  defp put_experimental_capabilities(metadata, experimental) when is_map(experimental) do
+    capabilities =
+      metadata
+      |> map_value(:capabilities, %{})
+      |> normalize_string_key_map()
+      |> Map.put("experimental", normalize_string_key_map(experimental))
+
+    metadata
+    |> Map.delete(:capabilities)
+    |> Map.delete("capabilities")
+    |> Map.put(:capabilities, capabilities)
+  end
+
+  defp put_experimental_capabilities(metadata, _experimental), do: metadata
+
+  defp normalize_string_key_map(map) when is_map(map) do
+    Map.new(map, fn {key, value} ->
+      value =
+        if is_map(value) do
+          normalize_string_key_map(value)
+        else
+          value
+        end
+
+      {to_string(key), value}
+    end)
+  end
+
+  defp normalize_string_key_map(_value), do: %{}
+
+  defp map_value(map, key, default) when is_map(map) do
+    Map.get(map, key, Map.get(map, Atom.to_string(key), default))
+  end
+
   defp normalize_auth(nil), do: nil
   defp normalize_auth(%Auth{} = auth), do: Auth.new(auth)
   defp normalize_auth({provider, opts}), do: Auth.new(provider, opts)
+  defp normalize_auth(provider) when is_function(provider, 2), do: Auth.new(provider)
+  defp normalize_auth(provider) when is_function(provider, 3), do: Auth.new(provider)
   defp normalize_auth(provider) when is_atom(provider), do: Auth.new(provider)
   defp normalize_tasks(tasks), do: TaskConfig.new(tasks)
 

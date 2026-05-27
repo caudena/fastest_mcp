@@ -108,6 +108,32 @@ case FastestMCP.Interact.text(ctx, "What should we call this release?") do
 end
 ```
 
+Elicitation requests can include response metadata for clients that render a
+form title or field description:
+
+```elixir
+case FastestMCP.Interact.text(ctx, "What should we call this release?",
+       response_title: "Release name",
+       response_description: "A short name shown in release notes"
+     ) do
+  {:ok, value} -> %{name: value}
+  :declined -> %{status: "declined"}
+  :cancelled -> %{status: "cancelled"}
+end
+```
+
+The same options are accepted by `Context.elicit/4`:
+
+```elixir
+FastestMCP.Context.elicit(ctx, "How many copies?", :integer,
+  response_title: "Copies",
+  response_description: "Positive integer quantity"
+)
+```
+
+Scalar responses accept either the raw scalar value or `%{"value" => value}`
+from the client-side elicitation handler.
+
 ### Choose
 
 ```elixir

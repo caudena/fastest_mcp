@@ -62,11 +62,16 @@ every handler.
 
 FastestMCP already handles:
 
-- span naming from MCP method and target
-- attributes for server name, method, component key, transport, session, and
-  request id
+- span naming from MCP method and component type
+- attributes for server name, MCP method, component key, transport, session,
+  request id, and GenAI/MCP semantic fields
 - exception recording on failed spans
 - trace context extraction and injection
+
+Resource URIs are recorded as attributes rather than embedded in span names, so
+high-cardinality resource values do not fragment trace dashboards. Failed spans
+also include `error.type`, and nil attributes are dropped before they reach the
+OpenTelemetry exporter.
 
 Most applications do not need to call the internal tracing helper module
 directly. The runtime instrumentation is the default.

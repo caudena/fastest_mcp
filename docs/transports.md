@@ -47,6 +47,28 @@ forward "/mcp", FastestMCP.Transport.HTTPApp,
   allowed_hosts: :any
 ```
 
+When the route sits behind your Plug or Phoenix auth pipeline, select assigns
+for auth with `auth_assigns:`:
+
+```elixir
+pipeline :mcp do
+  plug :fetch_session
+  plug MyAppWeb.UserAuth, :fetch_current_user
+end
+
+scope "/" do
+  pipe_through :mcp
+
+  forward "/mcp", FastestMCP.Transport.HTTPApp,
+    server_name: MyApp.MCPServer,
+    path: "/mcp",
+    auth_assigns: [:current_user]
+end
+```
+
+Selected assigns are copied into auth input under `"assigns"` and are not added
+to normal handler request metadata.
+
 ## Stdio
 
 The stdio transport is available for local tooling and process-owned workflows:

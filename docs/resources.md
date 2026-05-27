@@ -74,6 +74,7 @@ FastestMCP.read_resource("resources", "weather://london/current")
 FastestMCP currently supports:
 
 - path placeholders such as `{id}`
+- hyphenated path placeholders such as `{user-id}`
 - wildcard path placeholders such as `{path*}`
 - optional query variables such as `{?format,limit}`
 - reserved expansions such as `{+path}`
@@ -122,6 +123,23 @@ server =
 FastestMCP.read_resource("template-wildcards", "repo://prefecthq/src/templates/release.md")
 # => %{"owner" => "prefecthq", "path" => "src/templates/release.md"}
 ```
+
+Hyphenated template names are normalized to underscore handler keys:
+
+```elixir
+server =
+  FastestMCP.server("template-hyphen")
+  |> FastestMCP.add_resource_template(
+    "users://{user-id}{?include-empty}",
+    fn %{"user_id" => user_id, "include_empty" => include_empty}, _ctx ->
+      %{user_id: user_id, include_empty: include_empty}
+    end
+  )
+```
+
+Blank query values are preserved. Path captures take precedence over query
+captures, and templates that would create a hyphen/underscore collision are
+rejected.
 
 ## Template Parameter Validation and Completion
 
@@ -197,6 +215,20 @@ them automatically. When you need more control, use the helper structs:
 - `FastestMCP.Resources.Result`
 - `FastestMCP.Resources.Text`
 - `FastestMCP.Resources.Binary`
+
+Plain maps, lists, tuples, dates, URIs, `MapSet`, and safe finite enumerable
+values such as ranges are encoded as JSON resource bodies:
+
+```elixir
+FastestMCP.server("resources")
+|> FastestMCP.add_resource("memo://numbers", fn _arguments, _ctx ->
+  %{values: 1..3}
+end)
+```
+
+Return lists for lazy streams or other enumerables whose size is not known.
+FastestMCP avoids automatically materializing arbitrary `Stream` values because
+they may be infinite.
 
 Example:
 
@@ -610,20 +642,19 @@ server =
 This keeps the resource builder, helper type, and handler return shape
 explicit.
 
-## Python Concepts vs Elixir Shape
+## Resource Design Shape
 
-FastestMCP aims for public resources-contract parity, not internal
-implementation parity with the Python library.
+FastestMCP keeps the public resource contract transport-safe while using
+explicit Elixir APIs and OTP-owned runtime state internally.
 
-- Python decorators map to explicit `FastestMCP.add_resource/4` and
+- resource registration uses explicit `FastestMCP.add_resource/4` and
   `FastestMCP.add_resource_template/4` calls
-- Python request globals map to an explicit `%FastestMCP.Context{}` passed to
-  every handler
-- Python storage or orchestration layers do not need to be copied directly;
-  FastestMCP uses OTP processes plus ETS-backed runtime state unless you
-  intentionally swap in a backend seam
+- request data is carried by an explicit `%FastestMCP.Context{}` passed to every
+  handler
+- storage and orchestration use OTP processes plus ETS-backed runtime state
+  unless you intentionally swap in a backend seam
 - mounted providers, versioning, and visibility are first-class Elixir runtime
-  concerns rather than add-on wrappers around a Python-style registry
+  concerns
 
 That is why examples in this guide stay explicit about handler arguments,
 context access, and runtime APIs.

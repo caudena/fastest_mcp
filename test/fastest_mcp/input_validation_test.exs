@@ -76,7 +76,8 @@ defmodule FastestMCP.InputValidationTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    profile = Jason.encode!(%{"name" => "Alice", "age" => "30", "email" => "alice@example.com"})
+    profile =
+      JSON.encode!(%{"name" => "Alice", "age" => "30", "email" => "alice@example.com"})
 
     assert "Alice:30:alice@example.com" ==
              FastestMCP.call_tool(server_name, "create_user", %{"profile" => profile})
@@ -207,6 +208,40 @@ defmodule FastestMCP.InputValidationTest do
 
     assert_raise Error, ~r/must match exactly one allowed shape/, fn ->
       FastestMCP.call_tool(server_name, "echo_value", %{"value" => 7})
+    end
+  end
+
+  test "boolean schemas and additionalProperties false are enforced" do
+    server_name =
+      "input-boolean-schema-" <> Integer.to_string(System.unique_integer([:positive]))
+
+    schema = %{
+      "type" => "object",
+      "properties" => %{
+        "anything" => true,
+        "blocked" => false
+      },
+      "additionalProperties" => false
+    }
+
+    server =
+      FastestMCP.server(server_name, strict_input_validation: true)
+      |> FastestMCP.add_tool("echo", fn args, _ctx -> args end, input_schema: schema)
+
+    assert {:ok, _pid} = FastestMCP.start_server(server)
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+
+    assert %{"anything" => %{"nested" => "value"}} ==
+             FastestMCP.call_tool(server_name, "echo", %{
+               "anything" => %{"nested" => "value"}
+             })
+
+    assert_raise Error, ~r/blocked does not match schema/, fn ->
+      FastestMCP.call_tool(server_name, "echo", %{"blocked" => "nope"})
+    end
+
+    assert_raise Error, ~r/extra is not allowed/, fn ->
+      FastestMCP.call_tool(server_name, "echo", %{"extra" => "nope"})
     end
   end
 end

@@ -86,7 +86,7 @@ defmodule FastestMCP.MiddlewarePingTest do
       conn(
         :post,
         "/mcp/tools/call",
-        Jason.encode!(%{"name" => "echo", "arguments" => %{"message" => "http"}})
+        JSON.encode!(%{"name" => "echo", "arguments" => %{"message" => "http"}})
       )
       |> put_req_header("content-type", "application/json")
       |> put_req_header("x-fastestmcp-session", "http-session")

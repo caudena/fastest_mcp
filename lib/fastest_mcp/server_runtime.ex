@@ -22,7 +22,6 @@ defmodule FastestMCP.ServerRuntime do
 
   use GenServer
 
-  alias FastestMCP.Auth.StateStore
   alias FastestMCP.BackgroundTaskStore
   alias FastestMCP.BackgroundTaskSupervisor
   alias FastestMCP.CallSupervisor
@@ -39,6 +38,7 @@ defmodule FastestMCP.ServerRuntime do
   alias FastestMCP.SessionStateStore.Memory, as: SessionStateStoreMemory
   alias FastestMCP.TaskBackend.Memory, as: MemoryTaskBackend
   alias FastestMCP.TaskNotificationSupervisor
+  alias FastestMCP.TTLStore
   alias FastestMCP.SessionSupervisor
 
   @doc "Starts the runtime or application process owned by this module."
@@ -80,16 +80,16 @@ defmodule FastestMCP.ServerRuntime do
   def init({%Server{} = server, opts}) do
     Process.flag(:trap_exit, true)
 
-    with {:ok, lifespan_context, lifespan_cleanups} <- Lifespan.run_all(server, server.lifespans) do
-      {:ok, component_manager_pid} =
-        ComponentManager.start_link(server_name: server.name, on_duplicate: server.on_duplicate)
-
-      component_manager = ComponentManager.new(server.name, component_manager_pid)
-
-      server =
-        %{server | providers: server.providers ++ [Provider.new(component_manager)]}
-        |> materialize_server_runtime()
-
+    with {:ok, lifespan_context, lifespan_cleanups} <- Lifespan.run_all(server, server.lifespans),
+         {:ok, component_manager_pid} <-
+           ComponentManager.start_link(
+             server_name: server.name,
+             on_duplicate: server.on_duplicate
+           ),
+         component_manager = ComponentManager.new(server.name, component_manager_pid),
+         {:ok, server} <-
+           %{server | providers: server.providers ++ [Provider.new(component_manager)]}
+           |> materialize_server_runtime() do
       {:ok, session_state_store} = start_session_state_store(opts)
 
       {:ok, session_supervisor} =
@@ -100,7 +100,7 @@ defmodule FastestMCP.ServerRuntime do
         )
 
       {:ok, terminated_session_store} =
-        StateStore.start_link(ttl_ms: terminated_session_ttl(opts))
+        TTLStore.start_link(ttl_ms: terminated_session_ttl(opts))
 
       {:ok, call_supervisor} =
         CallSupervisor.start_link(max_children: max_concurrent_calls(opts))
@@ -131,19 +131,8 @@ defmodule FastestMCP.ServerRuntime do
       {:ok, session_notification_supervisor} =
         SessionNotificationSupervisor.start_link()
 
-      {:ok, oauth_state_store} = StateStore.start_link(ttl_ms: oauth_state_ttl(opts))
-      {:ok, client_request_store} = StateStore.start_link(ttl_ms: client_request_ttl(opts))
-      {:ok, session_stream_store} = StateStore.start_link(ttl_ms: :infinity)
-      {:ok, oauth_client_store} = StateStore.start_link(ttl_ms: :infinity)
-
-      {:ok, oauth_authorization_code_store} =
-        StateStore.start_link(ttl_ms: oauth_authorization_code_ttl(opts))
-
-      access_token_ttl_ms = oauth_access_token_ttl(opts)
-      {:ok, oauth_access_token_store} = StateStore.start_link(ttl_ms: access_token_ttl_ms)
-
-      refresh_token_ttl_ms = oauth_refresh_token_ttl(opts)
-      {:ok, oauth_refresh_token_store} = StateStore.start_link(ttl_ms: refresh_token_ttl_ms)
+      {:ok, client_request_store} = TTLStore.start_link(ttl_ms: client_request_ttl(opts))
+      {:ok, session_stream_store} = TTLStore.start_link(ttl_ms: :infinity)
 
       Registry.register_server(server.name, self())
       Registry.register_components(server.name, Server.all_components(server))
@@ -165,14 +154,7 @@ defmodule FastestMCP.ServerRuntime do
          lifespan_context: lifespan_context,
          lifespan_cleanups: lifespan_cleanups,
          client_request_store: client_request_store,
-         session_stream_store: session_stream_store,
-         oauth_state_store: oauth_state_store,
-         oauth_client_store: oauth_client_store,
-         oauth_authorization_code_store: oauth_authorization_code_store,
-         oauth_access_token_store: oauth_access_token_store,
-         oauth_refresh_token_store: oauth_refresh_token_store,
-         oauth_access_token_ttl_ms: access_token_ttl_ms,
-         oauth_refresh_token_ttl_ms: refresh_token_ttl_ms
+         session_stream_store: session_stream_store
        }}
     else
       {:error, reason} ->
@@ -199,6 +181,7 @@ defmodule FastestMCP.ServerRuntime do
   @impl true
   @doc "Cleans up module state on shutdown."
   def terminate(_reason, state) do
+    terminate_session_streams(state)
     shutdown_server_runtime(Map.get(state, :server))
     Lifespan.cleanup_all(Map.get(state, :lifespan_cleanups, []))
     Registry.unregister_server(state.server.name)
@@ -378,78 +361,68 @@ defmodule FastestMCP.ServerRuntime do
     end
   end
 
-  defp oauth_state_ttl(opts) do
-    case Keyword.get(opts, :oauth_state_ttl, 5 * 60_000) do
-      value when is_integer(value) and value > 0 ->
-        value
-
-      other ->
-        raise ArgumentError,
-              "oauth_state_ttl must be a positive integer, got: #{inspect(other)}"
-    end
-  end
-
-  defp oauth_authorization_code_ttl(opts) do
-    case Keyword.get(opts, :oauth_authorization_code_ttl, 5 * 60_000) do
-      value when is_integer(value) and value > 0 ->
-        value
-
-      other ->
-        raise ArgumentError,
-              "oauth_authorization_code_ttl must be a positive integer, got: #{inspect(other)}"
-    end
-  end
-
-  defp oauth_access_token_ttl(opts) do
-    case Keyword.get(opts, :oauth_access_token_ttl, 60 * 60_000) do
-      value when is_integer(value) and value > 0 ->
-        value
-
-      other ->
-        raise ArgumentError,
-              "oauth_access_token_ttl must be a positive integer, got: #{inspect(other)}"
-    end
-  end
-
-  defp oauth_refresh_token_ttl(opts) do
-    case Keyword.get(opts, :oauth_refresh_token_ttl, :infinity) do
-      :infinity ->
-        :infinity
-
-      value when is_integer(value) and value > 0 ->
-        value
-
-      other ->
-        raise ArgumentError,
-              "oauth_refresh_token_ttl must be a positive integer or :infinity, got: #{inspect(other)}"
-    end
-  end
-
   defp materialize_server_runtime(%Server{} = server) do
-    %{
-      server
-      | middleware: Enum.map(server.middleware, &Middleware.activate_runtime/1),
-        providers: Enum.map(server.providers, &materialize_provider_runtime/1)
-    }
+    with {:ok, providers} <- materialize_provider_runtimes(server.providers) do
+      {:ok,
+       %{
+         server
+         | middleware: Enum.map(server.middleware, &Middleware.activate_runtime/1),
+           providers: providers
+       }}
+    end
+  end
+
+  defp materialize_provider_runtimes(providers) do
+    Enum.reduce_while(providers, {:ok, []}, fn provider, {:ok, acc} ->
+      case materialize_provider_runtime(provider) do
+        {:ok, materialized} -> {:cont, {:ok, [materialized | acc]}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:ok, providers} -> {:ok, Enum.reverse(providers)}
+      other -> other
+    end
   end
 
   defp materialize_provider_runtime(%Provider{} = provider) do
-    %{provider | inner: materialize_provider_inner(provider.inner)}
+    with {:ok, inner} <- materialize_provider_inner(provider.inner) do
+      {:ok, %{provider | inner: inner}}
+    end
   end
 
-  defp materialize_provider_runtime(provider), do: provider
+  defp materialize_provider_runtime(provider), do: {:ok, provider}
 
   defp materialize_provider_inner(%MountedServer{} = provider) do
-    %{provider | server: materialize_server_runtime(provider.server)}
+    with {:ok, lifespan_context, lifespan_cleanups} <-
+           Lifespan.run_all(provider.server, provider.server.lifespans),
+         {:ok, server} <- materialize_server_runtime(provider.server) do
+      {:ok,
+       %{
+         provider
+         | server: server,
+           lifespan_context: lifespan_context,
+           lifespan_cleanups: lifespan_cleanups
+       }}
+    else
+      {:error, reason} ->
+        {:error, reason}
+    end
   end
 
   defp materialize_provider_inner(%module{} = provider) do
     if function_exported?(module, :activate_runtime, 1) do
-      module.activate_runtime(provider)
+      case module.activate_runtime(provider) do
+        {:ok, activated} -> {:ok, activated}
+        {:error, reason} -> {:error, reason}
+        activated -> {:ok, activated}
+      end
     else
-      provider
+      {:ok, provider}
     end
   end
+
+  defp materialize_provider_inner(provider), do: {:ok, provider}
 
   defp shutdown_server_runtime(nil), do: :ok
 
@@ -464,6 +437,7 @@ defmodule FastestMCP.ServerRuntime do
 
   defp shutdown_provider_runtime(%MountedServer{} = provider) do
     shutdown_server_runtime(provider.server)
+    Lifespan.cleanup_all(provider.lifespan_cleanups || [])
   end
 
   defp shutdown_provider_runtime(%module{} = provider) do
@@ -475,4 +449,21 @@ defmodule FastestMCP.ServerRuntime do
   end
 
   defp shutdown_provider_runtime(_provider), do: :ok
+
+  defp terminate_session_streams(%{session_stream_store: store}) when is_pid(store) do
+    store
+    |> TTLStore.keys()
+    |> Enum.each(fn session_id ->
+      case TTLStore.get(store, session_id) do
+        {:ok, %{owner: owner}} when is_pid(owner) ->
+          send(owner, :session_stream_replaced)
+          TTLStore.delete(store, session_id)
+
+        _other ->
+          :ok
+      end
+    end)
+  end
+
+  defp terminate_session_streams(_state), do: :ok
 end

@@ -2,11 +2,10 @@
 
 FastestMCP is a BEAM-native MCP toolkit for Elixir.
 
-It keeps the useful FastMCP concepts familiar: tools, resources, prompts,
-middleware, auth, providers, background tasks, and streamable HTTP. The major
-difference is ownership. FastestMCP is built as an OTP system with supervised
-runtime trees, explicit request, session, and task lifetimes, and module-first
-server startup that fits normal Elixir applications.
+It includes MCP tools, resources, prompts, middleware, auth, providers,
+background tasks, and streamable HTTP. FastestMCP is built as an OTP system
+with supervised runtime trees, explicit request, session, and task lifetimes,
+and module-first server startup that fits normal Elixir applications.
 
 ## Installation
 
@@ -15,7 +14,7 @@ Add FastestMCP to your dependencies:
 ```elixir
 def deps do
   [
-    {:fastest_mcp, "~> 0.1.1"}
+    {:fastest_mcp, "~> 0.1.2"}
   ]
 end
 ```
@@ -98,7 +97,7 @@ FastestMCP keeps the public surface curated for the first Hex release.
 - `FastestMCP.Context`: explicit request, session, auth, and task context
 - `FastestMCP.RequestContext`: stable request snapshot derived from context
 - `FastestMCP.Client`: connected MCP client for streamable HTTP and stdio
-- `FastestMCP.Auth`: auth contract and shared provider wrapper
+- `FastestMCP.Auth`: auth contract and shared authenticator wrapper
 - `FastestMCP.Middleware`: built-in middleware constructors
 - `FastestMCP.Provider`: provider contract for mounted and dynamic surfaces
 - `FastestMCP.ComponentManager`: runtime mutation for live servers
@@ -145,10 +144,10 @@ FastestMCP currently ships:
 
 The main deferred items remain:
 
-- CLI parity
+- CLI tooling
 - cluster-aware runtime behavior
 - publishing automation after the first manual release path is proven
-- custom app or UI layer parity
+- custom app or UI layer
 
 Standalone SSE is intentionally unsupported. HTTP means streamable HTTP only.
 
@@ -168,6 +167,6 @@ FastestMCP is a good fit when:
 It is not the right choice yet if you need:
 
 - standalone SSE transport compatibility
-- FastMCP CLI parity
+- CLI tooling
 - distributed multi-node runtime behavior out of the box
 - a custom app or UI layer

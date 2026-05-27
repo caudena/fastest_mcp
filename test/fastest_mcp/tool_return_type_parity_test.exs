@@ -40,7 +40,7 @@ defmodule FastestMCP.ToolReturnTypeParityTest do
            } = FastestMCP.call_tool(server_name, "mixed_content", %{})
 
     assert Base.decode64!(encoded_image) == image_bytes
-    assert Jason.decode!(encoded_map) == %{"key" => "value"}
+    assert JSON.decode!(encoded_map) == %{"key" => "value"}
 
     assert ["apple", "banana", "cherry"] == FastestMCP.call_tool(server_name, "plain_list", %{})
   end
@@ -52,6 +52,7 @@ defmodule FastestMCP.ToolReturnTypeParityTest do
       FastestMCP.server(server_name)
       |> FastestMCP.add_tool("tuple_value", fn _args, _ctx -> {42, "hello", true} end)
       |> FastestMCP.add_tool("datetime_value", fn _args, _ctx -> ~U[2025-11-05 12:30:45Z] end)
+      |> FastestMCP.add_tool("range_value", fn _args, _ctx -> 1..3 end)
       |> FastestMCP.add_tool("explicit_envelope", fn _args, _ctx ->
         %{
           content: [%{type: "text", text: "hello"}],
@@ -63,6 +64,7 @@ defmodule FastestMCP.ToolReturnTypeParityTest do
 
     assert [42, "hello", true] == FastestMCP.call_tool(server_name, "tuple_value", %{})
     assert "2025-11-05T12:30:45Z" == FastestMCP.call_tool(server_name, "datetime_value", %{})
+    assert [1, 2, 3] == FastestMCP.call_tool(server_name, "range_value", %{})
 
     assert %{
              content: [%{type: "text", text: "hello"}],

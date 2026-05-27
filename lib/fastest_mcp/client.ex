@@ -728,7 +728,7 @@ defmodule FastestMCP.Client do
 
       case state.transport.type do
         :stdio ->
-          true = Port.command(state.transport.port, Jason.encode!(request) <> "\n")
+          true = Port.command(state.transport.port, JSON.encode!(request) <> "\n")
 
           entry = %{
             from: from,
@@ -1278,7 +1278,7 @@ defmodule FastestMCP.Client do
 
   defp normalize_target_statuses(opts) do
     case Keyword.get(opts, :status, Keyword.get(opts, :statuses)) do
-      nil -> MapSet.new(["completed", "failed", "cancelled"])
+      nil -> {:inactive, MapSet.new(["working", "submitted"])}
       value when is_binary(value) -> MapSet.new([value])
       value when is_atom(value) -> MapSet.new([to_string(value)])
       values when is_list(values) -> MapSet.new(Enum.map(values, &to_string/1))
@@ -1286,6 +1286,15 @@ defmodule FastestMCP.Client do
   end
 
   defp task_matches_target_status?(nil, _target_statuses), do: false
+
+  defp task_matches_target_status?(task, {:inactive, active_statuses}) do
+    status = task["status"] || task[:status]
+
+    case status do
+      nil -> false
+      status -> not MapSet.member?(active_statuses, to_string(status))
+    end
+  end
 
   defp task_matches_target_status?(task, target_statuses) do
     status = task["status"] || task[:status]
@@ -2026,7 +2035,7 @@ defmodule FastestMCP.Client do
 
   defp callback_cursor_start_index(tasks, cursor) when is_binary(cursor) and cursor != "" do
     with {:ok, decoded} <- Base.url_decode64(cursor, padding: false),
-         {:ok, %{"afterTaskId" => task_id}} <- Jason.decode(decoded),
+         {:ok, %{"afterTaskId" => task_id}} <- JSON.decode(decoded),
          index when is_integer(index) <- Enum.find_index(tasks, &(&1.id == task_id)) do
       {:ok, index + 1}
     else
@@ -2041,7 +2050,7 @@ defmodule FastestMCP.Client do
 
   defp encode_callback_task_cursor(task_id) do
     %{"afterTaskId" => task_id}
-    |> Jason.encode!()
+    |> JSON.encode!()
     |> Base.url_encode64(padding: false)
   end
 
@@ -2382,7 +2391,7 @@ defmodule FastestMCP.Client do
   end
 
   defp decode_jsonrpc_response(body) when is_binary(body) do
-    case Jason.decode(body) do
+    case JSON.decode(body) do
       {:ok, %{"result" => result}} ->
         {:ok, result}
 
@@ -2398,7 +2407,7 @@ defmodule FastestMCP.Client do
          }}
 
       {:error, error} ->
-        {:error, %Error{code: :internal_error, message: Exception.message(error)}}
+        {:error, %Error{code: :internal_error, message: json_decode_error_message(error)}}
     end
   end
 
@@ -2489,7 +2498,7 @@ defmodule FastestMCP.Client do
     if data == "" do
       nil
     else
-      Jason.decode!(data)
+      JSON.decode!(data)
     end
   end
 
@@ -2510,7 +2519,7 @@ defmodule FastestMCP.Client do
   end
 
   defp start_stream_http_request(request, timeout_ms, state, opts, profile) do
-    request_body = Jason.encode!(request)
+    request_body = JSON.encode!(request)
 
     headers =
       transport_headers(
@@ -2658,7 +2667,7 @@ defmodule FastestMCP.Client do
               cancel_timer(timer_ref)
 
               result =
-                case Jason.decode(line) do
+                case JSON.decode(line) do
                   {:ok, %{"ok" => true, "result" => result}} ->
                     {:ok, normalize_response(normalizer, result)}
 
@@ -2674,7 +2683,7 @@ defmodule FastestMCP.Client do
                     {:error,
                      %Error{
                        code: :internal_error,
-                       message: Exception.message(error),
+                       message: json_decode_error_message(error),
                        details: %{line: line}
                      }}
                 end
@@ -2736,14 +2745,12 @@ defmodule FastestMCP.Client do
   defp normalize_response(:task_result, result), do: result
 
   defp normalize_response(:tool_call, %{"task" => _task} = result), do: result
+  defp normalize_response(:tool_call, %{"isError" => true} = result), do: result
 
   defp normalize_response(:tool_call, %{"structuredContent" => structured} = result)
        when not is_nil(structured) do
     cond do
       Map.has_key?(result, "meta") ->
-        result
-
-      Map.has_key?(result, "isError") ->
         result
 
       tool_result_mirrors_structured_content?(result["content"], structured) ->
@@ -2807,11 +2814,13 @@ defmodule FastestMCP.Client do
   end
 
   defp decode_json_if_possible(text) when is_binary(text) do
-    case Jason.decode(text) do
+    case JSON.decode(text) do
       {:ok, decoded} -> decoded
       {:error, _reason} -> text
     end
   end
+
+  defp json_decode_error_message(error), do: "invalid JSON: #{inspect(error)}"
 
   defp ensure_http_path(%URI{path: nil} = uri), do: %{uri | path: "/mcp"}
   defp ensure_http_path(%URI{path: ""} = uri), do: %{uri | path: "/mcp"}

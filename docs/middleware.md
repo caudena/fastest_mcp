@@ -96,6 +96,31 @@ The response cache is local to the runtime in v0.1. See
 [Runtime State and Storage](runtime-state-and-storage.md) for the current
 storage model.
 
+## Error Handling
+
+Error handling middleware accepts one-arity loggers that receive a message or
+two-arity loggers that receive `{level, message}`:
+
+```elixir
+FastestMCP.Middleware.error_handling(
+  logger: fn level, message ->
+    Logger.log(level, message)
+  end
+)
+```
+
+Explicit `%FastestMCP.Error{}` values can choose their log level:
+
+```elixir
+raise FastestMCP.Error,
+  code: :invalid_params,
+  message: "missing required input",
+  log_level: :warning
+```
+
+Normalized errors are logged without traceback noise. Unexpected exceptions
+still include traceback details when `include_traceback: true` is configured.
+
 ## Synthetic Tool Surfaces
 
 Middleware can also inject tools into the catalog.

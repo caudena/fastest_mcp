@@ -1,28 +1,27 @@
 # Why FastestMCP
 
-FastestMCP aims for replacement-grade MCP server compatibility without turning
-Elixir code into a Python-shaped runtime.
+FastestMCP aims for MCP server compatibility while keeping runtime ownership,
+failure handling, and integration native to Elixir and OTP.
 
 ## Design Rules
 
 - compatibility is the default
-- divergence is allowed when Python's contract would fight OTP, explicit
+- divergence is allowed when a convention would fight OTP, explicit
   failure semantics, or normal Elixir application structure
-- public Elixir APIs stay idiomatic even when the underlying MCP contract is
-  Python-derived
+- public Elixir APIs stay idiomatic while preserving the underlying MCP contract
 - runtime ownership stays inside supervised Elixir processes
 
-## What Changed from FastMCP
+## Runtime Choices
 
-| Topic | FastMCP shape | FastestMCP shape |
-| --- | --- | --- |
-| Server startup | constructor and app oriented | `use FastestMCP.ServerModule` with generated `child_spec/1`, `start_link/1`, and `base_server/1` |
-| Runtime model | framework process oriented | OTP-first with per-server runtime trees, supervised workers, and crash isolation |
-| Context access | signature rewriting and injected helpers | explicit `%FastestMCP.Context{}` passed to handlers |
-| HTTP integration | Starlette and ASGI first | Plug-first via `FastestMCP.http_app/2` and transport child specs |
-| Client shape | convenience wrappers | connected `FastestMCP.Client` GenServer with negotiated session ownership |
-| Dynamic components | app and provider management | internal `FastestMCP.ComponentManager` GenServer provider |
-| Streaming | deprecated SSE history | streamable HTTP only; no standalone SSE transport |
+| Topic | FastestMCP shape |
+| --- | --- |
+| Server startup | `use FastestMCP.ServerModule` with generated `child_spec/1`, `start_link/1`, and `base_server/1` |
+| Runtime model | OTP-first with per-server runtime trees, supervised workers, and crash isolation |
+| Context access | explicit `%FastestMCP.Context{}` passed to handlers |
+| HTTP integration | Plug-first via `FastestMCP.http_app/2` and transport child specs |
+| Client shape | connected `FastestMCP.Client` GenServer with negotiated session ownership |
+| Dynamic components | internal `FastestMCP.ComponentManager` GenServer provider |
+| Streaming | streamable HTTP only; no standalone SSE transport |
 
 ## The Core Decisions
 
@@ -35,9 +34,9 @@ have.
 
 ### Explicit context
 
-FastestMCP does not rewrite handler signatures. Request state, session state,
-principal data, auth details, and task metadata all live on
-`FastestMCP.Context`, which makes lifetimes and failure modes visible.
+Request state, session state, principal data, auth details, and task metadata
+all live on `FastestMCP.Context`, which makes lifetimes and failure modes
+visible.
 
 ### One operation pipeline
 
@@ -61,6 +60,5 @@ system does the real work somewhere else.
 ## Why This Shape
 
 The goal is not novelty. The goal is to preserve the MCP contract while making
-the runtime feel native to Elixir. When the Python surface and OTP agree,
-FastestMCP follows it. When they disagree, FastestMCP keeps the protocol and
-changes the seam.
+the runtime feel native to Elixir. Protocol behavior stays stable while runtime
+ownership follows OTP conventions.
