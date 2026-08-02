@@ -98,11 +98,7 @@ defmodule FastestMCP.Transport.HTTPCommon do
   end
 
   defp error_status_and_headers(%Error{code: :overloaded} = error, _auth, _http_context) do
-    headers =
-      case retry_after_header(error.details) || "1" do
-        nil -> []
-        value -> [{"retry-after", value}]
-      end
+    headers = [{"retry-after", retry_after_header(error.details) || "1"}]
 
     {503, headers}
   end

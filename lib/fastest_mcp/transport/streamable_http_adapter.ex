@@ -496,8 +496,6 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
     |> Map.get("progressToken")
   end
 
-  defp progress_token(_payload), do: nil
-
   defp batch_request_id(payload) when is_map(payload), do: Map.get(payload, "id")
   defp batch_request_id(_payload), do: nil
 

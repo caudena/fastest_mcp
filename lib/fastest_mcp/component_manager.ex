@@ -180,9 +180,6 @@ defmodule FastestMCP.ComponentManager do
          {:ok, pid} <- {:ok, manager.pid} do
       GenServer.call(pid, {:resource_target, to_string(uri), version})
     else
-      nil ->
-        nil
-
       component ->
         {:exact, component, %{}}
     end

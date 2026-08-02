@@ -334,12 +334,6 @@ defmodule FastestMCP.OperationPipeline do
 
       {:error, %Error{} = error} ->
         raise error
-
-      {:error, reason} ->
-        raise Error,
-          code: :internal_error,
-          message: "failed to build operation context",
-          details: %{reason: inspect(reason)}
     end
   end
 

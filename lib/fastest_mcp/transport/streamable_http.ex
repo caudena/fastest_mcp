@@ -112,9 +112,6 @@ defmodule FastestMCP.Transport.StreamableHTTP do
       {:error, %Error{} = error, auth, http_context} ->
         HTTPCommon.render_error(conn, error, auth, http_context)
 
-      {:error, %Error{} = error} ->
-        HTTPCommon.render_error(conn, error, nil, HTTPCommon.http_context(conn, %{}, opts))
-
       {:error, error} ->
         HTTPCommon.json(conn, 500, %{
           error: %{code: :internal_error, message: Exception.message(error)}
@@ -236,14 +233,6 @@ defmodule FastestMCP.Transport.StreamableHTTP do
 
       {:error, %Error{} = error} ->
         {:error, request, error}
-
-      {:error, reason} ->
-        {:error, request,
-         %Error{
-           code: :internal_error,
-           message: "failed to open streamable HTTP session",
-           details: %{reason: inspect(reason)}
-         }}
     end
   end
 

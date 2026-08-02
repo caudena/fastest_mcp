@@ -220,7 +220,7 @@ defmodule FastestMCP.Providers.Skills.Common do
 
   defp sha256_file(path) do
     path
-    |> File.stream!([], 8192)
+    |> File.stream!(8192, [])
     |> Enum.reduce(:crypto.hash_init(:sha256), &:crypto.hash_update(&2, &1))
     |> :crypto.hash_final()
     |> Base.encode16(case: :lower)

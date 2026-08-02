@@ -407,7 +407,7 @@ defmodule FastestMCP.StreamableHTTPEventStreamTest do
   defp decode_chunked_body(body, acc) do
     [size_hex, rest] = String.split(body, "\r\n", parts: 2)
     {size, ""} = Integer.parse(size_hex, 16)
-    <<chunk::binary-size(size), "\r\n", remainder::binary>> = rest
+    <<chunk::binary-size(^size), "\r\n", remainder::binary>> = rest
     decode_chunked_body(remainder, acc <> chunk)
   end
 
@@ -453,7 +453,7 @@ defmodule FastestMCP.StreamableHTTPEventStreamTest do
             {acc, ""}
 
           {size, ""} when byte_size(rest) >= size + 2 ->
-            <<chunk::binary-size(size), "\r\n", remainder::binary>> = rest
+            <<chunk::binary-size(^size), "\r\n", remainder::binary>> = rest
             decode_available_chunked_body(remainder, acc <> chunk)
 
           _other ->

@@ -150,6 +150,15 @@ defmodule FastestMCP.MixProject do
           FastestMCP.Resources.Text
         ]
       ],
+      skip_code_autolink_to: [
+        "FastestMCP.Auth.Result",
+        "FastestMCP.Auth.StaticToken",
+        "FastestMCP.BackgroundTaskStore",
+        "FastestMCP.EventBus",
+        "FastestMCP.HTTP.request/3",
+        "FastestMCP.TaskBackend",
+        "FastestMCP.TaskBackend.Memory"
+      ],
       filter_modules: fn module, _metadata -> module in public_modules end
     ]
   end

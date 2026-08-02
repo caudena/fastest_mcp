@@ -131,12 +131,6 @@ defmodule FastestMCP.TaskOwner do
     Map.get(value, key, Map.get(value, to_string(key)))
   end
 
-  defp map_value(%_{} = value, key) do
-    value
-    |> Map.from_struct()
-    |> map_value(key)
-  end
-
   defp map_value(_value, _key), do: nil
 
   defp present?(value), do: not is_nil(value) and to_string(value) != ""

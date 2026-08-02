@@ -413,12 +413,6 @@ defmodule FastestMCP.Transport.Engine do
 
       {:error, %Error{} = error} ->
         raise error
-
-      {:error, reason} ->
-        raise Error,
-          code: :internal_error,
-          message: "failed to prepare task access context",
-          details: %{reason: inspect(reason), session_id: session_id}
     end
   end
 

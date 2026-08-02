@@ -378,7 +378,7 @@ defmodule FastestMCP.Server do
 
     case duplicate_match(existing_components, component) do
       nil ->
-        Map.update!(server, key, &(&1 ++ [component]))
+        Map.put(server, key, existing_components ++ [component])
 
       _match ->
         apply_duplicate_policy(server, key, component)

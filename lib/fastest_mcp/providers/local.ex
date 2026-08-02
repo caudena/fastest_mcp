@@ -138,7 +138,7 @@ defmodule FastestMCP.Providers.Local do
 
     case duplicate_match(components, component) do
       nil ->
-        Map.update!(provider, key, &(&1 ++ [component]))
+        Map.put(provider, key, components ++ [component])
 
       _match ->
         apply_duplicate_policy(provider, key, component)
