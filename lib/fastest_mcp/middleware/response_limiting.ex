@@ -14,6 +14,8 @@ defmodule FastestMCP.Middleware.ResponseLimiting do
   require Logger
 
   alias FastestMCP.Operation
+  alias FastestMCP.OperationPipeline
+  alias FastestMCP.Transport.Serializer
 
   @default_suffix "\n\n[Response truncated due to size limit]"
 
@@ -39,6 +41,13 @@ defmodule FastestMCP.Middleware.ResponseLimiting do
 
     if not (is_integer(max_size) and max_size > 0) do
       raise ArgumentError, "max_size must be positive, got #{inspect(max_size)}"
+    end
+
+    minimum_size = minimum_result_size()
+
+    if max_size < minimum_size do
+      raise ArgumentError,
+            "max_size must be at least #{minimum_size} bytes to encode a valid tool result, got #{max_size}"
     end
 
     middleware = %__MODULE__{
@@ -79,7 +88,8 @@ defmodule FastestMCP.Middleware.ResponseLimiting do
   end
 
   defp maybe_limit_result(%__MODULE__{} = middleware, %Operation{} = operation, result) do
-    serialized = JSON.encode!(result)
+    component = operation.component || resolved_component(operation.context)
+    serialized = result |> Serializer.tool_result(component) |> JSON.encode!()
 
     if byte_size(serialized) <= middleware.max_size do
       result
@@ -163,9 +173,18 @@ defmodule FastestMCP.Middleware.ResponseLimiting do
   defp encoded_result_size(text, metadata) do
     text
     |> limited_result(metadata)
+    |> Serializer.tool_result()
     |> JSON.encode!()
     |> byte_size()
   end
+
+  defp minimum_result_size, do: encoded_result_size("", %{})
+
+  defp resolved_component(%FastestMCP.Context{} = context) do
+    OperationPipeline.resolved_component(context)
+  end
+
+  defp resolved_component(_context), do: nil
 
   defp limited_result(text, metadata) do
     Map.merge(%{"content" => [%{"type" => "text", "text" => text}]}, metadata)

@@ -1,10 +1,9 @@
 defmodule FastestMCP.TaskSpecParityTest do
   use ExUnit.Case, async: false
 
-  import Plug.Test
-
   alias FastestMCP.Auth.Result
   alias FastestMCP.Error
+  alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
   alias FastestMCP.Tools.Result, as: ToolResult
   alias FastestMCP.Transport.Engine
   alias FastestMCP.Transport.Request
@@ -269,22 +268,25 @@ defmodule FastestMCP.TaskSpecParityTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
+    {session_id, _initialize_response, initialized_response} =
+      ProtocolTest.initialize_http(server_name)
+
+    assert initialized_response.status == 202
+
     response =
-      conn(:post, "/mcp", "")
-      |> Map.put(:body_params, %{
-        "jsonrpc" => "2.0",
-        "id" => 1,
-        "method" => "tasks/get",
-        "params" => %{"taskId" => "task-missing"}
+      ProtocolTest.http_request(server_name, session_id, 1, "tasks/get", %{
+        "taskId" => "task-missing"
       })
-      |> Plug.Conn.put_req_header("content-type", "application/json")
-      |> Plug.Conn.put_req_header("mcp-session-id", "jsonrpc-session")
-      |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
 
     assert response.status == 400
 
     assert %{
-             "error" => %{"code" => -32602, "message" => "Invalid taskId: task-missing not found"}
+             "jsonrpc" => "2.0",
+             "id" => 1,
+             "error" => %{
+               "code" => -32602,
+               "message" => "Invalid taskId: task-missing not found"
+             }
            } = JSON.decode!(response.resp_body)
   end
 end

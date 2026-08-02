@@ -4,12 +4,66 @@ defmodule FastestMCP.HTTPAppTest do
   import Plug.Conn
   import Plug.Test
 
+  alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
+  alias FastestMCP.Transport.HTTPApp
+
+  test "http child spec defaults to loopback and forwards Bandit options" do
+    server_name = "http-child-spec-#{System.unique_integer([:positive])}"
+    forwarded_options = [startup_log: false, thousand_island_options: [num_acceptors: 3]]
+
+    assert %{
+             id: {HTTPApp, ^server_name, 4_101},
+             start: {Bandit, :start_link, [bandit_options]}
+           } =
+             FastestMCP.streamable_http_child_spec(server_name,
+               port: 4_101,
+               bandit_options: forwarded_options
+             )
+
+    assert Keyword.fetch!(bandit_options, :ip) == :loopback
+    assert Keyword.fetch!(bandit_options, :scheme) == :http
+    assert Keyword.fetch!(bandit_options, :port) == 4_101
+    assert Keyword.fetch!(bandit_options, :startup_log) == false
+    assert Keyword.fetch!(bandit_options, :thousand_island_options) == [num_acceptors: 3]
+
+    assert {HTTPApp, plug_options} = Keyword.fetch!(bandit_options, :plug)
+    assert Keyword.fetch!(plug_options, :server_name) == server_name
+    assert Keyword.fetch!(plug_options, :bandit_options) == forwarded_options
+  end
+
+  test "http child spec validates external listener host protection" do
+    server_name = "http-external-listener-#{System.unique_integer([:positive])}"
+
+    assert_raise ArgumentError,
+                 "external HTTP listeners require a concrete allowed_hosts list",
+                 fn ->
+                   FastestMCP.streamable_http_child_spec(server_name,
+                     bandit_options: [ip: {0, 0, 0, 0}]
+                   )
+                 end
+
+    for protection <- [
+          [allowed_hosts: ["mcp.example.com"]],
+          [unsafe_allow_any_host: true]
+        ] do
+      child_spec =
+        FastestMCP.streamable_http_child_spec(
+          server_name,
+          Keyword.merge([bandit_options: [ip: {0, 0, 0, 0}]], protection)
+        )
+
+      assert %{start: {Bandit, :start_link, [bandit_options]}} = child_spec
+      assert Keyword.fetch!(bandit_options, :ip) == {0, 0, 0, 0}
+    end
+  end
+
   test "http app applies custom middleware to custom routes" do
     server_name = "http-app-routes-" <> Integer.to_string(System.unique_integer([:positive]))
     assert {:ok, _pid} = FastestMCP.start_server(FastestMCP.server(server_name))
 
     app =
       FastestMCP.http_app(server_name,
+        unsafe_allow_any_host: true,
         middleware: [
           fn conn, next ->
             conn
@@ -35,6 +89,7 @@ defmodule FastestMCP.HTTPAppTest do
 
     app =
       FastestMCP.http_app(server_name,
+        unsafe_allow_any_host: true,
         middleware: [
           fn conn, next ->
             conn
@@ -67,6 +122,8 @@ defmodule FastestMCP.HTTPAppTest do
 
     app =
       FastestMCP.http_app(server_name,
+        unsafe_allow_any_host: true,
+        json_response: true,
         middleware: [
           fn conn, next ->
             conn
@@ -76,21 +133,28 @@ defmodule FastestMCP.HTTPAppTest do
         ]
       )
 
+    session_id = initialize_app(app)
+
     response =
-      conn(
-        :post,
-        "/mcp/tools/call",
-        JSON.encode!(%{"name" => "echo", "arguments" => %{}})
+      app_request(
+        app,
+        ProtocolTest.jsonrpc_request(2, "tools/call", %{
+          "name" => "echo",
+          "arguments" => %{}
+        }),
+        session_id
       )
-      |> put_req_header("content-type", "application/json")
-      |> app.()
 
     assert response.status == 200
     assert get_resp_header(response, "x-transport-middleware") == ["applied"]
 
     assert %{
-             "content" => [%{"type" => "text", "text" => "{}"}],
-             "structuredContent" => %{}
+             "jsonrpc" => "2.0",
+             "id" => 2,
+             "result" => %{
+               "content" => [%{"type" => "text", "text" => "{}"}],
+               "structuredContent" => %{}
+             }
            } = JSON.decode!(response.resp_body)
   end
 
@@ -103,7 +167,12 @@ defmodule FastestMCP.HTTPAppTest do
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
 
-    app = FastestMCP.http_app(server_name, stateless_http: true)
+    app =
+      FastestMCP.http_app(server_name,
+        stateless_http: true,
+        unsafe_allow_any_host: true,
+        json_response: true
+      )
 
     get_response = conn(:get, "/mcp") |> app.()
     assert get_response.status == 405
@@ -120,6 +189,8 @@ defmodule FastestMCP.HTTPAppTest do
         })
       )
       |> put_req_header("content-type", "application/json")
+      |> put_req_header("accept", "application/json, text/event-stream")
+      |> put_req_header("mcp-protocol-version", ProtocolTest.protocol_version())
       |> app.()
 
     assert post_response.status == 200
@@ -148,11 +219,12 @@ defmodule FastestMCP.HTTPAppTest do
           "jsonrpc" => "2.0",
           "id" => 1,
           "method" => "initialize",
-          "params" => %{"clientInfo" => %{"name" => "dns-test"}}
+          "params" => ProtocolTest.initialize_params()
         })
       )
       |> Map.put(:host, "evil.example.com")
       |> put_req_header("content-type", "application/json")
+      |> put_req_header("accept", "application/json, text/event-stream")
       |> put_req_header("origin", "http://evil.example.com")
       |> app.()
 
@@ -166,11 +238,12 @@ defmodule FastestMCP.HTTPAppTest do
           "jsonrpc" => "2.0",
           "id" => 2,
           "method" => "initialize",
-          "params" => %{"clientInfo" => %{"name" => "dns-test"}}
+          "params" => ProtocolTest.initialize_params()
         })
       )
       |> Map.put(:host, "127.0.0.1")
       |> put_req_header("content-type", "application/json")
+      |> put_req_header("accept", "application/json, text/event-stream")
       |> put_req_header("origin", "http://127.0.0.1:4000")
       |> app.()
 
@@ -183,6 +256,7 @@ defmodule FastestMCP.HTTPAppTest do
 
     app =
       FastestMCP.http_app(server_name,
+        unsafe_allow_any_host: true,
         middleware: [
           fn conn, next ->
             conn
@@ -211,5 +285,42 @@ defmodule FastestMCP.HTTPAppTest do
     conn
     |> put_resp_content_type("application/json")
     |> send_resp(status, JSON.encode!(payload))
+  end
+
+  defp initialize_app(app) do
+    initialize_response =
+      app_request(
+        app,
+        ProtocolTest.jsonrpc_request(1, "initialize", ProtocolTest.initialize_params())
+      )
+
+    assert initialize_response.status == 200
+    [session_id] = get_resp_header(initialize_response, "mcp-session-id")
+
+    initialized_response =
+      app_request(
+        app,
+        ProtocolTest.jsonrpc_notification("notifications/initialized"),
+        session_id
+      )
+
+    assert initialized_response.status == 202
+    session_id
+  end
+
+  defp app_request(app, payload, session_id \\ nil) do
+    conn(:post, "/mcp", JSON.encode!(payload))
+    |> put_req_header("content-type", "application/json")
+    |> put_req_header("accept", "application/json, text/event-stream")
+    |> maybe_put_session_headers(session_id)
+    |> app.()
+  end
+
+  defp maybe_put_session_headers(conn, nil), do: conn
+
+  defp maybe_put_session_headers(conn, session_id) do
+    conn
+    |> put_req_header("mcp-session-id", session_id)
+    |> put_req_header("mcp-protocol-version", ProtocolTest.protocol_version())
   end
 end

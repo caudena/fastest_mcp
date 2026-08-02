@@ -10,6 +10,8 @@ defmodule FastestMCP.ResultNormalizer do
   module indirectly through higher-level APIs rather than calling it first.
   """
 
+  alias FastestMCP.Error
+  alias FastestMCP.JSONValue
   alias FastestMCP.Tools.Result, as: ToolResult
 
   @content_block_types MapSet.new(["text", "image", "audio", "resource", "resource_link"])
@@ -68,10 +70,11 @@ defmodule FastestMCP.ResultNormalizer do
                  :structuredContent,
                  "structuredContent",
                  :structured_content,
-                 "structured_content",
-                 :data,
-                 "data"
+                 "structured_content"
                ] ->
+            normalize_structured_content!(field_value)
+
+          key when key in [:data, "data"] ->
             normalize_json_value(field_value)
 
           _other ->
@@ -89,12 +92,10 @@ defmodule FastestMCP.ResultNormalizer do
   defp normalize_content_payload(value), do: [normalize_content_item(value)]
 
   defp content_list?(value) when is_list(value) do
-    value != [] and Enum.any?(value, &content_block?/1) and Enum.all?(value, &content_item?/1)
+    value != [] and Enum.any?(value, &content_block?/1)
   end
 
   defp content_list?(_value), do: false
-
-  defp content_item?(value), do: content_block?(value) or true
 
   defp content_block?(%{} = value) do
     value
@@ -150,75 +151,22 @@ defmodule FastestMCP.ResultNormalizer do
 
   defp normalize_resource_content(value), do: normalize_json_value(value)
 
-  defp normalize_json_value(%DateTime{} = value), do: DateTime.to_iso8601(value)
-  defp normalize_json_value(%NaiveDateTime{} = value), do: NaiveDateTime.to_iso8601(value)
-  defp normalize_json_value(%Date{} = value), do: Date.to_iso8601(value)
-  defp normalize_json_value(%Time{} = value), do: Time.to_iso8601(value)
-  defp normalize_json_value(%URI{} = value), do: URI.to_string(value)
+  defp normalize_json_value(value), do: JSONValue.normalize(value)
 
-  defp normalize_json_value(%MapSet{} = value) do
-    value
-    |> MapSet.to_list()
-    |> Enum.map(&normalize_json_value/1)
-    |> Enum.sort_by(&inspect/1)
+  defp normalize_structured_content!(nil), do: nil
+  defp normalize_structured_content!(%{} = value), do: normalize_json_value(value)
+
+  defp normalize_structured_content!(_value) do
+    raise Error,
+      code: :internal_error,
+      message: "tool structuredContent must be an object"
   end
-
-  defp normalize_json_value(value) when is_tuple(value) do
-    value
-    |> Tuple.to_list()
-    |> Enum.map(&normalize_json_value/1)
-  end
-
-  defp normalize_json_value(value) when is_list(value) do
-    Enum.map(value, &normalize_json_value/1)
-  end
-
-  defp normalize_json_value(%_{} = value) do
-    case finite_enumerable_to_list(value) do
-      {:ok, list} ->
-        Enum.map(list, &normalize_json_value/1)
-
-      :error ->
-        value
-        |> Map.from_struct()
-        |> normalize_json_map()
-    end
-  end
-
-  defp normalize_json_value(value) when is_map(value), do: normalize_json_map(value)
-
-  defp normalize_json_value(value) when is_binary(value) do
-    if String.valid?(value), do: value, else: Base.encode64(value)
-  end
-
-  defp normalize_json_value(value), do: value
-
-  defp normalize_json_map(map) do
-    Enum.into(map, %{}, fn {key, value} ->
-      {normalize_json_key(key), normalize_json_value(value)}
-    end)
-  end
-
-  defp normalize_json_key(key)
-       when is_atom(key) or is_binary(key) or is_integer(key) or is_float(key) or is_boolean(key),
-       do: key
-
-  defp normalize_json_key(key), do: inspect(key)
 
   defp normalize_binary_field(value) when is_binary(value) do
     if String.valid?(value), do: value, else: Base.encode64(value)
   end
 
   defp normalize_binary_field(value), do: normalize_json_value(value)
-
-  defp finite_enumerable_to_list(value) do
-    case Enumerable.count(value) do
-      {:ok, _count} -> {:ok, Enum.to_list(value)}
-      {:error, _module} -> :error
-    end
-  rescue
-    Protocol.UndefinedError -> :error
-  end
 
   defp stringify_content(value) do
     normalized = normalize_json_value(value)

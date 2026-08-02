@@ -154,9 +154,9 @@ The request snapshot also exposes the active transport:
 ```elixir
 FastestMCP.add_tool(server, "connection_info", fn _arguments, ctx ->
   case FastestMCP.Context.request_context(ctx).transport do
-    "stdio" -> "Connected via STDIO"
-    "sse" -> "Connected via SSE"
-    "streamable-http" -> "Connected via Streamable HTTP"
+    :stdio -> "Connected via stdio"
+    :streamable_http -> "Connected via streamable HTTP"
+    :in_process -> "Called in process"
     other -> "Connected via #{other || "unknown"}"
   end
 end)
@@ -213,7 +213,12 @@ server =
 ```
 
 Use session state when the value belongs to the client conversation, not to one
-request and not to the whole server.
+request and not to the whole server. Stateful HTTP, stdio, and normal in-process
+calls use `ctx.state_scope == :session`.
+
+Stateless HTTP uses `ctx.state_scope == :request` and `ctx.session_id == nil`.
+In that mode, `set_state/4`, `get_state/3`, and `delete_state/2` operate only on
+request-local storage; they never create or write a session backend entry.
 
 FastestMCP exposes three related APIs:
 

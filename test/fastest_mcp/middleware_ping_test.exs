@@ -1,13 +1,12 @@
 defmodule FastestMCP.MiddlewarePingTest do
   use ExUnit.Case, async: false
 
-  import Plug.Conn
-  import Plug.Test
-
   alias FastestMCP.EventBus
   alias FastestMCP.Middleware
   alias FastestMCP.Middleware.Ping
   alias FastestMCP.ServerRuntime
+  alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
+  alias FastestMCP.Transport.StdioAdapter
 
   test "ping middleware starts one loop per stdio session and cleans up when the session expires" do
     middleware = Middleware.ping(interval_ms: 10)
@@ -25,33 +24,38 @@ defmodule FastestMCP.MiddlewarePingTest do
     assert {:ok, runtime} = ServerRuntime.fetch(server_name)
     assert :ok = EventBus.subscribe(runtime.event_bus, server_name)
 
-    response =
-      FastestMCP.stdio_dispatch(server_name, %{
-        "method" => "tools/call",
-        "params" => %{
-          "name" => "echo",
-          "arguments" => %{"message" => "hello"},
-          "session_id" => "stdio-session"
-        }
-      })
+    {connection_id, _initialize_response} = ProtocolTest.initialize_stdio(server_name)
 
-    assert response["ok"] == true
+    {:ok, %{session_id: session_id}} =
+      StdioAdapter.decode(ProtocolTest.jsonrpc_request(99, "ping"),
+        connection_id: connection_id
+      )
+
+    response =
+      ProtocolTest.stdio_request(
+        server_name,
+        connection_id,
+        2,
+        "tools/call",
+        %{"name" => "echo", "arguments" => %{"message" => "hello"}}
+      )
+
+    assert response["jsonrpc"] == "2.0"
 
     assert_receive {:fastest_mcp_event, ^server_name, [:session, :ping], %{system_time: _},
-                    %{session_id: "stdio-session", transport: :stdio}},
+                    %{session_id: ^session_id, transport: :stdio}},
                    200
 
-    assert MapSet.member?(Ping.active_sessions(middleware), {server_name, "stdio-session"})
+    assert MapSet.member?(Ping.active_sessions(middleware), {server_name, session_id})
 
     _response =
-      FastestMCP.stdio_dispatch(server_name, %{
-        "method" => "tools/call",
-        "params" => %{
-          "name" => "echo",
-          "arguments" => %{"message" => "again"},
-          "session_id" => "stdio-session"
-        }
-      })
+      ProtocolTest.stdio_request(
+        server_name,
+        connection_id,
+        3,
+        "tools/call",
+        %{"name" => "echo", "arguments" => %{"message" => "again"}}
+      )
 
     assert MapSet.size(Ping.active_sessions(middleware)) == 1
 
@@ -82,23 +86,27 @@ defmodule FastestMCP.MiddlewarePingTest do
 
     assert MapSet.size(Ping.active_sessions(middleware)) == 0
 
+    {session_id, _initialize_response, initialized_response} =
+      ProtocolTest.initialize_http(server_name)
+
+    assert initialized_response.status == 202
+
     conn =
-      conn(
-        :post,
-        "/mcp/tools/call",
-        JSON.encode!(%{"name" => "echo", "arguments" => %{"message" => "http"}})
+      ProtocolTest.http_request(
+        server_name,
+        session_id,
+        2,
+        "tools/call",
+        %{"name" => "echo", "arguments" => %{"message" => "http"}}
       )
-      |> put_req_header("content-type", "application/json")
-      |> put_req_header("x-fastestmcp-session", "http-session")
-      |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
 
     assert conn.status == 200
 
     assert_receive {:fastest_mcp_event, ^server_name, [:session, :ping], %{system_time: _},
-                    %{session_id: "http-session", transport: :streamable_http}},
+                    %{session_id: ^session_id, transport: :streamable_http}},
                    200
 
-    assert MapSet.member?(Ping.active_sessions(middleware), {server_name, "http-session"})
+    assert MapSet.member?(Ping.active_sessions(middleware), {server_name, session_id})
   end
 
   test "ping close is safe after the state process already exits" do

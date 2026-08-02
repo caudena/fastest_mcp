@@ -20,9 +20,10 @@ defmodule FastestMCP.TaskBackend do
   @callback start_link(opts :: keyword()) :: GenServer.on_start()
   @callback put_task(store :: store_ref(), task()) :: :ok | {:error, term()}
   @callback fetch_task(store :: store_ref(), task_id :: String.t(), opts :: keyword()) ::
-              {:ok, task()} | :error
+              {:ok, task()} | {:error, :not_found | term()}
   @callback delete_task(store :: store_ref(), task_id :: String.t()) :: :ok | {:error, term()}
   @callback list_tasks(store :: store_ref(), opts :: keyword()) ::
               {:ok, list_result()} | {:error, term()}
-  @callback expire_tasks(store :: store_ref(), now_ms :: integer()) :: [String.t()]
+  @callback expire_tasks(store :: store_ref(), now_ms :: integer()) ::
+              {:ok, [String.t()]} | {:error, term()}
 end

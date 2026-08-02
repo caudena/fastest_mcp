@@ -1,4 +1,6 @@
 defmodule FastestMCP.Component do
+  require Logger
+
   @moduledoc """
   Shared helpers for component metadata, lookup identifiers, version ordering, and
   result normalization.
@@ -29,6 +31,8 @@ defmodule FastestMCP.Component do
   alias FastestMCP.Telemetry
   alias FastestMCP.Tools.Result, as: ToolResult
   alias FastestMCP.Tools.OutputSchema
+
+  @duplicate_policies [:error, :warn, :ignore, :replace]
 
   @doc "Returns the component or provider type."
   def type(%Tool{}), do: :tool
@@ -97,6 +101,49 @@ defmodule FastestMCP.Component do
           left < right -> :lt
           true -> :eq
         end
+    end
+  end
+
+  @doc false
+  def sort_by_version_desc(components) when is_list(components) do
+    sort_by_version_desc(components, &version/1)
+  end
+
+  @doc false
+  def sort_by_version_desc(items, version_fun)
+      when is_list(items) and is_function(version_fun, 1) do
+    items
+    |> Enum.with_index()
+    |> Enum.sort(fn {left, left_index}, {right, right_index} ->
+      case compare_versions(version_fun.(left), version_fun.(right)) do
+        :gt -> true
+        :lt -> false
+        :eq -> left_index < right_index
+      end
+    end)
+    |> Enum.map(&elem(&1, 0))
+  end
+
+  @doc false
+  def normalize_duplicate_policy!(policy) when policy in @duplicate_policies, do: policy
+
+  def normalize_duplicate_policy!(other) do
+    raise ArgumentError,
+          "on_duplicate must be one of #{inspect(@duplicate_policies)}, got #{inspect(other)}"
+  end
+
+  @doc false
+  def registration_action(existing_components, component, policy)
+      when is_list(existing_components) do
+    policy = normalize_duplicate_policy!(policy)
+    validate_version_mixing!(existing_components, component)
+
+    case Enum.find(existing_components, &same_registration?(&1, component)) do
+      nil ->
+        :insert
+
+      existing ->
+        duplicate_registration_action(existing, component, policy)
     end
   end
 
@@ -315,7 +362,14 @@ defmodule FastestMCP.Component do
         normalize_prompt_messages(Map.get(value, :messages, Map.get(value, "messages")))
       )
       |> maybe_put(:description, Map.get(value, :description, Map.get(value, "description")))
-      |> maybe_put(:meta, Map.get(value, :meta, Map.get(value, "meta")))
+      |> maybe_put(
+        :meta,
+        Map.get(
+          value,
+          :_meta,
+          Map.get(value, "_meta", Map.get(value, :meta, Map.get(value, "meta")))
+        )
+      )
     else
       %{messages: [%{role: "user", content: inspect(value)}]}
     end
@@ -453,5 +507,57 @@ defmodule FastestMCP.Component do
     if TaskConfig.supports_tasks?(config) do
       %{taskSupport: Atom.to_string(config.mode)}
     end
+  end
+
+  defp validate_version_mixing!(existing_components, component) do
+    siblings =
+      Enum.filter(existing_components, fn existing ->
+        type(existing) == type(component) and identifier(existing) == identifier(component)
+      end)
+
+    has_versioned? = Enum.any?(siblings, &(not is_nil(version(&1))))
+    has_unversioned? = Enum.any?(siblings, &is_nil(version(&1)))
+
+    cond do
+      is_nil(version(component)) and has_versioned? ->
+        raise ArgumentError,
+              "#{type(component)} #{inspect(identifier(component))} cannot mix unversioned and versioned definitions"
+
+      not is_nil(version(component)) and has_unversioned? ->
+        raise ArgumentError,
+              "#{type(component)} #{inspect(identifier(component))} cannot mix versioned and unversioned definitions"
+
+      true ->
+        :ok
+    end
+  end
+
+  defp same_registration?(left, right) do
+    type(left) == type(right) and identifier(left) == identifier(right) and
+      version(left) == version(right)
+  end
+
+  defp duplicate_registration_action(_existing, component, :error) do
+    raise ArgumentError, duplicate_error(component)
+  end
+
+  defp duplicate_registration_action(existing, component, :warn) do
+    Logger.warning(duplicate_warning(component))
+    {:replace, existing}
+  end
+
+  defp duplicate_registration_action(existing, _component, :ignore), do: {:ignore, existing}
+  defp duplicate_registration_action(existing, _component, :replace), do: {:replace, existing}
+
+  defp duplicate_error(component) do
+    if is_nil(version(component)) do
+      "#{type(component)} #{inspect(identifier(component))} is already defined without a version"
+    else
+      "#{type(component)} #{inspect(identifier(component))} version #{inspect(version(component))} is already defined"
+    end
+  end
+
+  defp duplicate_warning(component) do
+    duplicate_error(component) <> "; replacing existing definition"
   end
 end

@@ -50,7 +50,9 @@ assert {:ok, _pid} = start_supervised(MyApp.MCPServer)
 bandit =
   start_supervised!(
     {Bandit,
-     plug: {FastestMCP.Transport.HTTPApp, server_name: MyApp.MCPServer, path: "/mcp", allowed_hosts: :any},
+     plug:
+       {FastestMCP.Transport.HTTPApp,
+        server_name: MyApp.MCPServer, path: "/mcp", allowed_hosts: :localhost},
      scheme: :http,
      port: 0}
   )
@@ -72,6 +74,11 @@ Use this layer when you care about:
 - client callbacks
 - progress or log notifications
 - streamable HTTP behavior
+
+For raw transport tests, exercise the full lifecycle: initialize without a
+session header, retain the server-issued id, send `notifications/initialized`,
+then include both the session id and `MCP-Protocol-Version: 2025-11-25` on later
+requests. Each POST must contain one JSON-RPC message rather than a batch.
 
 ## 3. Background Task and Interaction Tests
 

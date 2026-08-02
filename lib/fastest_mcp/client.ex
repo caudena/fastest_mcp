@@ -66,6 +66,8 @@ defmodule FastestMCP.Client do
   alias FastestMCP.Protocol
   alias FastestMCP.TaskId
   alias FastestMCP.TaskWire
+  alias FastestMCP.Transport.JSONRPC
+  alias FastestMCP.Transport.SSEDecoder
 
   @default_timeout_ms 5_000
   @default_init_timeout_ms 10_000
@@ -190,7 +192,9 @@ defmodule FastestMCP.Client do
 
   @doc "Runs the MCP initialize handshake."
   def initialize(%__MODULE__{} = client, params \\ %{}, opts \\ []) do
-    request(client, "initialize", Map.new(params), :initialize, opts)
+    result = request(client, "initialize", Map.new(params), :initialize, opts)
+    :ok = notification(client, "notifications/initialized", %{}, opts)
+    result
   end
 
   @doc "Runs a ping request."
@@ -255,7 +259,6 @@ defmodule FastestMCP.Client do
   def read_resource(%__MODULE__{} = client, uri, opts \\ []) do
     params =
       %{"uri" => to_string(uri)}
-      |> maybe_put_task(opts)
       |> maybe_put_transport_version(opts[:version])
       |> maybe_put_request_meta(opts)
 
@@ -298,7 +301,6 @@ defmodule FastestMCP.Client do
         "name" => to_string(name),
         "arguments" => Map.new(arguments)
       }
-      |> maybe_put_task(opts)
       |> maybe_put_request_meta(opts)
 
     client
@@ -363,20 +365,6 @@ defmodule FastestMCP.Client do
 
     :ok = cache_task_status(client, task_id, task)
     task
-  end
-
-  @doc "Sends input to a background task waiting for user interaction."
-  def send_task_input(%__MODULE__{} = client, task_id, action, content \\ nil, opts \\ []) do
-    params =
-      %{
-        "taskId" => to_string(task_id),
-        "action" => to_string(action)
-      }
-      |> maybe_put("content", content)
-      |> maybe_put("requestId", opts[:request_id])
-      |> maybe_put_request_meta(opts)
-
-    request(client, "tasks/sendInput", params, :task, opts)
   end
 
   @doc "Builds or refreshes a remote task handle tracked by this client."
@@ -466,6 +454,8 @@ defmodule FastestMCP.Client do
         pending_stdio_buffer: "",
         pending_stdio_ref: nil,
         sampling_handler: Keyword.get(opts, :sampling_handler),
+        sampling_tools: normalize_sampling_tools(Keyword.get(opts, :sampling_tools, [])),
+        sampling_context: Keyword.get(opts, :sampling_context),
         elicitation_handler: Keyword.get(opts, :elicitation_handler),
         log_handler: Keyword.get(opts, :log_handler),
         progress_handler: Keyword.get(opts, :progress_handler),
@@ -475,6 +465,8 @@ defmodule FastestMCP.Client do
         task_registry: %{},
         callback_tasks: %{},
         session_stream: nil,
+        max_sse_event_bytes:
+          validate_max_sse_event_bytes!(Keyword.get(opts, :max_sse_event_bytes, 1_048_576)),
         timeout_ms: Keyword.get(opts, :timeout_ms, @default_timeout_ms),
         max_in_flight:
           Keyword.get_lazy(opts, :max_in_flight, fn ->
@@ -516,6 +508,22 @@ defmodule FastestMCP.Client do
       |> merge_auth_inputs(normalize_request_auth_opts(auth_input: auth_input))
 
     {:reply, :ok, %{state | auth_input: merged}}
+  end
+
+  def handle_call({:notification, method, params, opts}, _from, state) do
+    message = build_notification(method, params)
+
+    result =
+      case state.transport.type do
+        :stdio ->
+          true = Port.command(state.transport.port, JSON.encode!(message) <> "\n")
+          :ok
+
+        :streamable_http ->
+          send_http_notification(message, state, opts)
+      end
+
+    {:reply, result, state}
   end
 
   def handle_call({:register_task, task_id, kind, target}, _from, state) do
@@ -670,6 +678,7 @@ defmodule FastestMCP.Client do
                pid: pid,
                monitor_ref: monitor_ref,
                stream_ref: stream_ref,
+               request_ref: nil,
                started?: false,
                waiters: [from]
              }
@@ -679,7 +688,8 @@ defmodule FastestMCP.Client do
 
   def handle_call(:close_session_stream, _from, state) do
     if session_stream = state.session_stream do
-      if is_pid(session_stream.pid), do: Process.exit(session_stream.pid, :shutdown)
+      cancel_http_request(session_stream.request_ref)
+      if is_pid(session_stream.pid), do: Process.exit(session_stream.pid, :kill)
       if session_stream.monitor_ref, do: Process.demonitor(session_stream.monitor_ref, [:flush])
 
       state =
@@ -734,6 +744,7 @@ defmodule FastestMCP.Client do
             from: from,
             normalizer: normalizer,
             method: method,
+            request_id: request_id,
             timeout_ms: timeout_ms,
             worker_pid: nil,
             worker_ref: nil
@@ -752,7 +763,21 @@ defmodule FastestMCP.Client do
 
           {pid, worker_ref} =
             spawn_monitor(fn ->
-              result = run_http_request(request, method, normalizer, timeout_ms, state, opts)
+              request_started = fn request_ref ->
+                send(parent, {:http_request_started, ref, self(), request_ref})
+              end
+
+              result =
+                run_http_request(
+                  request,
+                  method,
+                  normalizer,
+                  timeout_ms,
+                  state,
+                  opts,
+                  request_started
+                )
+
               send(parent, {:http_request_complete, ref, result})
             end)
 
@@ -762,7 +787,8 @@ defmodule FastestMCP.Client do
             method: method,
             timeout_ms: timeout_ms,
             worker_ref: worker_ref,
-            worker_pid: pid
+            worker_pid: pid,
+            request_ref: nil
           }
 
           timer_ref = Process.send_after(self(), {:request_timeout, ref}, timeout_ms)
@@ -778,6 +804,20 @@ defmodule FastestMCP.Client do
 
   @impl true
   @doc "Processes asynchronous messages delivered to the process owned by this module."
+  def handle_info({:http_request_started, ref, worker_pid, request_ref}, state) do
+    case Map.get(state.in_flight, ref) do
+      %{worker_pid: ^worker_pid, request_ref: nil} ->
+        {:noreply, put_in(state.in_flight[ref].request_ref, request_ref)}
+
+      %{worker_pid: ^worker_pid, request_ref: ^request_ref} ->
+        {:noreply, state}
+
+      _stale_or_unknown_request ->
+        cancel_http_request(request_ref)
+        {:noreply, state}
+    end
+  end
+
   def handle_info({:http_request_complete, ref, result}, state) do
     case Map.pop(state.in_flight, ref) do
       {nil, _in_flight} ->
@@ -786,15 +826,17 @@ defmodule FastestMCP.Client do
       {%{from: from, timer_ref: timer_ref, worker_ref: worker_ref, normalizer: normalizer},
        in_flight} ->
         cancel_timer(timer_ref)
+        cancel_http_request(get_in(state.in_flight, [ref, :request_ref]))
         if worker_ref, do: Process.demonitor(worker_ref, [:flush])
-        GenServer.reply(from, result)
+        {reply, state} = apply_http_response_metadata(result, state)
+        GenServer.reply(from, reply)
 
         {:noreply,
          %{
            state
            | in_flight: in_flight,
              worker_refs: drop_worker_ref(state.worker_refs, worker_ref),
-             initialize_result: initialize_result_for(normalizer, result, state.initialize_result)
+             initialize_result: initialize_result_for(normalizer, reply, state.initialize_result)
          }}
     end
   end
@@ -809,6 +851,7 @@ defmodule FastestMCP.Client do
         worker_pid = Map.get(entry, :worker_pid)
         worker_ref = Map.get(entry, :worker_ref)
 
+        cancel_http_request(Map.get(entry, :request_ref))
         if is_pid(worker_pid), do: Process.exit(worker_pid, :kill)
         if worker_ref, do: Process.demonitor(worker_ref, [:flush])
 
@@ -852,6 +895,7 @@ defmodule FastestMCP.Client do
 
               {%{from: from, timer_ref: timer_ref}, in_flight} ->
                 cancel_timer(timer_ref)
+                cancel_http_request(get_in(state.in_flight, [ref, :request_ref]))
 
                 error =
                   %Error{
@@ -864,6 +908,27 @@ defmodule FastestMCP.Client do
                 {:noreply, %{state | in_flight: in_flight, worker_refs: worker_refs}}
             end
         end
+    end
+  end
+
+  def handle_info({:session_stream_request_started, stream_ref, worker_pid, request_ref}, state) do
+    case state.session_stream do
+      %{stream_ref: ^stream_ref, pid: ^worker_pid} = session_stream ->
+        case Map.get(session_stream, :request_ref) do
+          nil ->
+            {:noreply, put_in(state.session_stream.request_ref, request_ref)}
+
+          ^request_ref ->
+            {:noreply, state}
+
+          _other_request_ref ->
+            cancel_http_request(request_ref)
+            {:noreply, state}
+        end
+
+      _stale_or_unknown_stream ->
+        cancel_http_request(request_ref)
+        {:noreply, state}
     end
   end
 
@@ -885,6 +950,7 @@ defmodule FastestMCP.Client do
     if match?(%{stream_ref: ^stream_ref}, state.session_stream) do
       session_stream = state.session_stream
 
+      cancel_http_request(session_stream.request_ref)
       if session_stream.monitor_ref, do: Process.demonitor(session_stream.monitor_ref, [:flush])
 
       state =
@@ -971,9 +1037,19 @@ defmodule FastestMCP.Client do
   @doc "Cleans up module state on shutdown."
   def terminate(_reason, state) do
     if session_stream = state.session_stream do
-      if is_pid(session_stream.pid), do: Process.exit(session_stream.pid, :shutdown)
+      cancel_http_request(session_stream.request_ref)
+      if is_pid(session_stream.pid), do: Process.exit(session_stream.pid, :kill)
       if session_stream.monitor_ref, do: Process.demonitor(session_stream.monitor_ref, [:flush])
     end
+
+    Enum.each(state.in_flight, fn {_ref, entry} ->
+      cancel_http_request(Map.get(entry, :request_ref))
+      if is_pid(entry[:worker_pid]), do: Process.exit(entry.worker_pid, :kill)
+      if entry[:worker_ref], do: Process.demonitor(entry.worker_ref, [:flush])
+      cancel_timer(entry[:timer_ref])
+    end)
+
+    terminate_remote_http_session(state)
 
     case state.transport do
       %{type: :stdio, port: port} when is_port(port) ->
@@ -985,6 +1061,29 @@ defmodule FastestMCP.Client do
 
     :ok
   end
+
+  defp terminate_remote_http_session(
+         %{
+           transport: %{type: :streamable_http, base_url: base_url},
+           session_id: session_id
+         } = state
+       )
+       when is_binary(session_id) and session_id != "" do
+    _ =
+      HTTP.request(:delete, base_url,
+        headers:
+          transport_headers(
+            [{"accept", "application/json"}, {"connection", "close"}],
+            state,
+            []
+          ),
+        timeout_ms: min(state.timeout_ms, 1_000)
+      )
+
+    :ok
+  end
+
+  defp terminate_remote_http_session(_state), do: :ok
 
   defp request(%__MODULE__{pid: pid}, method, params, normalizer, opts) do
     timeout_ms = Keyword.get(opts, :timeout_ms, @default_timeout_ms)
@@ -1004,6 +1103,15 @@ defmodule FastestMCP.Client do
     end
   end
 
+  defp notification(%__MODULE__{pid: pid}, method, params, opts) do
+    timeout_ms = Keyword.get(opts, :timeout_ms, @default_timeout_ms)
+
+    case GenServer.call(pid, {:notification, method, params, opts}, timeout_ms + 1_000) do
+      :ok -> :ok
+      {:error, %Error{} = error} -> raise error
+    end
+  end
+
   defp normalize_transport({:stdio, command}, opts),
     do: normalize_transport({:stdio, command, []}, opts)
 
@@ -1014,32 +1122,41 @@ defmodule FastestMCP.Client do
        type: :stdio,
        command: command,
        args: Enum.map(args, &to_string/1),
-       session_id: generated_session_id()
+       session_id: nil
      }}
   end
 
   defp normalize_transport(url, opts) when is_binary(url) do
     uri = URI.parse(url)
 
-    if uri.scheme in ["http", "https"] do
-      endpoint =
-        uri
-        |> ensure_http_path()
-        |> URI.to_string()
+    cond do
+      Keyword.has_key?(opts, :session_id) ->
+        {:error,
+         %Error{
+           code: :bad_request,
+           message: "client session_id is server-negotiated and cannot be configured"
+         }}
 
-      {:ok,
-       %{
-         type: :streamable_http,
-         base_url: endpoint,
-         session_id: Keyword.get(opts, :session_id, generated_session_id())
-       }}
-    else
-      {:error,
-       %Error{
-         code: :bad_request,
-         message: "unsupported client target",
-         details: %{target: url}
-       }}
+      uri.scheme in ["http", "https"] ->
+        endpoint =
+          uri
+          |> ensure_http_path()
+          |> URI.to_string()
+
+        {:ok,
+         %{
+           type: :streamable_http,
+           base_url: endpoint,
+           session_id: nil
+         }}
+
+      true ->
+        {:error,
+         %Error{
+           code: :bad_request,
+           message: "unsupported client target",
+           details: %{target: url}
+         }}
     end
   end
 
@@ -1061,7 +1178,6 @@ defmodule FastestMCP.Client do
           :exit_status,
           :hide,
           :use_stdio,
-          :stderr_to_stdout,
           {:args, transport.args}
         ]
       )
@@ -1097,10 +1213,13 @@ defmodule FastestMCP.Client do
   defp session_stream_started?(_state), do: false
 
   defp handle_session_stream_down(%{session_stream: %{started?: true}} = state, _reason) do
+    cancel_http_request(state.session_stream.request_ref)
     %{state | session_stream: nil}
   end
 
   defp handle_session_stream_down(%{session_stream: session_stream} = state, reason) do
+    cancel_http_request(session_stream.request_ref)
+
     reply_session_stream_waiters(
       %{state | session_stream: nil},
       {:error,
@@ -1123,10 +1242,6 @@ defmodule FastestMCP.Client do
   defp saturated?(%{max_in_flight: :infinity}), do: false
   defp saturated?(state), do: map_size(state.in_flight) >= state.max_in_flight
 
-  defp generated_session_id do
-    "client-session-" <> Integer.to_string(System.unique_integer([:positive]))
-  end
-
   defp normalize_client_info(nil) do
     %{
       "name" => "FastestMCP.Client",
@@ -1139,7 +1254,7 @@ defmodule FastestMCP.Client do
 
   defp application_version do
     case Application.spec(:fastest_mcp, :vsn) do
-      nil -> "0.1.0"
+      nil -> "0.2.0"
       version when is_list(version) -> List.to_string(version)
       version -> to_string(version)
     end
@@ -1238,6 +1353,7 @@ defmodule FastestMCP.Client do
               pid: pid,
               monitor_ref: monitor_ref,
               stream_ref: stream_ref,
+              request_ref: nil,
               started?: false,
               waiters: []
             }
@@ -1335,11 +1451,10 @@ defmodule FastestMCP.Client do
     case state.transport.type do
       :stdio ->
         %{
+          "jsonrpc" => "2.0",
+          "id" => request_id,
           "method" => method,
-          "params" =>
-            params
-            |> Map.put_new("session_id", state.session_id)
-            |> maybe_put_auth_input(request_auth_input(state, opts))
+          "params" => put_stdio_auth_metadata(params, request_auth_input(state, opts))
         }
 
       :streamable_http ->
@@ -1357,11 +1472,19 @@ defmodule FastestMCP.Client do
 
     auto =
       %{}
-      |> maybe_put("sampling", if(state.sampling_handler, do: %{}))
+      |> maybe_put("sampling", sampling_capability(state))
       |> maybe_put("elicitation", if(state.elicitation_handler, do: %{}))
       |> maybe_put("tasks", initialize_task_capabilities(state))
 
     deep_merge_maps(base, auto)
+  end
+
+  defp sampling_capability(%{sampling_handler: nil}), do: nil
+
+  defp sampling_capability(state) do
+    %{}
+    |> maybe_put("context", if(state.sampling_context, do: %{}))
+    |> maybe_put("tools", if(state.sampling_tools != [], do: %{}))
   end
 
   defp initialize_task_capabilities(state) do
@@ -1389,86 +1512,99 @@ defmodule FastestMCP.Client do
 
   defp deep_merge_maps(_left, right), do: right
 
-  defp run_http_request(request, method, normalizer, timeout_ms, state, opts) do
+  defp run_http_request(
+         request,
+         method,
+         normalizer,
+         timeout_ms,
+         state,
+         opts,
+         request_started
+       ) do
+    opts = Keyword.put(opts, :request_started, request_started)
+
     with :ok <- ensure_http_apps(),
-         {:ok, result} <- do_http_request(request, method, timeout_ms, state, opts) do
-      {:ok, normalize_response(normalizer, result)}
+         {:ok, result, headers} <- stream_http_request(request, method, timeout_ms, state, opts),
+         {:ok, normalized_result} <- normalize_response_result(normalizer, result) do
+      {:ok, normalized_result, headers}
     end
   end
 
-  defp do_http_request(request, "tools/call", timeout_ms, state, opts) do
-    stream_http_request(request, timeout_ms, state, opts)
-  end
+  defp stream_http_request(request, method, timeout_ms, state, opts) do
+    decoder = SSEDecoder.new(max_event_bytes: state.max_sse_event_bytes)
 
-  defp do_http_request(request, "tasks/result", timeout_ms, state, opts) do
-    stream_http_request(request, timeout_ms, state, opts)
-  end
-
-  defp do_http_request(request, _method, timeout_ms, state, opts) do
-    case HTTP.request(:post, state.transport.base_url,
-           json: request,
-           headers:
-             transport_headers(
-               [{"accept", "application/json"}, {"content-type", "application/json"}],
-               state,
-               opts
-             ),
-           timeout_ms: timeout_ms
-         ) do
-      {:ok, _status, _headers, body} ->
-        decode_jsonrpc_response(body)
-
-      {:error, reason} ->
-        {:error,
-         %Error{
-           code: :internal_error,
-           message: "HTTP client request failed",
-           details: %{reason: inspect(reason)}
-         }}
-    end
-  end
-
-  defp stream_http_request(request, timeout_ms, state, opts) do
-    profile = temporary_http_profile()
-
-    try do
-      with :ok <- start_http_profile(profile),
-           {:ok, request_ref} <-
-             start_stream_http_request(request, timeout_ms, state, opts, profile) do
-        receive_stream_events(request_ref, request["id"], timeout_ms, "", nil, state, opts)
+    with {:ok, request_ref} <- start_stream_http_request(request, timeout_ms, state, opts) do
+      try do
+        receive_stream_events(
+          request_ref,
+          request["id"],
+          method,
+          timeout_ms,
+          {:pending, decoder},
+          nil,
+          state,
+          opts
+        )
+      after
+        _ = HTTP.cancel_request(request_ref)
+        flush_http_messages(request_ref)
       end
-    after
-      stop_http_profile(profile)
     end
   end
 
-  defp receive_stream_events(request_ref, original_id, timeout_ms, buffer, headers, state, opts) do
+  defp receive_stream_events(
+         request_ref,
+         original_id,
+         method,
+         timeout_ms,
+         response_body,
+         headers,
+         state,
+         opts
+       ) do
     receive do
       {:http, {^request_ref, :stream_start, response_headers}} ->
         receive_stream_events(
           request_ref,
           original_id,
+          method,
           timeout_ms,
-          buffer,
+          streamed_response_body(response_headers, response_body),
           response_headers,
           state,
           opts
         )
 
       {:http, {^request_ref, :stream, chunk}} ->
-        {events, rest} = parse_sse_events(buffer <> chunk)
+        case feed_streamed_response(response_body, chunk, state.max_sse_event_bytes) do
+          {:ok, {:sse, next_decoder}, events} ->
+            case handle_stream_events(events, original_id, state, opts) do
+              {:ok, result} ->
+                {:ok, result, normalize_httpc_headers(headers)}
 
-        case handle_stream_events(events, original_id, state, opts) do
-          {:ok, result} ->
-            await_stream_end(request_ref, timeout_ms)
-            {:ok, result}
+              :continue ->
+                receive_stream_events(
+                  request_ref,
+                  original_id,
+                  method,
+                  timeout_ms,
+                  {:sse, next_decoder},
+                  headers,
+                  state,
+                  opts
+                )
 
-          :continue ->
+              {:error, %Error{} = error} ->
+                {:error, error}
+            end
+
+          {:ok, {:json, body}, []} ->
             receive_stream_events(
               request_ref,
               original_id,
+              method,
               timeout_ms,
-              rest,
+              {:json, body},
               headers,
               state,
               opts
@@ -1479,55 +1615,117 @@ defmodule FastestMCP.Client do
         end
 
       {:http, {^request_ref, :stream_end, _response_headers}} ->
-        {:error,
-         %Error{code: :internal_error, message: "stream ended before delivering a result"}}
+        finish_streamed_response(response_body, headers, original_id)
 
-      {:http, {^request_ref, {{_version, _status, _reason}, _response_headers, body}}} ->
-        decode_jsonrpc_response(body)
+      {:http, {^request_ref, {{_version, status, _reason}, response_headers, body}}}
+      when status in 200..299 ->
+        case decode_jsonrpc_response(body, original_id) do
+          {:ok, result} -> {:ok, result, normalize_httpc_headers(response_headers)}
+          {:error, %Error{} = error} -> {:error, error}
+        end
+
+      {:http, {^request_ref, {{_version, status, reason}, _response_headers, body}}} ->
+        {:error,
+         decode_http_error(
+           body,
+           status,
+           "HTTP client request failed with HTTP #{status} #{reason}"
+         )}
+
+      {:http, {^request_ref, {:error, reason}}} ->
+        {:error,
+         %Error{
+           code: :internal_error,
+           message: "HTTP client request failed",
+           details: %{reason: inspect(reason)}
+         }}
     after
       timeout_ms ->
-        :httpc.cancel_request(request_ref)
-
         {:error,
          %Error{
            code: :timeout,
-           message: "tools/call timed out",
+           message: "#{method} timed out",
            details: %{timeout_ms: timeout_ms}
          }}
     end
   end
 
-  defp await_stream_end(request_ref, timeout_ms) do
-    receive do
-      {:http, {^request_ref, :stream_end, _response_headers}} -> :ok
-      {:http, {^request_ref, _other}} -> :ok
-    after
-      timeout_ms -> :ok
+  defp streamed_response_body(headers, {_mode, decoder}) do
+    case response_header(headers, "content-type") do
+      content_type when is_binary(content_type) ->
+        if String.starts_with?(String.downcase(content_type), "application/json") do
+          {:json, ""}
+        else
+          {:sse, decoder}
+        end
+
+      nil ->
+        {:sse, decoder}
+    end
+  end
+
+  defp feed_streamed_response({:pending, decoder}, chunk, _max_bytes),
+    do: feed_streamed_response({:sse, decoder}, chunk, nil)
+
+  defp feed_streamed_response({:sse, decoder}, chunk, _max_bytes) do
+    case SSEDecoder.feed(decoder, chunk) do
+      {:ok, events, next_decoder} -> {:ok, {:sse, next_decoder}, events}
+      {:error, %Error{} = error} -> {:error, error}
+    end
+  end
+
+  defp feed_streamed_response({:json, body}, chunk, max_bytes) do
+    body = body <> IO.iodata_to_binary(chunk)
+
+    if byte_size(body) <= max_bytes do
+      {:ok, {:json, body}, []}
+    else
+      {:error,
+       %Error{
+         code: :bad_request,
+         message: "streamed JSON response exceeds configured size limit",
+         details: %{max_event_bytes: max_bytes}
+       }}
+    end
+  end
+
+  defp finish_streamed_response({:json, body}, headers, original_id) do
+    case decode_jsonrpc_response(body, original_id) do
+      {:ok, result} -> {:ok, result, normalize_httpc_headers(headers)}
+      {:error, %Error{} = error} -> {:error, error}
+    end
+  end
+
+  defp finish_streamed_response({_mode, decoder}, _headers, _original_id) do
+    case SSEDecoder.finish(decoder) do
+      :ok ->
+        {:error,
+         %Error{code: :internal_error, message: "stream ended before delivering a result"}}
+
+      {:error, %Error{} = error} ->
+        {:error, error}
     end
   end
 
   defp handle_stream_events([], _original_id, _state, _opts), do: :continue
 
   defp handle_stream_events([event | rest], original_id, state, opts) do
-    cond do
-      is_map(event) and Map.get(event, "id") == original_id and Map.has_key?(event, "result") ->
-        {:ok, event["result"]}
+    case JSONRPC.decode(event) do
+      {:ok, {:response, response_id, response}} ->
+        decode_jsonrpc_response(response_id, response, original_id)
 
-      is_map(event) and Map.get(event, "id") == original_id and Map.has_key?(event, "error") ->
-        {:error, jsonrpc_error(event["error"])}
-
-      is_map(event) and Map.has_key?(event, "method") and Map.has_key?(event, "id") ->
-        case handle_server_request(event, state, opts) do
-          {:ok, _next_state} -> handle_stream_events(rest, original_id, state, opts)
-          {:error, %Error{} = error} -> {:error, error}
-        end
-
-      is_map(event) and Map.has_key?(event, "method") ->
+      {:ok, {:request, _method, _params, nil}} ->
         dispatch_notification(event, state)
         handle_stream_events(rest, original_id, state, opts)
 
-      true ->
-        handle_stream_events(rest, original_id, state, opts)
+      {:ok, {:request, _method, _params, _request_id}} ->
+        case handle_server_request(event, state, opts) do
+          {:ok, next_state} -> handle_stream_events(rest, original_id, next_state, opts)
+          {:error, %Error{} = error} -> {:error, error}
+        end
+
+      {:error, %Error{} = error} ->
+        {:error, error}
     end
   end
 
@@ -1552,15 +1750,23 @@ defmodule FastestMCP.Client do
          state,
          opts
        ) do
-    maybe_start_callback_task(
-      state,
-      id,
-      "sampling/createMessage",
-      params,
-      state.sampling_handler,
-      fn handler -> sampling_response(handler, params) end,
-      opts
-    )
+    case validate_sampling_request_capabilities(params, state) do
+      :ok ->
+        maybe_start_callback_task(
+          state,
+          id,
+          "sampling/createMessage",
+          params,
+          state.sampling_handler,
+          fn handler -> sampling_response(handler, params) end,
+          opts
+        )
+
+      {:error, %Error{} = error} ->
+        with :ok <- post_client_response(state, id, {:error, error}, opts) do
+          {:ok, state}
+        end
+    end
   end
 
   defp process_server_request(
@@ -1685,7 +1891,10 @@ defmodule FastestMCP.Client do
              state,
              id,
              {:error,
-              %Error{code: :not_found, message: "unsupported client callback #{inspect(method)}"}},
+              %Error{
+                code: :method_not_found,
+                message: "unsupported client callback #{inspect(method)}"
+              }},
              opts
            ) do
       {:ok, state}
@@ -1705,7 +1914,7 @@ defmodule FastestMCP.Client do
         "error" => %{
           "code" => callback_jsonrpc_error_code(error),
           "message" => error.message,
-          "data" => error.details
+          "data" => callback_error_data(error)
         }
       }
       |> maybe_put("_meta", error.meta)
@@ -1719,6 +1928,23 @@ defmodule FastestMCP.Client do
     end)
 
     :ok
+  end
+
+  defp await_client_callback_post(
+         %{transport: %{type: :stdio, port: port}},
+         payload,
+         _opts
+       ) do
+    if Port.info(port) do
+      true = Port.command(port, JSON.encode!(payload) <> "\n")
+      :ok
+    else
+      {:error,
+       %Error{
+         code: :internal_error,
+         message: "stdio client transport is closed"
+       }}
+    end
   end
 
   defp await_client_callback_post(state, payload, opts) do
@@ -1747,45 +1973,41 @@ defmodule FastestMCP.Client do
   end
 
   defp do_post_client_response(state, payload, opts) do
-    profile = temporary_http_profile()
+    result =
+      HTTP.request(:post, state.transport.base_url,
+        json: payload,
+        headers:
+          transport_headers(
+            [
+              {"accept", "application/json, text/event-stream"},
+              {"content-type", "application/json"},
+              {"connection", "close"}
+            ],
+            state,
+            opts
+          ),
+        timeout_ms: state.timeout_ms
+      )
 
-    try do
-      with :ok <- start_http_profile(profile),
-           result <-
-             HTTP.request(:post, state.transport.base_url,
-               json: payload,
-               headers:
-                 transport_headers(
-                   [{"accept", "application/json"}, {"content-type", "application/json"}],
-                   state,
-                   opts
-                 ),
-               timeout_ms: state.timeout_ms,
-               profile: profile
-             ) do
-        case result do
-          {:ok, status, _headers, _body} when status in 200..299 ->
-            :ok
+    case result do
+      {:ok, status, _headers, _body} when status in 200..299 ->
+        :ok
 
-          {:ok, status, _headers, body} ->
-            {:error,
-             %Error{
-               code: :internal_error,
-               message: "client callback response was rejected",
-               details: %{status: status, body: decode_json_if_possible(body)}
-             }}
+      {:ok, status, _headers, body} ->
+        {:error,
+         %Error{
+           code: :internal_error,
+           message: "client callback response was rejected",
+           details: %{status: status, body: decode_json_if_possible(body)}
+         }}
 
-          {:error, reason} ->
-            {:error,
-             %Error{
-               code: :internal_error,
-               message: "failed to POST client callback response",
-               details: %{reason: inspect(reason)}
-             }}
-        end
-      end
-    after
-      stop_http_profile(profile)
+      {:error, reason} ->
+        {:error,
+         %Error{
+           code: :internal_error,
+           message: "failed to POST client callback response",
+           details: %{reason: inspect(reason)}
+         }}
     end
   end
 
@@ -2107,27 +2329,27 @@ defmodule FastestMCP.Client do
   defp maybe_post_callback_task_notification(_state, _task), do: :ok
 
   defp parse_task_request(params) when is_map(params) do
-    task_value =
-      params
-      |> Map.get("_meta", %{})
-      |> Map.get("task", Map.get(params, "task"))
-
-    cond do
-      task_value in [nil, false] ->
+    case fetch_task_request(params) do
+      :error ->
         {false, 60_000}
 
-      task_value == true ->
-        {true, 60_000}
-
-      is_map(task_value) ->
+      {:ok, %{} = task_value} ->
         {true, normalize_callback_task_ttl(Map.get(task_value, "ttl", Map.get(task_value, :ttl)))}
 
-      true ->
-        raise ArgumentError, "task metadata must be boolean or a map, got #{inspect(task_value)}"
+      {:ok, task_value} ->
+        raise ArgumentError, "task metadata must be an object, got #{inspect(task_value)}"
     end
   end
 
   defp parse_task_request(_params), do: {false, 60_000}
+
+  defp fetch_task_request(params) do
+    cond do
+      Map.has_key?(params, "task") -> Map.fetch(params, "task")
+      Map.has_key?(params, :task) -> Map.fetch(params, :task)
+      true -> :error
+    end
+  end
 
   defp safe_parse_task_request(params) do
     {:ok, parse_task_request(params)}
@@ -2246,6 +2468,29 @@ defmodule FastestMCP.Client do
       |> invoke_handler([messages, params], params)
       |> normalize_sampling_result()
     end)
+  end
+
+  defp validate_sampling_request_capabilities(params, state) do
+    cond do
+      (Map.has_key?(params, "tools") or Map.has_key?(params, "toolChoice")) and
+          state.sampling_tools == [] ->
+        {:error,
+         %Error{
+           code: :bad_request,
+           message: "sampling request requires undeclared sampling.tools support"
+         }}
+
+      Map.get(params, "includeContext") in ["thisServer", "allServers"] and
+          is_nil(state.sampling_context) ->
+        {:error,
+         %Error{
+           code: :bad_request,
+           message: "sampling request requires undeclared sampling.context support"
+         }}
+
+      true ->
+        :ok
+    end
   end
 
   defp elicitation_response(handler, %{"message" => message} = params) do
@@ -2390,37 +2635,72 @@ defmodule FastestMCP.Client do
     end
   end
 
-  defp decode_jsonrpc_response(body) when is_binary(body) do
+  defp decode_jsonrpc_response(body, expected_id) when is_binary(body) do
     case JSON.decode(body) do
-      {:ok, %{"result" => result}} ->
-        {:ok, result}
-
-      {:ok, %{"error" => error}} ->
-        {:error, jsonrpc_error(error)}
-
       {:ok, payload} ->
-        {:error,
-         %Error{
-           code: :internal_error,
-           message: "unexpected HTTP client response",
-           details: %{payload: payload}
-         }}
+        decode_jsonrpc_response_payload(payload, expected_id)
 
-      {:error, error} ->
-        {:error, %Error{code: :internal_error, message: json_decode_error_message(error)}}
+      {:error, reason} ->
+        {:error,
+         JSONRPC.parse_error("invalid JSON-RPC response JSON", %{reason: inspect(reason)})}
     end
   end
 
+  defp decode_jsonrpc_response_payload(payload, expected_id) do
+    case JSONRPC.decode(payload) do
+      {:ok, {:response, response_id, response}} ->
+        decode_jsonrpc_response(response_id, response, expected_id)
+
+      {:ok, {:request, _method, _params, _request_id}} ->
+        {:error,
+         %Error{
+           code: :invalid_request,
+           message: "expected a JSON-RPC response",
+           details: %{payload: payload}
+         }}
+
+      {:error, %Error{} = error} ->
+        {:error, error}
+    end
+  end
+
+  defp decode_jsonrpc_response(response_id, response, expected_id) do
+    with :ok <- validate_jsonrpc_response_id(response_id, expected_id) do
+      case response do
+        %{"result" => result} -> {:ok, result}
+        %{"error" => error} -> {:error, jsonrpc_error(error)}
+      end
+    end
+  end
+
+  defp validate_jsonrpc_response_id(expected_id, expected_id), do: :ok
+
+  defp validate_jsonrpc_response_id(response_id, expected_id) do
+    {:error,
+     %Error{
+       code: :invalid_request,
+       message: "JSON-RPC response id does not match the request",
+       details: %{expected_id: expected_id, response_id: response_id}
+     }}
+  end
+
   defp jsonrpc_error(%{"message" => message} = error) do
+    data = Map.get(error, "data", %{})
+    fastestmcp = if is_map(data), do: Map.get(data, "fastestmcp", %{}), else: %{}
+
     %Error{
-      code: decode_error_code(Map.get(error, "code")),
+      code:
+        decode_symbolic_error_code(Map.get(fastestmcp, "code")) ||
+          decode_error_code(Map.get(error, "code")),
       message: to_string(message),
-      details: Map.get(error, "data", %{})
+      details: Map.get(fastestmcp, "details", data)
     }
   end
 
-  defp decode_error_code(-32601), do: :not_found
-  defp decode_error_code(-32602), do: :bad_request
+  defp decode_error_code(-32700), do: :parse_error
+  defp decode_error_code(-32600), do: :invalid_request
+  defp decode_error_code(-32601), do: :method_not_found
+  defp decode_error_code(-32602), do: :invalid_params
   defp decode_error_code(-32603), do: :internal_error
   defp decode_error_code(-32001), do: :timeout
   defp decode_error_code(-32002), do: :overloaded
@@ -2428,7 +2708,22 @@ defmodule FastestMCP.Client do
   defp decode_error_code(-32004), do: :forbidden
   defp decode_error_code(_other), do: :internal_error
 
-  defp callback_jsonrpc_error_code(%Error{code: :not_found}), do: -32601
+  defp decode_symbolic_error_code("parse_error"), do: :parse_error
+  defp decode_symbolic_error_code("invalid_request"), do: :invalid_request
+  defp decode_symbolic_error_code("method_not_found"), do: :method_not_found
+  defp decode_symbolic_error_code("not_found"), do: :not_found
+  defp decode_symbolic_error_code("bad_request"), do: :bad_request
+  defp decode_symbolic_error_code("invalid_params"), do: :invalid_params
+  defp decode_symbolic_error_code("invalid_task_id"), do: :invalid_task_id
+  defp decode_symbolic_error_code("internal_error"), do: :internal_error
+  defp decode_symbolic_error_code("timeout"), do: :timeout
+  defp decode_symbolic_error_code("overloaded"), do: :overloaded
+  defp decode_symbolic_error_code("unauthorized"), do: :unauthorized
+  defp decode_symbolic_error_code("forbidden"), do: :forbidden
+  defp decode_symbolic_error_code(_code), do: nil
+
+  defp callback_jsonrpc_error_code(%Error{code: :method_not_found}), do: -32601
+  defp callback_jsonrpc_error_code(%Error{code: :not_found}), do: -32602
   defp callback_jsonrpc_error_code(%Error{code: :invalid_task_id}), do: -32602
   defp callback_jsonrpc_error_code(%Error{code: :bad_request}), do: -32602
   defp callback_jsonrpc_error_code(%Error{code: :internal_error}), do: -32603
@@ -2437,6 +2732,11 @@ defmodule FastestMCP.Client do
   defp callback_jsonrpc_error_code(%Error{code: :unauthorized}), do: -32003
   defp callback_jsonrpc_error_code(%Error{code: :forbidden}), do: -32004
   defp callback_jsonrpc_error_code(_error), do: -32000
+
+  defp callback_error_data(%Error{code: code, details: details}) do
+    details = if is_map(details), do: details, else: %{}
+    Map.put(details, "fastestmcp", %{"code" => to_string(code)})
+  end
 
   defp callback_failure(target, code, message, details) do
     %Error{
@@ -2460,89 +2760,42 @@ defmodule FastestMCP.Client do
     )
   end
 
-  defp parse_sse_events(buffer) do
-    case String.split(buffer, "\n\n") do
-      [single] ->
-        {[], single}
-
-      parts ->
-        {events, [rest]} =
-          parts
-          |> Enum.split(length(parts) - 1)
-
-        decoded =
-          Enum.reduce(events, [], fn event, acc ->
-            case parse_sse_event(event) do
-              nil -> acc
-              decoded -> [decoded | acc]
-            end
-          end)
-          |> Enum.reverse()
-
-        {decoded, rest}
-    end
-  end
-
-  defp parse_sse_event(event) do
-    data =
-      event
-      |> String.split("\n")
-      |> Enum.reduce([], fn
-        "data: " <> chunk, acc -> [chunk | acc]
-        "data:" <> chunk, acc -> [String.trim_leading(chunk) | acc]
-        _line, acc -> acc
-      end)
-      |> Enum.reverse()
-      |> Enum.join("\n")
-
-    if data == "" do
-      nil
-    else
-      JSON.decode!(data)
-    end
-  end
-
   defp run_session_stream(parent, stream_ref, state) do
-    profile = temporary_http_profile()
+    decoder = SSEDecoder.new(max_event_bytes: state.max_sse_event_bytes)
 
-    try do
-      with :ok <- start_http_profile(profile),
-           {:ok, request_ref} <- start_session_stream_request(state, profile) do
-        receive_session_stream_events(parent, stream_ref, request_ref, "", false)
-      else
-        {:error, %Error{} = error} ->
-          send(parent, {:session_stream_failed, stream_ref, error})
+    with {:ok, request_ref} <- start_session_stream_request(state) do
+      send(parent, {:session_stream_request_started, stream_ref, self(), request_ref})
+
+      try do
+        receive_session_stream_events(parent, stream_ref, request_ref, decoder, false)
+      after
+        _ = HTTP.cancel_request(request_ref)
+        flush_http_messages(request_ref)
       end
-    after
-      stop_http_profile(profile)
+    else
+      {:error, %Error{} = error} ->
+        send(parent, {:session_stream_failed, stream_ref, error})
     end
   end
 
-  defp start_stream_http_request(request, timeout_ms, state, opts, profile) do
-    request_body = JSON.encode!(request)
-
+  defp start_stream_http_request(request, timeout_ms, state, opts) do
     headers =
       transport_headers(
         [
           {"accept", "application/json, text/event-stream"},
-          {"content-type", "application/json"}
+          {"content-type", "application/json"},
+          {"connection", "close"}
         ],
         state,
         opts
       )
-      |> Enum.map(fn {key, value} -> {String.to_charlist(key), String.to_charlist(value)} end)
 
-    http_options = [timeout: timeout_ms, connect_timeout: timeout_ms]
-
-    transport_request =
-      {String.to_charlist(state.transport.base_url), headers, ~c"application/json", request_body}
-
-    case :httpc.request(
-           :post,
-           transport_request,
-           http_options,
-           [body_format: :binary, sync: false, stream: :self],
-           profile
+    case HTTP.stream_request(:post, state.transport.base_url,
+           json: request,
+           headers: headers,
+           timeout_ms: timeout_ms,
+           request_timeout_ms: :infinity,
+           request_started: Keyword.fetch!(opts, :request_started)
          ) do
       {:ok, request_ref} ->
         {:ok, request_ref}
@@ -2557,21 +2810,15 @@ defmodule FastestMCP.Client do
     end
   end
 
-  defp start_session_stream_request(state, profile) do
+  defp start_session_stream_request(state) do
     headers =
       [{"accept", "text/event-stream"}]
       |> transport_headers(state, [])
-      |> Enum.map(fn {key, value} -> {String.to_charlist(key), String.to_charlist(value)} end)
 
-    http_options = [timeout: :infinity, connect_timeout: state.timeout_ms]
-    transport_request = {String.to_charlist(state.transport.base_url), headers}
-
-    case :httpc.request(
-           :get,
-           transport_request,
-           http_options,
-           [body_format: :binary, sync: false, stream: :self],
-           profile
+    case HTTP.stream_request(:get, state.transport.base_url,
+           headers: headers,
+           timeout_ms: state.timeout_ms,
+           request_timeout_ms: :infinity
          ) do
       {:ok, request_ref} ->
         {:ok, request_ref}
@@ -2586,31 +2833,42 @@ defmodule FastestMCP.Client do
     end
   end
 
-  defp receive_session_stream_events(parent, stream_ref, request_ref, buffer, started?) do
+  defp receive_session_stream_events(parent, stream_ref, request_ref, decoder, started?) do
     receive do
       {:http, {^request_ref, :stream_start, _response_headers}} ->
         if not started?, do: send(parent, {:session_stream_opened, stream_ref})
-        receive_session_stream_events(parent, stream_ref, request_ref, buffer, true)
+        receive_session_stream_events(parent, stream_ref, request_ref, decoder, true)
 
       {:http, {^request_ref, :stream, chunk}} ->
-        {events, rest} = parse_sse_events(buffer <> chunk)
+        case SSEDecoder.feed(decoder, chunk) do
+          {:ok, events, next_decoder} ->
+            Enum.each(events, fn event ->
+              send(parent, {:session_stream_event, stream_ref, event})
+            end)
 
-        Enum.each(events, fn event -> send(parent, {:session_stream_event, stream_ref, event}) end)
+            receive_session_stream_events(parent, stream_ref, request_ref, next_decoder, true)
 
-        receive_session_stream_events(parent, stream_ref, request_ref, rest, true)
+          {:error, %Error{} = error} ->
+            send(parent, {:session_stream_failed, stream_ref, error})
+        end
 
       {:http, {^request_ref, :stream_end, _response_headers}} ->
-        if started? do
-          :ok
-        else
-          send(
-            parent,
-            {:session_stream_failed, stream_ref,
-             %Error{
-               code: :internal_error,
-               message: "session stream ended before opening"
-             }}
-          )
+        case SSEDecoder.finish(decoder) do
+          {:error, %Error{} = error} ->
+            send(parent, {:session_stream_failed, stream_ref, error})
+
+          :ok when not started? ->
+            send(
+              parent,
+              {:session_stream_failed, stream_ref,
+               %Error{
+                 code: :internal_error,
+                 message: "session stream ended before opening"
+               }}
+            )
+
+          :ok ->
+            :ok
         end
 
       {:http, {^request_ref, {{_version, status, reason}, _headers, body}}} ->
@@ -2639,80 +2897,135 @@ defmodule FastestMCP.Client do
   defp classify_stream_message(%{"method" => _method} = message), do: {:notification, message}
   defp classify_stream_message(_other), do: :ignore
 
-  defp drain_stdio_buffer(%{pending_stdio_buffer: buffer, pending_stdio_ref: nil} = state) do
+  defp drain_stdio_buffer(%{pending_stdio_buffer: buffer} = state) do
     case String.split(buffer, "\n", parts: 2) do
       [line, rest] ->
-        if String.trim(line) == "" do
-          drain_stdio_buffer(%{state | pending_stdio_buffer: rest})
-        else
-          %{state | pending_stdio_buffer: rest}
-        end
+        next_state =
+          if String.trim(line) == "" do
+            %{state | pending_stdio_buffer: rest}
+          else
+            state
+            |> Map.put(:pending_stdio_buffer, rest)
+            |> handle_stdio_line(line)
+          end
+
+        drain_stdio_buffer(next_state)
 
       [_single] ->
         state
     end
   end
 
-  defp drain_stdio_buffer(%{pending_stdio_buffer: buffer, pending_stdio_ref: ref} = state) do
-    case String.split(buffer, "\n", parts: 2) do
-      [line, rest] ->
-        if String.trim(line) == "" do
-          drain_stdio_buffer(%{state | pending_stdio_buffer: rest, pending_stdio_ref: ref})
-        else
-          case Map.pop(state.in_flight, ref) do
-            {nil, _in_flight} ->
-              %{state | pending_stdio_buffer: rest, pending_stdio_ref: nil}
+  defp handle_stdio_line(state, line) do
+    case JSON.decode(line) do
+      {:ok, payload} ->
+        handle_decoded_stdio_message(state, payload)
 
-            {%{from: from, timer_ref: timer_ref, normalizer: normalizer}, in_flight} ->
-              cancel_timer(timer_ref)
+      {:error, error} ->
+        fail_pending_stdio_request(state, json_decode_error_message(error), %{line: line})
+    end
+  end
 
-              result =
-                case JSON.decode(line) do
-                  {:ok, %{"ok" => true, "result" => result}} ->
-                    {:ok, normalize_response(normalizer, result)}
+  defp handle_decoded_stdio_message(state, payload) do
+    case JSONRPC.decode(payload) do
+      {:ok, {:request, _method, _params, nil}} ->
+        dispatch_notification(payload, state)
 
-                  {:ok, %{"ok" => false, "error" => error}} ->
-                    {:error,
-                     %Error{
-                       code: decode_stdio_error_code(Map.get(error, "code")),
-                       message: Map.get(error, "message", "stdio request failed"),
-                       details: Map.get(error, "details", %{})
-                     }}
-
-                  {:error, error} ->
-                    {:error,
-                     %Error{
-                       code: :internal_error,
-                       message: json_decode_error_message(error),
-                       details: %{line: line}
-                     }}
-                end
-
-              GenServer.reply(from, result)
-
-              next_state = %{
-                state
-                | pending_stdio_buffer: rest,
-                  pending_stdio_ref: nil,
-                  in_flight: in_flight,
-                  initialize_result:
-                    initialize_result_for(normalizer, result, state.initialize_result)
-              }
-
-              if String.contains?(rest, "\n"),
-                do: drain_stdio_buffer(next_state),
-                else: next_state
-          end
+      {:ok, {:request, _method, _params, _id}} ->
+        case process_server_request(payload, expire_callback_tasks(state), []) do
+          {:ok, next_state} -> next_state
+          {:error, _error} -> state
         end
 
-      [_single] ->
+      {:ok, {:response, id, %{"result" => result}}} ->
+        complete_stdio_response(state, id, {:ok, result})
+
+      {:ok, {:response, id, %{"error" => error}}} ->
+        complete_stdio_response(state, id, {:error, jsonrpc_error(error)})
+
+      {:error, %Error{} = error} ->
+        fail_pending_stdio_request(state, error.message, error.details)
+    end
+  end
+
+  defp complete_stdio_response(%{pending_stdio_ref: nil} = state, _id, _result), do: state
+
+  defp complete_stdio_response(%{pending_stdio_ref: ref} = state, id, result) do
+    case Map.get(state.in_flight, ref) do
+      %{request_id: ^id, normalizer: normalizer} ->
+        normalized_result =
+          case result do
+            {:ok, value} -> normalize_response_result(normalizer, value)
+            {:error, %Error{} = error} -> {:error, error}
+          end
+
+        finish_stdio_request(state, ref, normalized_result)
+
+      _other ->
+        # A timed-out response can arrive after the next request was issued.
+        # IDs, not arrival order, determine which request a response completes.
         state
     end
+  end
+
+  defp fail_pending_stdio_request(%{pending_stdio_ref: nil} = state, _message, _details),
+    do: state
+
+  defp fail_pending_stdio_request(%{pending_stdio_ref: ref} = state, message, details) do
+    finish_stdio_request(
+      state,
+      ref,
+      {:error, %Error{code: :internal_error, message: message, details: details}}
+    )
+  end
+
+  defp finish_stdio_request(state, ref, result) do
+    case Map.pop(state.in_flight, ref) do
+      {nil, _in_flight} ->
+        %{state | pending_stdio_ref: nil}
+
+      {%{from: from, timer_ref: timer_ref, normalizer: normalizer}, in_flight} ->
+        cancel_timer(timer_ref)
+        GenServer.reply(from, result)
+
+        %{
+          state
+          | pending_stdio_ref: nil,
+            in_flight: in_flight,
+            initialize_result: initialize_result_for(normalizer, result, state.initialize_result)
+        }
+    end
+  end
+
+  defp normalize_response_result(:initialize, %{"protocolVersion" => protocol_version} = result) do
+    if protocol_version == Protocol.current_version() do
+      {:ok, result}
+    else
+      unsupported_initialize_protocol(protocol_version)
+    end
+  end
+
+  defp normalize_response_result(:initialize, result) do
+    protocol_version =
+      if is_map(result), do: Map.get(result, "protocolVersion"), else: nil
+
+    unsupported_initialize_protocol(protocol_version)
+  end
+
+  defp normalize_response_result(normalizer, result),
+    do: {:ok, normalize_response(normalizer, result)}
+
+  defp unsupported_initialize_protocol(protocol_version) do
+    {:error,
+     %Error{
+       code: :invalid_request,
+       message: "server returned an unsupported protocolVersion #{inspect(protocol_version)}",
+       details: %{supported: [Protocol.current_version()]}
+     }}
   end
 
   defp normalize_response(:identity, result), do: result
 
-  defp normalize_response(:initialize, result), do: result
   defp normalize_response(:completion, %{"completion" => completion}), do: completion
 
   defp normalize_response(:tools, %{"tools" => tools} = page) do
@@ -2725,10 +3038,6 @@ defmodule FastestMCP.Client do
 
   defp normalize_response(:resource_templates, %{"resourceTemplates" => templates} = page) do
     %{items: templates, next_cursor: page["nextCursor"]}
-  end
-
-  defp normalize_response(:resource_templates, %{"resource_templates" => templates} = page) do
-    %{items: templates, next_cursor: page["nextCursor"] || page["next_cursor"]}
   end
 
   defp normalize_response(:prompts, %{"prompts" => prompts} = page) do
@@ -2750,7 +3059,7 @@ defmodule FastestMCP.Client do
   defp normalize_response(:tool_call, %{"structuredContent" => structured} = result)
        when not is_nil(structured) do
     cond do
-      Map.has_key?(result, "meta") ->
+      Map.has_key?(result, "_meta") ->
         result
 
       tool_result_mirrors_structured_content?(result["content"], structured) ->
@@ -2767,7 +3076,7 @@ defmodule FastestMCP.Client do
   defp normalize_response(:tool_call, result), do: result
 
   defp normalize_response(:resource_read, %{"contents" => [content]} = result) do
-    if is_nil(result["meta"]) and is_nil(content["meta"]) do
+    if is_nil(result["_meta"]) and is_nil(content["_meta"]) do
       cond do
         is_binary(content["text"]) -> decode_json_if_possible(content["text"])
         is_binary(content["blob"]) -> content["blob"]
@@ -2820,6 +3129,96 @@ defmodule FastestMCP.Client do
     end
   end
 
+  defp build_notification(method, params) do
+    %{"jsonrpc" => "2.0", "method" => method}
+    |> maybe_put("params", if(map_size(params) == 0, do: nil, else: params))
+  end
+
+  defp send_http_notification(message, state, opts) do
+    case HTTP.request(:post, state.transport.base_url,
+           json: message,
+           headers:
+             transport_headers(
+               [
+                 {"accept", "application/json, text/event-stream"},
+                 {"content-type", "application/json"},
+                 {"connection", "close"}
+               ],
+               state,
+               opts
+             ),
+           timeout_ms: Keyword.get(opts, :timeout_ms, state.timeout_ms)
+         ) do
+      {:ok, status, _headers, _body} when status in 200..299 ->
+        :ok
+
+      {:ok, status, _headers, body} ->
+        {:error, decode_http_error(body, status, "HTTP notification failed")}
+
+      {:error, reason} ->
+        {:error,
+         %Error{
+           code: :internal_error,
+           message: "HTTP notification failed",
+           details: %{reason: inspect(reason)}
+         }}
+    end
+  end
+
+  defp apply_http_response_metadata({:ok, result, headers}, state) do
+    session_id = response_header(headers, "mcp-session-id") || state.session_id
+    {{:ok, result}, %{state | session_id: session_id}}
+  end
+
+  defp apply_http_response_metadata(result, state), do: {result, state}
+
+  defp decode_http_error(body, status, fallback_message) do
+    case JSON.decode(body) do
+      {:ok, %{"jsonrpc" => "2.0", "error" => %{} = error}} ->
+        jsonrpc_error(error)
+
+      _other ->
+        %Error{
+          code: if(status in 400..499, do: :bad_request, else: :internal_error),
+          message: "#{fallback_message} with status #{status}",
+          details: %{status: status, body: decode_json_if_possible(body)}
+        }
+    end
+  end
+
+  defp response_header(headers, name) do
+    Enum.find_value(headers || [], fn {key, value} ->
+      if String.downcase(to_string(key)) == name, do: to_string(value)
+    end)
+  end
+
+  defp normalize_httpc_headers(nil), do: []
+
+  defp normalize_httpc_headers(headers) do
+    Enum.map(headers, fn {key, value} -> {to_string(key), to_string(value)} end)
+  end
+
+  defp flush_http_messages(request_ref) do
+    receive do
+      {:http, {^request_ref, _message}} -> flush_http_messages(request_ref)
+    after
+      0 -> :ok
+    end
+  end
+
+  defp normalize_sampling_tools(nil), do: []
+  defp normalize_sampling_tools(tools) when is_list(tools), do: tools
+
+  defp normalize_sampling_tools(other) do
+    raise ArgumentError, "sampling_tools must be a list, got #{inspect(other)}"
+  end
+
+  defp validate_max_sse_event_bytes!(value) when is_integer(value) and value > 0, do: value
+
+  defp validate_max_sse_event_bytes!(value) do
+    raise ArgumentError, "max_sse_event_bytes must be a positive integer, got #{inspect(value)}"
+  end
+
   defp json_decode_error_message(error), do: "invalid JSON: #{inspect(error)}"
 
   defp ensure_http_path(%URI{path: nil} = uri), do: %{uri | path: "/mcp"}
@@ -2833,18 +3232,20 @@ defmodule FastestMCP.Client do
         params
 
       true ->
-        Map.put(params, "task", true)
+        put_task_request(params, %{})
 
       false ->
         params
 
       task_opts when is_list(task_opts) ->
-        Map.put(params, "task", %{"ttl" => task_opts[:ttl_ms] || task_opts[:ttl]})
+        put_task_request(params, %{"ttl" => task_opts[:ttl_ms] || task_opts[:ttl]})
 
       task_opts when is_map(task_opts) ->
-        Map.put(params, "task", Map.new(task_opts))
+        put_task_request(params, Map.new(task_opts))
     end
   end
+
+  defp put_task_request(params, task), do: Map.put(params, "task", task)
 
   defp maybe_put_request_meta(params, opts) do
     existing_meta =
@@ -2898,9 +3299,6 @@ defmodule FastestMCP.Client do
     end)
   end
 
-  defp maybe_put_auth_input(params, auth_input) when map_size(auth_input) == 0, do: params
-  defp maybe_put_auth_input(params, auth_input), do: Map.put(params, "auth_input", auth_input)
-
   defp pagination_params(opts) do
     page_size = opts[:page_size] || opts[:pageSize] || opts[:limit]
 
@@ -2913,6 +3311,13 @@ defmodule FastestMCP.Client do
 
   defp cancel_timer(timer_ref) do
     Process.cancel_timer(timer_ref, async: true, info: false)
+    :ok
+  end
+
+  defp cancel_http_request(nil), do: :ok
+
+  defp cancel_http_request(request_ref) do
+    _ = HTTP.cancel_request(request_ref)
     :ok
   end
 
@@ -2955,9 +3360,15 @@ defmodule FastestMCP.Client do
     default_headers
     |> normalize_header_map()
     |> merge_header_maps(request_auth_input(state, opts) |> Map.get("headers", %{}))
-    |> Map.put("mcp-session-id", state.session_id)
+    |> maybe_put("mcp-session-id", state.session_id)
+    |> maybe_put("mcp-protocol-version", negotiated_protocol_version(state))
     |> Enum.into([])
   end
+
+  defp negotiated_protocol_version(%{initialize_result: %{"protocolVersion" => version}}),
+    do: version
+
+  defp negotiated_protocol_version(_state), do: nil
 
   defp normalize_auth_input(%{} = auth_input) do
     auth_input =
@@ -2991,6 +3402,19 @@ defmodule FastestMCP.Client do
   end
 
   defp merge_header_maps(left, right), do: Map.merge(left, right)
+
+  defp put_stdio_auth_metadata(params, auth_input) when map_size(auth_input) == 0, do: params
+
+  defp put_stdio_auth_metadata(params, auth_input) do
+    meta = Map.get(params, "_meta", %{})
+    fastestmcp = Map.get(meta, "fastestmcp", %{})
+
+    Map.put(
+      params,
+      "_meta",
+      Map.put(meta, "fastestmcp", Map.put(fastestmcp, "auth", auth_input))
+    )
+  end
 
   defp merge_auth_inputs(base, override) do
     headers =
@@ -3050,48 +3474,9 @@ defmodule FastestMCP.Client do
   defp bearer_authorization(""), do: nil
   defp bearer_authorization(token) when is_binary(token), do: "Bearer " <> token
 
-  defp start_http_profile(profile) do
-    with :ok <- ensure_http_apps() do
-      case :inets.start(:httpc, [{:profile, profile}]) do
-        {:ok, _pid} ->
-          :ok
-
-        {:error, {:already_started, _pid}} ->
-          :ok
-
-        {:error, reason} ->
-          {:error,
-           %Error{
-             code: :internal_error,
-             message: "failed to start HTTP client profile",
-             details: %{reason: inspect(reason)}
-           }}
-      end
-    end
-  end
-
-  defp stop_http_profile(profile) do
-    _ = :inets.stop(:httpc, profile)
-    :ok
-  end
-
-  defp temporary_http_profile do
-    :"fastest_mcp_client_callback_#{System.unique_integer([:positive])}"
-  end
-
   defp initialize_result_for(:initialize, {:ok, result}, _current), do: result
   defp initialize_result_for(_normalizer, _result, current), do: current
 
   defp drop_worker_ref(worker_refs, nil), do: worker_refs
   defp drop_worker_ref(worker_refs, worker_ref), do: Map.delete(worker_refs, worker_ref)
-
-  defp decode_stdio_error_code(nil), do: :internal_error
-  defp decode_stdio_error_code("not_found"), do: :not_found
-  defp decode_stdio_error_code("bad_request"), do: :bad_request
-  defp decode_stdio_error_code("internal_error"), do: :internal_error
-  defp decode_stdio_error_code("timeout"), do: :timeout
-  defp decode_stdio_error_code("overloaded"), do: :overloaded
-  defp decode_stdio_error_code("unauthorized"), do: :unauthorized
-  defp decode_stdio_error_code("forbidden"), do: :forbidden
-  defp decode_stdio_error_code(_other), do: :internal_error
 end

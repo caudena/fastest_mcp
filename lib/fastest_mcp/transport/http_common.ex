@@ -105,6 +105,9 @@ defmodule FastestMCP.Transport.HTTPCommon do
 
   defp error_status_and_headers(%Error{code: :not_found}, _auth, _http_context), do: {404, []}
 
+  defp error_status_and_headers(%Error{code: :method_not_found}, _auth, _http_context),
+    do: {404, []}
+
   defp error_status_and_headers(%Error{code: :invalid_task_id}, _auth, _http_context),
     do: {400, []}
 
@@ -148,42 +151,22 @@ defmodule FastestMCP.Transport.HTTPCommon do
   defp server_metadata(_runtime), do: %{}
 
   defp allowed_hosts(opts) do
-    case Keyword.get(opts, :allowed_hosts, :auto) do
-      nil ->
-        nil
+    if Keyword.get(opts, :unsafe_allow_any_host, false) == true do
+      nil
+    else
+      case Keyword.get(opts, :allowed_hosts, :localhost) do
+        :localhost ->
+          @localhost_hosts
 
-      :any ->
-        nil
+        hosts when is_list(hosts) and hosts != [] ->
+          hosts
+          |> Enum.map(&normalize_allowed_host/1)
+          |> MapSet.new()
 
-      false ->
-        nil
-
-      :localhost ->
-        @localhost_hosts
-
-      :auto ->
-        case Keyword.get(opts, :base_url) do
-          nil ->
-            nil
-
-          base_url ->
-            uri = URI.parse(to_string(base_url))
-
-            if local_host?(uri.host) and uri.scheme == "http" do
-              @localhost_hosts
-            else
-              nil
-            end
-        end
-
-      hosts when is_list(hosts) ->
-        hosts
-        |> Enum.map(&normalize_allowed_host/1)
-        |> MapSet.new()
-
-      other ->
-        raise ArgumentError,
-              "allowed_hosts must be :auto, :any, :localhost, false, nil, or a list, got #{inspect(other)}"
+        other ->
+          raise ArgumentError,
+                "allowed_hosts must be :localhost or a non-empty list; use unsafe_allow_any_host: true to disable validation, got #{inspect(other)}"
+      end
     end
   end
 
@@ -259,12 +242,6 @@ defmodule FastestMCP.Transport.HTTPCommon do
         host
     end
   end
-
-  defp local_host?(host) when is_binary(host) do
-    MapSet.member?(@localhost_hosts, String.downcase(host))
-  end
-
-  defp local_host?(_host), do: false
 
   defp normalize_base_path(path) do
     "/" <> String.trim(String.trim_leading(to_string(path), "/"), "/")

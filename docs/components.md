@@ -67,8 +67,9 @@ Most component types share the same shaping options:
 - `meta`
 
 Tools also support `annotations`, `input_schema`, and `output_schema`. Resources
-and prompts can also participate in task execution and visibility rules, just
-like tools.
+and prompts can participate in local in-process task execution and visibility
+rules. On the MCP `2025-11-25` wire, task augmentation is limited to
+`tools/call`.
 
 ## Common Helper Shapes
 

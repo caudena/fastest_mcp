@@ -10,6 +10,8 @@ defmodule FastestMCP.Providers.Skills.Common do
   resources without hard-coding directory conventions in your application.
   """
 
+  alias FastestMCP.PathSafety
+
   defmodule SkillFileInfo do
     @moduledoc """
     Metadata describing one file inside a loaded skill directory.
@@ -46,13 +48,23 @@ defmodule FastestMCP.Providers.Skills.Common do
       raise File.Error, reason: :enoent, action: "read directory", path: skill_path
     end
 
-    unless File.regular?(main_file_path) do
+    real_path = PathSafety.realpath!(skill_path)
+
+    real_main_file_path =
+      case PathSafety.safe_realpath(real_path, main_file_path) do
+        {:ok, path} ->
+          path
+
+        {:error, reason} ->
+          raise File.Error, reason: reason, action: "read file", path: main_file_path
+      end
+
+    unless File.regular?(real_main_file_path) do
       raise File.Error, reason: :enoent, action: "read file", path: main_file_path
     end
 
-    content = File.read!(main_file_path)
+    content = File.read!(real_main_file_path)
     {frontmatter, body} = parse_frontmatter(content)
-    real_path = realpath!(skill_path)
 
     %SkillInfo{
       name: Path.basename(skill_path),
@@ -63,6 +75,30 @@ defmodule FastestMCP.Providers.Skills.Common do
       files: scan_skill_files(skill_path, real_path),
       frontmatter: frontmatter
     }
+  end
+
+  @doc false
+  def skill_metadata_key(skill_path, main_file_name \\ "SKILL.md") do
+    skill_path = Path.expand(to_string(skill_path))
+
+    with {:ok, real_root} <- PathSafety.realpath(skill_path),
+         {:ok, files} <- safe_skill_files(skill_path, real_root),
+         true <-
+           Enum.any?(files, fn {relative_path, _real_path} ->
+             relative_path == main_file_name
+           end) do
+      metadata =
+        Enum.map(files, fn {relative_path, real_path} ->
+          stat = File.stat!(real_path)
+
+          {relative_path, real_path, stat.size, stat.mtime, stat.ctime, stat.inode, stat.mode}
+        end)
+
+      {:ok, {real_root, metadata}}
+    else
+      false -> {:error, :enoent}
+      {:error, reason} -> {:error, reason}
+    end
   end
 
   @doc "Builds the JSON manifest payload for a loaded skill."
@@ -87,21 +123,20 @@ defmodule FastestMCP.Providers.Skills.Common do
 
   @doc "Resolves a supporting file path while keeping it inside the skill root."
   def safe_file_path(%SkillInfo{} = skill_info, relative_path) do
-    joined_path = Path.join(skill_info.path, to_string(relative_path))
+    relative_path = to_string(relative_path)
 
-    with {:ok, real_path} <- realpath(joined_path),
-         :ok <- assert_within_root(skill_info.real_path, real_path),
-         true <- File.regular?(real_path) do
-      {:ok, real_path}
+    if Path.type(relative_path) == :relative do
+      joined_path = Path.expand(relative_path, skill_info.path)
+
+      with {:ok, real_path} <- PathSafety.safe_realpath(skill_info.real_path, joined_path),
+           true <- File.regular?(real_path) do
+        {:ok, real_path}
+      else
+        {:error, reason} -> {:error, reason}
+        false -> {:error, :enoent}
+      end
     else
-      {:error, reason} ->
-        {:error, reason}
-
-      false ->
-        {:error, :enoent}
-
-      :error ->
-        {:error, :invalid_path}
+      {:error, :invalid_path}
     end
   end
 
@@ -182,40 +217,15 @@ defmodule FastestMCP.Providers.Skills.Common do
   end
 
   defp scan_skill_files(skill_path, real_root) do
-    skill_path
-    |> Path.join("**/*")
-    |> Path.wildcard(match_dot: true)
-    |> Enum.reduce([], fn path, files ->
-      cond do
-        not File.regular?(path) ->
-          files
+    {:ok, files} = safe_skill_files(skill_path, real_root)
 
-        true ->
-          case realpath(path) do
-            {:ok, real_path} ->
-              case assert_within_root(real_root, real_path) do
-                :ok ->
-                  relative_path = Path.relative_to(path, skill_path) |> String.replace("\\", "/")
-
-                  [
-                    %SkillFileInfo{
-                      path: relative_path,
-                      size: File.stat!(real_path).size,
-                      hash: "sha256:" <> sha256_file(real_path)
-                    }
-                    | files
-                  ]
-
-                :error ->
-                  files
-              end
-
-            {:error, _reason} ->
-              files
-          end
-      end
+    Enum.map(files, fn {relative_path, real_path} ->
+      %SkillFileInfo{
+        path: relative_path,
+        size: File.stat!(real_path).size,
+        hash: "sha256:" <> sha256_file(real_path)
+      }
     end)
-    |> Enum.sort_by(& &1.path)
   end
 
   defp sha256_file(path) do
@@ -226,87 +236,60 @@ defmodule FastestMCP.Providers.Skills.Common do
     |> Base.encode16(case: :lower)
   end
 
-  defp realpath!(path) do
-    case realpath(path) do
-      {:ok, resolved_path} ->
-        resolved_path
-
-      {:error, reason} ->
-        raise File.Error, reason: reason, action: "resolve path", path: path
+  defp safe_skill_files(skill_path, real_root) do
+    case walk_skill_files(skill_path, skill_path, real_root, MapSet.new()) do
+      {:ok, files, _visited} -> {:ok, files}
+      {:error, reason} -> {:error, reason}
     end
   end
 
-  defp realpath(path) do
-    path
-    |> Path.expand()
-    |> Path.split()
-    |> resolve_segments([], MapSet.new())
-  end
+  defp walk_skill_files(logical_path, skill_path, real_root, visited) do
+    with {:ok, real_path} <- PathSafety.realpath(logical_path),
+         true <- PathSafety.within?(real_root, real_path),
+         false <- MapSet.member?(visited, real_path),
+         {:ok, entries} <- File.ls(logical_path) do
+      visited = MapSet.put(visited, real_path)
 
-  defp resolve_segments([], resolved_segments, _seen) do
-    {:ok, resolved_segments |> Enum.reverse() |> Path.join() |> normalize_rooted_path()}
-  end
+      {files, visited} =
+        entries
+        |> Enum.sort()
+        |> Enum.reduce({[], visited}, fn entry, {files, visited} ->
+          child = Path.join(logical_path, entry)
 
-  defp resolve_segments([segment | rest], resolved_segments, seen) do
-    candidate =
-      [segment | resolved_segments] |> Enum.reverse() |> Path.join() |> normalize_rooted_path()
-
-    case File.lstat(candidate) do
-      {:ok, %File.Stat{type: :symlink}} ->
-        if MapSet.member?(seen, candidate) do
-          {:error, :eloop}
-        else
-          with {:ok, link_target} <- File.read_link(candidate) do
-            target_path =
-              if Path.type(link_target) == :absolute do
-                link_target
-              else
-                Path.expand(link_target, Path.dirname(candidate))
+          case safe_child(child, real_root) do
+            {:ok, _real_child, :directory} ->
+              case walk_skill_files(child, skill_path, real_root, visited) do
+                {:ok, nested, visited} -> {Enum.reverse(nested, files), visited}
+                {:error, _reason} -> {files, visited}
               end
 
-            case realpath(target_path) do
-              {:ok, resolved_target} ->
-                target_segments = Path.split(resolved_target)
-                resolve_segments(rest, Enum.reverse(target_segments), MapSet.put(seen, candidate))
+            {:ok, real_child, :regular} ->
+              relative_path =
+                child
+                |> Path.relative_to(skill_path)
+                |> String.replace("\\", "/")
 
-              {:error, reason} ->
-                {:error, reason}
-            end
+              {[{relative_path, real_child} | files], visited}
+
+            _other ->
+              {files, visited}
           end
-        end
+        end)
 
-      {:ok, _stat} ->
-        resolve_segments(rest, [segment | resolved_segments], seen)
-
-      {:error, _reason} when rest == [] ->
-        # Preserve the final path for not-yet-existing files while still allowing
-        # path escape checks on the expanded location.
-        {:ok,
-         [segment | resolved_segments] |> Enum.reverse() |> Path.join() |> normalize_rooted_path()}
-
-      {:error, reason} ->
-        {:error, reason}
+      {:ok, Enum.reverse(files), visited}
+    else
+      false -> {:ok, [], visited}
+      {:error, reason} -> {:error, reason}
     end
   end
 
-  defp normalize_rooted_path("/"), do: "/"
-
-  defp normalize_rooted_path(path) do
-    if String.starts_with?(path, "/") do
-      path
+  defp safe_child(path, real_root) do
+    with {:ok, real_path} <- PathSafety.realpath(path),
+         true <- PathSafety.within?(real_root, real_path),
+         {:ok, %File.Stat{type: type}} <- File.stat(real_path) do
+      {:ok, real_path, type}
     else
-      "/" <> path
-    end
-  end
-
-  defp assert_within_root(root, path) do
-    root = String.trim_trailing(root, "/")
-    path = String.trim_trailing(path, "/")
-
-    if path == root or String.starts_with?(path, root <> "/") do
-      :ok
-    else
-      :error
+      _other -> :error
     end
   end
 end

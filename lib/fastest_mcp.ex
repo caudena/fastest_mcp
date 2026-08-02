@@ -309,6 +309,12 @@ defmodule FastestMCP do
 
       {:error, :not_found} ->
         raise invalid_task_id_error(task_id)
+
+      {:error, %Error{} = error} ->
+        raise error
+
+      {:error, reason} ->
+        raise task_storage_error(:fetch, reason)
     end
   end
 
@@ -330,6 +336,9 @@ defmodule FastestMCP do
 
       {:error, :not_found} ->
         raise invalid_task_id_error(task_id)
+
+      {:error, reason} ->
+        raise task_storage_error(:await, reason)
     end
   end
 
@@ -351,6 +360,9 @@ defmodule FastestMCP do
 
       {:error, :not_found} ->
         raise invalid_task_id_error(task_id)
+
+      {:error, reason} ->
+        raise task_storage_error(:result, reason)
     end
   end
 
@@ -362,7 +374,7 @@ defmodule FastestMCP do
     case BackgroundTaskStore.list(task_store, opts) do
       {:ok, page} -> page
       {:error, %Error{} = error} -> raise error
-      {:error, reason} -> raise Error, code: :internal_error, message: inspect(reason)
+      {:error, reason} -> raise task_storage_error(:list, reason)
     end
   end
 
@@ -384,6 +396,9 @@ defmodule FastestMCP do
 
       {:error, :not_found} ->
         raise invalid_task_id_error(task_id)
+
+      {:error, reason} ->
+        raise task_storage_error(:cancel, reason)
     end
   end
 
@@ -401,6 +416,9 @@ defmodule FastestMCP do
 
       {:error, :not_found} ->
         raise invalid_task_id_error(task_id)
+
+      {:error, reason} ->
+        raise task_storage_error(:send_input, reason)
     end
   end
 
@@ -489,6 +507,14 @@ defmodule FastestMCP do
     %Error{
       code: :invalid_task_id,
       message: "Invalid taskId: #{to_string(task_id)} not found"
+    }
+  end
+
+  defp task_storage_error(operation, reason) do
+    %Error{
+      code: :internal_error,
+      message: "background task storage #{operation} failed",
+      details: %{reason: inspect(reason)}
     }
   end
 end

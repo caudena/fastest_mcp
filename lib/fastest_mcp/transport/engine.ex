@@ -13,9 +13,12 @@ defmodule FastestMCP.Transport.Engine do
   alias FastestMCP.Error
   alias FastestMCP.ErrorExposure
   alias FastestMCP.Operation
+  alias FastestMCP.OperationPipeline
   alias FastestMCP.Provider
+  alias FastestMCP.Protocol
   alias FastestMCP.Registry
   alias FastestMCP.ServerRuntime
+  alias FastestMCP.Session
   alias FastestMCP.TaskOwner
   alias FastestMCP.TaskWire
   alias FastestMCP.Transport.Serializer
@@ -23,6 +26,10 @@ defmodule FastestMCP.Transport.Engine do
 
   @doc "Dispatches the normalized transport request through the operation pipeline."
   def dispatch!(server_name, %Request{} = request, opts \\ []) do
+    validate_wire_task_request!(request)
+    validate_initialize_request!(request)
+    validate_stdio_lifecycle!(server_name, request)
+
     request_opts =
       Keyword.merge(
         opts,
@@ -33,13 +40,19 @@ defmodule FastestMCP.Transport.Engine do
         task: request.task_request,
         task_ttl_ms: request.task_ttl_ms
       )
+      |> put_context_scope(request)
+      |> put_negotiated_context(server_name, request)
 
     case request.method do
       "notifications/initialized" ->
+        mark_session_initialized!(server_name, request)
         %{}
 
       "initialize" ->
-        FastestMCP.initialize(server_name, request.payload, request_opts)
+        initialize_params = validate_initialize_params!(request.payload)
+        result = FastestMCP.initialize(server_name, initialize_params, request_opts)
+        begin_session_initialization!(server_name, request, initialize_params)
+        result
 
       "ping" ->
         FastestMCP.ping(server_name, request.payload, request_opts)
@@ -81,15 +94,17 @@ defmodule FastestMCP.Transport.Engine do
         version = transport_request_version(request.payload)
         request_opts = maybe_put_opt(request_opts, :version, version)
         tool_name = fetch_required!(request.payload, "name", request.method)
-        descriptor = resolve_tool_descriptor(server_name, tool_name, request, request_opts)
 
-        task_or_result(
-          FastestMCP.call_tool(
+        {result, descriptor} =
+          OperationPipeline.call_tool_with_component(
             server_name,
             tool_name,
             Map.get(request.payload, "arguments", %{}),
             maybe_require_task_session(request, request_opts)
-          ),
+          )
+
+        task_or_result(
+          result,
           &Serializer.tool_result(&1, descriptor)
         )
 
@@ -100,13 +115,7 @@ defmodule FastestMCP.Transport.Engine do
             Keyword.merge(request_opts, pagination_opts(request.payload))
           )
 
-        resource_templates =
-          FastestMCP.list_resource_templates(server_name, request_opts)
-
-        paginated_resources_response(
-          resources,
-          resource_templates
-        )
+        paginated_response(resources, :resources, &Serializer.resource_metadata/1)
 
       "resources/templates/list" ->
         list_result =
@@ -117,7 +126,7 @@ defmodule FastestMCP.Transport.Engine do
 
         paginated_response(
           list_result,
-          :resource_templates,
+          :resourceTemplates,
           &Serializer.resource_template_metadata/1
         )
 
@@ -126,15 +135,17 @@ defmodule FastestMCP.Transport.Engine do
         request_opts = maybe_put_opt(request_opts, :version, version)
         uri = fetch_required!(request.payload, "uri", request.method)
 
-        task_or_result(
-          FastestMCP.read_resource(
+        {result, descriptor} =
+          OperationPipeline.read_resource_with_component(
             server_name,
             uri,
             maybe_require_task_session(request, request_opts)
-          ),
-          fn result ->
-            descriptor = resolve_resource_descriptor(server_name, uri, request, request_opts)
-            Serializer.resource_result(uri, descriptor && descriptor.mime_type, result)
+          )
+
+        task_or_result(
+          result,
+          fn value ->
+            Serializer.resource_result(uri, descriptor && descriptor.mime_type, value)
           end
         )
 
@@ -162,13 +173,16 @@ defmodule FastestMCP.Transport.Engine do
         paginated_response(list_result, :prompts, &Serializer.prompt_metadata/1)
 
       "prompts/get" ->
-        task_or_result(
-          FastestMCP.render_prompt(
+        {result, _descriptor} =
+          OperationPipeline.render_prompt_with_component(
             server_name,
             fetch_required!(request.payload, "name", request.method),
             Map.get(request.payload, "arguments", %{}),
             maybe_require_task_session(request, request_opts)
-          ),
+          )
+
+        task_or_result(
+          result,
           &Serializer.prompt_result/1
         )
 
@@ -245,29 +259,164 @@ defmodule FastestMCP.Transport.Engine do
           public_task_opts(server_name)
         )
 
-      "tasks/sendInput" ->
-        access_opts = task_access_opts(server_name, request)
-
-        TaskWire.task(
-          FastestMCP.send_task_input(
-            server_name,
-            fetch_required!(request.payload, "taskId", request.method),
-            fetch_required!(request.payload, "action", request.method),
-            Map.get(request.payload, "content"),
-            Keyword.merge(
-              access_opts,
-              request_id: Map.get(request.payload, "requestId")
-            )
-          ),
-          public_task_opts(server_name)
-        )
-
       method ->
         raise Error,
-          code: :not_found,
+          code: :method_not_found,
           message: "unknown #{request.transport} method #{inspect(method)}"
     end
   end
+
+  defp validate_initialize_params!(params) when is_map(params) do
+    protocol_version = Map.get(params, "protocolVersion")
+    capabilities = Map.get(params, "capabilities")
+    client_info = Map.get(params, "clientInfo")
+
+    cond do
+      protocol_version != Protocol.current_version() ->
+        raise Error,
+          code: :invalid_params,
+          message: "unsupported protocolVersion #{inspect(protocol_version)}",
+          details: %{supported: [Protocol.current_version()]}
+
+      not is_map(capabilities) ->
+        raise Error,
+          code: :invalid_params,
+          message: "initialize requires object capabilities"
+
+      not valid_implementation?(client_info) ->
+        raise Error,
+          code: :invalid_params,
+          message: "initialize requires clientInfo with string name and version"
+
+      true ->
+        params
+    end
+  end
+
+  defp validate_initialize_params!(_params) do
+    raise Error, code: :invalid_params, message: "initialize params must be an object"
+  end
+
+  defp valid_implementation?(%{"name" => name, "version" => version}) do
+    is_binary(name) and name != "" and is_binary(version) and version != ""
+  end
+
+  defp valid_implementation?(_client_info), do: false
+
+  defp begin_session_initialization!(_server_name, %{session_id: nil}, _params), do: :ok
+
+  defp begin_session_initialization!(server_name, request, params) do
+    case Session.begin_initialization(
+           server_name,
+           request.session_id,
+           Map.fetch!(params, "protocolVersion"),
+           Map.fetch!(params, "capabilities"),
+           Map.fetch!(params, "clientInfo")
+         ) do
+      :ok ->
+        :ok
+
+      {:error, :not_found} ->
+        raise Error, code: :internal_error, message: "initialize session was not created"
+
+      {:error, {:unsupported_protocol_version, version}} ->
+        raise Error,
+          code: :invalid_params,
+          message: "unsupported protocolVersion #{inspect(version)}"
+
+      {:error, {:invalid_transition, state}} ->
+        raise Error,
+          code: :invalid_request,
+          message: "initialize is invalid while session is #{state}"
+    end
+  end
+
+  defp mark_session_initialized!(_server_name, %{session_id: nil}), do: :ok
+
+  defp mark_session_initialized!(server_name, request) do
+    case Session.mark_initialized(server_name, request.session_id) do
+      :ok ->
+        :ok
+
+      {:error, :not_found} ->
+        raise Error, code: :not_found, message: "unknown session"
+
+      {:error, {:invalid_transition, state}} ->
+        raise Error,
+          code: :invalid_request,
+          message: "notifications/initialized is invalid while session is #{state}"
+    end
+  end
+
+  defp validate_wire_task_request!(%Request{task_request: true, method: method})
+       when method != "tools/call" do
+    raise Error,
+      code: :invalid_params,
+      message: "task augmentation is only supported for tools/call"
+  end
+
+  defp validate_wire_task_request!(_request), do: :ok
+
+  defp validate_stdio_lifecycle!(_server_name, %Request{transport: transport, protocol: protocol})
+       when transport != :stdio or protocol != :jsonrpc,
+       do: :ok
+
+  defp validate_stdio_lifecycle!(_server_name, %Request{method: "initialize"}), do: :ok
+
+  defp validate_stdio_lifecycle!(server_name, %Request{} = request) do
+    case Session.lifecycle(server_name, request.session_id) do
+      {:ok, %{state: :initialized}} ->
+        :ok
+
+      {:ok, %{state: :initializing}}
+      when request.method in ["notifications/initialized", "ping"] ->
+        :ok
+
+      {:ok, %{state: state}} ->
+        raise Error,
+          code: :invalid_request,
+          message: "session is not initialized",
+          details: %{state: state}
+
+      {:error, :not_found} ->
+        raise Error, code: :invalid_request, message: "initialize must be called first"
+    end
+  end
+
+  defp validate_initialize_request!(%Request{
+         protocol: :jsonrpc,
+         method: "initialize",
+         request_id: nil
+       }) do
+    raise Error,
+      code: :invalid_request,
+      message: "initialize must be a JSON-RPC request"
+  end
+
+  defp validate_initialize_request!(_request), do: :ok
+
+  defp put_context_scope(opts, %Request{request_metadata: metadata}) do
+    if Map.get(metadata, :stateless_http, false) do
+      Keyword.put(opts, :state_scope, :request)
+    else
+      opts
+    end
+  end
+
+  defp put_negotiated_context(opts, server_name, %Request{session_id: session_id})
+       when is_binary(session_id) do
+    case Session.lifecycle(server_name, session_id) do
+      {:ok, lifecycle} ->
+        opts
+        |> Keyword.put(:negotiated_protocol_version, lifecycle.protocol_version)
+        |> Keyword.put(:client_capabilities, lifecycle.client_capabilities)
+
+      _other ->
+        opts
+    end
+  end
+
+  defp put_negotiated_context(opts, _server_name, _request), do: opts
 
   defp fetch_required!(payload, key, method) do
     case Map.fetch(payload, key) do
@@ -687,21 +836,6 @@ defmodule FastestMCP.Transport.Engine do
 
   defp paginated_response(items, key, serializer) when is_list(items) do
     %{key => Enum.map(items, serializer)}
-  end
-
-  defp paginated_resources_response(%{items: items, next_cursor: next_cursor}, templates) do
-    %{
-      resources: Enum.map(items, &Serializer.resource_metadata/1),
-      resourceTemplates: Enum.map(templates, &Serializer.resource_template_metadata/1)
-    }
-    |> maybe_put(:nextCursor, next_cursor)
-  end
-
-  defp paginated_resources_response(items, templates) when is_list(items) do
-    %{
-      resources: Enum.map(items, &Serializer.resource_metadata/1),
-      resourceTemplates: Enum.map(templates, &Serializer.resource_template_metadata/1)
-    }
   end
 
   defp fetch_runtime!(server_name) do

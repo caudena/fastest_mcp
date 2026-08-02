@@ -9,16 +9,21 @@ defmodule FastestMCP.Transport.StreamableHTTP do
 
   import Plug.Conn
 
-  alias FastestMCP.Context
   alias FastestMCP.Error
   alias FastestMCP.ErrorExposure
+  alias FastestMCP.MIME
+  alias FastestMCP.Protocol
+  alias FastestMCP.Registry
   alias FastestMCP.ServerRuntime
+  alias FastestMCP.Session
   alias FastestMCP.SessionSupervisor
   alias FastestMCP.Transport.Engine
   alias FastestMCP.Transport.HTTPApp
   alias FastestMCP.Transport.HTTPCommon
   alias FastestMCP.Transport.StreamableHTTPAdapter
   alias FastestMCP.TTLStore
+
+  @protocol_version Protocol.current_version()
 
   @doc "Builds a child specification for supervising this module."
   def child_spec(opts) do
@@ -67,9 +72,6 @@ defmodule FastestMCP.Transport.StreamableHTTP do
       {:handled, %Plug.Conn{} = handled_conn} ->
         handled_conn
 
-      {:redirect, status, location} ->
-        HTTPCommon.redirect(conn, status, location)
-
       {:ok, status, payload, headers} ->
         conn =
           Enum.reduce(headers, conn, fn {key, value}, current ->
@@ -82,6 +84,21 @@ defmodule FastestMCP.Transport.StreamableHTTP do
         HTTPCommon.json(conn, status, payload)
 
       {:empty, status, headers} ->
+        conn =
+          Enum.reduce(headers, conn, fn {key, value}, current ->
+            put_resp_header(current, key, value)
+          end)
+
+        send_resp(conn, status, "")
+
+      {:error,
+       %FastestMCP.Transport.Request{
+         protocol: :jsonrpc,
+         request_id: nil,
+         request_metadata: %{jsonrpc_notification: true}
+       }, %Error{} = error, auth, http_context} ->
+        {status, headers, _payload} = HTTPCommon.error_response(error, auth, http_context)
+
         conn =
           Enum.reduce(headers, conn, fn {key, value}, current ->
             put_resp_header(current, key, value)
@@ -121,30 +138,11 @@ defmodule FastestMCP.Transport.StreamableHTTP do
 
   defp dispatch(conn, runtime, opts) do
     case StreamableHTTPAdapter.decode(conn, opts) do
-      {:ok, {:batch, entries}} ->
-        execute_batch(runtime, entries, opts)
-
-      {:ok, %FastestMCP.Transport.Request{method: "__transport/client_response__"} = request} ->
-        handle_client_response(runtime, request)
-
-      {:ok,
-       %FastestMCP.Transport.Request{
-         method: method
-       } = request}
-      when method in ["tools/call", "tasks/result"] ->
-        maybe_stream_task_request(conn, runtime, request, opts)
-
-      {:ok, %FastestMCP.Transport.Request{method: "__transport/session_get__"} = request} ->
-        maybe_stream_session(conn, runtime, request)
-
-      {:ok, %FastestMCP.Transport.Request{method: "__transport/delete_session__"} = request} ->
-        terminate_http_session(runtime, request)
-
-      {:ok, request} ->
-        execute_request(runtime, request, opts)
-
-      {:redirect, status, target_path} ->
-        {:redirect, status, redirect_location(conn, opts, target_path)}
+      {:ok, %FastestMCP.Transport.Request{} = request} ->
+        case validate_http_request(runtime, request) do
+          :ok -> dispatch_request(conn, runtime, request, opts)
+          {:error, %Error{} = error} -> {:error, request, error}
+        end
 
       {:response, status, payload} ->
         {:ok, status, maybe_put_health_server_name(payload, runtime.server.name)}
@@ -153,27 +151,128 @@ defmodule FastestMCP.Transport.StreamableHTTP do
         {:ok, status, maybe_put_health_server_name(payload, runtime.server.name), headers}
 
       {:error, %Error{} = error} ->
-        {:error, error}
+        request = %FastestMCP.Transport.Request{
+          protocol: :jsonrpc,
+          request_id: nil,
+          request_metadata: %{}
+        }
+
+        {:error, request, error}
     end
   end
 
-  defp execute_batch(runtime, entries, opts) do
-    {responses, headers} =
-      Enum.reduce(entries, {[], []}, fn entry, {responses, headers} ->
-        case execute_batch_entry(runtime, entry, opts) do
-          {:ok, nil, entry_headers} ->
-            {responses, headers ++ entry_headers}
+  defp dispatch_request(
+         _conn,
+         runtime,
+         %{method: "__transport/client_response__"} = request,
+         _opts
+       ),
+       do: handle_client_response(runtime, request)
 
-          {:ok, response, entry_headers} ->
-            {responses ++ [response], headers ++ entry_headers}
-        end
-      end)
+  defp dispatch_request(conn, runtime, %{method: method} = request, opts)
+       when method in ["tools/call", "tasks/result"],
+       do: maybe_stream_task_request(conn, runtime, request, opts)
 
-    case responses do
-      [] -> {:empty, 202, headers}
-      _responses -> {:ok, 200, responses, headers}
+  defp dispatch_request(conn, runtime, %{method: "__transport/session_get__"} = request, _opts),
+    do: maybe_stream_session(conn, runtime, request)
+
+  defp dispatch_request(
+         _conn,
+         runtime,
+         %{method: "__transport/delete_session__"} = request,
+         _opts
+       ),
+       do: terminate_http_session(runtime, request)
+
+  defp dispatch_request(_conn, runtime, request, opts),
+    do: execute_request(runtime, request, opts)
+
+  defp validate_http_request(_runtime, %{method: "initialize"}), do: :ok
+
+  defp validate_http_request(_runtime, %{request_metadata: %{stateless_http: true}} = request) do
+    with :ok <- validate_protocol_header(request),
+         :ok <- reject_stateless_session_features(request) do
+      :ok
     end
   end
+
+  defp validate_http_request(runtime, request) do
+    with :ok <- require_session_header(request),
+         :ok <- validate_protocol_header(request),
+         {:ok, _pid} <- lookup_http_session(runtime, request.session_id),
+         :ok <- validate_lifecycle(runtime, request) do
+      :ok
+    end
+  end
+
+  defp require_session_header(%{session_id: session_id})
+       when is_binary(session_id) and session_id != "",
+       do: :ok
+
+  defp require_session_header(_request) do
+    {:error, %Error{code: :bad_request, message: "MCP-Session-Id is required"}}
+  end
+
+  defp validate_protocol_header(%{request_metadata: metadata}) do
+    case Map.get(metadata, :protocol_version) do
+      @protocol_version ->
+        :ok
+
+      nil ->
+        {:error, %Error{code: :bad_request, message: "MCP-Protocol-Version is required"}}
+
+      version ->
+        {:error,
+         %Error{
+           code: :bad_request,
+           message: "unsupported MCP-Protocol-Version #{inspect(version)}"
+         }}
+    end
+  end
+
+  defp lookup_http_session(runtime, session_id) do
+    case Registry.lookup_session(runtime.server.name, session_id) do
+      {:ok, pid} ->
+        {:ok, pid}
+
+      _other ->
+        {:error, %Error{code: :not_found, message: "unknown session #{inspect(session_id)}"}}
+    end
+  end
+
+  defp validate_lifecycle(runtime, %{method: method, session_id: session_id}) do
+    case Session.lifecycle(runtime.server.name, session_id) do
+      {:ok, %{state: :initialized}} ->
+        :ok
+
+      {:ok, %{state: :initializing}}
+      when method in ["notifications/initialized", "ping"] ->
+        :ok
+
+      {:ok, %{state: state}} ->
+        {:error,
+         %Error{
+           code: :invalid_request,
+           message: "session is not initialized",
+           details: %{state: state}
+         }}
+
+      {:error, :not_found} ->
+        {:error, %Error{code: :not_found, message: "unknown session #{inspect(session_id)}"}}
+    end
+  end
+
+  defp reject_stateless_session_features(%{task_request: true}) do
+    {:error,
+     %Error{code: :bad_request, message: "stateless HTTP does not support task augmentation"}}
+  end
+
+  defp reject_stateless_session_features(%{method: method})
+       when method in ["resources/subscribe", "resources/unsubscribe"] do
+    {:error, %Error{code: :bad_request, message: "stateless HTTP does not support subscriptions"}}
+  end
+
+  defp reject_stateless_session_features(_request), do: :ok
 
   defp terminate_http_session(runtime, request) do
     session_id = request.session_id
@@ -197,11 +296,15 @@ defmodule FastestMCP.Transport.StreamableHTTP do
                session_id
              ) do
           :ok ->
+            close_session_stream(runtime, session_id)
             :ok = TTLStore.put(store, session_id, true)
             {:empty, 204, []}
 
           {:error, :not_found} ->
             {:error, %Error{code: :not_found, message: "unknown session #{inspect(session_id)}"}}
+
+          {:error, %Error{} = error} ->
+            {:error, error}
 
           {:error, reason} ->
             {:error,
@@ -214,42 +317,31 @@ defmodule FastestMCP.Transport.StreamableHTTP do
     end
   end
 
-  defp ensure_http_session(runtime, request) do
-    case Context.build(
-           runtime.server.name,
-           server: runtime.server,
-           dependencies: runtime.server.dependencies,
-           task_store: Map.get(runtime, :task_store),
-           session_supervisor: runtime.session_supervisor,
-           terminated_session_store: Map.get(runtime, :terminated_session_store),
-           event_bus: runtime.event_bus,
-           lifespan_context: Map.get(runtime, :lifespan_context, %{}),
-           transport: :streamable_http,
-           session_id: request.session_id,
-           request_metadata: request.request_metadata
-         ) do
-      {:ok, _context} ->
-        {:empty, 204, [{"mcp-session-id", request.session_id}]}
+  defp close_session_stream(runtime, session_id) do
+    store = Map.fetch!(runtime, :session_stream_store)
 
-      {:error, %Error{} = error} ->
-        {:error, request, error}
+    case TTLStore.get(store, session_id) do
+      {:ok, %{owner: owner} = stream_owner} when is_pid(owner) ->
+        send(owner, :session_stream_replaced)
+        _ = TTLStore.delete_if(store, session_id, stream_owner)
+        :ok
+
+      _other ->
+        :ok
     end
   end
 
   defp maybe_stream_session(conn, runtime, request) do
     if accepts_event_stream?(conn) do
-      case ensure_http_session(runtime, request) do
-        {:empty, 204, _headers} ->
-          {:handled, stream_session(conn, runtime, request)}
+      case lookup_http_session(runtime, request.session_id) do
+        {:ok, session_pid} ->
+          {:handled, stream_session(conn, runtime, request, session_pid)}
 
-        {:error, %FastestMCP.Transport.Request{} = failed_request, %Error{} = error} ->
-          {:error, failed_request, error}
-
-        other ->
-          other
+        {:error, %Error{} = error} ->
+          {:error, request, error}
       end
     else
-      ensure_http_session(runtime, request)
+      {:error, request, %Error{code: :bad_request, message: "MCP GET requires text/event-stream"}}
     end
   end
 
@@ -259,67 +351,34 @@ defmodule FastestMCP.Transport.StreamableHTTP do
 
   defp maybe_put_health_server_name(payload, _server_name), do: payload
 
-  defp redirect_location(conn, opts, target_path) do
-    HTTPCommon.http_context(conn, %{}, opts).base_url <> target_path
-  end
-
   defp execute_request(runtime, request, opts) do
     try do
       payload = Engine.dispatch!(runtime.server.name, request, opts)
       StreamableHTTPAdapter.encode_success(request, payload)
     rescue
       error in Error ->
+        cleanup_failed_initialize(runtime, request)
         {:error, request, public_error(error, runtime.server, request)}
 
       error ->
+        cleanup_failed_initialize(runtime, request)
         {:error, error}
     end
   end
 
-  defp execute_batch_entry(_runtime, {:error, request_id, %Error{} = error}, _opts) do
-    request = %FastestMCP.Transport.Request{protocol: :jsonrpc, request_id: request_id}
-    {:ok, StreamableHTTPAdapter.encode_jsonrpc_error(request, error), []}
+  defp cleanup_failed_initialize(runtime, %{method: "initialize", session_id: session_id})
+       when is_binary(session_id) do
+    _ =
+      SessionSupervisor.terminate_session(
+        runtime.session_supervisor,
+        runtime.server.name,
+        session_id
+      )
+
+    :ok
   end
 
-  defp execute_batch_entry(runtime, {:request, request}, opts) do
-    result =
-      case request.method do
-        "__transport/client_response__" ->
-          handle_client_response(runtime, request)
-
-        _other ->
-          execute_request(runtime, request, opts)
-      end
-
-    case result do
-      {:empty, _status, headers} ->
-        {:ok, nil, headers}
-
-      {:ok, _status, _payload, headers}
-      when request.protocol == :jsonrpc and is_nil(request.request_id) ->
-        {:ok, nil, headers}
-
-      {:ok, _status, _payload}
-      when request.protocol == :jsonrpc and is_nil(request.request_id) ->
-        {:ok, nil, []}
-
-      {:ok, _status, payload, headers} ->
-        {:ok, payload, headers}
-
-      {:ok, _status, payload} ->
-        {:ok, payload, []}
-
-      {:error, %FastestMCP.Transport.Request{} = failed_request, %Error{} = error} ->
-        {:ok, StreamableHTTPAdapter.encode_jsonrpc_error(failed_request, error), []}
-
-      {:error, %Error{} = error} ->
-        {:ok, StreamableHTTPAdapter.encode_jsonrpc_error(request, error), []}
-
-      {:error, error} ->
-        {:ok, StreamableHTTPAdapter.encode_jsonrpc_error(request, normalize_stream_error(error)),
-         []}
-    end
-  end
+  defp cleanup_failed_initialize(_runtime, _request), do: :ok
 
   defp maybe_stream_task_request(conn, runtime, request, opts) do
     if stream_event_tool_call?(conn, request, opts) do
@@ -334,24 +393,12 @@ defmodule FastestMCP.Transport.StreamableHTTP do
       streamable_task_request?(request)
   end
 
-  # Legacy /mcp/tasks/result and /mcp/tools/call endpoints still need the same
-  # streamed relay behavior as JSON-RPC /mcp requests. When they opt into
-  # event-stream responses we synthesize a request id so the SSE payload can use
-  # the same JSON-RPC message framing as the standard path.
   defp streamable_request(%{protocol: :jsonrpc, request_id: request_id} = request)
        when not is_nil(request_id),
        do: request
 
-  defp streamable_request(request) do
-    %{request | protocol: :jsonrpc, request_id: next_stream_request_id()}
-  end
-
   defp streamable_task_request?(%{protocol: :jsonrpc, request_id: request_id})
        when not is_nil(request_id),
-       do: true
-
-  defp streamable_task_request?(%{protocol: :native, method: method})
-       when method in ["tools/call", "tasks/result"],
        do: true
 
   defp streamable_task_request?(_request), do: false
@@ -363,7 +410,7 @@ defmodule FastestMCP.Transport.StreamableHTTP do
   defp accepts_event_stream?(conn) do
     conn
     |> get_req_header("accept")
-    |> Enum.any?(&String.contains?(&1, "text/event-stream"))
+    |> MIME.accepts?("text/event-stream")
   end
 
   defp stream_task_request(conn, runtime, request, opts) do
@@ -371,12 +418,21 @@ defmodule FastestMCP.Transport.StreamableHTTP do
       conn
       |> put_resp_header("content-type", "text/event-stream")
       |> put_resp_header("cache-control", "no-cache")
-      |> put_resp_header("connection", "keep-alive")
+      |> put_resp_header("connection", "close")
       |> maybe_put_session_header(request)
 
     conn = send_chunked(conn, 200)
 
+    case chunk_raw(conn, sse_event("", next_stream_event_id())) do
+      {:ok, conn} -> run_stream_task(conn, runtime, request, opts)
+      {:error, _reason} -> conn
+    end
+  end
+
+  defp run_stream_task(conn, runtime, request, opts) do
     owner = self()
+    result_alias = :erlang.alias()
+    stream_ref = make_ref()
 
     spawned_request =
       %{
@@ -388,50 +444,92 @@ defmodule FastestMCP.Transport.StreamableHTTP do
             })
       }
 
-    spawn(fn ->
-      result =
-        try do
-          {:ok, Engine.dispatch!(runtime.server.name, spawned_request, opts)}
-        rescue
-          error in Error ->
-            {:error, public_error(error, runtime.server, spawned_request)}
+    try do
+      {:ok, task_pid} =
+        Task.Supervisor.start_child(runtime.stream_task_supervisor, fn ->
+          result =
+            try do
+              {:ok, Engine.dispatch!(runtime.server.name, spawned_request, opts)}
+            rescue
+              error in Error ->
+                {:error, public_error(error, runtime.server, spawned_request)}
 
-          error ->
-            {:error, normalize_stream_error(error)}
-        catch
-          :exit, reason ->
-            {:error,
-             %Error{
-               code: :internal_error,
-               message: "streamed task request exited",
-               details: %{reason: inspect(reason)}
-             }}
+              error ->
+                {:error, normalize_stream_error(error)}
+            catch
+              :exit, reason ->
+                {:error,
+                 %Error{
+                   code: :internal_error,
+                   message: "streamed task request exited",
+                   details: %{reason: inspect(reason)}
+                 }}
 
-          kind, reason ->
-            {:error,
-             %Error{
-               code: :internal_error,
-               message: "streamed task request failed",
-               details: %{kind: inspect(kind), reason: inspect(reason)}
-             }}
-        end
+              kind, reason ->
+                {:error,
+                 %Error{
+                   code: :internal_error,
+                   message: "streamed task request failed",
+                   details: %{kind: inspect(kind), reason: inspect(reason)}
+                 }}
+            end
 
-      send(owner, {:stream_dispatch_result, request.request_id, result})
-    end)
+          send(result_alias, {:stream_dispatch_result, stream_ref, result})
+        end)
 
-    stream_loop(conn, runtime, request)
+      monitor_ref = Process.monitor(task_pid)
+      timeout_ms = Keyword.get(opts, :stream_request_timeout_ms, 60_000)
+      deadline = System.monotonic_time(:millisecond) + timeout_ms
+
+      try do
+        stream_loop(
+          conn,
+          runtime,
+          request,
+          task_pid,
+          monitor_ref,
+          stream_ref,
+          deadline,
+          timeout_ms
+        )
+      after
+        deactivate_stream_result(result_alias, stream_ref)
+        Process.demonitor(monitor_ref, [:flush])
+      end
+    after
+      deactivate_stream_result(result_alias, stream_ref)
+    end
   end
 
-  defp next_stream_request_id do
-    "http-" <> Integer.to_string(System.unique_integer([:positive]))
-  end
+  defp stream_loop(
+         conn,
+         runtime,
+         request,
+         task_pid,
+         monitor_ref,
+         stream_ref,
+         deadline,
+         timeout_ms
+       ) do
+    remaining_ms = max(deadline - System.monotonic_time(:millisecond), 0)
 
-  defp stream_loop(conn, runtime, request) do
     receive do
       {:client_bridge_notification, message} ->
         case chunk_message(conn, message) do
-          {:ok, conn} -> stream_loop(conn, runtime, request)
-          {:error, _reason} -> conn
+          {:ok, conn} ->
+            stream_loop(
+              conn,
+              runtime,
+              request,
+              task_pid,
+              monitor_ref,
+              stream_ref,
+              deadline,
+              timeout_ms
+            )
+
+          {:error, _reason} ->
+            conn
         end
 
       {:client_bridge_request, waiter, client_request_id, message, store, session_id, timeout_ms} ->
@@ -445,7 +543,16 @@ defmodule FastestMCP.Transport.StreamableHTTP do
 
         case chunk_message(conn, message) do
           {:ok, conn} ->
-            stream_loop(conn, runtime, request)
+            stream_loop(
+              conn,
+              runtime,
+              request,
+              task_pid,
+              monitor_ref,
+              stream_ref,
+              deadline,
+              timeout_ms
+            )
 
           {:error, reason} ->
             :ok = TTLStore.delete(store, client_request_id)
@@ -464,15 +571,40 @@ defmodule FastestMCP.Transport.StreamableHTTP do
             conn
         end
 
-      {:stream_dispatch_result, request_id, {:ok, payload}}
-      when request_id == request.request_id ->
+      {:stream_dispatch_result, ^stream_ref, {:ok, payload}} ->
         case chunk_message(conn, StreamableHTTPAdapter.encode_jsonrpc_success(request, payload)) do
           {:ok, conn} -> conn
           {:error, _reason} -> conn
         end
 
-      {:stream_dispatch_result, request_id, {:error, %Error{} = error}}
-      when request_id == request.request_id ->
+      {:stream_dispatch_result, ^stream_ref, {:error, %Error{} = error}} ->
+        case chunk_message(conn, StreamableHTTPAdapter.encode_jsonrpc_error(request, error)) do
+          {:ok, conn} -> conn
+          {:error, _reason} -> conn
+        end
+
+      {:DOWN, ^monitor_ref, :process, ^task_pid, reason} ->
+        error =
+          %Error{
+            code: :internal_error,
+            message: "streamed request worker exited",
+            details: %{reason: inspect(reason)}
+          }
+
+        case chunk_message(conn, StreamableHTTPAdapter.encode_jsonrpc_error(request, error)) do
+          {:ok, conn} -> conn
+          {:error, _reason} -> conn
+        end
+    after
+      remaining_ms ->
+        _ = Task.Supervisor.terminate_child(runtime.stream_task_supervisor, task_pid)
+
+        error = %Error{
+          code: :timeout,
+          message: "streamed request timed out",
+          details: %{timeout_ms: timeout_ms}
+        }
+
         case chunk_message(conn, StreamableHTTPAdapter.encode_jsonrpc_error(request, error)) do
           {:ok, conn} -> conn
           {:error, _reason} -> conn
@@ -480,16 +612,18 @@ defmodule FastestMCP.Transport.StreamableHTTP do
     end
   end
 
-  defp stream_session(conn, runtime, request) do
+  defp stream_session(conn, runtime, request, session_pid) do
     conn =
       conn
       |> put_resp_header("content-type", "text/event-stream")
       |> put_resp_header("cache-control", "no-cache")
-      |> put_resp_header("connection", "keep-alive")
+      |> put_resp_header("connection", "close")
       |> maybe_put_session_header(request)
 
     stream_id = next_stream_event_id()
+    session_monitor = Process.monitor(session_pid)
     session_stream_store = Map.fetch!(runtime, :session_stream_store)
+    stream_owner = %{stream_id: stream_id, owner: self(), session_pid: session_pid}
 
     previous_stream =
       case TTLStore.get(session_stream_store, request.session_id) do
@@ -501,96 +635,129 @@ defmodule FastestMCP.Transport.StreamableHTTP do
       TTLStore.put(
         session_stream_store,
         request.session_id,
-        %{stream_id: stream_id, owner: self()},
-        :infinity
+        stream_owner
       )
 
     maybe_replace_previous_session_stream(previous_stream, self(), stream_id)
 
-    {:ok, subscriber} =
-      FastestMCP.SessionNotificationSupervisor.start_subscriber(
-        runtime.session_notification_supervisor,
-        server_name: runtime.server.name,
-        session_id: request.session_id,
-        event_bus: runtime.event_bus,
-        task_store: runtime.task_store,
-        owner: self(),
-        target: self()
-      )
-
     try do
-      conn = send_chunked(conn, 200)
+      {:ok, subscriber} =
+        FastestMCP.SessionNotificationSupervisor.start_subscriber(
+          runtime.session_notification_supervisor,
+          server_name: runtime.server.name,
+          session_id: request.session_id,
+          event_bus: runtime.event_bus,
+          task_store: runtime.task_store,
+          owner: self(),
+          target: self()
+        )
 
-      case chunk_raw(conn, sse_event("", stream_id)) do
-        {:ok, conn} ->
-          session_stream_loop(conn, runtime, request, subscriber, stream_id)
+      try do
+        conn = send_chunked(conn, 200)
 
-        {:error, _reason} ->
-          GenServer.stop(subscriber)
-          clear_session_stream_owner(runtime, request.session_id, stream_id)
-          conn
+        case chunk_raw(conn, sse_event("", stream_id)) do
+          {:ok, conn} ->
+            session_stream_loop(
+              conn,
+              runtime,
+              request,
+              session_pid,
+              session_monitor,
+              stream_owner
+            )
+
+          {:error, _reason} ->
+            conn
+        end
+      after
+        stop_session_stream_subscriber(runtime, subscriber)
       end
-    rescue
-      error ->
-        GenServer.stop(subscriber)
-        clear_session_stream_owner(runtime, request.session_id, stream_id)
-        reraise error, __STACKTRACE__
+    after
+      Process.demonitor(session_monitor, [:flush])
+      clear_session_stream_owner(runtime, request.session_id, stream_owner)
     end
   end
 
-  defp session_stream_loop(conn, runtime, request, subscriber, stream_id) do
+  defp session_stream_loop(
+         conn,
+         runtime,
+         request,
+         session_pid,
+         session_monitor,
+         stream_owner
+       ) do
     receive do
       {:fastest_mcp_task_notification, server_name, notification}
       when server_name == runtime.server.name ->
-        if session_stream_owner?(runtime, request.session_id, stream_id) do
+        if session_stream_owner?(runtime, request.session_id, stream_owner) do
           case chunk_message(conn, notification, next_stream_event_id()) do
             {:ok, conn} ->
-              session_stream_loop(conn, runtime, request, subscriber, stream_id)
+              refresh_session_stream_owner(runtime, request.session_id, stream_owner)
+
+              session_stream_loop(
+                conn,
+                runtime,
+                request,
+                session_pid,
+                session_monitor,
+                stream_owner
+              )
 
             {:error, _reason} ->
-              GenServer.stop(subscriber)
-              clear_session_stream_owner(runtime, request.session_id, stream_id)
               conn
           end
         else
-          GenServer.stop(subscriber)
           conn
         end
 
       {:fastest_mcp_session_notification, server_name, notification}
       when server_name == runtime.server.name ->
-        if session_stream_owner?(runtime, request.session_id, stream_id) do
+        if session_stream_owner?(runtime, request.session_id, stream_owner) do
           case chunk_message(conn, notification, next_stream_event_id()) do
             {:ok, conn} ->
-              session_stream_loop(conn, runtime, request, subscriber, stream_id)
+              refresh_session_stream_owner(runtime, request.session_id, stream_owner)
+
+              session_stream_loop(
+                conn,
+                runtime,
+                request,
+                session_pid,
+                session_monitor,
+                stream_owner
+              )
 
             {:error, _reason} ->
-              GenServer.stop(subscriber)
-              clear_session_stream_owner(runtime, request.session_id, stream_id)
               conn
           end
         else
-          GenServer.stop(subscriber)
           conn
         end
 
       :session_stream_replaced ->
-        GenServer.stop(subscriber)
+        conn
+
+      {:DOWN, ^session_monitor, :process, ^session_pid, _reason} ->
         conn
     after
       30_000 ->
-        if session_stream_owner?(runtime, request.session_id, stream_id) do
+        if session_stream_owner?(runtime, request.session_id, stream_owner) do
           case chunk_raw(conn, sse_retry(1_000)) do
             {:ok, conn} ->
-              session_stream_loop(conn, runtime, request, subscriber, stream_id)
+              refresh_session_stream_owner(runtime, request.session_id, stream_owner)
+
+              session_stream_loop(
+                conn,
+                runtime,
+                request,
+                session_pid,
+                session_monitor,
+                stream_owner
+              )
 
             {:error, _reason} ->
-              GenServer.stop(subscriber)
-              clear_session_stream_owner(runtime, request.session_id, stream_id)
               conn
           end
         else
-          GenServer.stop(subscriber)
           conn
         end
     end
@@ -688,23 +855,46 @@ defmodule FastestMCP.Transport.StreamableHTTP do
 
   defp maybe_replace_previous_session_stream(_other, _current_owner, _stream_id), do: :ok
 
-  defp session_stream_owner?(runtime, session_id, stream_id) do
+  defp session_stream_owner?(runtime, session_id, stream_owner) do
     runtime
     |> Map.fetch!(:session_stream_store)
     |> TTLStore.get(session_id)
     |> case do
-      {:ok, %{stream_id: ^stream_id}} -> true
+      {:ok, ^stream_owner} -> true
       _other -> false
     end
   end
 
-  defp clear_session_stream_owner(runtime, session_id, stream_id) do
-    store = Map.fetch!(runtime, :session_stream_store)
+  defp clear_session_stream_owner(runtime, session_id, stream_owner) do
+    runtime
+    |> Map.fetch!(:session_stream_store)
+    |> TTLStore.delete_if(session_id, stream_owner)
+  end
 
-    case TTLStore.get(store, session_id) do
-      {:ok, %{stream_id: ^stream_id}} -> TTLStore.delete(store, session_id)
-      _other -> :ok
+  defp refresh_session_stream_owner(runtime, session_id, stream_owner) do
+    runtime
+    |> Map.fetch!(:session_stream_store)
+    |> TTLStore.refresh(session_id, stream_owner)
+  end
+
+  defp stop_session_stream_subscriber(runtime, subscriber) do
+    DynamicSupervisor.terminate_child(runtime.session_notification_supervisor, subscriber)
+  catch
+    :exit, _reason -> :ok
+  end
+
+  defp flush_stream_dispatch_result(stream_ref) do
+    receive do
+      {:stream_dispatch_result, ^stream_ref, _result} ->
+        flush_stream_dispatch_result(stream_ref)
+    after
+      0 -> :ok
     end
+  end
+
+  defp deactivate_stream_result(result_alias, stream_ref) do
+    _ = :erlang.unalias(result_alias)
+    flush_stream_dispatch_result(stream_ref)
   end
 
   defp normalize_stream_error(%Error{} = error), do: error

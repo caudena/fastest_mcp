@@ -50,11 +50,14 @@ defmodule FastestMCP.IconsTest do
     assert %{tools: [%{"icons" => serialized_tool_icons}]} =
              Engine.dispatch!(server_name, %Request{method: "tools/list", transport: :stdio})
 
-    assert %{
-             resources: [%{"icons" => serialized_resource_icons}],
-             resourceTemplates: [%{"icons" => serialized_template_icons}]
-           } =
+    assert %{resources: [%{"icons" => serialized_resource_icons}]} =
              Engine.dispatch!(server_name, %Request{method: "resources/list", transport: :stdio})
+
+    assert %{resourceTemplates: [%{"icons" => serialized_template_icons}]} =
+             Engine.dispatch!(server_name, %Request{
+               method: "resources/templates/list",
+               transport: :stdio
+             })
 
     assert %{prompts: [%{"icons" => serialized_prompt_icons}]} =
              Engine.dispatch!(server_name, %Request{method: "prompts/list", transport: :stdio})

@@ -152,6 +152,13 @@ Authorization rules can also filter list results with tags:
 FastestMCP.Authorization.restrict_tag("internal")
 ```
 
+Authorization is fail closed. A component check authorizes only when it returns
+`true` or `:ok`. `false`, `nil`, malformed return values, exceptions, throws,
+and exits all deny access; a binary `{:error, message}` also denies with that
+message. When multiple versions share an identity, an unauthorized higher
+version is skipped so an authorized lower version can remain visible, while an
+explicit request for the unauthorized version is rejected.
+
 ## HTTP Behavior
 
 HTTP auth failures use plain bearer challenges:

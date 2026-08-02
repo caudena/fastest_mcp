@@ -171,7 +171,7 @@ defmodule FastestMCP.DocsExamplesTest do
         FastestMCP.call_tool(server_name, "dynamic.echo", %{"value" => "blocked"})
       end
 
-    assert error.code == :not_found
+    assert error.code == :disabled
     assert {:ok, _removed} = ComponentManager.remove_tool(manager, "dynamic.echo")
   end
 
@@ -313,7 +313,7 @@ defmodule FastestMCP.DocsExamplesTest do
     assert %{
              "content" => [%{"type" => "text"}],
              "structuredContent" => %{"result" => ["alpha", "beta"]},
-             "meta" => %{"fastestmcp" => %{"wrap_result" => true}}
+             "_meta" => %{"fastestmcp" => %{"wrap_result" => true}}
            } = Client.call_tool(client, "list_values", %{})
 
     :ok = FastestMCP.disable_components(server_name, tags: ["private"], components: [:tool])

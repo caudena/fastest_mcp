@@ -308,7 +308,7 @@ defmodule FastestMCP.SessionVisibilityNotificationsTest do
         {Bandit,
          plug:
            {FastestMCP.Transport.HTTPApp,
-            server_name: server_name, path: "/mcp", allowed_hosts: :any},
+            server_name: server_name, path: "/mcp", unsafe_allow_any_host: true},
          scheme: :http,
          port: 0}
       )

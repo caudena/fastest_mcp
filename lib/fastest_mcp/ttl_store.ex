@@ -34,6 +34,16 @@ defmodule FastestMCP.TTLStore do
     GenServer.call(store, {:delete, to_string(key)})
   end
 
+  @doc "Renews an entry only when its current value matches the expected value."
+  def refresh(store, key, expected_value, ttl_ms \\ :default) do
+    GenServer.call(store, {:refresh, to_string(key), expected_value, ttl_ms})
+  end
+
+  @doc "Deletes an entry only when its current value matches the expected value."
+  def delete_if(store, key, expected_value) do
+    GenServer.call(store, {:delete_if, to_string(key), expected_value})
+  end
+
   @doc "Returns the current keys in the backing store."
   def keys(store) do
     GenServer.call(store, :keys)
@@ -80,6 +90,30 @@ defmodule FastestMCP.TTLStore do
   def handle_call({:delete, key}, _from, state) do
     {_entry, state} = pop_entry(state, key)
     {:reply, :ok, state}
+  end
+
+  def handle_call({:refresh, key, expected_value, ttl_ms}, _from, state) do
+    case Map.get(state.entries, key) do
+      %{value: ^expected_value} ->
+        ttl_ms = normalize_ttl(ttl_ms, state.ttl_ms)
+        {_entry, state} = pop_entry(state, key)
+        state = put_entry(state, key, expected_value, ttl_ms, make_ref())
+        {:reply, :ok, state}
+
+      _other ->
+        {:reply, {:error, :not_found}, state}
+    end
+  end
+
+  def handle_call({:delete_if, key, expected_value}, _from, state) do
+    case Map.get(state.entries, key) do
+      %{value: ^expected_value} ->
+        {_entry, state} = pop_entry(state, key)
+        {:reply, :ok, state}
+
+      _other ->
+        {:reply, {:error, :not_found}, state}
+    end
   end
 
   def handle_call(:keys, _from, state) do

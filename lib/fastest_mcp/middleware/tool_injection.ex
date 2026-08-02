@@ -15,7 +15,10 @@ defmodule FastestMCP.Middleware.ToolInjection do
 
   alias FastestMCP.Component
   alias FastestMCP.ComponentCompiler
+  alias FastestMCP.ComponentPolicy
+  alias FastestMCP.Error
   alias FastestMCP.Operation
+  alias FastestMCP.OperationPipeline
 
   defstruct [:middleware, tools: [], tools_by_name: %{}]
 
@@ -36,6 +39,7 @@ defmodule FastestMCP.Middleware.ToolInjection do
       tools
       |> List.wrap()
       |> Enum.map(&normalize_tool(&1, opts))
+      |> deduplicate_tools()
 
     middleware = %__MODULE__{
       tools: normalized,
@@ -74,7 +78,15 @@ defmodule FastestMCP.Middleware.ToolInjection do
   @doc "Runs the middleware around the next operation."
   def call(%__MODULE__{} = middleware, %Operation{method: "tools/list"} = operation, next)
       when is_function(next, 1) do
-    Enum.map(middleware.tools, &Component.metadata/1) ++ List.wrap(next.(operation))
+    visible_tools = apply_list_policy(middleware.tools, operation)
+    visible_names = MapSet.new(visible_tools, & &1.name)
+
+    base_tools =
+      next.(operation)
+      |> List.wrap()
+      |> Enum.reject(&MapSet.member?(visible_names, listed_tool_name(&1)))
+
+    Enum.map(visible_tools, &Component.metadata/1) ++ base_tools
   end
 
   def call(
@@ -85,9 +97,19 @@ defmodule FastestMCP.Middleware.ToolInjection do
       when is_function(next, 1) do
     case Map.fetch(middleware.tools_by_name, to_string(target)) do
       {:ok, tool} ->
-        operation = %{operation | component: tool}
-        FastestMCP.Telemetry.annotate_span(operation)
-        Component.execute(tool, operation)
+        case ComponentPolicy.apply_result(operation.context.server, tool, operation) do
+          {:ok, visible_tool} ->
+            operation = %{operation | component: visible_tool}
+            FastestMCP.Telemetry.annotate_span(operation)
+            OperationPipeline.record_resolved_component(operation.context, visible_tool)
+            Component.execute(visible_tool, operation)
+
+          {:error, %Error{code: code}} when code in [:disabled, :filtered, :not_visible] ->
+            next.(operation)
+
+          {:error, %Error{} = error} ->
+            raise error
+        end
 
       :error ->
         next.(operation)
@@ -117,6 +139,37 @@ defmodule FastestMCP.Middleware.ToolInjection do
   defp normalize_tool(other, _opts) do
     raise ArgumentError,
           "tool injection entries must be compiled tools or {name, handler[, opts]} tuples, got #{inspect(other)}"
+  end
+
+  defp deduplicate_tools(tools) do
+    {names, tools_by_name} =
+      Enum.reduce(tools, {[], %{}}, fn tool, {names, tools_by_name} ->
+        if Map.has_key?(tools_by_name, tool.name) do
+          {names, Map.put(tools_by_name, tool.name, tool)}
+        else
+          {[tool.name | names], Map.put(tools_by_name, tool.name, tool)}
+        end
+      end)
+
+    names
+    |> Enum.reverse()
+    |> Enum.map(&Map.fetch!(tools_by_name, &1))
+  end
+
+  defp apply_list_policy(tools, operation) do
+    Enum.reduce(tools, [], fn tool, visible ->
+      case ComponentPolicy.apply_result(operation.context.server, tool, operation) do
+        {:ok, visible_tool} -> [visible_tool | visible]
+        {:error, %Error{}} -> visible
+      end
+    end)
+    |> Enum.reverse()
+  end
+
+  defp listed_tool_name(tool) when is_map(tool) do
+    tool
+    |> Map.get(:name, Map.get(tool, "name"))
+    |> to_string()
   end
 
   defp list_prompts_tool(_arguments, context) do

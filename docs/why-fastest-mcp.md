@@ -19,9 +19,10 @@ failure handling, and integration native to Elixir and OTP.
 | Runtime model | OTP-first with per-server runtime trees, supervised workers, and crash isolation |
 | Context access | explicit `%FastestMCP.Context{}` passed to handlers |
 | HTTP integration | Plug-first via `FastestMCP.http_app/2` and transport child specs |
+| Protocol boundary | MCP `2025-11-25`, strict JSON-RPC 2.0, one configured `/mcp` endpoint |
 | Client shape | connected `FastestMCP.Client` GenServer with negotiated session ownership |
 | Dynamic components | internal `FastestMCP.ComponentManager` GenServer provider |
-| Streaming | streamable HTTP only; no standalone SSE transport |
+| Streaming | stateful or stateless streamable HTTP only; no standalone SSE transport |
 
 ## The Core Decisions
 

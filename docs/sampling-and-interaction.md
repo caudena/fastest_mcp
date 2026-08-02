@@ -69,6 +69,23 @@ response =
 - sampling tool definitions
 - plain function captures with metadata
 
+Sampling requests serialize these definitions in `tools` and accept
+`tool_choice: :auto | :required | :none`. When the model returns `tool_use`
+blocks, FastestMCP executes each known tool, appends matching `tool_result`
+blocks, merges runner and `tool_use` `_meta` (with `tool_use` values winning on
+key collisions), and samples again. Tool failures become explicit
+`isError` results; malformed, duplicate, and unknown uses fail the request.
+The loop is bounded by `max_tool_rounds:`, which defaults to and cannot exceed
+eight.
+
+```elixir
+FastestMCP.Sampling.run!(ctx, "Use a tool if useful",
+  tools: tools,
+  tool_choice: :auto,
+  max_tool_rounds: 8
+)
+```
+
 ### Normalized Response
 
 `FastestMCP.Sampling.run!/3` returns a normalized response struct with:
@@ -160,7 +177,9 @@ FastestMCP.Interact.form(
 
 ## Background Tasks and Interaction
 
-Interactive workflows usually belong on background tasks.
+Interactive workflows usually belong on background tasks. The explicit input
+API below is for local, in-process Elixir workflows; remote MCP clients use the
+standard `tasks/result` relay instead of the removed `tasks/sendInput` method.
 
 That is what allows:
 
@@ -191,6 +210,7 @@ client =
   FastestMCP.Client.connect!("http://127.0.0.1:4100/mcp",
     client_info: %{"name" => "docs-client", "version" => "1.0.0"},
     sampling_handler: fn _messages, _params -> %{"text" => "sampled"} end,
+    sampling_tools: FastestMCP.prepare_sampling_tools(MyApp.MCPServer),
     elicitation_handler: fn _message, _params -> {:accept, %{"confirmed" => true}} end
   )
 ```

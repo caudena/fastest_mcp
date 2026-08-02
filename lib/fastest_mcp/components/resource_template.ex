@@ -42,6 +42,10 @@ defmodule FastestMCP.Components.ResourceTemplate do
 
   @doc "Compiles the given URI template into a matcher."
   def compile_matcher!(template) when is_binary(template) do
+    if String.contains?(template, "#") do
+      raise ArgumentError, "resource-template fragments are not supported"
+    end
+
     {source, variables, query_variables, query_variable_sources} = regex_source(template)
 
     {%{

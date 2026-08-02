@@ -83,10 +83,13 @@ defmodule FastestMCP.Context do
   alias FastestMCP.HTTPRequest
   alias FastestMCP.OperationPipeline
   alias FastestMCP.RequestContext
+  alias FastestMCP.SamplingTool
   alias FastestMCP.Session
   alias FastestMCP.SessionSupervisor
   alias FastestMCP.TaskWire
   alias FastestMCP.TTLStore
+
+  require Logger
 
   @excluded_http_headers ["accept", "content-length", "content-type", "host"]
   @visibility_rules_key {:fastest_mcp, :visibility_rules}
@@ -107,11 +110,14 @@ defmodule FastestMCP.Context do
     :session_id,
     :request_id,
     :transport,
+    :state_scope,
+    :negotiated_protocol_version,
     :event_bus,
     :task_store,
     :principal,
     auth: %{},
     capabilities: [],
+    client_capabilities: %{},
     lifespan_context: %{},
     dependencies: %{},
     request_metadata: %{},
@@ -121,14 +127,17 @@ defmodule FastestMCP.Context do
   @type t :: %__MODULE__{
           server_name: String.t(),
           server: FastestMCP.Server.t() | nil,
-          session_id: String.t(),
+          session_id: String.t() | nil,
           request_id: String.t(),
           transport: atom(),
+          state_scope: :request | :session,
+          negotiated_protocol_version: String.t() | nil,
           event_bus: pid() | atom(),
           task_store: pid() | atom() | nil,
           principal: any(),
           auth: map(),
           capabilities: [any()],
+          client_capabilities: map(),
           lifespan_context: map(),
           dependencies: map(),
           request_metadata: map(),
@@ -137,10 +146,11 @@ defmodule FastestMCP.Context do
 
   @doc "Builds the value managed by this module from runtime state and options."
   def build(server_name, opts \\ []) do
-    session_id = opts[:session_id] || generate_session_id()
-
     request_id = "req-" <> Integer.to_string(System.unique_integer([:positive]))
     transport = Keyword.get(opts, :transport, :in_process)
+    request_metadata = Map.new(Keyword.get(opts, :request_metadata, %{}))
+    state_scope = context_state_scope(opts, request_metadata)
+    session_id = context_session_id(opts, state_scope)
     event_bus = Keyword.get(opts, :event_bus, EventBus)
     server = Keyword.get(opts, :server)
     task_store = Keyword.get(opts, :task_store)
@@ -149,53 +159,62 @@ defmodule FastestMCP.Context do
     principal = Keyword.get(opts, :principal)
     auth = normalize_map(Keyword.get(opts, :auth, %{}))
     capabilities = normalize_capabilities(Keyword.get(opts, :capabilities, []))
+    client_capabilities = normalize_map(Keyword.get(opts, :client_capabilities, %{}))
+    negotiated_protocol_version = Keyword.get(opts, :negotiated_protocol_version)
     lifespan_context = Map.new(Keyword.get(opts, :lifespan_context, %{}))
     dependencies = normalize_dependencies(Keyword.get(opts, :dependencies, %{}))
-    request_metadata = Map.new(Keyword.get(opts, :request_metadata, %{}))
     task_metadata = Map.new(Keyword.get(opts, :task_metadata, %{}))
 
-    with :ok <-
-           ensure_session_not_terminated(
-             terminated_session_store,
-             transport,
-             session_id,
-             request_metadata
-           ) do
-      case SessionSupervisor.ensure_session(session_supervisor, server_name, session_id) do
-        {:ok, _pid} ->
-          {:ok,
-           %__MODULE__{
-             server_name: to_string(server_name),
-             server: server,
-             session_id: to_string(session_id),
-             request_id: request_id,
-             transport: transport,
-             event_bus: event_bus,
-             task_store: task_store,
-             principal: principal,
-             auth: auth,
-             capabilities: capabilities,
-             lifespan_context: lifespan_context,
-             dependencies: dependencies,
-             request_metadata: request_metadata,
-             task_metadata: task_metadata
-           }}
+    context = %__MODULE__{
+      server_name: to_string(server_name),
+      server: server,
+      session_id: session_id,
+      request_id: request_id,
+      transport: transport,
+      state_scope: state_scope,
+      negotiated_protocol_version: negotiated_protocol_version,
+      event_bus: event_bus,
+      task_store: task_store,
+      principal: principal,
+      auth: auth,
+      capabilities: capabilities,
+      client_capabilities: client_capabilities,
+      lifespan_context: lifespan_context,
+      dependencies: dependencies,
+      request_metadata: request_metadata,
+      task_metadata: task_metadata
+    }
 
-        {:error, :overloaded} ->
-          {:error,
-           %Error{
-             code: :overloaded,
-             message: "session was rejected because the server is at session capacity",
-             details: %{resource: :sessions, retry_after_seconds: 1}
-           }}
+    if state_scope == :request do
+      {:ok, context}
+    else
+      with :ok <-
+             ensure_session_not_terminated(
+               terminated_session_store,
+               transport,
+               session_id,
+               request_metadata
+             ) do
+        case SessionSupervisor.ensure_session(session_supervisor, server_name, session_id) do
+          {:ok, _pid} ->
+            {:ok, context}
 
-        {:error, reason} ->
-          {:error,
-           %Error{
-             code: :internal_error,
-             message: "failed to create session context",
-             details: %{reason: inspect(reason)}
-           }}
+          {:error, :overloaded} ->
+            {:error,
+             %Error{
+               code: :overloaded,
+               message: "session was rejected because the server is at session capacity",
+               details: %{resource: :sessions, retry_after_seconds: 1}
+             }}
+
+          {:error, reason} ->
+            {:error,
+             %Error{
+               code: :internal_error,
+               message: "failed to create session context",
+               details: %{reason: inspect(reason)}
+             }}
+        end
       end
     end
   end
@@ -206,9 +225,12 @@ defmodule FastestMCP.Context do
     Process.put({__MODULE__, :current_context}, context)
 
     try do
-      fun.()
+      try do
+        fun.()
+      after
+        run_dependency_cleanups(context)
+      end
     after
-      run_dependency_cleanups(context)
       restore_current(previous)
       clear_request_state(context)
     end
@@ -350,7 +372,7 @@ defmodule FastestMCP.Context do
 
   @doc "Stores state for the current context."
   def set_state(%__MODULE__{} = context, key, value, opts \\ []) do
-    if Keyword.get(opts, :serializable, true) do
+    if context.state_scope == :session and Keyword.get(opts, :serializable, true) do
       :ok = delete_request_state(context, {:state, key})
       Session.put(context.server_name, context.session_id, key, value)
     else
@@ -362,7 +384,11 @@ defmodule FastestMCP.Context do
   def get_state(%__MODULE__{} = context, key, default \\ nil) do
     case get_request_state(context, {:state, key}, :__missing__) do
       :__missing__ ->
-        Session.get(context.server_name, context.session_id, key, default)
+        if context.state_scope == :session do
+          Session.get(context.server_name, context.session_id, key, default)
+        else
+          default
+        end
 
       value ->
         value
@@ -372,7 +398,12 @@ defmodule FastestMCP.Context do
   @doc "Deletes state for the current context."
   def delete_state(%__MODULE__{} = context, key) do
     :ok = delete_request_state(context, {:state, key})
-    Session.delete(context.server_name, context.session_id, key)
+
+    if context.state_scope == :session do
+      Session.delete(context.server_name, context.session_id, key)
+    else
+      :ok
+    end
   end
 
   @doc "Stores a resolved auth result on the context."
@@ -469,6 +500,10 @@ defmodule FastestMCP.Context do
   end
 
   def sample(%__MODULE__{} = context, messages, opts) when is_list(messages) do
+    tools = sampling_tool_definitions(Keyword.get(opts, :tools))
+    include_context = normalize_sampling_include_context(Keyword.get(opts, :include_context))
+    validate_sampling_capabilities!(context, tools, include_context)
+
     params =
       %{
         "messages" => messages,
@@ -477,9 +512,11 @@ defmodule FastestMCP.Context do
       |> maybe_put_map("systemPrompt", Keyword.get(opts, :system_prompt))
       |> maybe_put_map("temperature", Keyword.get(opts, :temperature))
       |> maybe_put_map("stopSequences", Keyword.get(opts, :stop_sequences))
-      |> maybe_put_map("metadata", Keyword.get(opts, :metadata))
+      |> maybe_put_map("_meta", Keyword.get(opts, :meta, Keyword.get(opts, :metadata)))
       |> maybe_put_map("modelPreferences", Keyword.get(opts, :model_preferences))
-      |> maybe_put_map("includeContext", Keyword.get(opts, :include_context))
+      |> maybe_put_map("includeContext", include_context)
+      |> maybe_put_map("tools", tools)
+      |> maybe_put_sampling_tool_choice(tools, Keyword.get(opts, :tool_choice, :auto))
 
     cond do
       is_background_task(context) ->
@@ -778,6 +815,43 @@ defmodule FastestMCP.Context do
   defp normalize_capabilities(nil), do: []
   defp normalize_capabilities(capability), do: List.wrap(capability)
 
+  defp context_state_scope(opts, request_metadata) do
+    requested =
+      Keyword.get_lazy(opts, :state_scope, fn ->
+        if Map.get(
+             request_metadata,
+             :stateless_http,
+             Map.get(request_metadata, "stateless_http", false)
+           ) do
+          :request
+        else
+          :session
+        end
+      end)
+
+    if requested in [:request, :session] do
+      requested
+    else
+      raise ArgumentError, "state_scope must be :request or :session, got #{inspect(requested)}"
+    end
+  end
+
+  defp context_session_id(_opts, :request), do: nil
+
+  defp context_session_id(opts, :session) do
+    session_id =
+      case Keyword.get(opts, :session_id) do
+        nil -> generate_session_id()
+        session_id -> to_string(session_id)
+      end
+
+    if session_id == "" do
+      raise ArgumentError, "session_id must not be empty for session-scoped context"
+    else
+      session_id
+    end
+  end
+
   defp ensure_session_not_terminated(nil, _transport, _session_id, _request_metadata), do: :ok
 
   defp ensure_session_not_terminated(store, :streamable_http, session_id, request_metadata) do
@@ -1045,7 +1119,9 @@ defmodule FastestMCP.Context do
   defp request_client_info(%__MODULE__{} = context) do
     request_metadata_value(context, :clientInfo) ||
       request_metadata_value(context, :client_info) ||
-      Session.client_info(context.server_name, context.session_id)
+      if(context.state_scope == :session,
+        do: Session.client_info(context.server_name, context.session_id)
+      )
   end
 
   defp principal_value(%__MODULE__{principal: %{} = principal}, key) do
@@ -1089,12 +1165,21 @@ defmodule FastestMCP.Context do
     context
     |> get_request_state(:dependency_cleanups, [])
     |> Enum.each(fn {cleanup, value} ->
-      try do
-        run_dependency_cleanup(cleanup, value, context)
-      rescue
-        _error -> :ok
-      end
+      run_dependency_cleanup_safely(cleanup, value, context)
     end)
+  end
+
+  defp run_dependency_cleanup_safely(cleanup, value, context) do
+    _ = run_dependency_cleanup(cleanup, value, context)
+    :ok
+  rescue
+    error ->
+      Logger.error("dependency cleanup failed: #{Exception.message(error)}")
+      :ok
+  catch
+    kind, reason ->
+      Logger.error("dependency cleanup failed: #{kind}: #{inspect(reason)}")
+      :ok
   end
 
   defp run_dependency_cleanup(cleanup, _value, _context) when is_function(cleanup, 0),
@@ -1137,6 +1222,76 @@ defmodule FastestMCP.Context do
     else
       raise ArgumentError, "unsupported log level #{inspect(level)}"
     end
+  end
+
+  defp sampling_tool_definitions(nil), do: nil
+  defp sampling_tool_definitions([]), do: nil
+
+  defp sampling_tool_definitions(tools) when is_list(tools) do
+    Enum.map(tools, fn
+      %SamplingTool{} = tool -> SamplingTool.definition(tool)
+      %{} = definition -> Map.new(definition, fn {key, value} -> {to_string(key), value} end)
+      other -> raise ArgumentError, "invalid sampling tool #{inspect(other)}"
+    end)
+  end
+
+  defp validate_sampling_capabilities!(context, tools, include_context) do
+    cond do
+      not is_nil(tools) and not client_sampling_capability?(context, "tools") ->
+        raise Error,
+          code: :bad_request,
+          message: "connected client did not declare sampling.tools support"
+
+      include_context in ["thisServer", "allServers"] and
+          not client_sampling_capability?(context, "context") ->
+        raise Error,
+          code: :bad_request,
+          message: "connected client did not declare sampling.context support"
+
+      true ->
+        :ok
+    end
+  end
+
+  defp client_sampling_capability?(%__MODULE__{client_capabilities: capabilities}, key) do
+    case Map.get(capabilities, "sampling", Map.get(capabilities, :sampling)) do
+      %{} = sampling ->
+        Map.has_key?(sampling, key) or Map.has_key?(sampling, sampling_capability_atom(key))
+
+      _other ->
+        false
+    end
+  end
+
+  defp sampling_capability_atom("tools"), do: :tools
+  defp sampling_capability_atom("context"), do: :context
+
+  defp normalize_sampling_include_context(nil), do: nil
+  defp normalize_sampling_include_context(:none), do: "none"
+  defp normalize_sampling_include_context(:this_server), do: "thisServer"
+  defp normalize_sampling_include_context(:all_servers), do: "allServers"
+
+  defp normalize_sampling_include_context(value)
+       when value in ["none", "thisServer", "allServers"],
+       do: value
+
+  defp normalize_sampling_include_context(other) do
+    raise ArgumentError,
+          "include_context must be :none, :this_server, :all_servers, or the corresponding MCP value, got #{inspect(other)}"
+  end
+
+  defp maybe_put_sampling_tool_choice(params, nil, _choice), do: params
+
+  defp maybe_put_sampling_tool_choice(params, _tools, choice) do
+    Map.put(params, "toolChoice", sampling_tool_choice(choice))
+  end
+
+  defp sampling_tool_choice(choice) when choice in [:auto, :required, :none],
+    do: %{"mode" => Atom.to_string(choice)}
+
+  defp sampling_tool_choice(other) do
+    raise ArgumentError,
+          "tool_choice must be :auto, :required, or :none, got #{inspect(other)}"
   end
 
   defp generate_session_id do

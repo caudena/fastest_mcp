@@ -614,7 +614,7 @@ FastestMCP.call_tool("tool-output-wrap", "list_values", %{})
 ```
 
 Transport clients receive `structuredContent.result` plus
-`meta.fastestmcp.wrap_result = true`.
+`_meta.fastestmcp.wrap_result = true`.
 
 ## Timeouts
 

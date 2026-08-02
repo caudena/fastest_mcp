@@ -14,7 +14,7 @@ Add FastestMCP to your dependencies:
 ```elixir
 def deps do
   [
-    {:fastest_mcp, "~> 0.1.2"}
+    {:fastest_mcp, "~> 0.2.0"}
   ]
 end
 ```
@@ -24,6 +24,21 @@ Then fetch dependencies:
 ```bash
 mix deps.get
 ```
+
+### Upgrading from 0.1.x
+
+FastestMCP 0.2.0 has one protocol boundary: MCP `2025-11-25` over JSON-RPC
+2.0. Streamable HTTP accepts one message per POST at `/mcp`; legacy
+method-specific routes and JSON-RPC batches are gone. Stateful clients must use
+the server-issued session id and complete the initialize lifecycle. Stateless
+HTTP is POST-only and has no sessions, subscriptions, or task augmentation.
+
+Remote task augmentation is standard `tools/call` only. Local Elixir prompt and
+resource tasks remain available, as does local `FastestMCP.send_task_input/5`,
+but the remote prompt/resource task extensions and wire `tasks/sendInput` method
+were removed. See the [0.2.0 changelog](CHANGELOG.md#020---2026-08-02) and
+[transport migration notes](docs/transports.md#migrating-from-01) for the full
+checklist.
 
 ## Quick Start
 
@@ -89,7 +104,7 @@ client call, lives in [docs/onboarding.md](docs/onboarding.md).
 
 ## Public API
 
-FastestMCP keeps the public surface curated for the first Hex release.
+FastestMCP keeps the public surface deliberately curated.
 
 - `FastestMCP`: top-level server, transport, runtime, and task helpers
 - `FastestMCP.ServerModule`: preferred module-owned startup wrapper
@@ -98,6 +113,8 @@ FastestMCP keeps the public surface curated for the first Hex release.
 - `FastestMCP.RequestContext`: stable request snapshot derived from context
 - `FastestMCP.Client`: connected MCP client for streamable HTTP and stdio
 - `FastestMCP.Auth`: auth contract and shared authenticator wrapper
+- `FastestMCP.Auth.Result`: normalized authenticator result
+- `FastestMCP.Auth.StaticToken`: hermetic bearer-token authenticator
 - `FastestMCP.Middleware`: built-in middleware constructors
 - `FastestMCP.Provider`: provider contract for mounted and dynamic surfaces
 - `FastestMCP.ComponentManager`: runtime mutation for live servers
@@ -105,6 +122,8 @@ FastestMCP keeps the public surface curated for the first Hex release.
 - `FastestMCP.Interact`: higher-level elicitation helpers
 - `FastestMCP.SessionStateStore` and `FastestMCP.SessionStateStore.Memory`:
   session-state backend contract and default backend
+- `FastestMCP.TaskBackend` and `FastestMCP.TaskBackend.Memory`: background-task
+  storage contract and default ETS-backed backend
 - `FastestMCP.Tools.Result`: explicit tool result helper type
 - `FastestMCP.Prompts.Message` and `FastestMCP.Prompts.Result`: explicit prompt
   helper types
@@ -136,6 +155,8 @@ FastestMCP currently ships:
 - per-server runtime isolation, bounded concurrency, overload control, and task
   supervision
 - streamable HTTP and stdio transports
+- MCP `2025-11-25` as the sole protocol version
+- one JSON-RPC message per request at the configured `/mcp` endpoint
 - a Plug-first HTTP embedding surface for Bandit, Phoenix, or custom Plug apps
 - a connected client for streamable HTTP and stdio
 - client-side sampling, elicitation, logging, and progress callbacks
@@ -149,7 +170,8 @@ The main deferred items remain:
 - publishing automation after the first manual release path is proven
 - custom app or UI layer
 
-Standalone SSE is intentionally unsupported. HTTP means streamable HTTP only.
+Standalone SSE, legacy method-specific HTTP routes, and JSON-RPC batches are
+intentionally unsupported. HTTP means streamable HTTP at `/mcp` only.
 
 ## When To Use FastestMCP
 

@@ -24,9 +24,19 @@ defmodule FastestMCP.Transport.HTTPApp do
     server_name = Keyword.fetch!(opts, :server_name)
     port = Keyword.get(opts, :port, 4_000)
 
+    bandit_options =
+      opts
+      |> Keyword.get(:bandit_options, [])
+      |> Keyword.put_new(:scheme, Keyword.get(opts, :scheme, :http))
+      |> Keyword.put_new(:port, port)
+      |> Keyword.put_new(:ip, :loopback)
+      |> Keyword.put(:plug, {__MODULE__, opts})
+
+    validate_listener_security!(bandit_options, opts)
+
     %{
       id: {__MODULE__, server_name, port},
-      start: {Bandit, :start_link, [[plug: {__MODULE__, opts}, scheme: :http, port: port]]}
+      start: {Bandit, :start_link, [bandit_options]}
     }
   end
 
@@ -123,6 +133,29 @@ defmodule FastestMCP.Transport.HTTPApp do
         Enum.flat_map(runtime.server.providers, &Provider.http_routes/1)
     else
       _other -> []
+    end
+  end
+
+  defp validate_listener_security!(bandit_options, opts) do
+    ip = Keyword.fetch!(bandit_options, :ip)
+
+    if loopback_listener?(ip) or concrete_allowed_hosts?(opts) do
+      :ok
+    else
+      raise ArgumentError,
+            "external HTTP listeners require a concrete allowed_hosts list"
+    end
+  end
+
+  defp loopback_listener?(:loopback), do: true
+  defp loopback_listener?({127, _b, _c, _d}), do: true
+  defp loopback_listener?({0, 0, 0, 0, 0, 0, 0, 1}), do: true
+  defp loopback_listener?(_ip), do: false
+
+  defp concrete_allowed_hosts?(opts) do
+    case Keyword.get(opts, :allowed_hosts) do
+      hosts when is_list(hosts) and hosts != [] -> true
+      _other -> Keyword.get(opts, :unsafe_allow_any_host, false) == true
     end
   end
 end

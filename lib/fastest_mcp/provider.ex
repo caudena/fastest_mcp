@@ -67,6 +67,13 @@ defmodule FastestMCP.Provider do
 
   @doc "Resolves one component by type and identifier."
   def get_component(%__MODULE__{} = provider, component_type, identifier, operation) do
+    provider
+    |> get_component_candidates(component_type, identifier, operation)
+    |> Component.highest_version()
+  end
+
+  @doc false
+  def get_component_candidates(%__MODULE__{} = provider, component_type, identifier, operation) do
     with {:ok, raw_identifier} <-
            reverse_identifier(
              provider.transforms,
@@ -74,55 +81,47 @@ defmodule FastestMCP.Provider do
              to_string(identifier),
              operation
            ),
-         component when not is_nil(component) <-
-           do_get_component(provider.inner, component_type, raw_identifier, operation),
-         component when not is_nil(component) <-
-           apply_transforms(component, provider.transforms, operation),
-         true <- Component.identifier(component) == to_string(identifier) do
-      component
+         candidates <-
+           do_get_component_candidates(
+             provider.inner,
+             component_type,
+             raw_identifier,
+             operation
+           ) do
+      candidates
+      |> apply_transforms(provider.transforms, operation)
+      |> Enum.filter(fn component ->
+        Component.identifier(component) == to_string(identifier) and
+          version_matches?(component, operation_version(operation))
+      end)
+      |> Component.sort_by_version_desc()
     else
-      _ -> nil
+      _ -> []
     end
   end
 
   @doc "Resolves the backing resource target for a concrete URI."
   def get_resource_target(%__MODULE__{} = provider, uri, operation) do
+    provider
+    |> get_resource_target_candidates(uri, operation)
+    |> pick_resource_target()
+  end
+
+  @doc false
+  def get_resource_target_candidates(%__MODULE__{} = provider, uri, operation) do
     with {:ok, raw_uri} <-
            reverse_identifier(provider.transforms, :resource, to_string(uri), operation) do
-      case do_get_resource_target(provider.inner, raw_uri, operation) do
-        {:exact, component, _captures} ->
-          case apply_transforms(component, provider.transforms, operation) do
-            nil ->
-              nil
-
-            transformed ->
-              if Component.identifier(transformed) == to_string(uri) do
-                {:exact, transformed, %{}}
-              else
-                nil
-              end
-          end
-
-        {:template, component, captures} ->
-          case apply_transforms(component, provider.transforms, operation) do
-            %ResourceTemplate{} = transformed when provider.transforms == [] ->
-              {:template, transformed, captures}
-
-            %ResourceTemplate{} = transformed ->
-              case ResourceTemplate.match(transformed, uri) do
-                nil -> nil
-                captures -> {:template, transformed, captures}
-              end
-
-            _ ->
-              nil
-          end
-
-        nil ->
-          nil
-      end
+      provider.inner
+      |> do_get_resource_target_candidates(raw_uri, operation)
+      |> Enum.reduce([], fn target, transformed ->
+        case transform_resource_target(target, provider.transforms, uri, operation) do
+          nil -> transformed
+          target -> [target | transformed]
+        end
+      end)
+      |> Enum.reverse()
     else
-      _ -> nil
+      _ -> []
     end
   end
 
@@ -156,51 +155,80 @@ defmodule FastestMCP.Provider do
     end
   end
 
-  defp do_get_component(%module{} = provider, component_type, identifier, operation) do
+  defp do_get_component_candidates(%module{} = provider, component_type, identifier, operation) do
     cond do
+      function_exported?(module, :get_component_candidates, 4) ->
+        provider
+        |> module.get_component_candidates(component_type, to_string(identifier), operation)
+        |> List.wrap()
+
       function_exported?(module, :get_component, 4) ->
-        module.get_component(provider, component_type, to_string(identifier), operation)
+        provider
+        |> module.get_component(component_type, to_string(identifier), operation)
+        |> List.wrap()
+
+      function_exported?(module, :list_components, 3) ->
+        listed_component_candidates(provider, component_type, identifier, operation)
 
       true ->
-        provider
-        |> do_list_components(component_type, operation)
-        |> Enum.filter(&(Component.identifier(&1) == to_string(identifier)))
-        |> Component.highest_version()
+        []
     end
   end
 
-  defp do_get_resource_target(%module{} = provider, uri, operation) do
-    cond do
-      function_exported?(module, :get_resource_target, 3) ->
-        module.get_resource_target(provider, to_string(uri), operation)
+  defp listed_component_candidates(provider, component_type, identifier, operation) do
+    provider
+    |> do_list_components(component_type, operation)
+    |> Enum.filter(&(Component.identifier(&1) == to_string(identifier)))
+  end
 
-      true ->
-        exact = do_get_component(provider, :resource, uri, operation)
+  defp do_get_resource_target_candidates(%module{} = provider, uri, operation) do
+    cond do
+      function_exported?(module, :get_resource_target_candidates, 3) ->
+        provider
+        |> module.get_resource_target_candidates(to_string(uri), operation)
+        |> List.wrap()
+
+      function_exported?(module, :list_components, 3) ->
+        exact =
+          provider
+          |> do_get_component_candidates(:resource, uri, operation)
+          |> filter_versions(operation_version(operation))
 
         case exact do
-          nil ->
+          [] ->
             provider
             |> do_list_components(:resource_template, operation)
+            |> filter_versions(operation_version(operation))
             |> Enum.reduce([], fn template, matches ->
               case ResourceTemplate.match(template, uri) do
                 nil -> matches
-                captures -> [{template, captures} | matches]
+                captures -> [{:template, template, captures} | matches]
               end
             end)
-            |> pick_template()
+            |> Enum.reverse()
 
-          component ->
-            {:exact, component, %{}}
+          components ->
+            Enum.map(components, &{:exact, &1, %{}})
         end
+
+      function_exported?(module, :get_resource_target, 3) ->
+        provider
+        |> module.get_resource_target(to_string(uri), operation)
+        |> List.wrap()
+
+      true ->
+        []
     end
   end
 
   defp validate!(provider, module) do
     unless function_exported?(module, :list_components, 3) or
+             function_exported?(module, :get_component_candidates, 4) or
              function_exported?(module, :get_component, 4) or
+             function_exported?(module, :get_resource_target_candidates, 3) or
              function_exported?(module, :get_resource_target, 3) do
       raise ArgumentError,
-            "provider #{inspect(module)} must export list_components/3, get_component/4, or get_resource_target/3"
+            "provider #{inspect(module)} must export a component listing, candidate lookup, or resource-target lookup callback"
     end
 
     provider
@@ -234,20 +262,68 @@ defmodule FastestMCP.Provider do
     end)
   end
 
-  defp pick_template([]), do: nil
+  defp transform_resource_target({:exact, component, _captures}, transforms, uri, operation) do
+    case apply_transforms(component, transforms, operation) do
+      nil ->
+        nil
 
-  defp pick_template(matches) do
-    {component, captures} =
-      Enum.reduce(matches, nil, fn
-        current, nil ->
-          current
-
-        {candidate, _} = current, {best, _} = previous ->
-          if Component.compare_versions(candidate.version, best.version) == :gt,
-            do: current,
-            else: previous
-      end)
-
-    {:template, component, captures}
+      transformed ->
+        if Component.identifier(transformed) == to_string(uri) and
+             version_matches?(transformed, operation_version(operation)) do
+          {:exact, transformed, %{}}
+        end
+    end
   end
+
+  defp transform_resource_target(
+         {:template, component, captures},
+         [],
+         _uri,
+         operation
+       ) do
+    if version_matches?(component, operation_version(operation)) do
+      {:template, component, captures}
+    end
+  end
+
+  defp transform_resource_target({:template, component, _captures}, transforms, uri, operation) do
+    case apply_transforms(component, transforms, operation) do
+      %ResourceTemplate{} = transformed ->
+        if version_matches?(transformed, operation_version(operation)) do
+          case ResourceTemplate.match(transformed, uri) do
+            nil -> nil
+            captures -> {:template, transformed, captures}
+          end
+        end
+
+      _other ->
+        nil
+    end
+  end
+
+  defp transform_resource_target(_other, _transforms, _uri, _operation), do: nil
+
+  defp pick_resource_target([]), do: nil
+
+  defp pick_resource_target(targets) do
+    exact = Enum.filter(targets, &(elem(&1, 0) == :exact))
+    targets = if exact == [], do: targets, else: exact
+
+    targets
+    |> Component.sort_by_version_desc(fn {_, component, _} -> Component.version(component) end)
+    |> List.first()
+  end
+
+  defp filter_versions(components, nil), do: components
+
+  defp filter_versions(components, version) do
+    Enum.filter(components, &version_matches?(&1, version))
+  end
+
+  defp operation_version(%{version: nil}), do: nil
+  defp operation_version(%{version: version}), do: to_string(version)
+  defp operation_version(_operation), do: nil
+
+  defp version_matches?(_component, nil), do: true
+  defp version_matches?(component, version), do: Component.version(component) == version
 end

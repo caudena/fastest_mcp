@@ -1,15 +1,14 @@
 defmodule FastestMCP.ErrorExposureTest do
   use ExUnit.Case, async: false
 
-  import Plug.Conn
-  import Plug.Test
-
   alias FastestMCP.Error
   alias FastestMCP.EventBus
   alias FastestMCP.ServerRuntime
+  alias FastestMCP.Session
+  alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
   alias FastestMCP.Transport.Engine
   alias FastestMCP.Transport.Request
-  alias FastestMCP.Transport.Stdio
+  alias FastestMCP.Transport.StdioAdapter
 
   test "unexpected tool crashes remain detailed locally and over transports by default" do
     server_name =
@@ -40,11 +39,16 @@ defmodule FastestMCP.ErrorExposureTest do
     assert http_response.status == 400
     assert get_in(json_body(http_response), ["error", "message"]) =~ "secret token 123"
 
+    {connection_id, _initialize_response} = ProtocolTest.initialize_stdio(server_name)
+
     stdio_response =
-      Stdio.dispatch(server_name, %{
-        "method" => "tools/call",
-        "params" => %{"name" => "explode", "arguments" => %{}}
-      })
+      ProtocolTest.stdio_request(
+        server_name,
+        connection_id,
+        2,
+        "tools/call",
+        %{"name" => "explode", "arguments" => %{}}
+      )
 
     assert get_in(stdio_response, ["error", "message"]) =~ "secret token 123"
   end
@@ -96,15 +100,20 @@ defmodule FastestMCP.ErrorExposureTest do
     assert http_crash.status == 400
     assert get_in(json_body(http_crash), ["error", "message"]) == ~s(tool "explode" failed)
 
+    auth_input = %{"token" => "valid-token"}
+
+    {connection_id, _initialize_response} =
+      ProtocolTest.initialize_stdio(server_name, auth_input: auth_input)
+
     stdio_crash =
-      Stdio.dispatch(server_name, %{
-        "method" => "tools/call",
-        "params" => %{
-          "name" => "explode",
-          "arguments" => %{},
-          "auth_token" => "valid-token"
-        }
-      })
+      ProtocolTest.stdio_request(
+        server_name,
+        connection_id,
+        2,
+        "tools/call",
+        %{"name" => "explode", "arguments" => %{}},
+        auth_input: auth_input
+      )
 
     assert get_in(stdio_crash, ["error", "message"]) == ~s(tool "explode" failed)
     refute get_in(stdio_crash, ["error", "message"]) =~ "secret token 123"
@@ -165,29 +174,29 @@ defmodule FastestMCP.ErrorExposureTest do
     end
 
     resource_default =
-      legacy_http(unmasked_server_name, "/mcp/resources/read", %{"uri" => "file://secret"})
+      jsonrpc_http(unmasked_server_name, "resources/read", %{"uri" => "file://secret"})
 
     assert get_in(json_body(resource_default), ["error", "message"]) =~ "resource secret"
 
     resource_masked =
-      legacy_http(masked_server_name, "/mcp/resources/read", %{"uri" => "file://secret"})
+      jsonrpc_http(masked_server_name, "resources/read", %{"uri" => "file://secret"})
 
     assert get_in(json_body(resource_masked), ["error", "message"]) ==
              ~s(resource "file://secret" failed)
 
     template_default =
-      legacy_http(unmasked_server_name, "/mcp/resources/read", %{"uri" => "user://42"})
+      jsonrpc_http(unmasked_server_name, "resources/read", %{"uri" => "user://42"})
 
     assert get_in(json_body(template_default), ["error", "message"]) =~ "template secret"
 
     template_masked =
-      legacy_http(masked_server_name, "/mcp/resources/read", %{"uri" => "user://42"})
+      jsonrpc_http(masked_server_name, "resources/read", %{"uri" => "user://42"})
 
     assert get_in(json_body(template_masked), ["error", "message"]) ==
              ~s(resource "user://42" failed)
 
     prompt_default =
-      legacy_http(unmasked_server_name, "/mcp/prompts/get", %{
+      jsonrpc_http(unmasked_server_name, "prompts/get", %{
         "name" => "explode_prompt",
         "arguments" => %{}
       })
@@ -195,7 +204,7 @@ defmodule FastestMCP.ErrorExposureTest do
     assert get_in(json_body(prompt_default), ["error", "message"]) =~ "prompt secret"
 
     prompt_masked =
-      legacy_http(masked_server_name, "/mcp/prompts/get", %{
+      jsonrpc_http(masked_server_name, "prompts/get", %{
         "name" => "explode_prompt",
         "arguments" => %{}
       })
@@ -265,22 +274,54 @@ defmodule FastestMCP.ErrorExposureTest do
     assert get_in(json_body(http_result), ["error", "message"]) == ~s(tool "explode" failed)
 
     assert get_in(json_body(http_result), [
-             "_meta",
+             "error",
+             "data",
+             "fastestmcp",
+             "meta",
              "io.modelcontextprotocol/related-task",
              "taskId"
            ]) ==
              handle.task_id
 
-    stdio_result =
-      Stdio.dispatch(server_name, %{
-        "method" => "tasks/result",
-        "params" => %{"session_id" => "task-session", "taskId" => handle.task_id}
+    {connection_id, _initialize_response} = ProtocolTest.initialize_stdio(server_name)
+
+    create_response =
+      ProtocolTest.stdio_request(server_name, connection_id, 2, "tools/call", %{
+        "name" => "explode",
+        "arguments" => %{},
+        "task" => %{}
       })
+
+    stdio_task_id = get_in(create_response, ["result", "task", "taskId"])
+
+    {:ok, %Request{session_id: stdio_session_id}} =
+      StdioAdapter.decode(ProtocolTest.jsonrpc_request(99, "ping"),
+        connection_id: connection_id
+      )
+
+    assert_raise Error, fn ->
+      FastestMCP.await_task(server_name, stdio_task_id, 1_000, session_id: stdio_session_id)
+    end
+
+    stdio_result =
+      ProtocolTest.stdio_request(
+        server_name,
+        connection_id,
+        3,
+        "tasks/result",
+        %{"taskId" => stdio_task_id}
+      )
 
     assert get_in(stdio_result, ["error", "message"]) == ~s(tool "explode" failed)
 
-    assert get_in(stdio_result, ["_meta", "io.modelcontextprotocol/related-task", "taskId"]) ==
-             handle.task_id
+    assert get_in(stdio_result, [
+             "error",
+             "data",
+             "fastestmcp",
+             "meta",
+             "io.modelcontextprotocol/related-task",
+             "taskId"
+           ]) == stdio_task_id
   end
 
   test "explicit task failures stay detailed in public task responses when masking is enabled" do
@@ -332,28 +373,29 @@ defmodule FastestMCP.ErrorExposureTest do
   end
 
   defp jsonrpc_http(server_name, method, params, headers \\ []) do
-    conn(:post, "/mcp", "")
-    |> Map.put(:body_params, %{
-      "jsonrpc" => "2.0",
-      "id" => 1,
-      "method" => method,
-      "params" => params
-    })
-    |> put_req_header("content-type", "application/json")
-    |> put_headers(headers)
-    |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
+    session_id = header_value(headers, "mcp-session-id") || "error-http-#{server_name}"
+    ensure_initialized_session(server_name, session_id)
+
+    request_headers =
+      Enum.reject(headers, fn {key, _value} ->
+        String.downcase(to_string(key)) in ["mcp-session-id", "mcp-protocol-version"]
+      end)
+
+    ProtocolTest.http_request(server_name, session_id, 1, method, params,
+      headers: request_headers
+    )
   end
 
-  defp legacy_http(server_name, path, params, headers \\ []) do
-    conn(:post, path, JSON.encode!(params))
-    |> put_req_header("content-type", "application/json")
-    |> put_headers(headers)
-    |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
+  defp ensure_initialized_session(server_name, session_id) do
+    case Session.lifecycle(server_name, session_id) do
+      {:ok, %{state: :initialized}} -> :ok
+      _other -> ProtocolTest.initialize_session(server_name, session_id)
+    end
   end
 
-  defp put_headers(conn, headers) do
-    Enum.reduce(headers, conn, fn {key, value}, current ->
-      put_req_header(current, key, value)
+  defp header_value(headers, name) do
+    Enum.find_value(headers, fn {key, value} ->
+      if String.downcase(to_string(key)) == name, do: to_string(value)
     end)
   end
 

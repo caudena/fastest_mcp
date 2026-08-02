@@ -13,6 +13,9 @@ defmodule FastestMCP.Transport.Serializer do
 
   @content_block_types MapSet.new(["text", "image", "audio", "resource", "resource_link"])
 
+  alias FastestMCP.Error
+  alias FastestMCP.JSONValue
+  alias FastestMCP.MIME
   alias FastestMCP.Prompts.Message, as: PromptMessage
   alias FastestMCP.Prompts.Result, as: PromptResult
   alias FastestMCP.Resources.Content, as: ResourceContent
@@ -26,8 +29,7 @@ defmodule FastestMCP.Transport.Serializer do
       "name" => fetch(tool, :name),
       "title" => fetch(tool, :title) || fetch(tool, :name),
       "description" => fetch(tool, :description) || "",
-      "inputSchema" => fetch(tool, :input_schema) || %{"type" => "object"},
-      "execution" => fetch(tool, :execution) || %{}
+      "inputSchema" => fetch(tool, :input_schema) || %{"type" => "object"}
     }
     |> maybe_put("icons", normalize_json(fetch(tool, :icons)))
     |> maybe_put("annotations", normalize_json(fetch(tool, :annotations)))
@@ -35,7 +37,9 @@ defmodule FastestMCP.Transport.Serializer do
     |> Map.put(
       "_meta",
       normalize_json(
-        component_meta(fetch(tool, :meta), fetch(tool, :tags), fetch(tool, :version))
+        component_meta(fetch(tool, :meta), fetch(tool, :tags), fetch(tool, :version), %{
+          "execution" => fetch(tool, :execution) || %{}
+        })
       )
     )
   end
@@ -47,14 +51,20 @@ defmodule FastestMCP.Transport.Serializer do
       "name" => fetch(resource, :title) || fetch(resource, :uri),
       "description" => fetch(resource, :description) || ""
     }
-    |> maybe_put("execution", fetch(resource, :execution))
     |> maybe_put("icons", normalize_json(fetch(resource, :icons)))
     |> maybe_put("annotations", normalize_json(fetch(resource, :annotations)))
     |> maybe_put("mimeType", fetch(resource, :mime_type))
     |> Map.put(
       "_meta",
       normalize_json(
-        component_meta(fetch(resource, :meta), fetch(resource, :tags), fetch(resource, :version))
+        component_meta(
+          fetch(resource, :meta),
+          fetch(resource, :tags),
+          fetch(resource, :version),
+          %{
+            "execution" => fetch(resource, :execution)
+          }
+        )
       )
     )
   end
@@ -64,17 +74,23 @@ defmodule FastestMCP.Transport.Serializer do
     %{
       "uriTemplate" => fetch(template, :uri_template),
       "name" => fetch(template, :title) || fetch(template, :uri_template),
-      "description" => fetch(template, :description) || "",
-      "parameters" => fetch(template, :parameters) || %{}
+      "description" => fetch(template, :description) || ""
     }
-    |> maybe_put("execution", fetch(template, :execution))
     |> maybe_put("icons", normalize_json(fetch(template, :icons)))
     |> maybe_put("annotations", normalize_json(fetch(template, :annotations)))
     |> maybe_put("mimeType", fetch(template, :mime_type))
     |> Map.put(
       "_meta",
       normalize_json(
-        component_meta(fetch(template, :meta), fetch(template, :tags), fetch(template, :version))
+        component_meta(
+          fetch(template, :meta),
+          fetch(template, :tags),
+          fetch(template, :version),
+          %{
+            "execution" => fetch(template, :execution),
+            "parameters" => fetch(template, :parameters) || %{}
+          }
+        )
       )
     )
   end
@@ -95,6 +111,14 @@ defmodule FastestMCP.Transport.Serializer do
         end)
     }
     |> maybe_put("icons", normalize_json(fetch(prompt, :icons)))
+    |> Map.put(
+      "_meta",
+      normalize_json(
+        component_meta(fetch(prompt, :meta), fetch(prompt, :tags), fetch(prompt, :version), %{
+          "execution" => fetch(prompt, :execution)
+        })
+      )
+    )
   end
 
   @doc "Serializes a tool result for transport exposure."
@@ -117,8 +141,8 @@ defmodule FastestMCP.Transport.Serializer do
 
           %{}
           |> Map.put("content", normalize_content_payload(content))
-          |> maybe_put("structuredContent", normalize_json(structured_content))
-          |> maybe_put("meta", normalize_json(fetch(result, :meta)))
+          |> maybe_put("structuredContent", normalize_structured_content!(structured_content))
+          |> maybe_put("_meta", normalize_json(fetch_meta(result)))
           |> maybe_put("isError", fetch_with_presence(result, :is_error, :isError))
 
         content_block?(result) ->
@@ -133,10 +157,11 @@ defmodule FastestMCP.Transport.Serializer do
         true ->
           normalized = normalize_json(result)
 
-          %{
-            "content" => [text_block(normalized)],
-            "structuredContent" => normalized
-          }
+          %{"content" => [text_block(normalized)]}
+          |> maybe_put(
+            "structuredContent",
+            if(is_map(normalized) or wrap_result?(tool), do: normalized)
+          )
       end
 
     maybe_wrap_tool_result(payload, tool)
@@ -153,7 +178,7 @@ defmodule FastestMCP.Transport.Serializer do
 
       is_map(result) and not is_nil(fetch(result, :contents)) ->
         %{"contents" => Enum.map(fetch(result, :contents), &resource_content(uri, mime_type, &1))}
-        |> maybe_put("meta", normalize_json(fetch(result, :meta)))
+        |> maybe_put("_meta", normalize_json(fetch_meta(result)))
 
       match?(%ResourceContent{}, result) ->
         %{"contents" => [resource_content(uri, mime_type, result)]}
@@ -191,7 +216,7 @@ defmodule FastestMCP.Transport.Serializer do
 
     %{"messages" => messages}
     |> maybe_put("description", if(is_map(result), do: fetch(result, :description)))
-    |> maybe_put("meta", if(is_map(result), do: normalize_json(fetch(result, :meta))))
+    |> maybe_put("_meta", if(is_map(result), do: normalize_json(fetch_meta(result))))
   end
 
   defp prompt_message(message) when is_map(message) do
@@ -205,7 +230,7 @@ defmodule FastestMCP.Transport.Serializer do
       "role" => fetch(message, :role, "user"),
       "content" => prompt_content(fetch(message, :content, ""))
     }
-    |> maybe_put("meta", normalize_json(fetch(message, :meta)))
+    |> maybe_put("_meta", normalize_json(fetch_meta(message)))
   end
 
   defp prompt_message(message) when is_binary(message) do
@@ -258,7 +283,7 @@ defmodule FastestMCP.Transport.Serializer do
 
     %{"uri" => uri}
     |> maybe_put("mimeType", mime_type)
-    |> maybe_put("meta", normalize_json(fetch(content, :meta)))
+    |> maybe_put("_meta", normalize_json(fetch_meta(content)))
     |> Map.merge(resource_body(mime_type, body))
   end
 
@@ -301,11 +326,12 @@ defmodule FastestMCP.Transport.Serializer do
   end
 
   defp normalize_content_block(block) do
-    type = fetch(block, :type)
+    type = block |> fetch(:type) |> to_string()
 
     base =
       %{"type" => type}
       |> maybe_put("annotations", normalize_json(fetch(block, :annotations)))
+      |> maybe_put("_meta", normalize_json(fetch_meta(block)))
 
     case type do
       "text" ->
@@ -325,11 +351,21 @@ defmodule FastestMCP.Transport.Serializer do
         Map.put(base, "resource", normalize_resource_block(fetch(block, :resource)))
 
       "resource_link" ->
-        Map.put(
-          base,
-          "resourceLink",
-          normalize_json(fetch(block, :resource_link) || fetch(block, :resourceLink))
+        resource_link = fetch(block, :resource_link) || fetch(block, :resourceLink) || block
+
+        base
+        |> Map.put("uri", fetch(resource_link, :uri))
+        |> maybe_put("name", fetch(resource_link, :name))
+        |> maybe_put("title", fetch(resource_link, :title))
+        |> maybe_put("description", fetch(resource_link, :description))
+        |> maybe_put(
+          "mimeType",
+          fetch(resource_link, :mimeType) || fetch(resource_link, :mime_type)
         )
+        |> maybe_put("size", fetch(resource_link, :size))
+        |> maybe_put("icons", normalize_json(fetch(resource_link, :icons)))
+        |> maybe_put("annotations", normalize_json(fetch(resource_link, :annotations)))
+        |> maybe_put("_meta", normalize_json(fetch_meta(resource_link)))
 
       _other ->
         base
@@ -341,6 +377,7 @@ defmodule FastestMCP.Transport.Serializer do
     |> maybe_put("mimeType", fetch(resource, :mimeType) || fetch(resource, :mime_type))
     |> maybe_put("text", fetch(resource, :text))
     |> maybe_put("blob", encode_optional_binary(fetch(resource, :blob)))
+    |> maybe_put("_meta", normalize_json(fetch_meta(resource)))
   end
 
   defp contentish?(value), do: content_block?(value)
@@ -367,34 +404,7 @@ defmodule FastestMCP.Transport.Serializer do
     end
   end
 
-  defp normalize_json(%DateTime{} = value), do: DateTime.to_iso8601(value)
-  defp normalize_json(%NaiveDateTime{} = value), do: NaiveDateTime.to_iso8601(value)
-  defp normalize_json(%Date{} = value), do: Date.to_iso8601(value)
-  defp normalize_json(%Time{} = value), do: Time.to_iso8601(value)
-  defp normalize_json(%URI{} = value), do: URI.to_string(value)
-
-  defp normalize_json(%MapSet{} = value) do
-    value
-    |> MapSet.to_list()
-    |> Enum.map(&normalize_json/1)
-  end
-
-  defp normalize_json(value) when is_list(value), do: Enum.map(value, &normalize_json/1)
-
-  defp normalize_json(value) when is_tuple(value) do
-    value
-    |> Tuple.to_list()
-    |> Enum.map(&normalize_json/1)
-  end
-
-  defp normalize_json(value) when is_map(value) do
-    Map.new(value, fn {key, item} -> {normalize_key(key), normalize_json(item)} end)
-  end
-
-  defp normalize_json(value), do: value
-
-  defp normalize_key(key) when is_atom(key), do: Atom.to_string(key)
-  defp normalize_key(key), do: key
+  defp normalize_json(value), do: JSONValue.stringify_keys(value)
 
   defp encode_binary(value) when is_binary(value) do
     if String.valid?(value), do: value, else: Base.encode64(value)
@@ -418,16 +428,20 @@ defmodule FastestMCP.Transport.Serializer do
       already_wrapped_result?(structured) ->
         Map.put(
           payload,
-          "meta",
-          normalize_json(merge_transport_meta(Map.get(payload, "meta"), %{"wrap_result" => true}))
+          "_meta",
+          normalize_json(
+            merge_transport_meta(Map.get(payload, "_meta"), %{"wrap_result" => true})
+          )
         )
 
       true ->
         payload
         |> Map.put("structuredContent", %{"result" => structured})
         |> Map.put(
-          "meta",
-          normalize_json(merge_transport_meta(Map.get(payload, "meta"), %{"wrap_result" => true}))
+          "_meta",
+          normalize_json(
+            merge_transport_meta(Map.get(payload, "_meta"), %{"wrap_result" => true})
+          )
         )
     end
   end
@@ -446,11 +460,15 @@ defmodule FastestMCP.Transport.Serializer do
   defp already_wrapped_result?(%{result: _value}), do: true
   defp already_wrapped_result?(_value), do: false
 
-  defp component_meta(meta, tags, version) do
-    merge_transport_meta(meta, %{
-      "tags" => normalize_tags(tags),
-      "version" => normalize_optional_string(version)
-    })
+  defp component_meta(meta, tags, version, compat_updates) do
+    merge_transport_meta(
+      meta,
+      %{
+        "tags" => normalize_tags(tags),
+        "version" => normalize_optional_string(version)
+      }
+      |> Map.merge(compat_updates)
+    )
   end
 
   defp merge_transport_meta(meta, compat_updates) do
@@ -485,6 +503,12 @@ defmodule FastestMCP.Transport.Serializer do
 
   defp normalize_compat_meta(_value), do: %{}
 
+  defp normalize_tags(%MapSet{} = tags) do
+    tags
+    |> MapSet.to_list()
+    |> normalize_tags()
+  end
+
   defp normalize_tags(tags) do
     tags
     |> List.wrap()
@@ -495,15 +519,22 @@ defmodule FastestMCP.Transport.Serializer do
   defp normalize_optional_string(nil), do: nil
   defp normalize_optional_string(value), do: to_string(value)
 
-  defp binary_mime_type?(mime_type) when is_binary(mime_type) do
-    not String.starts_with?(mime_type, "text/") and mime_type != "application/json"
-  end
+  defp binary_mime_type?(mime_type), do: MIME.binary?(mime_type)
 
-  defp binary_mime_type?(_mime_type), do: false
+  defp normalize_structured_content!(nil), do: nil
+  defp normalize_structured_content!(%{} = value), do: normalize_json(value)
+
+  defp normalize_structured_content!(_value) do
+    raise Error,
+      code: :internal_error,
+      message: "tool structuredContent must be an object"
+  end
 
   defp fetch(map, key, default \\ nil) when is_map(map) do
     Map.get(map, key, Map.get(map, to_string(key), default))
   end
+
+  defp fetch_meta(map), do: fetch(map, :_meta) || fetch(map, :meta)
 
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)

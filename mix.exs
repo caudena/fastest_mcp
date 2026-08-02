@@ -4,7 +4,7 @@ defmodule FastestMCP.MixProject do
   def project do
     [
       app: :fastest_mcp,
-      version: "0.1.2",
+      version: "0.2.0",
       description:
         "BEAM-native MCP toolkit for supervised Elixir servers, clients, auth, and transports",
       source_url: "https://github.com/caudena/fastest_mcp",
@@ -40,7 +40,8 @@ defmodule FastestMCP.MixProject do
   end
 
   defp docs do
-    public_modules = public_modules()
+    module_groups = module_groups()
+    public_modules = Enum.flat_map(module_groups, fn {_group, modules} -> modules end)
 
     [
       main: "readme",
@@ -108,58 +109,62 @@ defmodule FastestMCP.MixProject do
           "docs/runtime-state-and-storage.md"
         ]
       ],
-      groups_for_modules: [
-        "Core API": [
-          FastestMCP,
-          FastestMCP.Lifespan,
-          FastestMCP.ServerModule,
-          FastestMCP.Server,
-          FastestMCP.Context,
-          FastestMCP.RequestContext,
-          FastestMCP.BackgroundTask
-        ],
-        "Client and Transport": [
-          FastestMCP.Client,
-          FastestMCP.Protocol,
-          FastestMCP.Transport.HTTPApp,
-          FastestMCP.Transport.StreamableHTTP,
-          FastestMCP.Transport.Stdio
-        ],
-        "Runtime Features": [
-          FastestMCP.Auth,
-          FastestMCP.ComponentManager,
-          FastestMCP.Error,
-          FastestMCP.Interact,
-          FastestMCP.Middleware,
-          FastestMCP.Operation,
-          FastestMCP.Provider,
-          FastestMCP.Sampling,
-          FastestMCP.SessionStateStore,
-          FastestMCP.SessionStateStore.Memory
-        ],
-        "Prompt, Resource, and Tool Helpers": [
-          FastestMCP.Tools.Result,
-          FastestMCP.Prompts.Message,
-          FastestMCP.Prompts.Result,
-          FastestMCP.Resources.Binary,
-          FastestMCP.Resources.Content,
-          FastestMCP.Resources.Directory,
-          FastestMCP.Resources.File,
-          FastestMCP.Resources.HTTP,
-          FastestMCP.Resources.Result,
-          FastestMCP.Resources.Text
-        ]
-      ],
+      groups_for_modules: module_groups,
       skip_code_autolink_to: [
-        "FastestMCP.Auth.Result",
-        "FastestMCP.Auth.StaticToken",
         "FastestMCP.BackgroundTaskStore",
         "FastestMCP.EventBus",
-        "FastestMCP.HTTP.request/3",
-        "FastestMCP.TaskBackend",
-        "FastestMCP.TaskBackend.Memory"
+        "FastestMCP.HTTP.request/3"
       ],
       filter_modules: fn module, _metadata -> module in public_modules end
+    ]
+  end
+
+  defp module_groups do
+    [
+      "Core API": [
+        FastestMCP,
+        FastestMCP.Lifespan,
+        FastestMCP.ServerModule,
+        FastestMCP.Server,
+        FastestMCP.Context,
+        FastestMCP.RequestContext,
+        FastestMCP.BackgroundTask
+      ],
+      "Client and Transport": [
+        FastestMCP.Client,
+        FastestMCP.Protocol,
+        FastestMCP.Transport.HTTPApp,
+        FastestMCP.Transport.StreamableHTTP,
+        FastestMCP.Transport.Stdio
+      ],
+      "Runtime Features": [
+        FastestMCP.Auth,
+        FastestMCP.Auth.Result,
+        FastestMCP.Auth.StaticToken,
+        FastestMCP.ComponentManager,
+        FastestMCP.Error,
+        FastestMCP.Interact,
+        FastestMCP.Middleware,
+        FastestMCP.Operation,
+        FastestMCP.Provider,
+        FastestMCP.Sampling,
+        FastestMCP.SessionStateStore,
+        FastestMCP.SessionStateStore.Memory,
+        FastestMCP.TaskBackend,
+        FastestMCP.TaskBackend.Memory
+      ],
+      "Prompt, Resource, and Tool Helpers": [
+        FastestMCP.Tools.Result,
+        FastestMCP.Prompts.Message,
+        FastestMCP.Prompts.Result,
+        FastestMCP.Resources.Binary,
+        FastestMCP.Resources.Content,
+        FastestMCP.Resources.Directory,
+        FastestMCP.Resources.File,
+        FastestMCP.Resources.HTTP,
+        FastestMCP.Resources.Result,
+        FastestMCP.Resources.Text
+      ]
     ]
   end
 
@@ -180,43 +185,6 @@ defmodule FastestMCP.MixProject do
       links: %{
         "GitHub" => "https://github.com/caudena/fastest_mcp"
       }
-    ]
-  end
-
-  defp public_modules do
-    [
-      FastestMCP,
-      FastestMCP.Auth,
-      FastestMCP.BackgroundTask,
-      FastestMCP.Client,
-      FastestMCP.ComponentManager,
-      FastestMCP.Context,
-      FastestMCP.Error,
-      FastestMCP.Interact,
-      FastestMCP.Lifespan,
-      FastestMCP.Middleware,
-      FastestMCP.Operation,
-      FastestMCP.Protocol,
-      FastestMCP.Prompts.Message,
-      FastestMCP.Prompts.Result,
-      FastestMCP.Provider,
-      FastestMCP.RequestContext,
-      FastestMCP.Resources.Binary,
-      FastestMCP.Resources.Content,
-      FastestMCP.Resources.Directory,
-      FastestMCP.Resources.File,
-      FastestMCP.Resources.HTTP,
-      FastestMCP.Resources.Result,
-      FastestMCP.Resources.Text,
-      FastestMCP.Sampling,
-      FastestMCP.Server,
-      FastestMCP.ServerModule,
-      FastestMCP.SessionStateStore,
-      FastestMCP.SessionStateStore.Memory,
-      FastestMCP.Tools.Result,
-      FastestMCP.Transport.HTTPApp,
-      FastestMCP.Transport.StreamableHTTP,
-      FastestMCP.Transport.Stdio
     ]
   end
 end

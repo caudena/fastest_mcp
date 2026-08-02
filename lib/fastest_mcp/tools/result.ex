@@ -36,7 +36,7 @@ defmodule FastestMCP.Tools.Result do
 
   @type t :: %__MODULE__{
           content: any(),
-          structured_content: any() | nil,
+          structured_content: map() | nil,
           meta: map() | nil,
           is_error: boolean() | nil
         }
@@ -44,9 +44,9 @@ defmodule FastestMCP.Tools.Result do
   @doc "Builds a normalized tool result."
   def new(content \\ nil, opts \\ []) do
     structured_content =
-      Keyword.get_lazy(opts, :structured_content, fn ->
-        Keyword.get(opts, :structuredContent)
-      end)
+      opts
+      |> Keyword.get_lazy(:structured_content, fn -> Keyword.get(opts, :structuredContent) end)
+      |> normalize_optional_structured_content()
 
     if is_nil(content) and is_nil(structured_content) do
       raise ArgumentError, "tool result requires content or structured_content"
@@ -76,7 +76,12 @@ defmodule FastestMCP.Tools.Result do
             Map.get(value, :structuredContent, Map.get(value, "structuredContent"))
           )
         ),
-      meta: Map.get(value, :meta, Map.get(value, "meta")),
+      meta:
+        Map.get(
+          value,
+          :_meta,
+          Map.get(value, "_meta", Map.get(value, :meta, Map.get(value, "meta")))
+        ),
       is_error:
         Map.get(
           value,
@@ -102,6 +107,14 @@ defmodule FastestMCP.Tools.Result do
 
   defp normalize_optional_map(other) do
     raise ArgumentError, "tool result meta must be a map, got #{inspect(other)}"
+  end
+
+  defp normalize_optional_structured_content(nil), do: nil
+  defp normalize_optional_structured_content(value) when is_map(value), do: value
+
+  defp normalize_optional_structured_content(other) do
+    raise ArgumentError,
+          "tool result structured_content must be a map, got #{inspect(other)}"
   end
 
   defp normalize_optional_boolean(nil), do: nil

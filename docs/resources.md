@@ -372,10 +372,11 @@ server =
 Transport metadata uses the same source options, but exposes them in the MCP
 shape clients expect:
 
-- direct Elixir list APIs keep `meta`, `tags`, `version`, and `task` on the
-  resource or template struct
+- direct Elixir list APIs keep `meta`, `tags`, `version`, and local `task`
+  configuration on the resource or template struct
 - transport list APIs merge `tags` and `version` into `_meta.fastestmcp`
-- `task: true` or explicit task config becomes `execution.taskSupport`
+- resource and resource-template task configuration is not advertised as a
+  remote request capability; MCP `2025-11-25` task augmentation is tool-only
 - underscore-prefixed keys inside `meta[:fastestmcp]` are stripped from the public
   transport payload, while your own keys are preserved
 
@@ -441,13 +442,12 @@ client =
       "version" => "2.0.0"
     }
   },
-  "execution" => %{"taskSupport" => "optional"},
   "uri" => "memo://report"
 }]} = FastestMCP.Client.list_resources(client)
 ```
 
-That same `_meta.fastestmcp` and `execution` contract is used for resource
-templates in `FastestMCP.Client.list_resource_templates/2`.
+The same `_meta.fastestmcp` metadata contract is used for resource templates in
+`FastestMCP.Client.list_resource_templates/2`.
 
 ## Context-Aware Resources
 
@@ -472,7 +472,7 @@ server =
 
 ## Background Tasks
 
-Resources can opt into task execution:
+Resources can opt into local, in-process task execution:
 
 ```elixir
 server =
@@ -489,27 +489,21 @@ server =
 This is useful when generating the resource itself is slow, even if the final
 shape is still a read result.
 
-The same resource can then be read synchronously or as a task:
+The same resource can then be read synchronously or as a local task:
 
 ```elixir
-alias FastestMCP.Client.Task, as: RemoteTask
-
-client =
-  FastestMCP.Client.connect!("http://127.0.0.1:4100/mcp",
-    client_info: %{"name" => "docs-client", "version" => "1.0.0"}
-  )
-
 task =
-  FastestMCP.Client.read_resource(client, "file://report.txt",
+  FastestMCP.read_resource("resource-tasks", "file://report.txt",
     task: true
   )
 
-RemoteTask.result(task)
+FastestMCP.await_task(task, 5_000)
 ```
 
-Use this when the read itself may block or when a remote caller wants normal
-task polling and cancellation. The task handle shape is the same one described
-in [Client](client.md) and [Background Tasks](background-tasks.md).
+Use this when the read itself may block inside an Elixir-owned workflow. Remote
+MCP `resources/read` requests are synchronous; task metadata on that wire method
+is rejected. See [Background Tasks](background-tasks.md) for the local/remote
+boundary.
 
 ## Runtime Changes
 

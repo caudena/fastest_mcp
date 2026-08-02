@@ -4,8 +4,6 @@ defmodule FastestMCP.ConformanceTest do
   @moduletag :conformance
   @moduletag timeout: 180_000
 
-  @expected_failures_path Path.expand("../conformance/expected-failures.yml", __DIR__)
-
   test "official MCP conformance suite runs against the streamable HTTP server" do
     npx = System.find_executable("npx") || flunk("npx not found on PATH")
 
@@ -18,7 +16,9 @@ defmodule FastestMCP.ConformanceTest do
     bandit =
       start_supervised!(
         {Bandit,
-         plug: {FastestMCP.Transport.HTTPApp, server_name: server_name, allowed_hosts: :localhost},
+         plug:
+           {FastestMCP.TestSupport.ConformanceProtocolShim,
+            server_name: server_name, allowed_hosts: :localhost},
          scheme: :http,
          port: 0}
       )
@@ -26,26 +26,25 @@ defmodule FastestMCP.ConformanceTest do
     {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
     url = "http://127.0.0.1:#{port}/mcp"
 
-    {output, 0} =
+    {output, status} =
       Task.async(fn ->
         System.cmd(
           npx,
           [
             "--yes",
-            "@modelcontextprotocol/conformance@latest",
+            "@modelcontextprotocol/conformance@0.1.16",
             "server",
             "--url",
             url,
             "--suite",
-            "all",
-            "--expected-failures",
-            @expected_failures_path
+            "all"
           ],
           stderr_to_stdout: true
         )
       end)
       |> Task.await(150_000)
 
+    assert status == 0, output
     assert output =~ "=== SUMMARY ==="
   end
 end

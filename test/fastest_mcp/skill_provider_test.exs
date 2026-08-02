@@ -154,6 +154,43 @@ defmodule FastestMCP.SkillProviderTest do
     end
   end
 
+  test "manifest hashes the complete contents of files larger than one stream chunk" do
+    skill_dir = create_skill_dir("large-file-skill")
+    File.write!(Path.join(skill_dir, "SKILL.md"), "# Large File")
+
+    content = :binary.copy(<<0, 1, 2, 3, 4, 5, 6, 7>>, 2_000)
+    File.write!(Path.join(skill_dir, "large.bin"), content)
+
+    provider = Skill.new(skill_dir)
+    manifest = provider.skill_info |> Common.manifest_json() |> JSON.decode!()
+    file = Enum.find(manifest["files"], &(&1["path"] == "large.bin"))
+
+    expected_hash =
+      content
+      |> then(&:crypto.hash(:sha256, &1))
+      |> Base.encode16(case: :lower)
+
+    assert file["size"] == byte_size(content)
+    assert file["hash"] == "sha256:" <> expected_hash
+  end
+
+  test "skill scanning ignores directory cycles and rejects an external main-file symlink" do
+    skill_dir = create_skill_dir("cycle-skill")
+    File.write!(Path.join(skill_dir, "SKILL.md"), "# Cycle Safe")
+    File.ln_s!(skill_dir, Path.join(skill_dir, "loop"))
+
+    provider = Skill.new(skill_dir)
+    assert Enum.map(provider.skill_info.files, & &1.path) == ["SKILL.md"]
+
+    outside = Path.join(Path.dirname(skill_dir), "outside.md")
+    unsafe_skill = Path.join(Path.dirname(skill_dir), "unsafe-skill")
+    File.write!(outside, "SECRET")
+    File.mkdir_p!(unsafe_skill)
+    File.ln_s!(outside, Path.join(unsafe_skill, "SKILL.md"))
+
+    assert_raise File.Error, fn -> Skill.new(unsafe_skill) end
+  end
+
   test "skill metadata survives mounted providers" do
     skill_dir = create_skill_dir("mounted-skill")
     File.write!(Path.join(skill_dir, "SKILL.md"), "# Mounted Skill")

@@ -39,7 +39,11 @@ defmodule FastestMCP.ToolAnnotationsTest do
                    "openWorldHint" => false,
                    "destructiveHint" => false
                  },
-                 "execution" => %{taskSupport: "optional"}
+                 "_meta" => %{
+                   "fastestmcp" => %{
+                     "execution" => %{"taskSupport" => "optional"}
+                   }
+                 }
                }
              ]
            } =
@@ -82,7 +86,8 @@ defmodule FastestMCP.ToolAnnotationsTest do
                    "fastestmcp" => %{
                      "hint" => "keep",
                      "tags" => ["math", "utility"],
-                     "version" => "2.0.0"
+                     "version" => "2.0.0",
+                     "execution" => %{}
                    }
                  }
                }
@@ -115,7 +120,7 @@ defmodule FastestMCP.ToolAnnotationsTest do
         {Bandit,
          plug:
            {FastestMCP.Transport.HTTPApp,
-            server_name: server_name, path: "/mcp", allowed_hosts: :any},
+            server_name: server_name, path: "/mcp", unsafe_allow_any_host: true},
          scheme: :http,
          port: 0}
       )
@@ -142,7 +147,8 @@ defmodule FastestMCP.ToolAnnotationsTest do
                    "fastestmcp" => %{
                      "hint" => "keep",
                      "tags" => ["math", "utility"],
-                     "version" => "2.0.0"
+                     "version" => "2.0.0",
+                     "execution" => %{}
                    }
                  }
                }
@@ -188,9 +194,15 @@ defmodule FastestMCP.ToolAnnotationsTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    assert %{resources: resources, resourceTemplates: templates} =
+    assert %{resources: resources} =
              Engine.dispatch!(server_name, %Request{
                method: "resources/list",
+               transport: :stdio
+             })
+
+    assert %{resourceTemplates: templates} =
+             Engine.dispatch!(server_name, %Request{
+               method: "resources/templates/list",
                transport: :stdio
              })
 
@@ -199,28 +211,32 @@ defmodule FastestMCP.ToolAnnotationsTest do
     users = Enum.find(templates, &(&1["uriTemplate"] == "memo://users/{id}"))
     sync_template = Enum.find(templates, &(&1["uriTemplate"] == "memo://sync/{id}"))
 
-    assert report["execution"] == %{taskSupport: "optional"}
+    refute Map.has_key?(report, "execution")
     refute Map.has_key?(sync, "execution")
 
     assert report["_meta"] == %{
              "vendor" => %{"stable" => true},
              "fastestmcp" => %{
+               "execution" => %{"taskSupport" => "optional"},
                "hint" => "keep",
                "tags" => ["docs", "utility"],
                "version" => "2.0.0"
              }
            }
 
-    assert users["execution"] == %{taskSupport: "optional"}
+    refute Map.has_key?(users, "execution")
+    refute Map.has_key?(users, "parameters")
     refute Map.has_key?(sync_template, "execution")
 
-    assert users["_meta"] == %{
+    assert %{
              "vendor" => %{"stable" => true},
              "fastestmcp" => %{
+               "execution" => %{"taskSupport" => "optional"},
                "hint" => "keep",
+               "parameters" => %{},
                "tags" => ["docs", "utility"],
                "version" => "2.0.0"
              }
-           }
+           } = users["_meta"]
   end
 end

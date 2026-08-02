@@ -14,6 +14,9 @@ defmodule FastestMCP.SessionSupervisor do
   use GenServer
 
   alias FastestMCP.Registry
+  alias FastestMCP.Session
+
+  require Logger
 
   @doc "Starts the process owned by this module."
   def start_link(opts \\ []) do
@@ -29,6 +32,7 @@ defmodule FastestMCP.SessionSupervisor do
     {:ok,
      %{
        sessions: sessions,
+       draining?: false,
        session_idle_ttl: session_idle_ttl(opts),
        session_state_store: Keyword.fetch!(opts, :session_state_store)
      }}
@@ -52,8 +56,17 @@ defmodule FastestMCP.SessionSupervisor do
     GenServer.call(supervisor, {:terminate_session, server_name, session_id})
   end
 
+  @doc false
+  def drain(supervisor) when is_pid(supervisor) or is_atom(supervisor) do
+    GenServer.call(supervisor, :drain, :infinity)
+  end
+
   @impl true
   @doc "Processes synchronous GenServer calls for the state owned by this module."
+  def handle_call({:ensure_session, _server_name, _session_id}, _from, %{draining?: true} = state) do
+    {:reply, {:error, :shutting_down}, state}
+  end
+
   def handle_call({:ensure_session, server_name, session_id}, _from, state) do
     reply =
       case Registry.lookup_session(server_name, session_id) do
@@ -77,17 +90,44 @@ defmodule FastestMCP.SessionSupervisor do
     reply =
       case Registry.lookup_session(server_name, session_id) do
         {:ok, pid} when is_pid(pid) ->
-          case DynamicSupervisor.terminate_child(state.sessions, pid) do
-            :ok -> :ok
-            {:error, :not_found} -> {:error, :not_found}
-            other -> other
-          end
+          Session.close(pid)
 
         _ ->
           {:error, :not_found}
       end
 
     {:reply, reply, state}
+  end
+
+  def handle_call(:drain, _from, state) do
+    state = %{state | draining?: true}
+
+    failures =
+      state.sessions
+      |> DynamicSupervisor.which_children()
+      |> Enum.reduce([], fn
+        {_id, pid, _type, _modules}, failures when is_pid(pid) ->
+          case Session.close(pid) do
+            :ok -> failures
+            {:error, reason} -> [{pid, reason} | failures]
+          end
+
+        _child, failures ->
+          failures
+      end)
+      |> Enum.reverse()
+
+    case failures do
+      [] ->
+        {:reply, :ok, state}
+
+      failures ->
+        Logger.error(
+          "failed to delete state for #{length(failures)} session(s) during shutdown: #{inspect(failures)}"
+        )
+
+        {:reply, {:error, failures}, state}
+    end
   end
 
   defp start_session(supervisor, server_name, session_id, session_idle_ttl, session_state_store) do
@@ -109,6 +149,7 @@ defmodule FastestMCP.SessionSupervisor do
     case DynamicSupervisor.start_child(supervisor, spec) do
       {:ok, pid} -> {:ok, pid}
       {:error, {:already_started, pid}} -> {:ok, pid}
+      {:error, {:already_registered, pid}} -> {:ok, pid}
       {:error, :max_children} -> {:error, :overloaded}
       other -> other
     end

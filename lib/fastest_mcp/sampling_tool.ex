@@ -107,9 +107,9 @@ defmodule FastestMCP.SamplingTool do
   def definition(%__MODULE__{} = tool) do
     %{
       "name" => tool.name,
-      "description" => tool.description,
       "inputSchema" => tool.parameters
     }
+    |> maybe_put("description", tool.description)
   end
 
   defp normalize_runner(fun) when is_function(fun) do
@@ -178,6 +178,9 @@ defmodule FastestMCP.SamplingTool do
     |> Map.put_new("type", "object")
     |> Map.put_new("properties", %{})
   end
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
   defp normalize_arguments(nil), do: %{}
   defp normalize_arguments(arguments) when is_map(arguments), do: arguments

@@ -1,11 +1,9 @@
 defmodule FastestMCP.InitializationTest do
   use ExUnit.Case, async: false
 
-  import Plug.Conn
-  import Plug.Test
-
   alias FastestMCP.Client
   alias FastestMCP.Protocol
+  alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
 
   test "initialize returns server info and middleware can observe and modify the result" do
     server_name = "initialize-" <> Integer.to_string(System.unique_integer([:positive]))
@@ -59,15 +57,8 @@ defmodule FastestMCP.InitializationTest do
              },
              "capabilities" => %{
                "completions" => %{},
-               "logging" => %{},
-               "prompts" => %{"listChanged" => true},
-               "resources" => %{"listChanged" => true, "subscribe" => true},
-               "tasks" => %{
-                 "cancel" => %{},
-                 "list" => %{},
-                 "requests" => %{"tools" => %{"call" => %{}}}
-               },
-               "tools" => %{"listChanged" => true}
+               "prompts" => %{},
+               "tools" => %{}
              }
            } = result
   end
@@ -103,6 +94,51 @@ defmodule FastestMCP.InitializationTest do
     result = FastestMCP.initialize(server_name, %{})
 
     assert get_in(result, ["capabilities", "experimental", "feature_flags", "alpha"]) == true
+  end
+
+  test "initialize keeps protocol and standard capabilities canonical" do
+    server_name = "initialize-canonical-#{System.unique_integer([:positive])}"
+
+    server =
+      FastestMCP.server(server_name,
+        metadata: %{
+          protocol_version: "2099-01-01",
+          capabilities: %{
+            resources: %{"unsupported" => true},
+            tasks: %{"requests" => %{"resources" => %{"read" => %{}}}},
+            experimental: %{feature_flags: %{beta: true}}
+          }
+        }
+      )
+
+    assert {:ok, _pid} = FastestMCP.start_server(server)
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+
+    result = FastestMCP.initialize(server_name)
+
+    assert result["protocolVersion"] == Protocol.current_version()
+    refute Map.has_key?(result["capabilities"], "resources")
+    refute Map.has_key?(result["capabilities"], "tasks")
+
+    assert get_in(result, ["capabilities", "experimental", "feature_flags", "beta"]) == true
+  end
+
+  test "stateless HTTP initialize omits session-dependent capabilities" do
+    server_name = "initialize-stateless-#{System.unique_integer([:positive])}"
+
+    assert {:ok, _pid} = FastestMCP.start_server(FastestMCP.server(server_name))
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+
+    result =
+      FastestMCP.initialize(
+        server_name,
+        %{"clientInfo" => %{"name" => "stateless-client"}},
+        transport: :streamable_http,
+        request_metadata: %{stateless_http: true}
+      )
+
+    refute Map.has_key?(result["capabilities"], "resources")
+    refute Map.has_key?(result["capabilities"], "tasks")
   end
 
   test "initialize advertises completion when tools expose completion sources" do
@@ -145,35 +181,36 @@ defmodule FastestMCP.InitializationTest do
       |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    stdio_response =
-      FastestMCP.stdio_dispatch(server_name, %{
-        "method" => "initialize",
-        "params" => %{"clientInfo" => %{"name" => "stdio-client"}}
-      })
-
-    assert stdio_response["ok"] == true
+    {_connection_id, stdio_response} = ProtocolTest.initialize_stdio(server_name)
 
     assert %{
-             "serverInfo" => %{"name" => ^server_name, "version" => "9.9.9"},
-             "instructions" => "Transport instructions"
-           } = stdio_response["result"]
+             "jsonrpc" => "2.0",
+             "id" => 1,
+             "result" => %{
+               "serverInfo" => %{"name" => ^server_name, "version" => "9.9.9"},
+               "instructions" => "Transport instructions"
+             }
+           } = stdio_response
 
-    conn =
-      conn(
-        :post,
-        "/mcp/initialize",
-        JSON.encode!(%{"clientInfo" => %{"name" => "http-client"}})
-      )
-      |> put_req_header("content-type", "application/json")
-      |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
+    {_session_id, conn, initialized_response} = ProtocolTest.initialize_http(server_name)
 
     assert conn.status == 200
+    assert initialized_response.status == 202
 
     assert %{
-             "protocolVersion" => ^protocol_version,
-             "serverInfo" => %{"name" => ^server_name, "version" => "9.9.9"},
-             "instructions" => "Transport instructions"
+             "jsonrpc" => "2.0",
+             "id" => 1,
+             "result" => %{
+               "protocolVersion" => ^protocol_version,
+               "serverInfo" => %{"name" => ^server_name, "version" => "9.9.9"},
+               "instructions" => "Transport instructions",
+               "capabilities" => %{
+                 "logging" => %{},
+                 "tools" => %{"listChanged" => true}
+               }
+             }
            } = JSON.decode!(conn.resp_body)
 
     assert %{} == FastestMCP.ping(server_name)
@@ -204,7 +241,7 @@ defmodule FastestMCP.InitializationTest do
         {Bandit,
          plug:
            {FastestMCP.Transport.HTTPApp,
-            server_name: server_name, path: "/mcp", allowed_hosts: :any},
+            server_name: server_name, path: "/mcp", unsafe_allow_any_host: true},
          scheme: :http,
          port: 0}
       )
@@ -257,7 +294,7 @@ defmodule FastestMCP.InitializationTest do
         {Bandit,
          plug:
            {FastestMCP.Transport.HTTPApp,
-            server_name: server_name, path: "/mcp", allowed_hosts: :any},
+            server_name: server_name, path: "/mcp", unsafe_allow_any_host: true},
          scheme: :http,
          port: 0}
       )

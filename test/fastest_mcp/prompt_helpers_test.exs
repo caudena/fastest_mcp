@@ -83,7 +83,7 @@ defmodule FastestMCP.PromptHelpersTest do
                }
              ],
              "description" => "Prompt helper result",
-             "meta" => %{"source" => "helper"}
+             "_meta" => %{"source" => "helper"}
            } =
              Engine.dispatch!(server_name, %Request{
                method: "prompts/get",

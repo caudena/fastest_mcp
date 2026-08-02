@@ -7,7 +7,7 @@ handles in one OTP process.
 It is the right API when you need:
 
 - a negotiated MCP session rather than stateless HTTP calls
-- remote task handles for `tools/call`, prompt tasks, or resource tasks
+- remote task handles for task-augmented `tools/call`
 - session-stream notifications
 - sampling or elicitation callbacks
 - subscriptions, completions, and auth reuse on one connection
@@ -35,6 +35,19 @@ client =
 %{items: tools} = FastestMCP.Client.list_tools(client)
 FastestMCP.Client.call_tool(client, "sum", %{"a" => 20, "b" => 22})
 ```
+
+For HTTP, the client performs the MCP `2025-11-25` lifecycle automatically. It
+sends `initialize` without a client-chosen session id, retains the
+`MCP-Session-Id` issued by the server, sends `notifications/initialized`, and
+adds the negotiated protocol and session headers to later requests.
+
+The 0.2 client no longer accepts an initial `session_id:`. A stateful HTTP
+session is always negotiated with the server and may remain `nil` for a
+stateless endpoint.
+
+`max_sse_event_bytes:` bounds every incrementally decoded JSON or SSE event and
+defaults to 1 MiB. Use a smaller positive value when the connected server has a
+tighter response contract.
 
 Use `session_stream: true` when you want:
 
@@ -148,30 +161,10 @@ RemoteTask.wait(task, status: "completed")
 RemoteTask.wait(task, statuses: ["completed", "failed"])
 ```
 
-The same handle shape works for prompt and resource tasks:
-
-```elixir
-prompt_task =
-  FastestMCP.Client.render_prompt(
-    client,
-    "draft_release",
-    %{"title" => "v1.2.3"},
-    task: true
-  )
-
-resource_task =
-  FastestMCP.Client.read_resource(
-    client,
-    "memo://release",
-    task: true
-  )
-
-FastestMCP.Client.Task.result(prompt_task)
-FastestMCP.Client.Task.result(resource_task)
-```
-
-SEP-1686 standardizes tool tasks. FastestMCP also supports prompt and resource
-tasks as Elixir client extensions over the same task-handle API.
+MCP `2025-11-25` standardizes remote task augmentation for `tools/call`.
+FastestMCP 0.2 no longer sends task metadata with remote `prompts/get` or
+`resources/read`. Prompt and resource tasks remain available through the local
+in-process Elixir API when the application owns both the runtime and task.
 
 ## Task Listing
 
@@ -254,8 +247,26 @@ stream on demand, and return the resumed result after the relay finishes.
 Scalar elicitation handlers may return the raw scalar value or
 `%{"value" => value}`.
 
-`FastestMCP.Client.send_task_input/5` still exists as a FastestMCP extension,
-but `tasks/result` is the standard SEP-1686 flow.
+To opt into sampling tool calls, pass the executable tool definitions through
+`sampling_tools:` together with a sampling handler. FastestMCP advertises
+`sampling.tools` only when this list is non-empty. `sampling_context:` similarly
+opts the client into the sampling context capability.
+
+```elixir
+client =
+  FastestMCP.Client.connect!("http://127.0.0.1:4100/mcp",
+    sampling_handler: &MyApp.Model.sample/2,
+    sampling_tools: FastestMCP.prepare_sampling_tools(MyApp.MCPServer),
+    sampling_context: %{tenant: "docs"},
+    max_sse_event_bytes: 1_048_576
+  )
+```
+
+The non-standard `tasks/sendInput` wire method and its connected-client helper
+were removed in 0.2. Interactive remote tasks use the standard `tasks/result`
+relay. The local
+`FastestMCP.send_task_input/5` API remains available for in-process Elixir
+workflows.
 
 ## Client-Owned Callback Tasks
 
@@ -320,7 +331,7 @@ client =
   )
 
 # Server flow on the same connection:
-# 1. sampling/createMessage arrives with _meta.task = true
+# 1. sampling/createMessage arrives with params.task = %{}
 # 2. client returns CreateTaskResult immediately
 # 3. server calls tasks/result with that taskId
 # 4. client waits for the sampling handler to finish

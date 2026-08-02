@@ -37,8 +37,11 @@ defmodule FastestMCP.OperationPipeline do
   alias FastestMCP.Protocol
   alias FastestMCP.Registry
   alias FastestMCP.ServerRuntime
+  alias FastestMCP.TaskConfig
   alias FastestMCP.TaskMeta
   alias FastestMCP.Telemetry
+
+  @resolved_component_key {__MODULE__, :resolved_component}
 
   @doc "Runs the MCP initialize handshake."
   def initialize(server_name, params \\ %{}, opts \\ []) do
@@ -141,7 +144,14 @@ defmodule FastestMCP.OperationPipeline do
 
   @doc "Calls a tool with the given arguments."
   def call_tool(server_name, name, arguments \\ %{}, opts \\ []) do
-    invoke(
+    server_name
+    |> call_tool_with_component(name, arguments, opts)
+    |> elem(0)
+  end
+
+  @doc false
+  def call_tool_with_component(server_name, name, arguments \\ %{}, opts \\ []) do
+    invoke_with_component(
       server_name,
       :tool,
       "tools/call",
@@ -153,12 +163,26 @@ defmodule FastestMCP.OperationPipeline do
 
   @doc "Reads a resource by URI."
   def read_resource(server_name, uri, opts \\ []) do
-    invoke(server_name, :resource, "resources/read", to_string(uri), %{}, opts)
+    server_name
+    |> read_resource_with_component(uri, opts)
+    |> elem(0)
+  end
+
+  @doc false
+  def read_resource_with_component(server_name, uri, opts \\ []) do
+    invoke_with_component(server_name, :resource, "resources/read", to_string(uri), %{}, opts)
   end
 
   @doc "Renders a prompt with the given arguments."
   def render_prompt(server_name, name, arguments \\ %{}, opts \\ []) do
-    invoke(
+    server_name
+    |> render_prompt_with_component(name, arguments, opts)
+    |> elem(0)
+  end
+
+  @doc false
+  def render_prompt_with_component(server_name, name, arguments \\ %{}, opts \\ []) do
+    invoke_with_component(
       server_name,
       :prompt,
       "prompts/get",
@@ -166,6 +190,16 @@ defmodule FastestMCP.OperationPipeline do
       normalize_arguments(arguments),
       opts
     )
+  end
+
+  @doc false
+  def record_resolved_component(%Context{} = context, component) do
+    Context.put_request_state(context, @resolved_component_key, component)
+  end
+
+  @doc false
+  def resolved_component(%Context{} = context) do
+    Context.get_request_state(context, @resolved_component_key)
   end
 
   defp list(server_name, component_type, method, opts) do
@@ -177,46 +211,78 @@ defmodule FastestMCP.OperationPipeline do
     |> Pagination.maybe_paginate(opts)
   end
 
-  defp invoke(server_name, :resource, method, target, arguments, opts) do
-    run(server_name, :resource, method, target, arguments, opts, fn server, operation ->
-      case resolve_resource_target(server, target, operation) do
-        {:exact, component, _captures} ->
+  defp invoke_with_component(server_name, :resource, method, target, arguments, opts) do
+    run_with_component(server_name, :resource, method, target, arguments, opts, fn
+      server, operation ->
+        case resolve_resource_target(server, target, operation) do
+          {:exact, component, _captures} ->
+            operation = %{operation | component: component}
+            Telemetry.annotate_span(operation)
+            execute_component(component, operation)
+
+          {:template, component, captures} ->
+            operation = %{operation | component: component}
+            Telemetry.annotate_span(operation)
+
+            execute_component(component, %{
+              operation
+              | arguments: Map.merge(captures, operation.arguments)
+            })
+
+          nil ->
+            raise Error, code: :not_found, message: "unknown resource #{inspect(target)}"
+        end
+    end)
+  end
+
+  defp invoke_with_component(server_name, component_type, method, target, arguments, opts) do
+    run_with_component(
+      server_name,
+      component_type,
+      method,
+      target,
+      arguments,
+      opts,
+      fn server, operation ->
+        component = resolve_component(server, component_type, target, operation)
+
+        if component do
           operation = %{operation | component: component}
           Telemetry.annotate_span(operation)
           execute_component(component, operation)
-
-        {:template, component, captures} ->
-          operation = %{operation | component: component}
-          Telemetry.annotate_span(operation)
-
-          execute_component(component, %{
-            operation
-            | arguments: Map.merge(captures, operation.arguments)
-          })
-
-        nil ->
-          raise Error, code: :not_found, message: "unknown resource #{inspect(target)}"
+        else
+          raise Error,
+            code: :not_found,
+            message: "unknown #{component_type} #{inspect(target)}"
+        end
       end
-    end)
-  end
-
-  defp invoke(server_name, component_type, method, target, arguments, opts) do
-    run(server_name, component_type, method, target, arguments, opts, fn server, operation ->
-      component = resolve_component(server, component_type, target, operation)
-
-      if component do
-        operation = %{operation | component: component}
-        Telemetry.annotate_span(operation)
-        execute_component(component, operation)
-      else
-        raise Error,
-          code: :not_found,
-          message: "unknown #{component_type} #{inspect(target)}"
-      end
-    end)
+    )
   end
 
   defp run(server_name, component_type, method, target, arguments, opts, executor, run_opts \\ []) do
+    server_name
+    |> run_with_component(
+      component_type,
+      method,
+      target,
+      arguments,
+      opts,
+      executor,
+      run_opts
+    )
+    |> elem(0)
+  end
+
+  defp run_with_component(
+         server_name,
+         component_type,
+         method,
+         target,
+         arguments,
+         opts,
+         executor,
+         run_opts \\ []
+       ) do
     runtime = fetch_runtime!(server_name)
     context = build_context!(server_name, runtime, opts)
 
@@ -224,77 +290,80 @@ defmodule FastestMCP.OperationPipeline do
       build_operation(runtime, component_type, method, target, arguments, context, opts)
 
     Context.with_request(context, fn ->
-      Telemetry.with_server_span(operation, fn ->
-        Telemetry.annotate_span(operation)
-        started_at = System.monotonic_time()
-
-        try do
-          operation =
-            maybe_authenticate_operation(runtime.server, operation, opts, run_opts)
-
+      result =
+        Telemetry.with_server_span(operation, fn ->
           Telemetry.annotate_span(operation)
+          started_at = System.monotonic_time()
 
-          Context.emit(
-            operation.context,
-            [:operation, :start],
-            %{system_time: System.system_time()},
-            telemetry_metadata(operation)
-          )
+          try do
+            operation =
+              maybe_authenticate_operation(runtime.server, operation, opts, run_opts)
 
-          result =
-            run_middleware(runtime.server.middleware, operation, fn updated_operation ->
-              executor.(runtime.server, updated_operation)
-            end)
-
-          Context.emit(
-            operation.context,
-            [:operation, :stop],
-            %{duration: System.monotonic_time() - started_at},
-            telemetry_metadata(operation)
-          )
-
-          result
-        rescue
-          error in Error ->
-            Telemetry.record_error(error, __STACKTRACE__, %{
-              "fastestmcp.error.code" => to_string(error.code)
-            })
+            Telemetry.annotate_span(operation)
 
             Context.emit(
-              context,
-              [:operation, :exception],
-              %{duration: System.monotonic_time() - started_at},
-              Map.merge(telemetry_metadata(operation), %{
-                code: error.code,
-                error: Exception.message(error)
-              })
+              operation.context,
+              [:operation, :start],
+              %{system_time: System.system_time()},
+              telemetry_metadata(operation)
             )
 
-            reraise error, __STACKTRACE__
-
-          error ->
-            Telemetry.record_error(error, __STACKTRACE__)
-
-            wrapped =
-              %Error{
-                code: :internal_error,
-                message: "operation #{method} failed: #{Exception.message(error)}",
-                details: %{kind: inspect(error.__struct__)}
-              }
+            result =
+              run_middleware(runtime.server.middleware, operation, fn updated_operation ->
+                executor.(runtime.server, updated_operation)
+              end)
 
             Context.emit(
-              context,
-              [:operation, :exception],
+              operation.context,
+              [:operation, :stop],
               %{duration: System.monotonic_time() - started_at},
-              Map.merge(telemetry_metadata(operation), %{
-                code: wrapped.code,
-                error: wrapped.message
-              })
+              telemetry_metadata(operation)
             )
 
-            raise wrapped
-        end
-      end)
+            result
+          rescue
+            error in Error ->
+              Telemetry.record_error(error, __STACKTRACE__, %{
+                "fastestmcp.error.code" => to_string(error.code)
+              })
+
+              Context.emit(
+                context,
+                [:operation, :exception],
+                %{duration: System.monotonic_time() - started_at},
+                Map.merge(telemetry_metadata(operation), %{
+                  code: error.code,
+                  error: Exception.message(error)
+                })
+              )
+
+              reraise error, __STACKTRACE__
+
+            error ->
+              Telemetry.record_error(error, __STACKTRACE__)
+
+              wrapped =
+                %Error{
+                  code: :internal_error,
+                  message: "operation #{method} failed: #{Exception.message(error)}",
+                  details: %{kind: inspect(error.__struct__)}
+                }
+
+              Context.emit(
+                context,
+                [:operation, :exception],
+                %{duration: System.monotonic_time() - started_at},
+                Map.merge(telemetry_metadata(operation), %{
+                  code: wrapped.code,
+                  error: wrapped.message
+                })
+              )
+
+              raise wrapped
+          end
+        end)
+
+      {result, Context.get_request_state(context, @resolved_component_key)}
     end)
   end
 
@@ -328,7 +397,7 @@ defmodule FastestMCP.OperationPipeline do
   end
 
   defp build_context!(server_name, runtime, opts) do
-    case Context.build(server_name, runtime_context_opts(runtime, opts)) do
+    case Context.build(server_name, ServerRuntime.context_opts(runtime, opts)) do
       {:ok, context} ->
         context
 
@@ -393,69 +462,6 @@ defmodule FastestMCP.OperationPipeline do
     end
   end
 
-  defp runtime_context_opts(runtime, opts) do
-    opts
-    |> maybe_inherit_context(runtime.server.name)
-    |> Keyword.merge(
-      server: runtime.server,
-      dependencies: runtime.server.dependencies,
-      task_store: Map.get(runtime, :task_store),
-      session_supervisor: runtime.session_supervisor,
-      terminated_session_store: Map.get(runtime, :terminated_session_store),
-      event_bus: runtime.event_bus,
-      lifespan_context: Map.get(runtime, :lifespan_context, %{})
-    )
-  end
-
-  defp maybe_inherit_context(opts, server_name) do
-    case Context.current() do
-      %Context{server_name: ^server_name} = context ->
-        opts
-        |> maybe_put_opt(:session_id, context.session_id)
-        |> maybe_put_opt(:transport, context.transport)
-        |> maybe_put_opt(:request_metadata, context.request_metadata)
-        |> maybe_put_opt(:auth_input, inherited_auth_input(context))
-        |> maybe_put_opt(:principal, context.principal)
-        |> maybe_put_opt(:auth, context.auth)
-        |> maybe_put_opt(:capabilities, context.capabilities)
-
-      _other ->
-        opts
-    end
-  end
-
-  defp inherited_auth_input(%Context{} = context) do
-    request_metadata = Map.new(context.request_metadata)
-    access_token = Context.access_token(context)
-
-    headers =
-      request_metadata
-      |> Map.get(:headers, Map.get(request_metadata, "headers", %{}))
-      |> Map.new()
-
-    has_authorization? =
-      Map.has_key?(headers, "authorization") or
-        Map.has_key?(headers, :authorization) or
-        Map.has_key?(request_metadata, "authorization") or
-        Map.has_key?(request_metadata, :authorization)
-
-    cond do
-      access_token && not has_authorization? ->
-        request_metadata
-        |> Map.put("headers", Map.put(headers, "authorization", "Bearer " <> access_token))
-        |> Map.put_new("authorization", "Bearer " <> access_token)
-
-      true ->
-        request_metadata
-    end
-  end
-
-  defp maybe_put_opt(opts, _key, nil), do: opts
-
-  defp maybe_put_opt(opts, key, value) do
-    if Keyword.has_key?(opts, key), do: opts, else: Keyword.put(opts, key, value)
-  end
-
   defp authenticate_operation(%{auth: nil}, operation, _opts), do: operation
 
   defp authenticate_operation(server, %Operation{} = operation, opts) do
@@ -517,6 +523,7 @@ defmodule FastestMCP.OperationPipeline do
   end
 
   defp execute_component(component, operation) do
+    :ok = record_resolved_component(operation.context, component)
     Component.execute(component, operation)
   end
 
@@ -546,11 +553,7 @@ defmodule FastestMCP.OperationPipeline do
   defp normalize_arguments(arguments) when is_list(arguments), do: Enum.into(arguments, %{})
   defp normalize_arguments(nil), do: %{}
 
-  defp completion_capability(server, operation) do
-    visible_tools = visible_components(server, :tool, operation)
-    visible_prompts = visible_components(server, :prompt, operation)
-    visible_templates = visible_components(server, :resource_template, operation)
-
+  defp completion_capability(visible_tools, visible_prompts, visible_templates) do
     if Enum.any?(visible_tools, &tool_has_completion?/1) or
          Enum.any?(visible_prompts, &prompt_has_completion?/1) or
          Enum.any?(visible_templates, &template_has_completion?/1) do
@@ -731,18 +734,24 @@ defmodule FastestMCP.OperationPipeline do
   end
 
   defp maybe_store_client_info(server_name, operation) do
-    case Map.get(operation.arguments, "clientInfo", Map.get(operation.arguments, :clientInfo)) do
-      %{} = client_info ->
-        FastestMCP.Session.set_client_info(server_name, operation.context.session_id, client_info)
+    if operation.context.session_id do
+      case Map.get(operation.arguments, "clientInfo", Map.get(operation.arguments, :clientInfo)) do
+        %{} = client_info ->
+          FastestMCP.Session.set_client_info(
+            server_name,
+            operation.context.session_id,
+            client_info
+          )
 
-      _other ->
-        :ok
+        _other ->
+          :ok
+      end
+    else
+      :ok
     end
   end
 
-  defp protocol_version(server) do
-    Protocol.version(server)
-  end
+  defp protocol_version(_server), do: Protocol.current_version()
 
   defp server_info(server) do
     %{}
@@ -758,45 +767,105 @@ defmodule FastestMCP.OperationPipeline do
 
   defp application_version do
     case Application.spec(:fastest_mcp, :vsn) do
-      nil -> "0.1.0"
+      nil -> "0.2.0"
       version when is_list(version) -> List.to_string(version)
       version -> to_string(version)
     end
   end
 
   defp server_capabilities(server, operation) do
-    base =
-      %{
-        "tools" => component_capabilities(operation.transport),
-        "resources" => resource_capabilities(operation.transport),
-        "prompts" => component_capabilities(operation.transport),
-        "logging" => %{}
-      }
-      |> maybe_put("completions", completion_capability(server, operation))
-      |> maybe_put("tasks", task_capabilities(server))
+    visible_tools = visible_components(server, :tool, operation)
+    visible_resources = visible_components(server, :resource, operation)
+    visible_templates = visible_components(server, :resource_template, operation)
+    visible_prompts = visible_components(server, :prompt, operation)
 
-    deep_merge(
-      base,
-      normalize_string_key_map(metadata_value(server.metadata, :capabilities) || %{})
+    %{}
+    |> maybe_put("logging", logging_capability(operation))
+    |> maybe_put("tools", capability_if_visible(visible_tools, component_capabilities(operation)))
+    |> maybe_put(
+      "resources",
+      capability_if_visible(
+        visible_resources ++ visible_templates,
+        resource_capabilities(operation)
+      )
     )
+    |> maybe_put(
+      "prompts",
+      capability_if_visible(visible_prompts, component_capabilities(operation))
+    )
+    |> maybe_put(
+      "completions",
+      completion_capability(visible_tools, visible_prompts, visible_templates)
+    )
+    |> maybe_put("tasks", task_capabilities(operation, visible_tools))
+    |> maybe_put("experimental", configured_experimental_capabilities(server))
   end
 
-  defp component_capabilities(:stdio), do: %{}
-  defp component_capabilities(_transport), do: %{"listChanged" => true}
+  defp capability_if_visible([], _capability), do: nil
+  defp capability_if_visible(_components, capability), do: capability
 
-  defp resource_capabilities(:stdio), do: %{}
-  defp resource_capabilities(_transport), do: %{"subscribe" => true, "listChanged" => true}
+  defp component_capabilities(operation) do
+    if stateful_streaming_http?(operation) do
+      %{"listChanged" => true}
+    else
+      %{}
+    end
+  end
 
-  defp task_capabilities(_server) do
-    %{
-      "list" => %{},
-      "cancel" => %{},
-      "requests" => %{
-        "tools" => %{"call" => %{}},
-        "prompts" => %{"get" => %{}},
-        "resources" => %{"read" => %{}}
+  defp resource_capabilities(operation) do
+    if stateful_streaming_http?(operation) do
+      %{"subscribe" => true, "listChanged" => true}
+    else
+      %{}
+    end
+  end
+
+  defp logging_capability(operation) do
+    if stateful_streaming_http?(operation), do: %{}
+  end
+
+  defp task_capabilities(operation, visible_tools) do
+    if stateless_http?(operation) or not Enum.any?(visible_tools, &tool_supports_tasks?/1) do
+      nil
+    else
+      %{
+        "list" => %{},
+        "cancel" => %{},
+        "requests" => %{
+          "tools" => %{"call" => %{}}
+        }
       }
-    }
+    end
+  end
+
+  defp tool_supports_tasks?(tool) do
+    tool
+    |> Map.get(:task, TaskConfig.new(false))
+    |> TaskConfig.supports_tasks?()
+  end
+
+  defp configured_experimental_capabilities(server) do
+    case metadata_value(server.metadata, :capabilities, %{}) do
+      %{} = capabilities ->
+        case metadata_value(capabilities, :experimental) do
+          %{} = experimental -> normalize_string_key_map(experimental)
+          _other -> nil
+        end
+
+      _other ->
+        nil
+    end
+  end
+
+  defp stateless_http?(operation) do
+    metadata = operation.context.request_metadata
+
+    operation.transport == :streamable_http and
+      (Map.get(metadata, :stateless_http) == true or Map.get(metadata, "stateless_http") == true)
+  end
+
+  defp stateful_streaming_http?(operation) do
+    operation.transport == :streamable_http and not stateless_http?(operation)
   end
 
   defp website_url(metadata) do
@@ -821,14 +890,6 @@ defmodule FastestMCP.OperationPipeline do
   end
 
   defp normalize_string_key_map(other), do: other
-
-  defp deep_merge(left, right) when is_map(left) and is_map(right) do
-    Map.merge(left, right, fn _key, left_value, right_value ->
-      deep_merge(left_value, right_value)
-    end)
-  end
-
-  defp deep_merge(_left, right), do: right
 
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)
@@ -864,32 +925,46 @@ defmodule FastestMCP.OperationPipeline do
 
   defp exact_component_candidates(server, component_type, target, operation) do
     local =
-      server.name
-      |> Registry.list_components(component_type)
-      |> Enum.filter(fn component ->
-        Component.identifier(component) == to_string(target) and
-          version_matches?(component, operation.version)
-      end)
+      Registry.lookup_component_candidates(
+        server.name,
+        component_type,
+        target,
+        version: operation.version
+      )
 
     provider =
       server.providers
-      |> Enum.flat_map(fn provider ->
-        case Provider.get_component(provider, component_type, target, operation) do
-          nil ->
-            []
-
-          component ->
-            if version_matches?(component, operation.version), do: [component], else: []
-        end
-      end)
+      |> Enum.flat_map(&Provider.get_component_candidates(&1, component_type, target, operation))
 
     local ++ provider
   end
 
   defp resolve_resource_target(server, uri, operation) do
-    case exact_resource_candidates(server, uri, operation) do
+    local_exact =
+      Registry.lookup_component_candidates(
+        server.name,
+        :resource,
+        uri,
+        version: operation.version
+      )
+
+    provider_targets =
+      Enum.flat_map(
+        server.providers,
+        &Provider.get_resource_target_candidates(&1, uri, operation)
+      )
+
+    provider_exact =
+      Enum.reduce(provider_targets, [], fn
+        {:exact, component, _captures}, candidates -> [component | candidates]
+        _target, candidates -> candidates
+      end)
+      |> Enum.reverse()
+
+    case local_exact ++ provider_exact do
       [] ->
-        matching_templates(server, uri, operation)
+        (matching_local_templates(server, uri, operation) ++
+           Enum.filter(provider_targets, &(elem(&1, 0) == :template)))
         |> select_template_candidate(server, operation)
 
       candidates ->
@@ -900,62 +975,21 @@ defmodule FastestMCP.OperationPipeline do
     end
   end
 
-  defp exact_resource_candidates(server, uri, operation) do
-    local =
-      server.name
-      |> Registry.list_components(:resource)
-      |> Enum.filter(fn component ->
-        Component.identifier(component) == to_string(uri) and
-          version_matches?(component, operation.version)
-      end)
-
-    provider =
-      server.providers
-      |> Enum.flat_map(fn provider ->
-        case Provider.get_resource_target(provider, uri, operation) do
-          {:exact, component, _captures} ->
-            if version_matches?(component, operation.version), do: [component], else: []
-
-          _other ->
-            []
+  defp matching_local_templates(server, uri, operation) do
+    server.name
+    |> Registry.list_components(:resource_template)
+    |> Enum.reduce([], fn template, matches ->
+      if version_matches?(template, operation.version) do
+        case FastestMCP.Components.ResourceTemplate.match(template, uri) do
+          nil -> matches
+          captures -> [{template, captures} | matches]
         end
-      end)
-
-    local ++ provider
-  end
-
-  defp matching_templates(server, uri, operation) do
-    local_matches =
-      server.name
-      |> Registry.list_components(:resource_template)
-      |> Enum.reduce([], fn template, matches ->
-        if version_matches?(template, operation.version) do
-          case FastestMCP.Components.ResourceTemplate.match(template, uri) do
-            nil -> matches
-            captures -> [{template, captures} | matches]
-          end
-        else
-          matches
-        end
-      end)
-
-    provider_matches =
-      server.providers
-      |> Enum.reduce([], fn provider, matches ->
-        case Provider.get_resource_target(provider, uri, operation) do
-          {:template, template, captures} ->
-            if version_matches?(template, operation.version) do
-              [{template, captures} | matches]
-            else
-              matches
-            end
-
-          _other ->
-            matches
-        end
-      end)
-
-    local_matches ++ provider_matches
+      else
+        matches
+      end
+    end)
+    |> Enum.reverse()
+    |> Enum.map(fn {template, captures} -> {:template, template, captures} end)
   end
 
   defp select_component_candidate(server, candidates, operation) do
@@ -967,7 +1001,7 @@ defmodule FastestMCP.OperationPipeline do
 
   defp select_component_candidate_result(server, candidates, operation) do
     candidates
-    |> Enum.sort(&component_version_desc?/2)
+    |> Component.sort_by_version_desc()
     |> Enum.reduce_while(nil, fn component, first_error ->
       case ComponentPolicy.apply_result(server, component, operation) do
         {:ok, visible_component} ->
@@ -975,7 +1009,7 @@ defmodule FastestMCP.OperationPipeline do
 
         {:error, %Error{} = error} ->
           case error.code do
-            code when code in [:disabled, :not_visible, :filtered] ->
+            code when code in [:disabled, :not_visible, :filtered, :forbidden] ->
               {:cont, first_error || error}
 
             _other ->
@@ -995,15 +1029,15 @@ defmodule FastestMCP.OperationPipeline do
 
   defp select_template_candidate(candidates, server, operation) do
     candidates
-    |> Enum.sort(fn {left, _}, {right, _} -> component_version_desc?(left, right) end)
-    |> Enum.reduce_while(nil, fn {template, captures}, first_error ->
+    |> sort_template_candidates()
+    |> Enum.reduce_while(nil, fn {:template, template, captures}, first_error ->
       case ComponentPolicy.apply_result(server, template, operation) do
         {:ok, visible_template} ->
           {:halt, {:template, visible_template, captures}}
 
         {:error, %Error{} = error} ->
           case error.code do
-            code when code in [:disabled, :not_visible, :filtered] ->
+            code when code in [:disabled, :not_visible, :filtered, :forbidden] ->
               {:cont, first_error || error}
 
             _other ->
@@ -1024,7 +1058,9 @@ defmodule FastestMCP.OperationPipeline do
   defp version_matches?(component, version),
     do: Component.version(component) == to_string(version)
 
-  defp component_version_desc?(left, right) do
-    Component.compare_versions(Component.version(left), Component.version(right)) != :lt
+  defp sort_template_candidates(candidates) do
+    Component.sort_by_version_desc(candidates, fn {:template, component, _} ->
+      Component.version(component)
+    end)
   end
 end

@@ -150,7 +150,7 @@ defmodule FastestMCP.ToolReturnTypeParityTest do
         {Bandit,
          plug:
            {FastestMCP.Transport.HTTPApp,
-            server_name: server_name, path: "/mcp", allowed_hosts: :any},
+            server_name: server_name, path: "/mcp", unsafe_allow_any_host: true},
          scheme: :http,
          port: 0}
       )
@@ -187,7 +187,7 @@ defmodule FastestMCP.ToolReturnTypeParityTest do
 
     assert %{
              "structuredContent" => %{"result" => ["alpha", "beta"]},
-             "meta" => %{"fastestmcp" => %{"wrap_result" => true}}
+             "_meta" => %{"fastestmcp" => %{"wrap_result" => true}}
            } =
              Engine.dispatch!(server_name, %Request{
                method: "tools/call",
@@ -198,7 +198,7 @@ defmodule FastestMCP.ToolReturnTypeParityTest do
     assert %{
              "content" => [%{"type" => "text"}],
              "structuredContent" => %{"result" => ["alpha", "beta"]},
-             "meta" => %{"fastestmcp" => %{"wrap_result" => true}}
+             "_meta" => %{"fastestmcp" => %{"wrap_result" => true}}
            } = Client.call_tool(client, "list_values", %{})
 
     task = Client.call_tool(client, "list_values", %{}, task: true)
@@ -206,7 +206,7 @@ defmodule FastestMCP.ToolReturnTypeParityTest do
     assert %{
              "content" => [%{"type" => "text"}],
              "structuredContent" => %{"result" => ["alpha", "beta"]},
-             "meta" => %{"fastestmcp" => %{"wrap_result" => true}}
+             "_meta" => %{"fastestmcp" => %{"wrap_result" => true}}
            } = Client.task_result(client, task.task_id)
   end
 
@@ -265,8 +265,10 @@ defmodule FastestMCP.ToolReturnTypeParityTest do
     assert %{
              "content" => [%{"type" => "text"}],
              "structuredContent" => %{"result" => ["alpha"]},
-             "meta" => %{"fastestmcp" => %{"wrap_result" => true}},
-             :_meta => %{"io.modelcontextprotocol/related-task" => %{taskId: ^task_id}}
+             "_meta" => %{
+               "fastestmcp" => %{"wrap_result" => true},
+               "io.modelcontextprotocol/related-task" => %{taskId: ^task_id}
+             }
            } =
              Engine.dispatch!(server_name, %Request{
                method: "tasks/result",

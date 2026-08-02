@@ -35,7 +35,10 @@ server =
   FastestMCP.server("middleware")
   |> FastestMCP.add_middleware(FastestMCP.Middleware.logging())
   |> FastestMCP.add_middleware(
-    FastestMCP.Middleware.rate_limiting(limit: 10, interval_ms: 1_000)
+    FastestMCP.Middleware.rate_limiting(
+      max_requests_per_second: 10.0,
+      burst_capacity: 20
+    )
   )
   |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
 ```
@@ -85,21 +88,21 @@ Read more in:
 Use middleware for cross-cutting execution policy:
 
 ```elixir
-FastestMCP.Middleware.rate_limiting(limit: 20, interval_ms: 1_000)
-FastestMCP.Middleware.sliding_window_rate_limiting(limit: 100, interval_ms: 60_000)
+FastestMCP.Middleware.rate_limiting(max_requests_per_second: 20.0, burst_capacity: 40)
+FastestMCP.Middleware.sliding_window_rate_limiting(max_requests: 100, window_minutes: 1)
 FastestMCP.Middleware.response_caching()
-FastestMCP.Middleware.response_limiting(max_bytes: 100_000)
+FastestMCP.Middleware.response_limiting(max_size: 100_000)
 FastestMCP.Middleware.retry(max_retries: 3)
 ```
 
-The response cache is local to the runtime in v0.1. See
+The response cache is local to the runtime. See
 [Runtime State and Storage](runtime-state-and-storage.md) for the current
 storage model.
 
 ## Error Handling
 
 Error handling middleware accepts one-arity loggers that receive a message or
-two-arity loggers that receive `{level, message}`:
+two-arity loggers that receive `level` and `message` as separate arguments:
 
 ```elixir
 FastestMCP.Middleware.error_handling(
@@ -148,8 +151,8 @@ This injects tool equivalents for prompt listing and rendering.
 FastestMCP.Middleware.resource_tools()
 ```
 
-This injects tool equivalents for listing and reading resources. It is the
-FastestMCP v0.1 answer to "tool-only clients need resource access."
+This injects tool equivalents for listing and reading resources when a
+tool-only client needs resource access.
 
 ## Custom Middleware
 

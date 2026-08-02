@@ -97,7 +97,13 @@ defmodule FastestMCP.Providers.Skill do
       skill_info.name,
       "skill://#{skill_info.name}/#{main_file_name}",
       fn _arguments, _context ->
-        File.read!(Path.join(skill_info.path, main_file_name))
+        case Common.safe_file_path(skill_info, main_file_name) do
+          {:ok, real_path} ->
+            read_file_content(real_path, main_file_name)
+
+          {:error, reason} ->
+            raise File.Error, reason: reason, action: "read file", path: main_file_name
+        end
       end,
       description: skill_info.description,
       mime_type: Common.infer_mime_type(main_file_name),

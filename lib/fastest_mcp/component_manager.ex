@@ -39,7 +39,6 @@ defmodule FastestMCP.ComponentManager do
   """
 
   use GenServer
-  require Logger
 
   alias FastestMCP.Component
   alias FastestMCP.ComponentCompiler
@@ -58,7 +57,8 @@ defmodule FastestMCP.ComponentManager do
       __MODULE__,
       %{
         server_name: server_name,
-        on_duplicate: normalize_on_duplicate(Keyword.get(opts, :on_duplicate, :error))
+        on_duplicate:
+          Component.normalize_duplicate_policy!(Keyword.get(opts, :on_duplicate, :error))
       },
       opts
     )
@@ -88,10 +88,17 @@ defmodule FastestMCP.ComponentManager do
 
   @doc "Reads a value from the backing store."
   def get(target, component_type, identifier, opts \\ []) do
+    target
+    |> get_candidates(component_type, identifier, opts)
+    |> Component.highest_version()
+  end
+
+  @doc false
+  def get_candidates(target, component_type, identifier, opts \\ []) do
     {_, pid} = resolve_target!(target)
 
     GenServer.call(pid, {
-      :get,
+      :get_candidates,
       normalize_component_type!(component_type),
       to_string(identifier),
       version_opt(opts),
@@ -172,17 +179,31 @@ defmodule FastestMCP.ComponentManager do
     )
   end
 
+  @doc false
+  def get_component_candidates(%__MODULE__{} = manager, component_type, identifier, operation) do
+    get_candidates(
+      manager,
+      component_type,
+      identifier,
+      version: operation_version(operation),
+      include_disabled: true
+    )
+  end
+
   @doc "Resolves the backing resource target for a concrete URI."
   def get_resource_target(%__MODULE__{} = manager, uri, operation) do
-    version = operation_version(operation)
+    manager
+    |> get_resource_target_candidates(uri, operation)
+    |> Enum.filter(fn {_kind, component, _captures} -> Component.enabled?(component) end)
+    |> pick_resource_target()
+  end
 
-    with nil <- get(manager, :resource, uri, version: version),
-         {:ok, pid} <- {:ok, manager.pid} do
-      GenServer.call(pid, {:resource_target, to_string(uri), version})
-    else
-      component ->
-        {:exact, component, %{}}
-    end
+  @doc false
+  def get_resource_target_candidates(%__MODULE__{} = manager, uri, operation) do
+    GenServer.call(
+      manager.pid,
+      {:resource_targets, to_string(uri), operation_version(operation)}
+    )
   end
 
   @impl true
@@ -213,15 +234,19 @@ defmodule FastestMCP.ComponentManager do
     {:reply, components, state}
   end
 
-  def handle_call({:get, component_type, identifier, version, include_disabled?}, _from, state) do
-    component =
+  def handle_call(
+        {:get_candidates, component_type, identifier, version, include_disabled?},
+        _from,
+        state
+      ) do
+    components =
       state
       |> fetch_bucket(component_type, identifier)
       |> bucket_components(version)
       |> maybe_filter_disabled(include_disabled?)
-      |> Component.highest_version()
+      |> Component.sort_by_version_desc()
 
-    {:reply, component, state}
+    {:reply, components, state}
   end
 
   def handle_call({:put, component, on_duplicate}, _from, state) do
@@ -257,22 +282,20 @@ defmodule FastestMCP.ComponentManager do
     end
   end
 
-  def handle_call({:resource_target, uri, version}, _from, state) do
-    match =
+  def handle_call({:resource_targets, uri, version}, _from, state) do
+    exact =
       state
-      |> fetch_buckets(:resource_template)
-      |> all_bucket_components()
-      |> maybe_filter_version(version)
-      |> maybe_filter_disabled(false)
-      |> Enum.reduce([], fn template, matches ->
-        case ResourceTemplate.match(template, uri) do
-          nil -> matches
-          captures -> [{template, captures} | matches]
-        end
-      end)
-      |> pick_template()
+      |> fetch_bucket(:resource, uri)
+      |> bucket_components(version)
+      |> Component.sort_by_version_desc()
 
-    {:reply, match, state}
+    targets =
+      case exact do
+        [] -> matching_resource_templates(state, uri, version)
+        components -> Enum.map(components, &{:exact, &1, %{}})
+      end
+
+    {:reply, targets, state}
   end
 
   defp add_component(target, component_type, identifier, handler, opts) do
@@ -333,7 +356,7 @@ defmodule FastestMCP.ComponentManager do
   end
 
   defp normalize_component(component) do
-    Map.put(component, :enabled, Map.get(component, :enabled, true))
+    Map.replace!(component, :enabled, Map.get(component, :enabled, true))
   end
 
   defp put_component(state, component, on_duplicate) do
@@ -342,10 +365,12 @@ defmodule FastestMCP.ComponentManager do
     version = component_version_key(component)
     bucket = fetch_bucket(state, component_type, identifier)
 
-    validate_version_mixing!(bucket, component)
-
-    case duplicate_match(bucket, component, version) do
-      nil ->
+    case Component.registration_action(
+           all_bucket_components(bucket),
+           component,
+           on_duplicate
+         ) do
+      :insert ->
         updated_bucket =
           case version do
             nil ->
@@ -357,17 +382,12 @@ defmodule FastestMCP.ComponentManager do
 
         {:ok, component, put_bucket(state, component_type, identifier, updated_bucket)}
 
-      existing ->
-        apply_duplicate_policy(
-          state,
-          component_type,
-          identifier,
-          bucket,
-          component,
-          version,
-          existing,
-          on_duplicate
-        )
+      {:replace, _existing} ->
+        {:ok, component,
+         replace_duplicate(state, component_type, identifier, bucket, component, version)}
+
+      {:ignore, existing} ->
+        {:ignore, existing, state}
     end
   end
 
@@ -533,59 +553,6 @@ defmodule FastestMCP.ComponentManager do
   defp operation_version(%{version: version}), do: to_string(version)
   defp operation_version(_other), do: nil
 
-  defp validate_version_mixing!(bucket, component) do
-    has_versioned = map_size(bucket.versioned) > 0
-    has_unversioned = not is_nil(bucket.unversioned)
-    incoming_version = Component.version(component)
-    incoming_unversioned = is_nil(incoming_version)
-    incoming_versioned = not incoming_unversioned
-
-    cond do
-      incoming_unversioned and has_versioned ->
-        raise ArgumentError,
-              "#{Component.type(component)} #{inspect(Component.identifier(component))} cannot mix unversioned and versioned definitions"
-
-      incoming_versioned and has_unversioned ->
-        raise ArgumentError,
-              "#{Component.type(component)} #{inspect(Component.identifier(component))} cannot mix versioned and unversioned definitions"
-
-      true ->
-        :ok
-    end
-  end
-
-  defp duplicate_match(bucket, _component, nil), do: bucket.unversioned
-  defp duplicate_match(bucket, _component, version), do: Map.get(bucket.versioned, version)
-
-  defp apply_duplicate_policy(
-         state,
-         component_type,
-         identifier,
-         bucket,
-         component,
-         version,
-         existing,
-         on_duplicate
-       ) do
-    case normalize_on_duplicate(on_duplicate) do
-      :error ->
-        raise_duplicate_error(component)
-
-      :warn ->
-        Logger.warning(duplicate_warning(component))
-
-        {:ok, component,
-         replace_duplicate(state, component_type, identifier, bucket, component, version)}
-
-      :replace ->
-        {:ok, component,
-         replace_duplicate(state, component_type, identifier, bucket, component, version)}
-
-      :ignore ->
-        {:ignore, existing, state}
-    end
-  end
-
   defp replace_duplicate(state, component_type, identifier, bucket, component, version) do
     updated_bucket =
       case version do
@@ -596,47 +563,33 @@ defmodule FastestMCP.ComponentManager do
     put_bucket(state, component_type, identifier, updated_bucket)
   end
 
-  defp raise_duplicate_error(component) do
-    if is_nil(Component.version(component)) do
-      raise ArgumentError,
-            "#{Component.type(component)} #{inspect(Component.identifier(component))} is already defined without a version"
-    else
-      raise ArgumentError,
-            "#{Component.type(component)} #{inspect(Component.identifier(component))} version #{inspect(Component.version(component))} is already defined"
-    end
+  defp matching_resource_templates(state, uri, version) do
+    state
+    |> fetch_buckets(:resource_template)
+    |> all_bucket_components()
+    |> maybe_filter_version(version)
+    |> Enum.reduce([], fn template, matches ->
+      case ResourceTemplate.match(template, uri) do
+        nil -> matches
+        captures -> [{:template, template, captures} | matches]
+      end
+    end)
+    |> Enum.reverse()
+    |> sort_resource_targets()
   end
 
-  defp duplicate_warning(component) do
-    if is_nil(Component.version(component)) do
-      "#{Component.type(component)} #{inspect(Component.identifier(component))} is already defined without a version; replacing existing definition"
-    else
-      "#{Component.type(component)} #{inspect(Component.identifier(component))} version #{inspect(Component.version(component))} is already defined; replacing existing definition"
-    end
+  defp pick_resource_target([]), do: nil
+
+  defp pick_resource_target(targets) do
+    targets
+    |> sort_resource_targets()
+    |> List.first()
   end
 
-  defp normalize_on_duplicate(policy) when policy in [:error, :warn, :ignore, :replace],
-    do: policy
-
-  defp normalize_on_duplicate(other) do
-    raise ArgumentError,
-          "on_duplicate must be one of :error, :warn, :ignore, or :replace, got #{inspect(other)}"
-  end
-
-  defp pick_template([]), do: nil
-
-  defp pick_template(matches) do
-    {component, captures} =
-      Enum.reduce(matches, nil, fn
-        current, nil ->
-          current
-
-        {candidate, _} = current, {best, _} = previous ->
-          if Component.compare_versions(candidate.version, best.version) == :gt,
-            do: current,
-            else: previous
-      end)
-
-    {:template, component, captures}
+  defp sort_resource_targets(targets) do
+    Component.sort_by_version_desc(targets, fn {_, component, _} ->
+      Component.version(component)
+    end)
   end
 
   defp broadcast_component_change(server_name, component_type) do

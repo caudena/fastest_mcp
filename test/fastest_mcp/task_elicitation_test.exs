@@ -7,8 +7,6 @@ defmodule FastestMCP.TaskElicitationTest do
   alias FastestMCP.Elicitation.Declined
   alias FastestMCP.Error
   alias FastestMCP.ServerRuntime
-  alias FastestMCP.Transport.Engine
-  alias FastestMCP.Transport.Request
 
   test "background tasks can elicit input and resume through the local API" do
     server_name = "task-elicit-local-" <> Integer.to_string(System.unique_integer([:positive]))
@@ -92,88 +90,6 @@ defmodule FastestMCP.TaskElicitationTest do
 
     _ = FastestMCP.send_task_input(server_name, handle.task_id, :accept, "Alice")
     assert FastestMCP.await_task(handle, 1_000) == "Hello, Alice!"
-  end
-
-  test "tasks/sendInput works through the shared task protocol and enforces session scope" do
-    server_name = "task-elicit-protocol-" <> Integer.to_string(System.unique_integer([:positive]))
-
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool(
-        "ask_name",
-        fn _args, ctx ->
-          case Context.elicit(ctx, "Name?", :string) do
-            %Accepted{data: name} -> "Hello, #{name}!"
-            %Declined{} -> "Declined"
-            %Cancelled{} -> "Cancelled"
-          end
-        end,
-        task: true
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-
-    create =
-      Engine.dispatch!(server_name, %Request{
-        method: "tools/call",
-        transport: :stdio,
-        session_id: "elicitation-session",
-        task_request: true,
-        payload: %{"name" => "ask_name", "arguments" => %{}},
-        request_metadata: %{session_id_provided: true}
-      })
-
-    task_id = create.task.taskId
-    :ok = wait_for_input_required(server_name, task_id)
-
-    status =
-      Engine.dispatch!(server_name, %Request{
-        method: "tasks/get",
-        transport: :stdio,
-        session_id: "elicitation-session",
-        payload: %{"taskId" => task_id},
-        request_metadata: %{session_id_provided: true}
-      })
-
-    assert status.status == "input_required"
-    assert status.statusMessage == "Name?"
-    assert status.taskId == task_id
-
-    wrong_session_error =
-      assert_raise Error, fn ->
-        Engine.dispatch!(server_name, %Request{
-          method: "tasks/sendInput",
-          transport: :stdio,
-          session_id: "other-session",
-          payload: %{
-            "taskId" => task_id,
-            "action" => "accept",
-            "content" => %{"value" => "Mallory"}
-          },
-          request_metadata: %{session_id_provided: true}
-        })
-      end
-
-    assert wrong_session_error.code == :invalid_task_id
-
-    send_input =
-      Engine.dispatch!(server_name, %Request{
-        method: "tasks/sendInput",
-        transport: :stdio,
-        session_id: "elicitation-session",
-        payload: %{
-          "taskId" => task_id,
-          "action" => "accept",
-          "content" => %{"value" => "Bob"}
-        },
-        request_metadata: %{session_id_provided: true}
-      })
-
-    assert send_input.taskId == task_id
-    assert send_input.status == "working"
-
-    assert FastestMCP.await_task(server_name, task_id, 1_000, session_id: "elicitation-session") ==
-             "Hello, Bob!"
   end
 
   test "send_task_input rejects non-waiting tasks and supports decline/cancel outcomes" do

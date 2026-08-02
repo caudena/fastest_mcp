@@ -209,6 +209,260 @@ defmodule FastestMCP.OpenAPIProviderEdgeCasesTest do
              "#/components/schemas/Node"
   end
 
+  test "operation parameters override path parameters and schema defaults are serialized" do
+    parent = self()
+
+    spec = %{
+      "openapi" => "3.0.0",
+      "info" => %{"title" => "Overrides", "version" => "1.0.0"},
+      "servers" => [%{"url" => "https://override.example.com"}],
+      "paths" => %{
+        "/search" => %{
+          "parameters" => [
+            %{
+              "name" => "query",
+              "in" => "query",
+              "description" => "path-level",
+              "schema" => %{"type" => "string", "default" => "old"}
+            }
+          ],
+          "get" => %{
+            "operationId" => "search",
+            "parameters" => [
+              %{
+                "name" => "query",
+                "in" => "query",
+                "description" => "operation-level",
+                "schema" => %{"type" => "string", "default" => "new"}
+              }
+            ],
+            "responses" => ok()
+          }
+        }
+      }
+    }
+
+    server_name = "openapi-overrides-" <> Integer.to_string(System.unique_integer([:positive]))
+
+    server =
+      FastestMCP.from_openapi(spec,
+        name: server_name,
+        requester: fn method, url, opts ->
+          send(parent, {:request, method, url, opts})
+          {:ok, 200, [{"content-type", "application/json"}], JSON.encode!(%{"ok" => true})}
+        end
+      )
+
+    assert {:ok, _pid} = FastestMCP.start_server(server)
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+
+    [tool] = FastestMCP.list_tools(server_name)
+    assert Map.keys(tool.input_schema["properties"]) == ["query"]
+    assert tool.input_schema["properties"]["query"]["description"] == "operation-level"
+
+    assert %{"ok" => true} == FastestMCP.call_tool(server_name, "search", %{})
+    assert_receive {:request, :get, "https://override.example.com/search", opts}
+    assert opts[:query] == [{"query", "new"}]
+  end
+
+  test "parameter locations are whitelisted without creating atoms" do
+    location = "untrusted_location_#{System.unique_integer([:positive])}"
+    assert_raise ArgumentError, fn -> String.to_existing_atom(location) end
+
+    spec = %{
+      "openapi" => "3.0.0",
+      "info" => %{"title" => "Locations", "version" => "1.0.0"},
+      "servers" => [%{"url" => "https://locations.example.com"}],
+      "paths" => %{
+        "/unsafe" => %{
+          "get" => %{
+            "operationId" => "unsafe",
+            "parameters" => [
+              %{"name" => "value", "in" => location, "schema" => %{"type" => "string"}}
+            ],
+            "responses" => ok()
+          }
+        }
+      }
+    }
+
+    assert_raise ArgumentError, ~r/unsupported OpenAPI parameter location/, fn ->
+      FastestMCP.from_openapi(spec)
+    end
+
+    assert_raise ArgumentError, fn -> String.to_existing_atom(location) end
+  end
+
+  test "parameter style defaults serialize arrays and path spaces correctly" do
+    parent = self()
+
+    spec = %{
+      "openapi" => "3.0.0",
+      "info" => %{"title" => "Styles", "version" => "1.0.0"},
+      "servers" => [%{"url" => "https://styles.example.com"}],
+      "paths" => %{
+        "/items/{id}" => %{
+          "get" => %{
+            "operationId" => "styled",
+            "parameters" => [
+              %{
+                "name" => "id",
+                "in" => "path",
+                "required" => true,
+                "schema" => %{"type" => "string"}
+              },
+              %{"name" => "tag", "in" => "query", "schema" => %{"type" => "array"}},
+              %{
+                "name" => "compact",
+                "in" => "query",
+                "style" => "form",
+                "explode" => false,
+                "schema" => %{"type" => "array"}
+              },
+              %{
+                "name" => "lang",
+                "in" => "query",
+                "schema" => %{"type" => "string", "default" => "en"}
+              },
+              %{"name" => "X-Flags", "in" => "header", "schema" => %{"type" => "array"}},
+              %{"name" => "session", "in" => "cookie", "schema" => %{"type" => "string"}}
+            ],
+            "responses" => ok()
+          }
+        }
+      }
+    }
+
+    server_name = "openapi-styles-" <> Integer.to_string(System.unique_integer([:positive]))
+
+    server =
+      FastestMCP.from_openapi(spec,
+        name: server_name,
+        requester: fn method, url, opts ->
+          send(parent, {:request, method, url, opts})
+          {:ok, 200, [{"content-type", "application/json"}], JSON.encode!(%{"ok" => true})}
+        end
+      )
+
+    assert {:ok, _pid} = FastestMCP.start_server(server)
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+
+    assert %{"ok" => true} ==
+             FastestMCP.call_tool(server_name, "styled", %{
+               "id" => "a b",
+               "tag" => ["one", "two"],
+               "compact" => ["a", "b"],
+               "X-Flags" => ["fast", "safe"],
+               "session" => "abc 123"
+             })
+
+    assert_receive {:request, :get, "https://styles.example.com/items/a%20b", opts}
+
+    assert opts[:query] == [
+             {"tag", "one"},
+             {"tag", "two"},
+             {"compact", "a,b"},
+             {"lang", "en"}
+           ]
+
+    assert {"X-Flags", "fast,safe"} in opts[:headers]
+    assert {"cookie", "session=abc+123"} in opts[:headers]
+  end
+
+  test "scalar and array JSON request bodies are sent without wrapper objects" do
+    parent = self()
+
+    spec = %{
+      "openapi" => "3.0.0",
+      "info" => %{"title" => "Raw JSON", "version" => "1.0.0"},
+      "servers" => [%{"url" => "https://body.example.com"}],
+      "paths" => %{
+        "/array" => %{
+          "post" => %{
+            "operationId" => "send_array",
+            "requestBody" => %{
+              "content" => %{
+                "application/json" => %{
+                  "schema" => %{"type" => "array", "items" => %{"type" => "integer"}}
+                }
+              }
+            },
+            "responses" => ok()
+          }
+        },
+        "/scalar" => %{
+          "post" => %{
+            "operationId" => "send_scalar",
+            "requestBody" => %{
+              "content" => %{"application/json" => %{"schema" => %{"type" => "string"}}}
+            },
+            "responses" => ok()
+          }
+        }
+      }
+    }
+
+    server_name = "openapi-raw-body-" <> Integer.to_string(System.unique_integer([:positive]))
+
+    server =
+      FastestMCP.from_openapi(spec,
+        name: server_name,
+        requester: fn method, url, opts ->
+          send(parent, {:request, method, url, opts})
+          {:ok, 200, [{"content-type", "application/json"}], JSON.encode!(%{"ok" => true})}
+        end
+      )
+
+    assert {:ok, _pid} = FastestMCP.start_server(server)
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+
+    assert %{"ok" => true} ==
+             FastestMCP.call_tool(server_name, "send_array", %{"body" => [1, 2, 3]})
+
+    assert_receive {:request, :post, "https://body.example.com/array", array_opts}
+    assert array_opts[:json] == [1, 2, 3]
+
+    assert %{"ok" => true} ==
+             FastestMCP.call_tool(server_name, "send_scalar", %{"body" => "raw"})
+
+    assert_receive {:request, :post, "https://body.example.com/scalar", scalar_opts}
+    assert scalar_opts[:json] == "raw"
+  end
+
+  test "responses decode only JSON media types and structured JSON suffixes" do
+    spec = %{
+      "openapi" => "3.0.0",
+      "info" => %{"title" => "Response MIME", "version" => "1.0.0"},
+      "servers" => [%{"url" => "https://response.example.com"}],
+      "paths" => %{
+        "/text" => %{"get" => %{"operationId" => "text", "responses" => ok()}},
+        "/problem" => %{"get" => %{"operationId" => "problem", "responses" => ok()}}
+      }
+    }
+
+    server_name =
+      "openapi-response-mime-" <> Integer.to_string(System.unique_integer([:positive]))
+
+    server =
+      FastestMCP.from_openapi(spec,
+        name: server_name,
+        requester: fn
+          :get, "https://response.example.com/text", _opts ->
+            {:ok, 200, [{"content-type", "text/plain"}], ~s({"looks":"json"})}
+
+          :get, "https://response.example.com/problem", _opts ->
+            {:ok, 200, [{"content-type", "application/problem+json; charset=utf-8"}],
+             ~s({"decoded":true})}
+        end
+      )
+
+    assert {:ok, _pid} = FastestMCP.start_server(server)
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+
+    assert ~s({"looks":"json"}) == FastestMCP.call_tool(server_name, "text", %{})
+    assert %{"decoded" => true} == FastestMCP.call_tool(server_name, "problem", %{})
+  end
+
   defp body(content_type) do
     %{
       "content" => %{

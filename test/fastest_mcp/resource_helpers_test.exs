@@ -79,16 +79,16 @@ defmodule FastestMCP.ResourceHelpersTest do
                  "uri" => "memo://bundle",
                  "mimeType" => "text/plain",
                  "text" => "hello",
-                 "meta" => %{"slot" => "text"}
+                 "_meta" => %{"slot" => "text"}
                },
                %{
                  "uri" => "memo://bundle",
                  "mimeType" => "application/octet-stream",
                  "blob" => "AAEC",
-                 "meta" => %{"slot" => "blob"}
+                 "_meta" => %{"slot" => "blob"}
                }
              ],
-             "meta" => %{"source" => "helper"}
+             "_meta" => %{"source" => "helper"}
            } =
              Engine.dispatch!(server_name, %Request{
                method: "resources/read",
@@ -112,14 +112,22 @@ defmodule FastestMCP.ResourceHelpersTest do
 
     assert JSON.decode!(encoded_json) == %{"ok" => true, "values" => [1, 2, 3]}
 
+    resources_page =
+      Engine.dispatch!(server_name, %Request{
+        method: "resources/list",
+        transport: :stdio
+      })
+
+    assert %{resources: resources} = resources_page
+    refute Map.has_key?(resources_page, :resourceTemplates)
+
     assert %{
-             resources: resources,
              resourceTemplates: [
                %{"uriTemplate" => "memo://users/{id}", "annotations" => %{"httpMethod" => "GET"}}
              ]
            } =
              Engine.dispatch!(server_name, %Request{
-               method: "resources/list",
+               method: "resources/templates/list",
                transport: :stdio
              })
 
@@ -234,6 +242,38 @@ defmodule FastestMCP.ResourceHelpersTest do
     assert_raise FastestMCP.Error, ~r/Error listing directory/, fn ->
       missing |> ResourceDirectory.new() |> ResourceDirectory.list_files()
     end
+  end
+
+  test "recursive directory resources stay contained and stop at symlink cycles" do
+    root =
+      Path.join(System.tmp_dir!(), "fastest_mcp_safe_dir_#{System.unique_integer([:positive])}")
+
+    outside =
+      Path.join(System.tmp_dir!(), "fastest_mcp_outside_#{System.unique_integer([:positive])}")
+
+    nested = Path.join(root, "nested")
+    top_file = Path.join(root, "top.txt")
+    nested_file = Path.join(nested, "nested.txt")
+    outside_file = Path.join(outside, "secret.txt")
+
+    File.mkdir_p!(nested)
+    File.mkdir_p!(outside)
+    File.write!(top_file, "top")
+    File.write!(nested_file, "nested")
+    File.write!(outside_file, "secret")
+    File.ln_s!(outside_file, Path.join(root, "leak.txt"))
+    File.ln_s!(root, Path.join(nested, "back"))
+
+    on_exit(fn ->
+      File.rm_rf(root)
+      File.rm_rf(outside)
+    end)
+
+    assert [^nested_file, ^top_file] =
+             root
+             |> ResourceDirectory.new(recursive: true)
+             |> ResourceDirectory.list_files()
+             |> Enum.sort()
   end
 
   test "directory resources work through normal resource handlers" do

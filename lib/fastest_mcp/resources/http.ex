@@ -7,6 +7,7 @@ defmodule FastestMCP.Resources.HTTP do
   """
 
   alias FastestMCP.Error
+  alias FastestMCP.MIME
   alias FastestMCP.Resources.Binary
   alias FastestMCP.Resources.Result
   alias FastestMCP.Resources.Text
@@ -93,9 +94,5 @@ defmodule FastestMCP.Resources.HTTP do
     end)
   end
 
-  defp binary_mime_type?(mime_type) when is_binary(mime_type) do
-    not String.starts_with?(mime_type, "text/") and mime_type != "application/json"
-  end
-
-  defp binary_mime_type?(_mime_type), do: false
+  defp binary_mime_type?(mime_type), do: MIME.binary?(mime_type)
 end

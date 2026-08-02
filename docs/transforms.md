@@ -125,7 +125,7 @@ name second.
 
 ## Tool-only Clients
 
-FastestMCP v0.1 does not ship a public tool-search transform, but it does ship
+FastestMCP v0.2 does not ship a public tool-search transform, but it does ship
 tool-injection middleware helpers for tool-only clients:
 
 - `FastestMCP.Middleware.prompt_tools/1`

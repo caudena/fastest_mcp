@@ -34,7 +34,7 @@ defmodule FastestMCP.Authorization do
             component: struct(),
             method: String.t(),
             server_name: String.t(),
-            session_id: String.t(),
+            session_id: String.t() | nil,
             transport: atom(),
             auth: map(),
             capabilities: [any()],
@@ -204,13 +204,16 @@ defmodule FastestMCP.Authorization do
         false -> false
         nil -> false
         {:error, message} when is_binary(message) -> raise Error, message: message
-        other -> other not in [false, nil]
+        _other -> false
       end
     rescue
       error in Error ->
         reraise error, __STACKTRACE__
 
       _error ->
+        false
+    catch
+      _kind, _reason ->
         false
     end
   end

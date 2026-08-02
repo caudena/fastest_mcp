@@ -2,7 +2,10 @@ defmodule FastestMCP.ServerModuleTest do
   use ExUnit.Case, async: false
 
   alias FastestMCP.Context
+  alias FastestMCP.Registry
   alias FastestMCP.ServerRuntime
+  alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
+  alias FastestMCP.TestSupport.ServerSupervisorIsolation
 
   defmodule ConfiguredServer do
     use FastestMCP.ServerModule,
@@ -101,44 +104,115 @@ defmodule FastestMCP.ServerModuleTest do
     assert {:error, :not_found} = ServerRuntime.fetch(HTTPServer)
   end
 
+  test "server module restores its owner claim after Registry replacement" do
+    assert {:ok, owner_pid} = FastestMCP.start_server(HTTPServer, [])
+    :ok = ServerSupervisorIsolation.terminate_unrelated_servers!(owner_pid)
+
+    on_exit(fn ->
+      if Process.alive?(owner_pid), do: FastestMCP.stop_server(HTTPServer)
+    end)
+
+    assert {:ok, old_runtime} = Registry.lookup_server(HTTPServer)
+    old_registry = Process.whereis(Registry)
+    Process.exit(old_registry, :kill)
+
+    assert_eventually(fn ->
+      with registry when is_pid(registry) and registry != old_registry <-
+             Process.whereis(Registry),
+           {:ok, ^owner_pid} <- Registry.lookup_server_owner(HTTPServer),
+           {:ok, runtime} when runtime != old_runtime <- Registry.lookup_server(HTTPServer) do
+        Process.alive?(runtime)
+      else
+        _other -> false
+      end
+    end)
+
+    assert Process.alive?(owner_pid)
+    assert [%{name: "echo"}] = FastestMCP.list_tools(HTTPServer)
+
+    assert :ok = FastestMCP.stop_server(HTTPServer)
+    assert_eventually(fn -> not Process.alive?(owner_pid) end)
+    assert {:error, :not_found} = Registry.lookup_server_owner(HTTPServer)
+  end
+
   test "server module child_spec can start streamable HTTP transport" do
     port = 46_000 + rem(System.unique_integer([:positive]), 1_000)
 
     assert {:ok, _pid} =
-             start_supervised({HTTPServer, http: [port: port, allowed_hosts: :localhost]})
+             start_supervised(
+               {HTTPServer, http: [port: port, allowed_hosts: :localhost, json_response: true]}
+             )
 
-    request_body =
-      JSON.encode!(%{
-        "jsonrpc" => "2.0",
-        "id" => 7,
-        "method" => "tools/call",
-        "params" => %{"name" => "echo", "arguments" => %{"message" => "hello"}}
-      })
-
-    {status, body} =
-      request(
+    initialize =
+      post_json(
         port,
-        [
-          "POST /mcp HTTP/1.1\r\n",
-          "Host: 127.0.0.1\r\n",
-          "Content-Type: application/json\r\n",
-          "mcp-session-id: module-http-session\r\n",
-          "Content-Length: ",
-          Integer.to_string(byte_size(request_body)),
-          "\r\n",
-          "Connection: close\r\n\r\n",
-          request_body
-        ]
-        |> IO.iodata_to_binary()
+        ProtocolTest.jsonrpc_request(1, "initialize", ProtocolTest.initialize_params())
       )
 
-    assert status == 200
+    assert initialize.status == 200
+    session_id = Map.fetch!(initialize.headers, "mcp-session-id")
+
+    initialized =
+      post_json(
+        port,
+        ProtocolTest.jsonrpc_notification("notifications/initialized"),
+        session_id
+      )
+
+    assert initialized.status == 202
+
+    response =
+      post_json(
+        port,
+        ProtocolTest.jsonrpc_request(7, "tools/call", %{
+          "name" => "echo",
+          "arguments" => %{"message" => "hello"}
+        }),
+        session_id
+      )
+
+    assert response.status == 200
 
     assert %{
              "jsonrpc" => "2.0",
              "id" => 7,
              "result" => %{"structuredContent" => %{"message" => "hello"}}
-           } = JSON.decode!(body)
+           } = JSON.decode!(response.body)
+  end
+
+  defp post_json(port, payload, session_id \\ nil) do
+    body = JSON.encode!(payload)
+
+    session_headers =
+      if session_id do
+        [
+          "MCP-Session-Id: ",
+          session_id,
+          "\r\n",
+          "MCP-Protocol-Version: ",
+          ProtocolTest.protocol_version(),
+          "\r\n"
+        ]
+      else
+        []
+      end
+
+    request(
+      port,
+      [
+        "POST /mcp HTTP/1.1\r\n",
+        "Host: 127.0.0.1\r\n",
+        "Content-Type: application/json\r\n",
+        "Accept: application/json, text/event-stream\r\n",
+        session_headers,
+        "Content-Length: ",
+        Integer.to_string(byte_size(body)),
+        "\r\n",
+        "Connection: close\r\n\r\n",
+        body
+      ]
+      |> IO.iodata_to_binary()
+    )
   end
 
   defp request(port, payload) do
@@ -148,16 +222,38 @@ defmodule FastestMCP.ServerModuleTest do
     :ok = :gen_tcp.close(socket)
 
     [head, body] = String.split(response, "\r\n\r\n", parts: 2)
-    [status_line | _headers] = String.split(head, "\r\n")
+    [status_line | header_lines] = String.split(head, "\r\n")
     ["HTTP/1.1", status, _reason] = String.split(status_line, " ", parts: 3)
 
-    {String.to_integer(status), body}
+    headers =
+      Map.new(header_lines, fn line ->
+        [name, value] = String.split(line, ":", parts: 2)
+        {String.downcase(name), String.trim(value)}
+      end)
+
+    %{status: String.to_integer(status), headers: headers, body: body}
   end
 
   defp recv_all(socket, acc) do
     case :gen_tcp.recv(socket, 0, 1_000) do
       {:ok, chunk} -> recv_all(socket, acc <> chunk)
       {:error, :closed} -> {:ok, acc}
+    end
+  end
+
+  defp assert_eventually(fun, attempts \\ 500)
+
+  defp assert_eventually(fun, attempts) do
+    cond do
+      fun.() ->
+        :ok
+
+      attempts == 0 ->
+        flunk("condition did not become true")
+
+      true ->
+        Process.sleep(10)
+        assert_eventually(fun, attempts - 1)
     end
   end
 end

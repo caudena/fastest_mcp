@@ -117,4 +117,16 @@ defmodule FastestMCP.ResourceTemplateQueryParamsTest do
       |> FastestMCP.add_resource_template("data://{user-id}/{user_id}", fn args, _ctx -> args end)
     end
   end
+
+  test "resource templates reject fragments" do
+    assert_raise ArgumentError, ~r/fragments are not supported/, fn ->
+      FastestMCP.server("resource-template-fragment")
+      |> FastestMCP.add_resource_template("data://items/{id}#details", fn args, _ctx -> args end)
+    end
+
+    assert_raise ArgumentError, ~r/fragments are not supported/, fn ->
+      FastestMCP.server("resource-template-fragment-expression")
+      |> FastestMCP.add_resource_template("data://items/{#fragment}", fn args, _ctx -> args end)
+    end
+  end
 end

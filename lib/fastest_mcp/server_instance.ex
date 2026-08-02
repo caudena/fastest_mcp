@@ -21,12 +21,8 @@ defmodule FastestMCP.ServerInstance do
 
   @doc "Starts the process owned by this module."
   def start_link({module, opts}) when is_atom(module) and is_list(opts) do
-    %{server: server} = definition = ServerModule.build_definition(module, opts)
-
-    with {:ok, pid} <- Supervisor.start_link(__MODULE__, definition) do
-      :ok = Registry.register_server_owner(server.name, pid)
-      {:ok, pid}
-    end
+    definition = ServerModule.build_definition(module, opts)
+    Supervisor.start_link(__MODULE__, definition)
   end
 
   @impl true
@@ -37,13 +33,22 @@ defmodule FastestMCP.ServerInstance do
         http_opts: http_opts,
         well_known_http_opts: well_known_http_opts
       }) do
-    children =
-      [
-        runtime_child_spec(server, runtime_opts)
-      ] ++
-        transport_children(server.name, http_opts, well_known_http_opts)
+    case Registry.register_server_owner(server.name, self()) do
+      :ok ->
+        children =
+          [
+            runtime_child_spec(
+              server,
+              Keyword.put(runtime_opts, :server_owner_pid, self())
+            )
+          ] ++
+            transport_children(server.name, http_opts, well_known_http_opts)
 
-    Supervisor.init(children, strategy: :one_for_one)
+        Supervisor.init(children, strategy: :one_for_one)
+
+      {:error, {:already_registered, _pid}} ->
+        :ignore
+    end
   end
 
   defp runtime_child_spec(server, runtime_opts) do

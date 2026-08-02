@@ -21,6 +21,7 @@ Elixir application structure.
 
 The active compatibility target includes:
 
+- MCP `2025-11-25` as the sole protocol version
 - server declaration and lifecycle
 - tools, resources, resource templates, and prompts
 - tool, prompt, and resource-template completions
@@ -28,6 +29,7 @@ The active compatibility target includes:
 - explicit request, session, and task context handling
 - request-context snapshots and narrow current-context helpers for nested code
 - streamable HTTP and stdio server behavior
+- strict JSON-RPC 2.0 with one message per HTTP POST or stdio line
 - per-server runtime isolation, overload handling, and task supervision
 - connected client support for streamable HTTP and stdio
 - connected client completions and session-scoped resource subscriptions
@@ -36,6 +38,7 @@ The active compatibility target includes:
 - runtime component mutation through `FastestMCP.ComponentManager`
 - explicit tool, prompt, and resource helper types for richer payload shaping
 - session-state backend configuration through `FastestMCP.SessionStateStore`
+- task-state backend configuration through `FastestMCP.TaskBackend`
 - unified `on_duplicate:` semantics for local server and runtime component registration
 - centralized protocol version and capability helpers
 - explicit experimental capability advertisement through server metadata
@@ -55,6 +58,11 @@ The following are intentionally outside the current milestone:
 
 - No standalone SSE transport. The supported HTTP transport is streamable HTTP
   only.
+- No legacy method-specific HTTP routes or JSON-RPC batches. MCP traffic uses
+  the single configured endpoint, `/mcp` by default.
+- Remote task augmentation is limited to standard `tools/call`. Local Elixir
+  prompt/resource tasks remain runtime conveniences rather than wire
+  extensions, and there is no `tasks/sendInput` MCP method.
 - No signature rewriting or annotation-based dependency injection. Elixir keeps
   explicit `%FastestMCP.Context{}` and
   `FastestMCP.add_dependency/3`.
@@ -84,6 +92,8 @@ Current status:
 - explicit tool, prompt, and resource helper modules are part of the curated public API
 - session-state storage is configurable; broader runtime storage is still local
 - standalone SSE remains an intentional non-goal
+- stateless HTTP is request-scoped and intentionally omits session, task, and
+  subscription behavior
 
 Anything not listed above should be treated as deferred or intentionally out of
 scope until documented otherwise.
@@ -92,4 +102,4 @@ scope until documented otherwise.
 
 This page owns the explicit boundary. The rationale page explains the design
 philosophy, but this page is the contract for what FastestMCP supports, what it
-deliberately does not support, and what remains outside the first release.
+deliberately does not support, and what remains outside the current release.

@@ -1,6 +1,4 @@
 defmodule FastestMCP.Server do
-  require Logger
-
   @moduledoc ~S"""
   Immutable server definition.
 
@@ -124,7 +122,8 @@ defmodule FastestMCP.Server do
       auth: normalize_auth(Keyword.get(opts, :auth)),
       strict_input_validation: Keyword.get(opts, :strict_input_validation, false),
       mask_error_details: Keyword.get(opts, :mask_error_details, false),
-      on_duplicate: normalize_on_duplicate(Keyword.get(opts, :on_duplicate, :error)),
+      on_duplicate:
+        Component.normalize_duplicate_policy!(Keyword.get(opts, :on_duplicate, :error)),
       metadata:
         opts
         |> Keyword.get(:metadata, %{})
@@ -374,63 +373,15 @@ defmodule FastestMCP.Server do
 
   defp put_component(%__MODULE__{} = server, key, component) do
     existing_components = Map.fetch!(server, key)
-    validate_version_mixing!(existing_components, component)
 
-    case duplicate_match(existing_components, component) do
-      nil ->
-        Map.put(server, key, existing_components ++ [component])
+    case Component.registration_action(existing_components, component, server.on_duplicate) do
+      :insert ->
+        Map.replace!(server, key, existing_components ++ [component])
 
-      _match ->
-        apply_duplicate_policy(server, key, component)
-    end
-  end
-
-  defp validate_version_mixing!(existing_components, component) do
-    siblings =
-      Enum.filter(existing_components, fn existing ->
-        Component.identifier(existing) == Component.identifier(component)
-      end)
-
-    has_versioned = Enum.any?(siblings, &(not is_nil(Component.version(&1))))
-    has_unversioned = Enum.any?(siblings, &is_nil(Component.version(&1)))
-    incoming_version = Component.version(component)
-    incoming_unversioned = is_nil(incoming_version)
-    incoming_versioned = not incoming_unversioned
-
-    cond do
-      incoming_unversioned and has_versioned ->
-        raise ArgumentError,
-              "#{Component.type(component)} #{inspect(Component.identifier(component))} cannot mix unversioned and versioned definitions"
-
-      incoming_versioned and has_unversioned ->
-        raise ArgumentError,
-              "#{Component.type(component)} #{inspect(Component.identifier(component))} cannot mix versioned and unversioned definitions"
-
-      true ->
-        :ok
-    end
-  end
-
-  defp duplicate_match(existing_components, component) do
-    Enum.find(existing_components, fn existing ->
-      Component.identifier(existing) == Component.identifier(component) and
-        Component.version(existing) == Component.version(component)
-    end)
-  end
-
-  defp apply_duplicate_policy(%__MODULE__{} = server, key, component) do
-    case server.on_duplicate do
-      :error ->
-        raise_duplicate_error(component)
-
-      :warn ->
-        Logger.warning(duplicate_warning(component))
+      {:replace, _existing} ->
         replace_duplicate(server, key, component)
 
-      :replace ->
-        replace_duplicate(server, key, component)
-
-      :ignore ->
+      {:ignore, _existing} ->
         server
     end
   end
@@ -448,34 +399,6 @@ defmodule FastestMCP.Server do
         end
       end)
 
-    Map.put(server, key, updated)
-  end
-
-  defp raise_duplicate_error(component) do
-    if is_nil(Component.version(component)) do
-      raise ArgumentError,
-            "#{Component.type(component)} #{inspect(Component.identifier(component))} is already defined without a version"
-    else
-      raise ArgumentError,
-            "#{Component.type(component)} #{inspect(Component.identifier(component))} version #{inspect(Component.version(component))} is already defined"
-    end
-  end
-
-  defp duplicate_warning(component) do
-    if is_nil(Component.version(component)) do
-      "#{Component.type(component)} #{inspect(Component.identifier(component))} is already defined without a version; replacing existing definition"
-    else
-      "#{Component.type(component)} #{inspect(Component.identifier(component))} version #{inspect(Component.version(component))} is already defined; replacing existing definition"
-    end
-  end
-
-  defp normalize_on_duplicate(policy) when policy in [:error, :warn, :ignore, :replace],
-    do: policy
-
-  defp normalize_on_duplicate(other) do
-    raise ArgumentError,
-          "on_duplicate must be one of :error, :warn, :ignore, or :replace, got #{inspect(other)}"
+    Map.replace!(server, key, updated)
   end
 end
-
-require Logger

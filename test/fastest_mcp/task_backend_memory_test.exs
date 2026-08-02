@@ -83,8 +83,8 @@ defmodule FastestMCP.TaskBackendMemoryTest do
       expires_at: 4_000
     )
 
-    assert ["expired-task"] == Memory.expire_tasks(backend, 2_000)
-    assert :error == Memory.fetch_task(backend, "expired-task")
+    assert {:ok, ["expired-task"]} == Memory.expire_tasks(backend, 2_000)
+    assert {:error, :not_found} == Memory.fetch_task(backend, "expired-task")
     assert {:ok, _task} = Memory.fetch_task(backend, "fresh-task", session_id: "session-a")
 
     assert {:ok, %{tasks: tasks, next_cursor: nil}} =

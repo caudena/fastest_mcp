@@ -104,10 +104,31 @@ defmodule FastestMCP.ClientStdioTest do
 
     assert error.code == :timeout
 
-    Process.sleep(150)
-
     assert Client.connected?(client)
     assert %{"message" => "hi"} = Client.call_tool(client, "echo", %{"message" => "hi"})
+  end
+
+  test "stdio client routes notifications without consuming the matching response" do
+    elixir = System.find_executable("elixir") || flunk("elixir executable not found on PATH")
+    test_pid = self()
+
+    client =
+      Client.connect!(
+        {:stdio, elixir, interleaved_stdio_server_args()},
+        notification_handler: fn message -> send(test_pid, {:stdio_notification, message}) end
+      )
+
+    on_exit(fn ->
+      if Client.connected?(client), do: Client.disconnect(client)
+    end)
+
+    assert_receive {:stdio_notification,
+                    %{"method" => "notifications/message", "params" => %{"data" => "ready"}}}
+
+    assert %{items: [%{"name" => "echo"}], next_cursor: nil} = Client.list_tools(client)
+
+    assert_receive {:stdio_notification,
+                    %{"method" => "notifications/message", "params" => %{"data" => "listing"}}}
   end
 
   defp stdio_server_args(server_name) do
@@ -189,6 +210,74 @@ defmodule FastestMCP.ClientStdioTest do
     {:ok, _pid} = FastestMCP.start_server(server)
     FastestMCP.Transport.Stdio.serve(#{inspect(server_name)})
     """
+
+    Enum.flat_map(code_paths, fn path -> ["-pa", path] end) ++ ["-e", code]
+  end
+
+  defp interleaved_stdio_server_args do
+    code_paths =
+      Mix.Project.build_path()
+      |> Path.join("lib/*/ebin")
+      |> Path.wildcard()
+
+    code = ~S'''
+    write = fn message -> IO.puts(JSON.encode!(message)) end
+
+    loop = fn loop ->
+      case IO.read(:stdio, :line) do
+        :eof ->
+          :ok
+
+        line ->
+          request = JSON.decode!(line)
+
+          case request["method"] do
+            "initialize" ->
+              write.(%{
+                "jsonrpc" => "2.0",
+                "method" => "notifications/message",
+                "params" => %{"data" => "ready"}
+              })
+
+              write.(%{
+                "jsonrpc" => "2.0",
+                "id" => request["id"],
+                "result" => %{
+                  "protocolVersion" => FastestMCP.Protocol.current_version(),
+                  "capabilities" => %{"tools" => %{}},
+                  "serverInfo" => %{"name" => "interleaved", "version" => "1.0.0"}
+                }
+              })
+
+            "tools/list" ->
+              write.(%{"jsonrpc" => "2.0", "id" => "stale", "result" => %{}})
+
+              write.(%{
+                "jsonrpc" => "2.0",
+                "method" => "notifications/message",
+                "params" => %{"data" => "listing"}
+              })
+
+              write.(%{
+                "jsonrpc" => "2.0",
+                "id" => request["id"],
+                "result" => %{
+                  "tools" => [
+                    %{"name" => "echo", "inputSchema" => %{"type" => "object"}}
+                  ]
+                }
+              })
+
+            _other ->
+              :ok
+          end
+
+          loop.(loop)
+      end
+    end
+
+    loop.(loop)
+    '''
 
     Enum.flat_map(code_paths, fn path -> ["-pa", path] end) ++ ["-e", code]
   end

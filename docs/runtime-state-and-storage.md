@@ -20,13 +20,14 @@ session lifecycle and session data are now split on purpose.
 Session lifecycle stays in the per-session runtime process, but user-facing
 session values live behind `FastestMCP.SessionStateStore`.
 
-That powers:
+The backend powers:
 
 - `Context.get_state/3`
 - `Context.set_state/4`
 - `Context.delete_state/2`
-- negotiated session lifetimes
-- session-aware task and notification flows
+
+Negotiation and lifecycle (`:new`, `:initializing`, `:initialized`) remain owned
+by the supervised per-session runtime rather than the state backend.
 
 By default, the runtime starts one in-memory backend per running server:
 
@@ -55,13 +56,15 @@ not be shared across requests or stored in the backend.
 Background task state lives in the task runtime owned by the server runtime,
 with storage delegated to `FastestMCP.TaskBackend`.
 
-That includes:
+The backend stores:
 
 - task status
 - result
 - progress
 - interactive input requirements
-- waiters and subscribers
+
+The supervised task store owns workers, waiters, subscribers, and notification
+fanout around those persisted records.
 
 By default, FastestMCP starts one ETS-backed backend per running server:
 
@@ -74,6 +77,11 @@ FastestMCP.start_server(server,
   task_backend: {MyApp.CustomTaskBackend, shard: :local}
 )
 ```
+
+Custom backends implement the public `FastestMCP.TaskBackend` contract. In
+0.2.0, `fetch_task/3` returns `{:ok, task}` or `{:error, reason}`, while
+`expire_tasks/2` returns `{:ok, task_ids}` or `{:error, reason}`. Backends written
+for 0.1.x must update the old `:error` and bare-list return shapes.
 
 The split is intentional:
 
@@ -129,7 +137,7 @@ not a general distributed persistence layer.
 
 ## What Is Still Local-Only
 
-The following remain runtime-local in v0.1:
+The following remain runtime-local in v0.2:
 
 - background task orchestration
 - middleware cache state
@@ -156,7 +164,7 @@ It is not a complete answer when you need:
 - distributed cache invalidation
 - distributed session visibility and subscription tracking
 
-Those are still outside the public v0.1 scope.
+Those are still outside the public v0.2 scope.
 
 ## Why This Shape
 

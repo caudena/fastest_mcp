@@ -271,7 +271,7 @@ for that session.
 
 ## Background Tasks
 
-Prompts can also run as tasks:
+Prompts can also run as local, in-process tasks:
 
 ```elixir
 server =
@@ -284,6 +284,11 @@ server =
     task: true
   )
 ```
+
+Call `FastestMCP.render_prompt/4` with `task: true` to create that local task.
+Remote MCP `prompts/get` requests are synchronous in 0.2; task metadata on that
+wire method is rejected because MCP `2025-11-25` task augmentation is
+tool-only.
 
 ## Runtime Changes
 

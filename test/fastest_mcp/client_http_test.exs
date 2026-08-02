@@ -6,7 +6,6 @@ defmodule FastestMCP.ClientHTTPTest do
   alias FastestMCP.Context
   alias FastestMCP.Elicitation.Accepted
   alias FastestMCP.Error
-  alias FastestMCP.Interact
   alias FastestMCP.Protocol
 
   test "connected client initializes and works against a live streamable HTTP server" do
@@ -30,7 +29,7 @@ defmodule FastestMCP.ClientHTTPTest do
         {Bandit,
          plug:
            {FastestMCP.Transport.HTTPApp,
-            server_name: server_name, path: "/mcp", allowed_hosts: :any},
+            server_name: server_name, path: "/mcp", unsafe_allow_any_host: true},
          scheme: :http,
          port: 0}
       )
@@ -118,7 +117,7 @@ defmodule FastestMCP.ClientHTTPTest do
         {Bandit,
          plug:
            {FastestMCP.Transport.HTTPApp,
-            server_name: server_name, path: "/mcp", allowed_hosts: :any},
+            server_name: server_name, path: "/mcp", unsafe_allow_any_host: true},
          scheme: :http,
          port: 0}
       )
@@ -137,10 +136,10 @@ defmodule FastestMCP.ClientHTTPTest do
              "name" => "memo://welcome",
              "description" => "",
              "mimeType" => "application/json",
-             "execution" => %{"taskSupport" => "optional"},
              "_meta" => %{
                "vendor" => %{"stable" => true},
                "fastestmcp" => %{
+                 "execution" => %{"taskSupport" => "optional"},
                  "hint" => "keep",
                  "tags" => ["docs", "utility"],
                  "version" => "2.0.0"
@@ -154,13 +153,13 @@ defmodule FastestMCP.ClientHTTPTest do
              "uriTemplate" => "memo://users/{id}",
              "name" => "memo://users/{id}",
              "description" => "",
-             "parameters" => %{},
              "mimeType" => "application/json",
-             "execution" => %{"taskSupport" => "optional"},
              "_meta" => %{
                "vendor" => %{"stable" => true},
                "fastestmcp" => %{
+                 "execution" => %{"taskSupport" => "optional"},
                  "hint" => "keep",
+                 "parameters" => %{},
                  "tags" => ["docs", "utility"],
                  "version" => "2.0.0"
                }
@@ -213,7 +212,7 @@ defmodule FastestMCP.ClientHTTPTest do
         {Bandit,
          plug:
            {FastestMCP.Transport.HTTPApp,
-            server_name: server_name, path: "/mcp", allowed_hosts: :any},
+            server_name: server_name, path: "/mcp", unsafe_allow_any_host: true},
          scheme: :http,
          port: 0}
       )
@@ -266,7 +265,7 @@ defmodule FastestMCP.ClientHTTPTest do
         {Bandit,
          plug:
            {FastestMCP.Transport.HTTPApp,
-            server_name: server_name, path: "/mcp", allowed_hosts: :any},
+            server_name: server_name, path: "/mcp", unsafe_allow_any_host: true},
          scheme: :http,
          port: 0}
       )
@@ -280,9 +279,22 @@ defmodule FastestMCP.ClientHTTPTest do
 
     task_a = Client.call_tool(client, "echo_1", %{"value" => 1}, task: true)
     task_b = Client.call_tool(client, "echo_2", %{"value" => 2}, task: true)
+    task_a_id = task_a.task_id
+    task_b_id = task_b.task_id
 
-    assert %{"value" => 1} = RemoteTask.result(task_a)
-    assert %{"value" => 2} = RemoteTask.result(task_b)
+    assert %{
+             "structuredContent" => %{"value" => 1},
+             "_meta" => %{
+               "io.modelcontextprotocol/related-task" => %{"taskId" => ^task_a_id}
+             }
+           } = RemoteTask.result(task_a)
+
+    assert %{
+             "structuredContent" => %{"value" => 2},
+             "_meta" => %{
+               "io.modelcontextprotocol/related-task" => %{"taskId" => ^task_b_id}
+             }
+           } = RemoteTask.result(task_b)
 
     assert %{items: [_one_tool], next_cursor: tool_cursor} =
              Client.list_tools(client, page_size: 1)
@@ -310,6 +322,7 @@ defmodule FastestMCP.ClientHTTPTest do
 
     assert second_task["taskId"] in [task_a.task_id, task_b.task_id]
     refute second_task["taskId"] == first_task["taskId"]
+    assert :ok = Client.disconnect(client)
   end
 
   test "connected client forwards log and progress notifications to handlers" do
@@ -334,7 +347,7 @@ defmodule FastestMCP.ClientHTTPTest do
         {Bandit,
          plug:
            {FastestMCP.Transport.HTTPApp,
-            server_name: server_name, path: "/mcp", allowed_hosts: :any},
+            server_name: server_name, path: "/mcp", unsafe_allow_any_host: true},
          scheme: :http,
          port: 0}
       )
@@ -391,7 +404,7 @@ defmodule FastestMCP.ClientHTTPTest do
         {Bandit,
          plug:
            {FastestMCP.Transport.HTTPApp,
-            server_name: server_name, path: "/mcp", allowed_hosts: :any},
+            server_name: server_name, path: "/mcp", unsafe_allow_any_host: true},
          scheme: :http,
          port: 0}
       )
@@ -463,7 +476,7 @@ defmodule FastestMCP.ClientHTTPTest do
         {Bandit,
          plug:
            {FastestMCP.Transport.HTTPApp,
-            server_name: server_name, path: "/mcp", allowed_hosts: :any},
+            server_name: server_name, path: "/mcp", unsafe_allow_any_host: true},
          scheme: :http,
          port: 0}
       )
@@ -530,7 +543,10 @@ defmodule FastestMCP.ClientHTTPTest do
         {Bandit,
          plug:
            {FastestMCP.Transport.HTTPApp,
-            server_name: server_name, path: "/mcp", allowed_hosts: :any, stateless_http: true},
+            server_name: server_name,
+            path: "/mcp",
+            unsafe_allow_any_host: true,
+            stateless_http: true},
          scheme: :http,
          port: 0}
       )
@@ -568,13 +584,9 @@ defmodule FastestMCP.ClientHTTPTest do
       )
       |> FastestMCP.add_tool(
         "confirm",
-        fn _arguments, ctx ->
-          case Interact.confirm(ctx, "Proceed?") do
-            {:ok, true} -> %{approved: true}
-            {:ok, false} -> %{approved: false}
-            :declined -> %{status: "declined"}
-            :cancelled -> %{status: "cancelled"}
-          end
+        fn _arguments, _ctx ->
+          Process.sleep(25)
+          %{approved: true}
         end,
         task: true
       )
@@ -587,7 +599,7 @@ defmodule FastestMCP.ClientHTTPTest do
         {Bandit,
          plug:
            {FastestMCP.Transport.HTTPApp,
-            server_name: server_name, path: "/mcp", allowed_hosts: :any},
+            server_name: server_name, path: "/mcp", unsafe_allow_any_host: true},
          scheme: :http,
          port: 0}
       )
@@ -607,20 +619,18 @@ defmodule FastestMCP.ClientHTTPTest do
     assert %{"taskId" => ^task_id} = RemoteTask.fetch(task)
     assert %{"taskId" => ^task_id} = RemoteTask.status(task)
 
-    assert wait_for_task_status(client, task_id, "input_required") == :ok
-
-    assert %{"taskId" => ^task_id, "status" => "input_required"} =
-             RemoteTask.wait(task)
-
-    assert %{"taskId" => ^task_id, "status" => "input_required"} =
-             RemoteTask.wait(task, status: "input_required")
-
-    assert %{"taskId" => ^task_id} =
-             Client.send_task_input(client, task_id, :accept, %{"confirmed" => true})
-
     assert wait_for_task_status(client, task_id, "completed") == :ok
-    assert %{"approved" => true} = RemoteTask.result(task)
-    assert %{"approved" => true} = RemoteTask.result(task)
+    assert %{"taskId" => ^task_id, "status" => "completed"} = RemoteTask.wait(task)
+
+    assert %{
+             "structuredContent" => %{"approved" => true},
+             "_meta" => %{
+               "io.modelcontextprotocol/related-task" => %{"taskId" => ^task_id}
+             }
+           } = result = RemoteTask.result(task)
+
+    assert ^result = RemoteTask.result(task)
+    assert :ok = Client.disconnect(client)
   end
 
   test "connected client receives task notifications over the session event stream" do
@@ -653,7 +663,7 @@ defmodule FastestMCP.ClientHTTPTest do
         {Bandit,
          plug:
            {FastestMCP.Transport.HTTPApp,
-            server_name: server_name, path: "/mcp", allowed_hosts: :any},
+            server_name: server_name, path: "/mcp", unsafe_allow_any_host: true},
          scheme: :http,
          port: 0}
       )
@@ -701,6 +711,7 @@ defmodule FastestMCP.ClientHTTPTest do
 
     assert %{"taskId" => ^task_id, "status" => "completed"} = RemoteTask.wait(task)
     assert wait_for_task_status(client, task_id, "completed") == :ok
+    assert :ok = Client.disconnect(client)
   end
 
   test "notification handler failures do not fail tool calls" do
@@ -723,7 +734,7 @@ defmodule FastestMCP.ClientHTTPTest do
         {Bandit,
          plug:
            {FastestMCP.Transport.HTTPApp,
-            server_name: server_name, path: "/mcp", allowed_hosts: :any},
+            server_name: server_name, path: "/mcp", unsafe_allow_any_host: true},
          scheme: :http,
          port: 0}
       )
@@ -784,7 +795,7 @@ defmodule FastestMCP.ClientHTTPTest do
         {Bandit,
          plug:
            {FastestMCP.Transport.HTTPApp,
-            server_name: server_name, path: "/mcp", allowed_hosts: :any},
+            server_name: server_name, path: "/mcp", unsafe_allow_any_host: true},
          scheme: :http,
          port: 0}
       )

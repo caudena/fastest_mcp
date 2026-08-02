@@ -132,6 +132,37 @@ defmodule FastestMCP.ClientCallbackTaskTest do
     assert get_in(task_capabilities, ["requests", "elicitation", "create"]) == %{}
   end
 
+  test "unsupported client callbacks use method-not-found without conflating missing data" do
+    state = start_supervised!({Agent, fn -> %{} end})
+    bandit = start_callback_server!(state)
+    client = connect_client!(bandit, session_stream: true)
+
+    on_exit(fn ->
+      if Client.connected?(client), do: Client.disconnect(client)
+    end)
+
+    wait_for_post("initialize")
+
+    FakeCallbackServer.push(state, %{
+      "jsonrpc" => "2.0",
+      "id" => "unsupported-callback",
+      "method" => "unsupported/callback",
+      "params" => %{}
+    })
+
+    assert_receive {:fake_callback_server_post,
+                    %{
+                      "id" => "unsupported-callback",
+                      "error" => %{
+                        "code" => -32_601,
+                        "data" => %{
+                          "fastestmcp" => %{"code" => "method_not_found"}
+                        }
+                      }
+                    }},
+                   2_000
+  end
+
   test "unexpected synchronous sampling callback failures are masked" do
     state = start_supervised!({Agent, fn -> %{} end})
     bandit = start_callback_server!(state)
@@ -241,7 +272,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
       "method" => "sampling/createMessage",
       "params" => %{
         "messages" => [%{"role" => "user", "content" => %{"type" => "text", "text" => "hello"}}],
-        "_meta" => %{"task" => true}
+        "task" => %{}
       }
     })
 
@@ -328,7 +359,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
       "method" => "sampling/createMessage",
       "params" => %{
         "messages" => [%{"role" => "user", "content" => %{"type" => "text", "text" => "hello"}}],
-        "_meta" => %{"task" => true}
+        "task" => %{}
       }
     })
 
@@ -398,7 +429,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
       "params" => %{
         "message" => "Deploy to production?",
         "requestedSchema" => %{"type" => "boolean"},
-        "_meta" => %{"task" => true}
+        "task" => %{}
       }
     })
 
@@ -492,7 +523,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
       "params" => %{
         "message" => "Deploy to production?",
         "requestedSchema" => %{"type" => "boolean"},
-        "_meta" => %{"task" => true}
+        "task" => %{}
       }
     })
 
@@ -559,7 +590,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
       "method" => "sampling/createMessage",
       "params" => %{
         "messages" => [%{"role" => "user", "content" => %{"type" => "text", "text" => "hello"}}],
-        "_meta" => %{"task" => true}
+        "task" => %{}
       }
     })
 
@@ -662,7 +693,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
       "method" => "sampling/createMessage",
       "params" => %{
         "messages" => [%{"role" => "user", "content" => %{"type" => "text", "text" => "hello"}}],
-        "_meta" => %{"task" => true}
+        "task" => %{}
       }
     })
 
@@ -732,7 +763,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
       "method" => "sampling/createMessage",
       "params" => %{
         "messages" => [%{"role" => "user", "content" => %{"type" => "text", "text" => "cancel"}}],
-        "_meta" => %{"task" => true}
+        "task" => %{}
       }
     })
 
@@ -793,7 +824,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
       "method" => "sampling/createMessage",
       "params" => %{
         "messages" => [%{"role" => "user", "content" => %{"type" => "text", "text" => "cancel"}}],
-        "_meta" => %{"task" => true}
+        "task" => %{}
       }
     })
 

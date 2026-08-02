@@ -56,6 +56,21 @@ defmodule FastestMCP.DuplicatePolicyTest do
     assert tool.compiled.(%{}, nil) == %{source: :first}
   end
 
+  test "local provider warn policy logs and replaces through the shared registration policy" do
+    log =
+      capture_log(fn ->
+        provider =
+          Local.new(on_duplicate: :warn)
+          |> Local.add_tool("echo", fn _arguments, _ctx -> :first end)
+          |> Local.add_tool("echo", fn _arguments, _ctx -> :second end)
+
+        assert hd(provider.tools).compiled.(%{}, nil) == :second
+      end)
+
+    assert log =~ "already defined"
+    assert log =~ "replacing existing definition"
+  end
+
   test "component manager adders honor duplicate policy overrides" do
     server_name = "dup-manager-" <> Integer.to_string(System.unique_integer([:positive]))
 

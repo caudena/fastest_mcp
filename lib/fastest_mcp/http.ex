@@ -11,7 +11,7 @@ defmodule FastestMCP.HTTP do
   """
 
   @default_timeout 5_000
-  @default_headers [{~c"accept", ~c"application/json"}, {~c"user-agent", ~c"FastestMCP/0.1"}]
+  @default_headers [{~c"accept", ~c"application/json"}, {~c"user-agent", ~c"FastestMCP/0.2"}]
 
   @doc "Fetches and decodes a JSON response."
   def get_json(url, opts \\ []) when is_binary(url) do
@@ -48,15 +48,50 @@ defmodule FastestMCP.HTTP do
         requester.(method, url, Keyword.delete(opts, :requester))
 
       nil ->
-        with :ok <- ensure_http_apps(),
-             {:ok, {{_version, status, _reason}, headers, body}} <-
-               build_request(method, url, opts) do
-          {:ok, status, normalize_response_headers(headers), body}
+        with {:ok, request_ref} <- async_request(method, url, opts) do
+          notify_request_started(opts, request_ref)
+
+          try do
+            await_response(request_ref, Keyword.get(opts, :timeout_ms, @default_timeout))
+          after
+            _ = cancel_request(request_ref)
+            flush_response_messages(request_ref)
+          end
         end
     end
   end
 
-  defp build_request(method, url, opts) do
+  @doc false
+  def stream_request(method, url, opts \\ [])
+      when method in [:get, :post, :put, :patch, :delete] and is_binary(url) and is_list(opts) do
+    request_opts =
+      opts
+      |> Keyword.put_new(:request_timeout_ms, :infinity)
+      |> Keyword.put(:stream_response, true)
+
+    with {:ok, request_ref} <- async_request(method, url, request_opts) do
+      notify_request_started(opts, request_ref)
+      {:ok, request_ref}
+    end
+  end
+
+  @doc false
+  def cancel_request(nil), do: :ok
+
+  def cancel_request(request_ref) do
+    :httpc.cancel_request(request_ref)
+  catch
+    :exit, _reason -> :ok
+  end
+
+  defp async_request(method, url, opts) do
+    with :ok <- ensure_http_apps() do
+      request_config = build_request_config(method, url, opts)
+      start_request_relay(request_config)
+    end
+  end
+
+  defp build_request_config(method, url, opts) do
     request_url =
       url
       |> append_query(Keyword.get(opts, :query))
@@ -71,26 +106,147 @@ defmodule FastestMCP.HTTP do
     uri = URI.parse(request_url)
 
     http_options =
-      [timeout: timeout, connect_timeout: timeout]
+      [
+        timeout: Keyword.get(opts, :request_timeout_ms, timeout),
+        connect_timeout: timeout
+      ]
       |> Keyword.merge(Keyword.get(opts, :http_options, []))
       |> maybe_put_ssl_options(uri)
       |> maybe_put_server_name_indication(opts)
 
     request = request_tuple(method, request_url, headers, opts)
-    request_opts = [body_format: :binary]
+    request_opts = async_request_options(opts)
 
-    case Keyword.get(opts, :profile) do
-      nil ->
-        :httpc.request(method, request, http_options, request_opts)
+    {method, request, http_options, request_opts, Keyword.get(opts, :profile)}
+  end
 
-      profile ->
-        :httpc.request(method, request, http_options, request_opts, profile)
+  defp async_request_options(opts) do
+    [sync: false]
+    |> maybe_stream_response(Keyword.get(opts, :stream_response, false))
+  end
+
+  defp maybe_stream_response(request_opts, true),
+    do: Keyword.put(request_opts, :stream, :self)
+
+  defp maybe_stream_response(request_opts, false), do: request_opts
+
+  defp start_request_relay(request_config) do
+    caller = self()
+    start_ref = make_ref()
+
+    {relay_pid, monitor_ref} =
+      spawn_monitor(fn -> request_relay(caller, start_ref, request_config) end)
+
+    receive do
+      {^start_ref, {:ok, request_ref}} ->
+        Process.demonitor(monitor_ref, [:flush])
+        {:ok, request_ref}
+
+      {^start_ref, {:error, reason}} ->
+        Process.demonitor(monitor_ref, [:flush])
+        {:error, reason}
+
+      {:DOWN, ^monitor_ref, :process, ^relay_pid, reason} ->
+        {:error, {:request_relay_down, reason}}
+    end
+  end
+
+  defp request_relay(caller, start_ref, {method, request, http_options, request_opts, profile}) do
+    caller_ref = Process.monitor(caller)
+    request_opts = Keyword.put(request_opts, :receiver, self())
+
+    case start_httpc_request(method, request, http_options, request_opts, profile) do
+      {:ok, request_ref} ->
+        send(caller, {start_ref, {:ok, request_ref}})
+        relay_responses(caller, caller_ref, request_ref)
+
+      {:error, reason} ->
+        Process.demonitor(caller_ref, [:flush])
+        send(caller, {start_ref, {:error, reason}})
+    end
+  end
+
+  defp start_httpc_request(method, request, http_options, request_opts, nil) do
+    :httpc.request(method, request, http_options, request_opts)
+  end
+
+  defp start_httpc_request(method, request, http_options, request_opts, profile) do
+    :httpc.request(method, request, http_options, request_opts, profile)
+  end
+
+  defp relay_responses(caller, caller_ref, request_ref) do
+    receive do
+      {:http, {^request_ref, _response} = message} ->
+        send(caller, {:http, message})
+
+      {:http, {^request_ref, _stream_kind, _data} = message} ->
+        send(caller, {:http, message})
+
+        unless terminal_response?(message) do
+          relay_responses(caller, caller_ref, request_ref)
+        end
+
+      {:http, {^request_ref, _stream_kind, _headers, _handler_pid} = message} ->
+        send(caller, {:http, message})
+        relay_responses(caller, caller_ref, request_ref)
+
+      {:DOWN, ^caller_ref, :process, ^caller, _reason} ->
+        _ = cancel_request(request_ref)
+    end
+  end
+
+  defp terminal_response?({_request_ref, :stream_start, _headers}), do: false
+  defp terminal_response?({_request_ref, :stream, _chunk}), do: false
+  defp terminal_response?({_request_ref, :stream_end, _headers}), do: true
+
+  defp await_response(request_ref, :infinity) do
+    receive do
+      {:http, {^request_ref, {{_version, status, _reason}, headers, body}}} ->
+        {:ok, status, normalize_response_headers(headers), body}
+
+      {:http, {^request_ref, {:error, reason}}} ->
+        {:error, reason}
+    end
+  end
+
+  defp await_response(request_ref, timeout) do
+    receive do
+      {:http, {^request_ref, {{_version, status, _reason}, headers, body}}} ->
+        {:ok, status, normalize_response_headers(headers), body}
+
+      {:http, {^request_ref, {:error, reason}}} ->
+        {:error, reason}
+    after
+      timeout -> {:error, :timeout}
+    end
+  end
+
+  defp notify_request_started(opts, request_ref) do
+    case Keyword.get(opts, :request_started) do
+      callback when is_function(callback, 1) -> callback.(request_ref)
+      nil -> :ok
+    end
+  end
+
+  defp flush_response_messages(request_ref) do
+    receive do
+      {:http, {^request_ref, _message}} ->
+        flush_response_messages(request_ref)
+
+      {:http, {^request_ref, _stream_kind, _message}} ->
+        flush_response_messages(request_ref)
+
+      {:http, {^request_ref, _stream_kind, _headers, _pid}} ->
+        flush_response_messages(request_ref)
+    after
+      0 -> :ok
     end
   end
 
   defp ensure_http_apps do
     with {:ok, _} <- Application.ensure_all_started(:ssl),
          {:ok, _} <- Application.ensure_all_started(:inets) do
+      :ok = :httpc.set_options(max_sessions: 100)
       :ok
     end
   end
@@ -123,7 +279,7 @@ defmodule FastestMCP.HTTP do
   defp request_body(opts) do
     cond do
       Keyword.has_key?(opts, :json) ->
-        {~c"application/json", JSON.encode!(Keyword.get(opts, :json))}
+        {request_content_type(opts, "application/json"), JSON.encode!(Keyword.get(opts, :json))}
 
       Keyword.has_key?(opts, :form) ->
         body =
@@ -132,21 +288,26 @@ defmodule FastestMCP.HTTP do
           |> normalize_form()
           |> URI.encode_query()
 
-        {~c"application/x-www-form-urlencoded", body}
+        {request_content_type(opts, "application/x-www-form-urlencoded"), body}
 
       Keyword.has_key?(opts, :multipart) ->
         {content_type, body} = multipart_body(Keyword.get(opts, :multipart, %{}))
         {to_charlist(content_type), body}
 
       Keyword.has_key?(opts, :body) ->
-        {
-          opts |> Keyword.get(:content_type, "application/octet-stream") |> to_charlist(),
-          Keyword.get(opts, :body)
-        }
+        {request_content_type(opts, "application/octet-stream"), Keyword.get(opts, :body)}
 
       true ->
         {~c"application/json", ""}
     end
+  end
+
+  defp request_content_type(opts, default) do
+    opts
+    |> Keyword.get(:content_type)
+    |> then(&(&1 || default))
+    |> to_string()
+    |> to_charlist()
   end
 
   defp normalize_form(form) when is_map(form), do: form
@@ -294,17 +455,17 @@ defmodule FastestMCP.HTTP do
 
   defp maybe_add_content_type(headers, opts) do
     cond do
-      Keyword.has_key?(opts, :json) ->
-        put_content_type(headers, ~c"application/json")
-
-      Keyword.has_key?(opts, :form) ->
-        put_content_type(headers, ~c"application/x-www-form-urlencoded")
-
       Keyword.has_key?(opts, :multipart) ->
         headers
 
       Keyword.has_key?(opts, :content_type) ->
-        put_content_type(headers, to_charlist(to_string(Keyword.fetch!(opts, :content_type))))
+        put_content_type(headers, request_content_type(opts, "application/octet-stream"))
+
+      Keyword.has_key?(opts, :json) ->
+        put_content_type(headers, request_content_type(opts, "application/json"))
+
+      Keyword.has_key?(opts, :form) ->
+        put_content_type(headers, request_content_type(opts, "application/x-www-form-urlencoded"))
 
       true ->
         headers

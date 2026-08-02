@@ -24,6 +24,7 @@ defmodule FastestMCP.Middleware.RateLimiting do
     :state,
     max_requests_per_second: 10.0,
     burst_capacity: 20,
+    max_clients: 10_000,
     global_limit: false
   ]
 
@@ -35,6 +36,7 @@ defmodule FastestMCP.Middleware.RateLimiting do
           state: pid() | nil,
           max_requests_per_second: float(),
           burst_capacity: pos_integer(),
+          max_clients: pos_integer(),
           global_limit: boolean()
         }
 
@@ -46,8 +48,9 @@ defmodule FastestMCP.Middleware.RateLimiting do
       Keyword.get(opts, :burst_capacity, max(1, trunc(max_requests_per_second * 2)))
 
     global_limit = Keyword.get(opts, :global_limit, false)
+    max_clients = Keyword.get(opts, :max_clients, 10_000)
 
-    validate!(max_requests_per_second, burst_capacity)
+    validate!(max_requests_per_second, burst_capacity, max_clients)
 
     middleware = %__MODULE__{
       get_client_id: Keyword.get(opts, :get_client_id),
@@ -56,6 +59,7 @@ defmodule FastestMCP.Middleware.RateLimiting do
       state: nil,
       max_requests_per_second: max_requests_per_second,
       burst_capacity: burst_capacity,
+      max_clients: max_clients,
       global_limit: global_limit
     }
 
@@ -71,6 +75,12 @@ defmodule FastestMCP.Middleware.RateLimiting do
     case __MODULE__.State.consume(middleware.state, client_id) do
       :ok ->
         next.(operation)
+
+      {:error, :overloaded} ->
+        raise Error,
+          code: :overloaded,
+          message: "rate limiter client capacity exceeded",
+          details: %{max_clients: middleware.max_clients}
 
       {:error, retry_after_seconds} ->
         raise Error,
@@ -92,7 +102,8 @@ defmodule FastestMCP.Middleware.RateLimiting do
     {:ok, state} =
       __MODULE__.State.start_link(
         burst_capacity: middleware.burst_capacity,
-        refill_rate: middleware.max_requests_per_second
+        refill_rate: middleware.max_requests_per_second,
+        max_clients: middleware.max_clients
       )
 
     runtime =
@@ -178,15 +189,16 @@ defmodule FastestMCP.Middleware.RateLimiting do
     %{middleware | middleware: fn operation, next -> call(middleware, operation, next) end}
   end
 
-  defp validate!(max_requests_per_second, burst_capacity)
+  defp validate!(max_requests_per_second, burst_capacity, max_clients)
        when is_number(max_requests_per_second) and max_requests_per_second > 0 and
-              is_integer(burst_capacity) and burst_capacity > 0 do
+              is_integer(burst_capacity) and burst_capacity > 0 and is_integer(max_clients) and
+              max_clients > 0 do
     :ok
   end
 
-  defp validate!(max_requests_per_second, burst_capacity) do
+  defp validate!(max_requests_per_second, burst_capacity, max_clients) do
     raise ArgumentError,
-          "max_requests_per_second must be positive and burst_capacity must be a positive integer, got: #{inspect(max_requests_per_second)} / #{inspect(burst_capacity)}"
+          "max_requests_per_second must be positive and burst_capacity and max_clients must be positive integers, got: #{inspect(max_requests_per_second)} / #{inspect(burst_capacity)} / #{inspect(max_clients)}"
   end
 
   defmodule State do
@@ -213,6 +225,7 @@ defmodule FastestMCP.Middleware.RateLimiting do
        %{
          capacity: Keyword.fetch!(opts, :burst_capacity),
          refill_rate: Keyword.fetch!(opts, :refill_rate),
+         max_clients: Keyword.get(opts, :max_clients, 10_000),
          buckets: %{}
        }}
     end
@@ -221,16 +234,54 @@ defmodule FastestMCP.Middleware.RateLimiting do
     @doc "Processes token-consumption requests for the token-bucket limiter process."
     def handle_call({:consume, client_id}, _from, state) do
       now = System.monotonic_time(:microsecond)
-      bucket = Map.get(state.buckets, client_id, new_bucket(state.capacity, now))
-      bucket = refill(bucket, state.capacity, state.refill_rate, now)
+      {bucket, state} = fetch_bucket(state, client_id, now)
 
-      if bucket.tokens >= 1.0 do
-        updated = %{bucket | tokens: bucket.tokens - 1.0}
-        {:reply, :ok, put_in(state.buckets[client_id], updated)}
-      else
-        retry_after = retry_after_seconds(bucket, state.refill_rate)
-        {:reply, {:error, retry_after}, put_in(state.buckets[client_id], bucket)}
+      case bucket do
+        :overloaded ->
+          {:reply, {:error, :overloaded}, state}
+
+        bucket ->
+          bucket = refill(bucket, state.capacity, state.refill_rate, now)
+
+          if bucket.tokens >= 1.0 do
+            updated = %{bucket | tokens: bucket.tokens - 1.0}
+            {:reply, :ok, put_in(state.buckets[client_id], updated)}
+          else
+            retry_after = retry_after_seconds(bucket, state.refill_rate)
+            {:reply, {:error, retry_after}, put_in(state.buckets[client_id], bucket)}
+          end
       end
+    end
+
+    defp fetch_bucket(state, client_id, now) do
+      case Map.fetch(state.buckets, client_id) do
+        {:ok, bucket} ->
+          {bucket, state}
+
+        :error ->
+          buckets = make_room(state, now)
+          state = %{state | buckets: buckets}
+
+          if map_size(buckets) < state.max_clients do
+            {new_bucket(state.capacity, now), state}
+          else
+            {:overloaded, state}
+          end
+      end
+    end
+
+    defp make_room(%{buckets: buckets, max_clients: max_clients}, _now)
+         when map_size(buckets) < max_clients,
+         do: buckets
+
+    defp make_room(state, now) do
+      Map.reject(state.buckets, fn {_client_id, bucket} ->
+        semantically_expired?(bucket, state.capacity, state.refill_rate, now)
+      end)
+    end
+
+    defp semantically_expired?(bucket, capacity, refill_rate, now) do
+      refill(bucket, capacity, refill_rate, now).tokens >= capacity
     end
 
     defp new_bucket(capacity, now), do: %{tokens: capacity * 1.0, last_refill: now}

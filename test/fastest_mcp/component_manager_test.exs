@@ -147,7 +147,7 @@ defmodule FastestMCP.ComponentManagerTest do
         FastestMCP.read_resource(server_name, "config://runtime")
       end
 
-    assert resource_error.code == :not_found
+    assert resource_error.code == :disabled
 
     assert {:ok, [_]} = ComponentManager.disable_resource_template(manager, "users://{id}")
 
@@ -156,7 +156,7 @@ defmodule FastestMCP.ComponentManagerTest do
         FastestMCP.read_resource(server_name, "users://42")
       end
 
-    assert template_error.code == :not_found
+    assert template_error.code == :disabled
 
     assert {:ok, [_]} = ComponentManager.disable_prompt(manager, "dynamic_greet")
 
@@ -165,7 +165,7 @@ defmodule FastestMCP.ComponentManagerTest do
         FastestMCP.render_prompt(server_name, "dynamic_greet", %{"name" => "Nate"})
       end
 
-    assert prompt_error.code == :not_found
+    assert prompt_error.code == :disabled
   end
 
   test "dynamic tools take precedence over static registry entries until disabled" do

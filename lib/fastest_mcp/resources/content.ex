@@ -15,6 +15,9 @@ defmodule FastestMCP.Resources.Content do
   handling for data that happens to be valid UTF-8.
   """
 
+  alias FastestMCP.JSONValue
+  alias FastestMCP.MIME
+
   defstruct content: nil, mime_type: nil, meta: nil
 
   @type t :: %__MODULE__{
@@ -61,32 +64,8 @@ defmodule FastestMCP.Resources.Content do
   end
 
   defp normalize_content(content, _opts) do
-    {JSON.encode!(normalize_json(content)), "application/json"}
+    {JSONValue.encode!(content), "application/json"}
   end
-
-  defp normalize_json(%DateTime{} = value), do: DateTime.to_iso8601(value)
-  defp normalize_json(%NaiveDateTime{} = value), do: NaiveDateTime.to_iso8601(value)
-  defp normalize_json(%Date{} = value), do: Date.to_iso8601(value)
-  defp normalize_json(%Time{} = value), do: Time.to_iso8601(value)
-  defp normalize_json(%URI{} = value), do: URI.to_string(value)
-
-  defp normalize_json(%MapSet{} = value),
-    do: value |> MapSet.to_list() |> Enum.map(&normalize_json/1)
-
-  defp normalize_json(%_{} = value), do: value |> Map.from_struct() |> normalize_json()
-
-  defp normalize_json(value) when is_map(value),
-    do: Map.new(value, fn {key, item} -> {normalize_key(key), normalize_json(item)} end)
-
-  defp normalize_json(value) when is_list(value), do: Enum.map(value, &normalize_json/1)
-
-  defp normalize_json(value) when is_tuple(value),
-    do: value |> Tuple.to_list() |> Enum.map(&normalize_json/1)
-
-  defp normalize_json(value), do: value
-
-  defp normalize_key(key) when is_atom(key), do: Atom.to_string(key)
-  defp normalize_key(key), do: key
 
   defp normalize_optional_map(nil), do: nil
   defp normalize_optional_map(map) when is_map(map), do: Map.new(map)
@@ -95,9 +74,5 @@ defmodule FastestMCP.Resources.Content do
     raise ArgumentError, "resource content meta must be a map, got #{inspect(other)}"
   end
 
-  defp binary_mime_type?(mime_type) when is_binary(mime_type) do
-    not String.starts_with?(mime_type, "text/") and mime_type != "application/json"
-  end
-
-  defp binary_mime_type?(_mime_type), do: false
+  defp binary_mime_type?(mime_type), do: MIME.binary?(mime_type)
 end

@@ -88,8 +88,13 @@ Phoenix forwarding works the same way:
 forward "/mcp", FastestMCP.Transport.HTTPApp,
   server_name: MyApp.MCPServer,
   path: "/mcp",
-  allowed_hosts: :any
+  allowed_hosts: ["mcp.example.com"]
 ```
+
+`allowed_hosts: :localhost` is the safe local default. Deployed listeners must
+use their concrete public host names; `allowed_hosts: :any` was removed in
+0.2.0. See [Transports](transports.md#host-and-listener-safety) before binding a
+listener outside loopback.
 
 ## 5. Connect with a client
 
@@ -108,6 +113,9 @@ FastestMCP.Client.complete(
   %{"name" => "environment", "value" => "pr"}
 )
 ```
+
+The client negotiates MCP `2025-11-25`, retains the server-issued session id,
+and sends `notifications/initialized` before normal requests.
 
 From here, branch into the focused guides:
 

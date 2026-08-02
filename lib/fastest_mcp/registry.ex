@@ -41,50 +41,47 @@ defmodule FastestMCP.Registry do
     create_table(@server_owners_table, :set)
     create_table(@middleware_runtime_table, :set)
     create_table(@middleware_runtime_instances_table, :bag)
-    {:ok, %{}}
+    {:ok, %{claims: %{}, monitors: %{}}}
   end
 
   @doc "Registers a running server."
   def register_server(server_name, pid) do
-    :ets.insert(@servers_table, {to_string(server_name), pid})
-    :ok
+    claim(:server, to_string(server_name), pid, nil)
   end
 
   @doc "Unregisters a running server."
-  def unregister_server(server_name) do
-    server_name = to_string(server_name)
-    :ets.delete(@servers_table, server_name)
-    :ets.match_delete(@components_table, {{server_name, :_, :_, :_}, :_})
-    :ets.match_delete(@templates_table, {{server_name, :_, :_}, :_})
-    :ok
-  end
+  def unregister_server(server_name, pid \\ self()),
+    do: release(:server, to_string(server_name), pid, nil)
 
   @doc "Looks up a running server."
   def lookup_server(server_name) do
-    case :ets.lookup(@servers_table, to_string(server_name)) do
-      [{_server_name, pid}] when is_pid(pid) -> {:ok, pid}
+    case lookup(@servers_table, to_string(server_name)) do
+      [{_server_name, pid}] when is_pid(pid) -> alive_pid(pid)
       _ -> {:error, :not_found}
     end
   end
 
   @doc "Registers the owning supervisor for a server."
   def register_server_owner(server_name, pid) when is_pid(pid) do
-    :ets.insert(@server_owners_table, {to_string(server_name), pid})
-    :ok
+    claim(:server_owner, to_string(server_name), pid, nil)
   end
+
+  @doc false
+  def acquire_server_owner(server_name, pid) when is_pid(pid) do
+    claim_with_status(:server_owner, to_string(server_name), pid, nil)
+  end
+
+  @doc "Unregisters a server owner when it is still owned by the given process."
+  def unregister_server_owner(server_name, pid \\ self()),
+    do: release(:server_owner, to_string(server_name), pid, nil)
 
   @doc "Looks up the owning supervisor for a server."
   def lookup_server_owner(server_name) do
     server_name = to_string(server_name)
 
-    case :ets.lookup(@server_owners_table, server_name) do
+    case lookup(@server_owners_table, server_name) do
       [{^server_name, pid}] when is_pid(pid) ->
-        if Process.alive?(pid) do
-          {:ok, pid}
-        else
-          :ets.delete(@server_owners_table, server_name)
-          {:error, :not_found}
-        end
+        alive_pid(pid)
 
       _ ->
         {:error, :not_found}
@@ -120,7 +117,7 @@ defmodule FastestMCP.Registry do
     server_name = to_string(server_name)
 
     @templates_table
-    |> :ets.match_object({{server_name, :_, :_}, :_})
+    |> match_object({{server_name, :_, :_}, :_})
     |> Enum.map(&elem(&1, 1))
   end
 
@@ -128,37 +125,40 @@ defmodule FastestMCP.Registry do
     server_name = to_string(server_name)
 
     @components_table
-    |> :ets.match_object({{server_name, type, :_, :_}, :_})
+    |> match_object({{server_name, type, :_, :_}, :_})
     |> Enum.map(&elem(&1, 1))
   end
 
   @doc "Resolves one component by type and identifier."
   def get_component(server_name, type, identifier, opts \\ [])
 
-  def get_component(server_name, :resource_template, identifier, opts) do
-    server_name = to_string(server_name)
-    identifier = to_string(identifier)
-    version = opts[:version] && to_string(opts[:version])
-
-    @templates_table
-    |> :ets.match_object({{server_name, identifier, :_}, :_})
-    |> Enum.map(&elem(&1, 1))
-    |> filter_version(version)
-    |> Component.highest_version()
+  def get_component(server_name, type, identifier, opts) do
+    server_name
+    |> lookup_component_candidates(type, identifier, opts)
+    |> List.first()
   end
 
-  def get_component(server_name, type, identifier, opts) do
+  @doc "Returns exact-match component candidates in descending version order."
+  def lookup_component_candidates(server_name, type, identifier, opts \\ [])
+
+  def lookup_component_candidates(server_name, :resource_template, identifier, opts) do
     server_name = to_string(server_name)
     identifier = to_string(identifier)
     version = opts[:version] && to_string(opts[:version])
 
-    matches =
-      @components_table
-      |> :ets.match_object({{server_name, type, identifier, :_}, :_})
-      |> Enum.map(&elem(&1, 1))
-      |> filter_version(version)
+    template_records(server_name, identifier, version)
+    |> Enum.map(&elem(&1, 1))
+    |> Component.sort_by_version_desc()
+  end
 
-    Component.highest_version(matches)
+  def lookup_component_candidates(server_name, type, identifier, opts) do
+    server_name = to_string(server_name)
+    identifier = to_string(identifier)
+    version = opts[:version] && to_string(opts[:version])
+
+    component_records(server_name, type, identifier, version)
+    |> Enum.map(&elem(&1, 1))
+    |> Component.sort_by_version_desc()
   end
 
   @doc "Resolves the backing resource target for a concrete URI."
@@ -177,7 +177,7 @@ defmodule FastestMCP.Registry do
     version = opts[:version] && to_string(opts[:version])
 
     @templates_table
-    |> :ets.match_object({{server_name, :_, :_}, :_})
+    |> match_object({{server_name, :_, :_}, :_})
     |> Enum.map(&elem(&1, 1))
     |> filter_version(version)
     |> Enum.reduce([], fn template, matches ->
@@ -190,23 +190,32 @@ defmodule FastestMCP.Registry do
   end
 
   @doc "Registers a session process."
-  def register_session(server_name, session_id, pid) do
-    :ets.insert(@sessions_table, {{to_string(server_name), to_string(session_id)}, pid})
-    :ok
-  end
+  def register_session(server_name, session_id, pid, generation \\ nil),
+    do:
+      claim(
+        :session,
+        {to_string(server_name), to_string(session_id)},
+        pid,
+        generation
+      )
 
   @doc "Unregisters a session process."
-  def unregister_session(server_name, session_id) do
-    :ets.delete(@sessions_table, {to_string(server_name), to_string(session_id)})
-    :ok
-  end
+  def unregister_session(server_name, session_id, pid \\ self(), generation \\ nil),
+    do:
+      release(
+        :session,
+        {to_string(server_name), to_string(session_id)},
+        pid,
+        generation
+      )
 
   @doc "Looks up a session process."
   def lookup_session(server_name, session_id) do
     key = {to_string(server_name), to_string(session_id)}
 
-    case :ets.lookup(@sessions_table, key) do
-      [{^key, pid}] when is_pid(pid) -> {:ok, pid}
+    case lookup(@sessions_table, key) do
+      [{^key, {pid, _generation}}] when is_pid(pid) -> alive_pid(pid)
+      [{^key, pid}] when is_pid(pid) -> alive_pid(pid)
       _ -> {:error, :not_found}
     end
   end
@@ -248,7 +257,7 @@ defmodule FastestMCP.Registry do
 
   @doc "Looks up runtime state for one middleware instance."
   def lookup_middleware_runtime(runtime_id) when is_reference(runtime_id) do
-    case :ets.lookup(@middleware_runtime_table, runtime_id) do
+    case lookup(@middleware_runtime_table, runtime_id) do
       [{^runtime_id, %{pid: pid} = runtime}] when is_pid(pid) ->
         if Process.alive?(pid) do
           {:ok, runtime}
@@ -265,7 +274,7 @@ defmodule FastestMCP.Registry do
   @doc "Lists runtime state for all runtimes owned by one middleware instance."
   def list_middleware_runtimes(instance_id) when is_reference(instance_id) do
     @middleware_runtime_instances_table
-    |> :ets.lookup(instance_id)
+    |> lookup(instance_id)
     |> Enum.reduce([], fn
       {^instance_id, runtime_id}, runtimes ->
         case lookup_middleware_runtime(runtime_id) do
@@ -274,6 +283,71 @@ defmodule FastestMCP.Registry do
         end
     end)
     |> Enum.reverse()
+  end
+
+  @impl true
+  def handle_call({:claim, kind, key, pid, token}, _from, state) do
+    {reply, state} = claim_entry(state, kind, key, pid, token)
+
+    reply =
+      case reply do
+        {:ok, _status} -> :ok
+        {:error, _reason} = error -> error
+      end
+
+    {:reply, reply, state}
+  end
+
+  def handle_call({:claim_with_status, kind, key, pid, token}, _from, state) do
+    {reply, state} = claim_entry(state, kind, key, pid, token)
+    {:reply, reply, state}
+  end
+
+  @impl true
+  def handle_call({:release, kind, key, pid, token}, _from, state) do
+    claim_key = {kind, key}
+
+    case Map.get(state.claims, claim_key) do
+      %{pid: ^pid, token: ^token} -> {:reply, :ok, drop_claim(state, claim_key)}
+      _other -> {:reply, :ok, state}
+    end
+  end
+
+  @impl true
+  def handle_info({:DOWN, monitor, :process, pid, _reason}, state) do
+    case Map.pop(state.monitors, monitor) do
+      {nil, _monitors} ->
+        {:noreply, state}
+
+      {claim_key, monitors} ->
+        case Map.get(state.claims, claim_key) do
+          %{pid: ^pid, monitor: ^monitor} ->
+            {:noreply, delete_claim(%{state | monitors: monitors}, claim_key)}
+
+          _other ->
+            {:noreply, %{state | monitors: monitors}}
+        end
+    end
+  end
+
+  defp claim_entry(state, kind, key, pid, token) do
+    claim_key = {kind, key}
+
+    case Map.get(state.claims, claim_key) do
+      %{pid: ^pid, token: ^token} ->
+        {{:ok, :existing}, state}
+
+      %{pid: owner_pid} when is_pid(owner_pid) ->
+        if Process.alive?(owner_pid) do
+          {{:error, {:already_registered, owner_pid}}, state}
+        else
+          state = drop_claim(state, claim_key)
+          {{:ok, :acquired}, put_claim(state, claim_key, pid, token)}
+        end
+
+      nil ->
+        {{:ok, :acquired}, put_claim(state, claim_key, pid, token)}
+    end
   end
 
   defp create_table(name, type) do
@@ -292,10 +366,111 @@ defmodule FastestMCP.Registry do
     end
   end
 
+  defp lookup(table, key), do: read_table(table, [], &:ets.lookup(&1, key))
+
+  defp match_object(table, pattern),
+    do: read_table(table, [], &:ets.match_object(&1, pattern))
+
+  defp template_records(server_name, identifier, nil),
+    do: match_object(@templates_table, {{server_name, identifier, :_}, :_})
+
+  defp template_records(server_name, identifier, version),
+    do: lookup(@templates_table, {server_name, identifier, Component.version_key(version)})
+
+  defp component_records(server_name, type, identifier, nil),
+    do: match_object(@components_table, {{server_name, type, identifier, :_}, :_})
+
+  defp component_records(server_name, type, identifier, version),
+    do:
+      lookup(
+        @components_table,
+        {server_name, type, identifier, Component.version_key(version)}
+      )
+
+  defp read_table(table, fallback, fun) do
+    case :ets.whereis(table) do
+      :undefined ->
+        fallback
+
+      table_id ->
+        try do
+          fun.(table_id)
+        catch
+          :error, :badarg ->
+            if :ets.info(table_id) == :undefined do
+              fallback
+            else
+              :erlang.raise(:error, :badarg, __STACKTRACE__)
+            end
+        end
+    end
+  end
+
   defp filter_version(components, nil), do: components
 
   defp filter_version(components, version),
     do: Enum.filter(components, &(Component.version(&1) == version))
+
+  defp claim(kind, key, pid, token) when is_pid(pid),
+    do: GenServer.call(__MODULE__, {:claim, kind, key, pid, token})
+
+  defp claim_with_status(kind, key, pid, token) when is_pid(pid),
+    do: GenServer.call(__MODULE__, {:claim_with_status, kind, key, pid, token})
+
+  defp release(kind, key, pid, token) when is_pid(pid),
+    do: GenServer.call(__MODULE__, {:release, kind, key, pid, token})
+
+  defp alive_pid(pid) do
+    if Process.alive?(pid), do: {:ok, pid}, else: {:error, :not_found}
+  end
+
+  defp put_claim(state, {kind, key} = claim_key, pid, token) do
+    monitor = Process.monitor(pid)
+    insert_claim(kind, key, pid, token)
+    claim = %{pid: pid, token: token, monitor: monitor}
+
+    %{
+      state
+      | claims: Map.put(state.claims, claim_key, claim),
+        monitors: Map.put(state.monitors, monitor, claim_key)
+    }
+  end
+
+  defp drop_claim(state, claim_key) do
+    case Map.get(state.claims, claim_key) do
+      nil ->
+        state
+
+      %{monitor: monitor} ->
+        Process.demonitor(monitor, [:flush])
+
+        state
+        |> Map.update!(:monitors, &Map.delete(&1, monitor))
+        |> delete_claim(claim_key)
+    end
+  end
+
+  defp delete_claim(state, {kind, key} = claim_key) do
+    delete_claim_record(kind, key)
+    %{state | claims: Map.delete(state.claims, claim_key)}
+  end
+
+  defp insert_claim(:server, key, pid, _token), do: :ets.insert(@servers_table, {key, pid})
+
+  defp insert_claim(:server_owner, key, pid, _token),
+    do: :ets.insert(@server_owners_table, {key, pid})
+
+  defp insert_claim(:session, key, pid, token),
+    do: :ets.insert(@sessions_table, {key, {pid, token}})
+
+  defp delete_claim_record(:server, key) do
+    :ets.delete(@servers_table, key)
+    :ets.match_delete(@components_table, {{key, :_, :_, :_}, :_})
+    :ets.match_delete(@templates_table, {{key, :_, :_}, :_})
+  end
+
+  defp delete_claim_record(:server_owner, key), do: :ets.delete(@server_owners_table, key)
+  defp delete_claim_record(:session, key), do: :ets.delete(@sessions_table, key)
 
   defp pick_template([]), do: nil
 

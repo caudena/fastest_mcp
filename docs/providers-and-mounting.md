@@ -148,9 +148,19 @@ When components come from somewhere else entirely, write a custom provider.
 At minimum, a provider can implement one or more of:
 
 - `list_components/3`
+- `get_component_candidates/4`
 - `get_component/4`
+- `get_resource_target_candidates/3`
 - `get_resource_target/3`
 - `http_routes/1`
+
+Candidate callbacks are the preferred exact-lookup interface for versioned
+providers. Return every matching version; FastestMCP applies provider transforms
+once, then chooses the highest candidate that remains visible and authorized.
+Legacy single-result callbacks remain supported and are authoritative, so an
+exact lookup does not also enumerate the provider. A provider that implements
+only `list_components/3` uses the generic all-version fallback. Implement a
+candidate callback whenever an exact lookup must expose multiple versions.
 
 Example:
 
@@ -189,7 +199,7 @@ See [Transforms](transforms.md) for the detailed patterns.
 
 ## What FastestMCP Does Not Ship Yet
 
-FastestMCP v0.1 does not yet expose filesystem or proxy providers as public
+FastestMCP v0.2 does not yet expose filesystem or proxy providers as public
 built-ins. The current provider surface focuses on:
 
 - mounted FastestMCP servers
@@ -198,7 +208,7 @@ built-ins. The current provider surface focuses on:
 - skills providers
 - custom provider implementations
 
-That keeps the first release focused on the provider shapes already exercised by
+That keeps the public surface focused on provider shapes already exercised by
 the runtime and test suite.
 
 ## Why This Shape

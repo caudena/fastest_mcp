@@ -18,10 +18,8 @@ defmodule FastestMCP.TaskWire do
   end
 
   def task_list(%{tasks: tasks, next_cursor: next_cursor}, opts \\ []) do
-    %{
-      tasks: Enum.map(tasks, &task(&1, opts)),
-      nextCursor: next_cursor
-    }
+    %{tasks: Enum.map(tasks, &task(&1, opts))}
+    |> maybe_put(:nextCursor, next_cursor)
   end
 
   def task_result(result, task_id) when is_map(result) do
@@ -40,10 +38,7 @@ defmodule FastestMCP.TaskWire do
 
     %{
       method: "notifications/tasks/status",
-      params:
-        task
-        |> task_payload(status_override, status_message_override)
-        |> Map.drop([:elicitation])
+      params: task_payload(task, status_override, status_message_override)
     }
   end
 
@@ -56,9 +51,18 @@ defmodule FastestMCP.TaskWire do
   end
 
   def attach_related_task_meta(%{} = payload, task_id, attrs \\ %{}) do
-    Map.update(payload, :_meta, related_task_meta(task_id, attrs), fn meta ->
-      Map.merge(meta, related_task_meta(task_id, attrs))
-    end)
+    related_meta = related_task_meta(task_id, attrs)
+
+    cond do
+      Map.has_key?(payload, "_meta") ->
+        Map.update!(payload, "_meta", &Map.merge(&1, related_meta))
+
+      Map.has_key?(payload, :_meta) ->
+        Map.update!(payload, :_meta, &Map.merge(&1, related_meta))
+
+      true ->
+        Map.put(payload, :_meta, related_meta)
+    end
   end
 
   def task_event_metadata(task, notification) do
@@ -114,7 +118,13 @@ defmodule FastestMCP.TaskWire do
     |> Map.put(:ttl, ttl_ms(task))
     |> Map.put(:pollInterval, poll_interval_ms(task))
     |> maybe_put(:statusMessage, status_message_override || status_message(task))
-    |> maybe_put(:elicitation, interaction_meta(task))
+    |> maybe_put_fastestmcp_meta(:elicitation, interaction_meta(task))
+  end
+
+  defp maybe_put_fastestmcp_meta(payload, _key, nil), do: payload
+
+  defp maybe_put_fastestmcp_meta(payload, key, value) do
+    Map.put(payload, :_meta, %{"fastestmcp" => %{to_string(key) => value}})
   end
 
   defp interaction_meta(%{

@@ -71,4 +71,27 @@ defmodule FastestMCP.ServerLifespanTest do
     assert_receive :failing_enter, 1_000
     assert_receive :cleaned, 1_000
   end
+
+  test "one failing cleanup does not skip the remaining cleanup callbacks" do
+    server_name = "lifespan-cleanup-" <> Integer.to_string(System.unique_integer([:positive]))
+    test_pid = self()
+
+    server =
+      FastestMCP.server(server_name)
+      |> FastestMCP.add_lifespan(fn _server ->
+        {%{}, fn -> send(test_pid, :first_cleanup) end}
+      end)
+      |> FastestMCP.add_lifespan(fn _server ->
+        {%{},
+         fn ->
+           send(test_pid, :failing_cleanup)
+           raise "cleanup failed"
+         end}
+      end)
+
+    assert {:ok, _pid} = FastestMCP.start_server(server)
+    assert :ok = FastestMCP.stop_server(server_name)
+    assert_receive :failing_cleanup, 1_000
+    assert_receive :first_cleanup, 1_000
+  end
 end

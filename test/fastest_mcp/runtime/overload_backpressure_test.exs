@@ -2,10 +2,7 @@ defmodule FastestMCP.Runtime.OverloadBackpressureTest do
   use ExUnit.Case, async: false
 
   alias FastestMCP.Error
-  alias FastestMCP.Transport.StreamableHTTP
-
-  import Plug.Conn
-  import Plug.Test
+  alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
 
   test "per-server call caps reject excess work without affecting another server" do
     parent = self()
@@ -94,24 +91,30 @@ defmodule FastestMCP.Runtime.OverloadBackpressureTest do
       end)
 
     assert_receive {:entered, pid}, 1_000
+    ProtocolTest.initialize_session(server_name, "overload-http-session")
 
-    conn =
-      conn(
-        "POST",
-        "/mcp/tools/call",
-        JSON.encode!(%{"name" => "wait", "arguments" => %{}})
+    response =
+      ProtocolTest.http_request(
+        server_name,
+        "overload-http-session",
+        1,
+        "tools/call",
+        %{"name" => "wait", "arguments" => %{}}
       )
-      |> put_req_header("content-type", "application/json")
-
-    response = StreamableHTTP.call(conn, server_name: server_name)
 
     assert response.status == 503
-    assert get_resp_header(response, "retry-after") == ["1"]
+    assert Plug.Conn.get_resp_header(response, "retry-after") == ["1"]
 
     assert %{
+             "jsonrpc" => "2.0",
+             "id" => 1,
              "error" => %{
-               "code" => "overloaded",
-               "details" => %{"resource" => "calls", "retry_after_seconds" => 1}
+               "data" => %{
+                 "fastestmcp" => %{
+                   "code" => "overloaded",
+                   "details" => %{"resource" => "calls", "retry_after_seconds" => 1}
+                 }
+               }
              }
            } = JSON.decode!(response.resp_body)
 

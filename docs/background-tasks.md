@@ -13,8 +13,7 @@ Use tasks when an operation:
 
 ## What Is Standard vs Extended
 
-SEP-1686 standardizes task management for task-capable MCP requests together
-with:
+MCP `2025-11-25` standardizes task augmentation for `tools/call` together with:
 
 - `tasks/get`
 - `tasks/list`
@@ -22,16 +21,15 @@ with:
 - `tasks/cancel`
 - `notifications/tasks/status`
 
-FastestMCP supports that wire contract and also extends it in three places:
-
-- prompt tasks for `prompts/get`
-- resource and resource-template tasks for `resources/read`
-- `tasks/sendInput` as a FastestMCP convenience method for local or custom
-  integrations
-
-The standard MCP path for interactive background work is still `tasks/result`.
-That request can block, relay elicitation or sampling over the connected
+FastestMCP supports that wire contract without prompt/resource task extensions
+or `tasks/sendInput`. The standard MCP path for interactive remote work is
+`tasks/result`; it can block, relay elicitation or sampling over the connected
 session, and resume when the client replies.
+
+The local Elixir API is intentionally broader. In-process callers can create
+tool, prompt, resource, and resource-template tasks and can answer local
+interaction waiters with `FastestMCP.send_task_input/5`. Those are runtime APIs,
+not additional MCP wire methods.
 
 ## Enabling Task Execution
 
@@ -75,7 +73,9 @@ Task modes:
 
 `task: true` is shorthand for `task: [mode: :optional]`.
 
-Enable tasks across the whole server with `tasks: true`:
+Enable tasks across the whole server with `tasks: true`. Over MCP, only tools
+can be task-augmented; the prompt and resource settings below apply to local
+in-process calls:
 
 ```elixir
 server =
@@ -108,7 +108,8 @@ result = FastestMCP.await_task(task, 5_000)
 final = FastestMCP.task_result(task)
 ```
 
-The same shape works for prompt, resource, and resource-template tasks:
+For local in-process callers, the same shape works for prompt, resource, and
+resource-template tasks:
 
 ```elixir
 prompt_task =
@@ -226,7 +227,7 @@ For connected clients, the standard flow is:
 3. let the server relay `elicitation/create` or `sampling/createMessage`
 4. receive the final result on the same request
 
-FastestMCP also exposes `tasks/sendInput` for local integrations:
+FastestMCP exposes an Elixir-only input API for local integrations:
 
 ```elixir
 task = FastestMCP.call_tool(MyApp.MCPServer, "approve_release", %{}, task: true)
@@ -239,7 +240,9 @@ FastestMCP.send_task_input(
 )
 ```
 
-`tasks/sendInput` is a FastestMCP extension, not the SEP-1686 standard path.
+This calls the supervised task runtime directly. It does not expose or send a
+`tasks/sendInput` MCP method. Remote interactive tasks use the standard
+`tasks/result` relay instead.
 
 ## Task Result Semantics
 
@@ -285,11 +288,13 @@ That means:
 - `tasks/list`
 - `tasks/result`
 - `tasks/cancel`
-- `tasks/sendInput`
 
 only operate on tasks visible to the current session and auth fingerprint.
 Wrong session, wrong auth context, expired tasks, and nonexistent task ids all
 resolve to the same invalid-task response shape.
+
+Local `FastestMCP.send_task_input/5` applies the same task ownership checks but
+does not cross the MCP transport.
 
 When auth is present, the task auth fingerprint prefers `client_id|sub` so two
 users sharing the same application client id do not see each other's tasks. If
@@ -320,17 +325,14 @@ initialization:
     "list" => %{},
     "cancel" => %{},
     "requests" => %{
-      "tools" => %{"call" => %{}},
-      "prompts" => %{"get" => %{}},
-      "resources" => %{"read" => %{}}
+      "tools" => %{"call" => %{}}
     }
   }
 } = FastestMCP.initialize(MyApp.MCPServer)["capabilities"]
 ```
 
-`tools.call` is the SEP-1686-standard request surface. `prompts.get` and
-`resources.read` are forward-compatible FastestMCP extensions that the Elixir
-runtime and client understand today.
+`tools.call` is the only advertised remote task request surface. Passing task
+metadata to remote `prompts/get` or `resources/read` is rejected.
 
 ## Related Guides
 
