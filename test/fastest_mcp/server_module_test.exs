@@ -40,6 +40,13 @@ defmodule FastestMCP.ServerModuleTest do
     assert server.name == to_string(ConfiguredServer)
   end
 
+  test "server module child specs preserve supervisor semantics and custom ids" do
+    assert %{id: ConfiguredServer, type: :supervisor} = ConfiguredServer.child_spec(repo: :repo)
+
+    assert %{id: :custom_server, type: :supervisor} =
+             ConfiguredServer.child_spec(repo: :repo, id: :custom_server)
+  end
+
   test "server module loads app config and starts with module identity" do
     Application.put_env(:fastest_mcp, ConfiguredServer,
       repo: :app_repo,

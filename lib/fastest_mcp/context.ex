@@ -1143,7 +1143,7 @@ defmodule FastestMCP.Context do
            request_opts
          ) do
       {:ok, result} ->
-        validate_peer_result!(method, result)
+        result
 
       {:error, %Error{} = error} ->
         raise error
@@ -1198,69 +1198,6 @@ defmodule FastestMCP.Context do
         params
     end
   end
-
-  defp validate_peer_result!("ping", %{} = result) when map_size(result) == 0, do: result
-
-  defp validate_peer_result!("roots/list", %{"roots" => roots} = result) when is_list(roots),
-    do: result
-
-  defp validate_peer_result!(method, %{"task" => %{} = task} = result)
-       when method in ["sampling/createMessage", "elicitation/create"] do
-    case Map.get(task, "taskId") do
-      task_id when is_binary(task_id) and task_id != "" -> result
-      _other -> raise Error, code: :bad_request, message: "peer task result is missing taskId"
-    end
-  end
-
-  defp validate_peer_result!("sampling/createMessage", %{} = result) do
-    role = Map.get(result, "role")
-    model = Map.get(result, "model")
-    content = Map.get(result, "content")
-
-    if role in ["user", "assistant"] and is_binary(model) and model != "" and
-         valid_sampling_content?(content) do
-      result
-    else
-      raise Error,
-        code: :bad_request,
-        message: "invalid sampling/createMessage result",
-        details: %{result: inspect(result, limit: 10)}
-    end
-  end
-
-  defp validate_peer_result!("elicitation/create", %{"action" => action} = result)
-       when action in ["accept", "decline", "cancel"] do
-    content? = Map.has_key?(result, "content")
-
-    if (action == "accept" and (not content? or is_map(result["content"]))) or
-         (action in ["decline", "cancel"] and not content?) do
-      result
-    else
-      raise Error, code: :bad_request, message: "invalid elicitation/create result"
-    end
-  end
-
-  defp validate_peer_result!(method, %{} = result)
-       when method in ["tasks/get", "tasks/result", "tasks/list", "tasks/cancel"],
-       do: result
-
-  defp validate_peer_result!(_method, %{} = result) do
-    if Map.has_key?(result, "task"), do: result, else: result
-  end
-
-  defp validate_peer_result!(method, result) do
-    raise Error,
-      code: :bad_request,
-      message: "invalid #{method} result",
-      details: %{result: inspect(result, limit: 10)}
-  end
-
-  defp valid_sampling_content?(content) when is_map(content), do: true
-
-  defp valid_sampling_content?(content) when is_list(content),
-    do: content != [] and Enum.all?(content, &is_map/1)
-
-  defp valid_sampling_content?(_content), do: false
 
   defp validate_sampling_result!(%{"task" => %{}} = result, _tools, _opts),
     do: result

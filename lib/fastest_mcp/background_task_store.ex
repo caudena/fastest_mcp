@@ -148,9 +148,13 @@ defmodule FastestMCP.BackgroundTaskStore do
       }
 
       store = self()
+      start_token = make_ref()
 
       case BackgroundTaskSupervisor.start_task(supervisor, task_id, fn ->
-             run_task(store, task_id, executor, background_operation)
+             receive do
+               {:run_background_task, ^start_token} ->
+                 run_task(store, task_id, executor, background_operation)
+             end
            end) do
         {:ok, pid} ->
           monitor_ref = Process.monitor(pid)
@@ -185,6 +189,8 @@ defmodule FastestMCP.BackgroundTaskStore do
 
           case put_task(state, task) do
             :ok ->
+              send(pid, {:run_background_task, start_token})
+
               handle = %BackgroundTask{
                 server_name: operation.server_name,
                 task_id: task_id,

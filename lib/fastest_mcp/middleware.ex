@@ -78,6 +78,7 @@ defmodule FastestMCP.Middleware do
 
   @doc false
   def shutdown_runtime_pid(pid) when is_pid(pid) do
+    Process.unlink(pid)
     ref = Process.monitor(pid)
     Process.exit(pid, :shutdown)
 

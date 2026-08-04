@@ -4082,7 +4082,7 @@ defmodule FastestMCP.Client do
         "jsonrpc" => "2.0",
         "id" => id,
         "error" => %{
-          "code" => callback_jsonrpc_error_code(error),
+          "code" => JSONRPC.error_code(error),
           "message" => error.message,
           "data" => callback_error_data(error)
         }
@@ -5365,49 +5365,14 @@ defmodule FastestMCP.Client do
 
     %Error{
       code:
-        decode_symbolic_error_code(Map.get(fastestmcp, "code")) ||
-          decode_error_code(Map.get(error, "code")),
+        JSONRPC.decode_error_code(
+          Map.get(fastestmcp, "code"),
+          Map.get(error, "code")
+        ),
       message: to_string(message),
       details: Map.get(fastestmcp, "details", data)
     }
   end
-
-  defp decode_error_code(-32700), do: :parse_error
-  defp decode_error_code(-32600), do: :invalid_request
-  defp decode_error_code(-32601), do: :method_not_found
-  defp decode_error_code(-32602), do: :invalid_params
-  defp decode_error_code(-32603), do: :internal_error
-  defp decode_error_code(-32001), do: :timeout
-  defp decode_error_code(-32002), do: :overloaded
-  defp decode_error_code(-32003), do: :unauthorized
-  defp decode_error_code(-32004), do: :forbidden
-  defp decode_error_code(_other), do: :internal_error
-
-  defp decode_symbolic_error_code("parse_error"), do: :parse_error
-  defp decode_symbolic_error_code("invalid_request"), do: :invalid_request
-  defp decode_symbolic_error_code("method_not_found"), do: :method_not_found
-  defp decode_symbolic_error_code("not_found"), do: :not_found
-  defp decode_symbolic_error_code("bad_request"), do: :bad_request
-  defp decode_symbolic_error_code("invalid_params"), do: :invalid_params
-  defp decode_symbolic_error_code("invalid_task_id"), do: :invalid_task_id
-  defp decode_symbolic_error_code("internal_error"), do: :internal_error
-  defp decode_symbolic_error_code("timeout"), do: :timeout
-  defp decode_symbolic_error_code("overloaded"), do: :overloaded
-  defp decode_symbolic_error_code("unauthorized"), do: :unauthorized
-  defp decode_symbolic_error_code("forbidden"), do: :forbidden
-  defp decode_symbolic_error_code(_code), do: nil
-
-  defp callback_jsonrpc_error_code(%Error{code: :method_not_found}), do: -32601
-  defp callback_jsonrpc_error_code(%Error{code: :invalid_request}), do: -32600
-  defp callback_jsonrpc_error_code(%Error{code: :not_found}), do: -32602
-  defp callback_jsonrpc_error_code(%Error{code: :invalid_task_id}), do: -32602
-  defp callback_jsonrpc_error_code(%Error{code: :bad_request}), do: -32602
-  defp callback_jsonrpc_error_code(%Error{code: :internal_error}), do: -32603
-  defp callback_jsonrpc_error_code(%Error{code: :timeout}), do: -32001
-  defp callback_jsonrpc_error_code(%Error{code: :overloaded}), do: -32002
-  defp callback_jsonrpc_error_code(%Error{code: :unauthorized}), do: -32003
-  defp callback_jsonrpc_error_code(%Error{code: :forbidden}), do: -32004
-  defp callback_jsonrpc_error_code(_error), do: -32000
 
   defp callback_error_data(%Error{code: code, details: details}) do
     details = if is_map(details), do: details, else: %{}

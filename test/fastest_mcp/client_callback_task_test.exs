@@ -778,7 +778,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
         session_stream: true,
         elicitation_handler: fn _message, _params ->
           raise Error,
-            code: :bad_request,
+            code: :invalid_params,
             message: "safe callback failure",
             details: %{field: "name"}
         end

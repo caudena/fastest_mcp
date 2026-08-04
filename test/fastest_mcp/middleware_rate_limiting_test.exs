@@ -155,11 +155,31 @@ defmodule FastestMCP.MiddlewareRateLimitingTest do
     assert :ok == RateLimiting.close(middleware)
   end
 
+  test "close unlinks a directly activated limiter from its calling process" do
+    parent = self()
+
+    {owner, monitor_ref} =
+      spawn_monitor(fn ->
+        middleware =
+          Middleware.rate_limiting()
+          |> RateLimiting.activate_runtime()
+
+        send(parent, {:limiter_runtime, RateLimiting.state_pid(middleware)})
+        send(parent, {:limiter_close, RateLimiting.close(middleware)})
+      end)
+
+    assert_receive {:limiter_runtime, runtime_pid}
+    assert_receive {:limiter_close, :ok}
+    assert_receive {:DOWN, ^monitor_ref, :process, ^owner, :normal}
+    refute Process.alive?(runtime_pid)
+  end
+
   test "http transport renders rate-limited JSON-RPC errors on HTTP 200" do
     middleware = Middleware.rate_limiting(max_requests_per_second: 1.0, burst_capacity: 1)
     on_exit(fn -> RateLimiting.close(middleware) end)
 
     server_name = "rate-http-" <> Integer.to_string(System.unique_integer([:positive]))
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
     server =
       FastestMCP.server(server_name)

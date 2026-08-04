@@ -217,7 +217,26 @@ defmodule FastestMCP.Runtime.TaskStoreBackendFailureTest do
     assert_failure_cleanup(context.store, task, :expire_failed)
   end
 
-  test "delete_task rollback failures are returned without leaking the submitted worker",
+  test "put_task failures reject a submission before its executor runs", context do
+    FailureBackend.fail(context.backend, :put_task, :put_failed)
+    parent = self()
+
+    assert {:error, :put_failed} =
+             submit_task(context, fn _operation ->
+               send(parent, :rejected_executor_started)
+               :done
+             end)
+
+    refute_receive :rejected_executor_started, 100
+
+    assert_eventually(fn ->
+      DynamicSupervisor.count_children(context.task_supervisor).active == 0
+    end)
+
+    assert_clean_state(context.store)
+  end
+
+  test "delete_task rollback failures are returned without running the submitted executor",
        context do
     FailureBackend.fail_after_write(context.backend, :put_task, :put_failed)
     FailureBackend.fail(context.backend, :delete_task, :delete_failed)
@@ -226,17 +245,18 @@ defmodule FastestMCP.Runtime.TaskStoreBackendFailureTest do
 
     assert {:error, {:task_backend_rollback_failed, :put_failed, :delete_failed}} =
              submit_task(context, fn operation ->
-               send(parent, {:rollback_worker, Context.task_id(operation.context), self()})
-
-               receive do
-                 :finish -> :done
-               end
+               send(parent, {:rollback_worker, Context.task_id(operation.context)})
+               :done
              end)
 
-    assert_receive {:rollback_worker, task_id, worker_pid}, 1_000
-    assert_eventually(fn -> not Process.alive?(worker_pid) end)
-    assert Map.has_key?(FailureBackend.tasks(context.backend), task_id)
+    refute_receive {:rollback_worker, _task_id}, 100
+    assert [_task_id] = Map.keys(FailureBackend.tasks(context.backend))
     assert :delete_task in FailureBackend.calls(context.backend)
+
+    assert_eventually(fn ->
+      DynamicSupervisor.count_children(context.task_supervisor).active == 0
+    end)
+
     assert_clean_state(context.store)
 
     assert_eventually(fn ->

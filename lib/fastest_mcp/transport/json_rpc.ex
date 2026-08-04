@@ -16,6 +16,36 @@ defmodule FastestMCP.Transport.JSONRPC do
 
   @client_task_methods MapSet.new(["tools/call"])
   @server_task_methods MapSet.new(["sampling/createMessage", "elicitation/create"])
+  @symbolic_error_codes %{
+    parse_error: -32_700,
+    invalid_request: -32_600,
+    not_found: -32_602,
+    method_not_found: -32_601,
+    bad_request: -32_602,
+    invalid_params: -32_602,
+    invalid_task_id: -32_602,
+    internal_error: -32_603,
+    timeout: -32_001,
+    overloaded: -32_002,
+    unauthorized: -32_003,
+    forbidden: -32_004,
+    url_elicitation_required: -32_042
+  }
+  @symbolic_error_names Map.new(@symbolic_error_codes, fn {name, _code} ->
+                          {Atom.to_string(name), name}
+                        end)
+  @numeric_error_codes %{
+    -32_700 => :parse_error,
+    -32_600 => :invalid_request,
+    -32_601 => :method_not_found,
+    -32_602 => :invalid_params,
+    -32_603 => :internal_error,
+    -32_001 => :timeout,
+    -32_002 => :overloaded,
+    -32_003 => :unauthorized,
+    -32_004 => :forbidden,
+    -32_042 => :url_elicitation_required
+  }
 
   @doc "Decodes and validates one JSON-RPC 2.0 message. Batches are not supported."
   @spec decode(term()) :: {:ok, decoded()} | {:error, Error.t()}
@@ -140,6 +170,12 @@ defmodule FastestMCP.Transport.JSONRPC do
       end
 
     if is_integer(explicit), do: explicit, else: symbolic_error_code(code)
+  end
+
+  @doc false
+  def decode_error_code(symbolic_code, numeric_code) do
+    Map.get(@symbolic_error_names, symbolic_code) ||
+      Map.get(@numeric_error_codes, numeric_code, :internal_error)
   end
 
   @doc "Builds a parse-error value suitable for either transport."
@@ -561,20 +597,7 @@ defmodule FastestMCP.Transport.JSONRPC do
     %Error{code: :invalid_params, message: message, details: %{jsonrpc_code: -32_602}}
   end
 
-  defp symbolic_error_code(:parse_error), do: -32_700
-  defp symbolic_error_code(:invalid_request), do: -32_600
-  defp symbolic_error_code(:not_found), do: -32_602
-  defp symbolic_error_code(:method_not_found), do: -32_601
-  defp symbolic_error_code(:bad_request), do: -32_602
-  defp symbolic_error_code(:invalid_params), do: -32_602
-  defp symbolic_error_code(:invalid_task_id), do: -32_602
-  defp symbolic_error_code(:internal_error), do: -32_603
-  defp symbolic_error_code(:timeout), do: -32_001
-  defp symbolic_error_code(:overloaded), do: -32_002
-  defp symbolic_error_code(:unauthorized), do: -32_003
-  defp symbolic_error_code(:forbidden), do: -32_004
-  defp symbolic_error_code(:url_elicitation_required), do: -32_042
-  defp symbolic_error_code(_code), do: -32_000
+  defp symbolic_error_code(code), do: Map.get(@symbolic_error_codes, code, -32_000)
 
   defp error_data(%Error{} = error) do
     %{

@@ -158,6 +158,21 @@ defmodule FastestMCP.TestSupport.ClientProtocolResponsePlug do
     })
   end
 
+  defp respond(conn, :error_semantics, %{"id" => id, "method" => "resources/read"}) do
+    send_json(conn, %{
+      "jsonrpc" => "2.0",
+      "id" => id,
+      "error" => %{
+        "code" => -32_042,
+        "message" => "URL elicitation is required",
+        "data" => %{
+          "elicitations" => [%{"elicitationId" => "url-1", "url" => "https://example.com"}],
+          "fastestmcp" => %{"code" => "url_elicitation_required"}
+        }
+      }
+    })
+  end
+
   defp respond(conn, :unsupported_initialize, %{"method" => "notifications/initialized"}) do
     send_resp(conn, 202, "")
   end
@@ -514,6 +529,13 @@ defmodule FastestMCP.ClientProtocolResponseTest do
     assert_error_code(:not_found, fn -> Client.list_resources(client) end)
     assert_error_code(:method_not_found, fn -> Client.list_prompts(client) end)
     assert_error_code(:invalid_task_id, fn -> Client.fetch_task(client, "missing-task") end)
+
+    error = assert_raise Error, fn -> Client.read_resource(client, "https://example.com") end
+    assert error.code == :url_elicitation_required
+
+    assert error.details["elicitations"] == [
+             %{"elicitationId" => "url-1", "url" => "https://example.com"}
+           ]
   end
 
   defp start_protocol_server(mode, opts \\ []) do
