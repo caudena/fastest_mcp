@@ -143,8 +143,52 @@ The following remain runtime-local in v0.2:
 - middleware cache state
 - session subscription tracking
 - session visibility rules
+- lifecycle, callback, request-id, roots, peer-task, URL-elicitation, and SSE
+  replay coordination
 
 Those do not yet expose public backend abstractions.
+
+Session/replay state is cleared on runtime restart. Multi-node HTTP deployments
+therefore require sticky routing or an application-supplied shared session
+boundary; a shared `SessionStateStore` alone does not distribute protocol
+coordination.
+
+## Bounded Session Defaults
+
+All correctness and overload limits are explicit runtime/server options. No
+environment variable changes protocol behavior.
+
+| Resource | Default | Option |
+| --- | ---: | --- |
+| Request/callback timeout | 60 seconds | `request_timeout_ms:` / `stream_request_timeout_ms:` |
+| Used request ids | 100,000 per direction and session | `max_request_ids:` |
+| Pending peer callbacks | 128 per session; 10,000 per runtime | `max_pending_requests:` / `max_runtime_pending_requests:` |
+| Active inbound requests | 128 per session; 10,000 per runtime | `max_active_requests:` / `max_runtime_active_requests:` |
+| Peer task records | 128 per session | `max_peer_tasks:` |
+| Peer task status callbacks | 128 per session | `max_peer_task_callbacks:` |
+| Queued peer messages | 1,024 messages and 16 MiB per session | `max_queued_messages:` / `max_queued_bytes:` |
+| SSE replay | 256 events and 4 MiB per stream; 64 MiB per runtime; five-minute TTL | `sse_replay_max_events:`, `sse_replay_max_stream_bytes:`, `sse_replay_max_total_bytes:`, `sse_replay_ttl_ms:` |
+| Outbound progress | 20 updates per second and token | `max_progress_per_second:` |
+| Inbound progress | 100 updates per second and session | `max_inbound_progress_per_second:` |
+| Protocol logging | 100 messages per second and session | `max_logs_per_second:` |
+| Session idle lifetime | 15 minutes | `session_idle_ttl:` |
+
+Active callbacks, requests, peer tasks, background tasks, and attached output
+sinks hold the session open. Replay records by themselves do not prevent idle
+expiry. Runtime quotas monitor session owners, so abnormal session termination
+releases its claims rather than leaking capacity. Peer-task status callbacks
+monitor the registering caller and are removed when that caller dies or the
+task reaches a terminal status.
+
+Schema, cursor, progress, logging, URL-elicitation, and SSE-decoder limits are
+documented with their owning features:
+
+- [Schema Validation](schema-validation.md)
+- [Pagination](pagination.md)
+- [Progress](progress.md)
+- [Logging](logging.md)
+- [Sampling and Interaction](sampling-and-interaction.md)
+- [Transports](transports.md)
 
 ## Choosing The Current Model
 

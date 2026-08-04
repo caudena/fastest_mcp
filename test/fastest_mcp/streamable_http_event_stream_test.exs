@@ -3,6 +3,8 @@ defmodule FastestMCP.StreamableHTTPEventStreamTest do
 
   alias FastestMCP.Context
   alias FastestMCP.Elicitation.Accepted
+  alias FastestMCP.Registry
+  alias FastestMCP.Session
   alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
 
   test "streamable HTTP uses event-stream framing for tool calls" do
@@ -31,10 +33,133 @@ defmodule FastestMCP.StreamableHTTPEventStreamTest do
     assert response.status == 200
     assert Map.get(response.headers, "content-type") == "text/event-stream"
     assert Map.get(response.headers, "mcp-session-id") == session_id
-    assert response.body =~ ~r/\Aid: \d+\nevent: message\ndata: \n\n/
+
+    assert response.body =~
+             ~r/\Aid: [A-Za-z0-9_-]+\nretry: 1000\ndata:\n\nid: [A-Za-z0-9_-]+\nevent: message\ndata: \{"id":7,"jsonrpc":"2.0"/
+
     assert response.body =~ "event: message\n"
     assert response.body =~ "\"jsonrpc\":\"2.0\""
     assert response.body =~ "\"structuredContent\":{\"message\":\"hi\"}"
+  end
+
+  test "a resumed GET exclusively receives an overlapping POST's live events" do
+    parent = self()
+    server_name = "http-overlap-owner-#{System.unique_integer([:positive])}"
+
+    server =
+      FastestMCP.server(server_name)
+      |> FastestMCP.add_tool("overlap", fn _arguments, context ->
+        send(parent, {:overlap_started, self()})
+
+        receive do
+          :emit_overlap_notification ->
+            delivery =
+              Context.send_notification(
+                context,
+                "notifications/overlap-owner",
+                %{"sequence" => 1}
+              )
+
+            send(parent, {:overlap_notification_sent, delivery})
+        end
+
+        receive do
+          :finish_overlap -> %{"owner" => "resumed"}
+        end
+      end)
+
+    assert {:ok, _pid} =
+             FastestMCP.start_server(server, session_idle_ttl: :infinity)
+
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+
+    port = start_http(server_name)
+    session_id = initialize_session(port)
+    {:ok, session_pid} = Registry.lookup_session(server_name, session_id)
+
+    payload =
+      ProtocolTest.jsonrpc_request(77, "tools/call", %{
+        "name" => "overlap",
+        "arguments" => %{}
+      })
+
+    {:ok, post_socket, %{status: 200}, post_state} =
+      open_post_stream(port, payload, session_id)
+
+    try do
+      assert_receive {:overlap_started, operation_pid}, 1_000
+
+      assert {:ok, post_cursor_stream, post_state} =
+               recv_stream_until(post_socket, post_state, "retry: 1000", 1_000)
+
+      [first_cursor] =
+        Regex.run(~r/^id: ([^\n]+)$/m, post_cursor_stream, capture: :all_but_first)
+
+      {:ok, get_socket, %{status: 200}, get_state} =
+        open_session_stream(port, session_id, first_cursor)
+
+      try do
+        assert {:ok, _get_cursor_stream, get_state} =
+                 recv_stream_until(get_socket, get_state, "retry: 1000", 1_000)
+
+        send(operation_pid, :emit_overlap_notification)
+
+        assert_receive {:overlap_notification_sent,
+                        {:ok,
+                         %{
+                           sink_ref: post_ref,
+                           delivery_sink_ref: get_ref,
+                           event_id: notification_id
+                         }}},
+                       1_000
+
+        assert is_reference(post_ref)
+        assert is_reference(get_ref)
+        refute post_ref == get_ref
+
+        assert {:ok, notification_stream, get_state} =
+                 recv_stream_until(
+                   get_socket,
+                   get_state,
+                   "notifications/overlap-owner",
+                   1_000
+                 )
+
+        assert notification_stream =~ "id: #{notification_id}\n"
+
+        assert length(
+                 Regex.scan(
+                   ~r/"method":"notifications\/overlap-owner"/,
+                   notification_stream
+                 )
+               ) == 1
+
+        assert {:error, :timeout} = :gen_tcp.recv(post_socket, 0, 100)
+
+        send(operation_pid, :finish_overlap)
+
+        assert {:ok, completed_stream, _get_state} =
+                 recv_stream_until(get_socket, get_state, "\"owner\":\"resumed\"", 1_000)
+
+        assert length(
+                 Regex.scan(
+                   ~r/"method":"notifications\/overlap-owner"/,
+                   completed_stream
+                 )
+               ) == 1
+
+        assert length(Regex.scan(~r/"id":77/, completed_stream)) == 1
+
+        post_stream = recv_stream_tail(post_socket, post_state, 1_000)
+        refute post_stream =~ "notifications/overlap-owner"
+        refute post_stream =~ "\"owner\":\"resumed\""
+        refute post_stream =~ "\"id\":77"
+      after
+        close_session_stream(get_socket, server_name, session_id, session_pid, 78)
+      end
+    after
+      :gen_tcp.close(post_socket)
+    end
   end
 
   test "GET session event streams relay task notifications for the same session" do
@@ -62,6 +187,7 @@ defmodule FastestMCP.StreamableHTTPEventStreamTest do
 
     port = start_http(server_name, json_response: true)
     session_id = initialize_session(port)
+    {:ok, session_pid} = Registry.lookup_session(server_name, session_id)
 
     {:ok, socket, response, stream_state} = open_session_stream(port, session_id)
 
@@ -104,7 +230,229 @@ defmodule FastestMCP.StreamableHTTPEventStreamTest do
 
       assert completed_stream =~ "\"taskId\":\"#{task_id}\""
     after
-      :gen_tcp.close(socket)
+      close_session_stream(socket, server_name, session_id, session_pid, 10_001)
+    end
+  end
+
+  test "GET resumes missed events by id without crossing sessions" do
+    server_name = "http-session-resume-#{System.unique_integer([:positive])}"
+
+    assert {:ok, _pid} =
+             FastestMCP.start_server(FastestMCP.server(server_name), session_idle_ttl: :infinity)
+
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+
+    port = start_http(server_name, json_response: true)
+    session_id = initialize_session(port)
+    {:ok, session_pid} = Registry.lookup_session(server_name, session_id)
+
+    {:ok, socket, %{status: 200}, stream_state} = open_session_stream(port, session_id)
+
+    first = replay_notification(1)
+    assert {:ok, %{event_id: first_id}} = Session.send_envelope(server_name, session_id, first)
+
+    assert {:ok, first_stream, _stream_state} =
+             recv_stream_until(socket, stream_state, "\"sequence\":1", 1_000)
+
+    assert first_stream =~ "id: #{first_id}\n"
+
+    :ok = :inet.setopts(socket, linger: {true, 0})
+    :ok = :gen_tcp.close(socket)
+
+    second = replay_notification(2)
+    assert {:ok, %{event_id: second_id}} = Session.send_envelope(server_name, session_id, second)
+
+    assert_eventually(fn ->
+      :sys.get_state(session_pid).sinks
+      |> Map.values()
+      |> Enum.all?(&(&1.kind != :get))
+    end)
+
+    third = replay_notification(3)
+
+    assert {:ok, %{queued: true}} =
+             Session.send_envelope(server_name, session_id, third, queue: true)
+
+    {:ok, resumed_socket, %{status: 200}, resumed_state} =
+      open_session_stream(port, session_id, first_id)
+
+    try do
+      assert {:ok, resumed_stream, _resumed_state} =
+               recv_stream_until(resumed_socket, resumed_state, "\"sequence\":3", 1_000)
+
+      refute resumed_stream =~ "\"sequence\":1"
+      assert resumed_stream =~ "\"sequence\":2"
+      assert resumed_stream =~ "\"sequence\":3"
+
+      assert [[^second_id], [cursor_id], [third_id]] =
+               Regex.scan(~r/^id: ([^\n]+)$/m, resumed_stream, capture: :all_but_first)
+
+      refute cursor_id == second_id
+      refute third_id == second_id
+      refute third_id == cursor_id
+    after
+      close_session_stream(resumed_socket, server_name, session_id, session_pid, 4)
+    end
+
+    {:ok, repeated_socket, %{status: 200}, repeated_state} =
+      open_session_stream(port, session_id, first_id)
+
+    try do
+      assert {:ok, %{event_id: repeated_live_id}} =
+               Session.send_envelope(server_name, session_id, replay_notification(5))
+
+      assert {:ok, repeated_stream, _repeated_state} =
+               recv_stream_until(repeated_socket, repeated_state, "\"sequence\":5", 1_000)
+
+      assert repeated_stream =~ "id: #{repeated_live_id}\n"
+      assert repeated_stream =~ "\"sequence\":2"
+      assert repeated_stream =~ "\"sequence\":3"
+      assert repeated_stream =~ "\"sequence\":4"
+    after
+      close_session_stream(repeated_socket, server_name, session_id, session_pid, 6)
+    end
+
+    other_session_id = initialize_session(port)
+    {:ok, other_session_pid} = Registry.lookup_session(server_name, other_session_id)
+
+    {:ok, foreign_socket, %{status: 400}, _foreign_state} =
+      open_session_stream(port, other_session_id, first_id)
+
+    :ok = :gen_tcp.close(foreign_socket)
+
+    {:ok, malformed_socket, %{status: 400}, _malformed_state} =
+      open_session_stream(port, other_session_id, "not-an-event-id")
+
+    :ok = :gen_tcp.close(malformed_socket)
+
+    {:ok, other_socket, %{status: 200}, other_state} =
+      open_session_stream(port, other_session_id)
+
+    try do
+      assert {:ok, %{event_id: other_id}} =
+               Session.send_envelope(server_name, other_session_id, replay_notification(99))
+
+      assert {:ok, other_stream, _other_state} =
+               recv_stream_until(other_socket, other_state, "\"sequence\":99", 1_000)
+
+      assert other_stream =~ "id: #{other_id}\n"
+      refute other_stream =~ "\"sequence\":2"
+      refute other_stream =~ "\"sequence\":3"
+      refute other_id == first_id
+    after
+      close_session_stream(
+        other_socket,
+        server_name,
+        other_session_id,
+        other_session_pid,
+        100
+      )
+    end
+  end
+
+  test "GET returns gone when a valid event id has fallen out of replay retention" do
+    server_name = "http-session-evicted-#{System.unique_integer([:positive])}"
+
+    assert {:ok, _pid} =
+             FastestMCP.start_server(FastestMCP.server(server_name),
+               session_idle_ttl: :infinity,
+               sse_replay_max_events: 1
+             )
+
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+
+    port = start_http(server_name, json_response: true)
+    session_id = initialize_session(port)
+    {:ok, session_pid} = Registry.lookup_session(server_name, session_id)
+    {:ok, socket, %{status: 200}, stream_state} = open_session_stream(port, session_id)
+
+    assert {:ok, %{event_id: first_id}} =
+             Session.send_envelope(server_name, session_id, replay_notification(1))
+
+    assert {:ok, first_stream, _stream_state} =
+             recv_stream_until(socket, stream_state, "\"sequence\":1", 1_000)
+
+    assert first_stream =~ "id: #{first_id}\n"
+
+    :ok = :inet.setopts(socket, linger: {true, 0})
+    :ok = :gen_tcp.close(socket)
+
+    assert {:ok, %{event_id: _second_id}} =
+             Session.send_envelope(server_name, session_id, replay_notification(2))
+
+    assert_eventually(fn ->
+      :sys.get_state(session_pid).sinks
+      |> Map.values()
+      |> Enum.all?(&(&1.kind != :get))
+    end)
+
+    {:ok, gone_socket, %{status: 410}, _gone_state} =
+      open_session_stream(port, session_id, first_id)
+
+    :ok = :gen_tcp.close(gone_socket)
+  end
+
+  test "GET still returns gone after an earlier operation pruned the event's stream" do
+    server_name = "http-session-pruned-#{System.unique_integer([:positive])}"
+
+    assert {:ok, _pid} =
+             FastestMCP.start_server(FastestMCP.server(server_name),
+               session_idle_ttl: :infinity,
+               sse_replay_ttl_ms: 10
+             )
+
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+
+    port = start_http(server_name, json_response: true)
+    session_id = initialize_session(port)
+    {:ok, session_pid} = Registry.lookup_session(server_name, session_id)
+    {:ok, socket, %{status: 200}, stream_state} = open_session_stream(port, session_id)
+
+    assert {:ok, %{event_id: first_id}} =
+             Session.send_envelope(server_name, session_id, replay_notification(1))
+
+    assert {:ok, _first_stream, _stream_state} =
+             recv_stream_until(socket, stream_state, "\"sequence\":1", 1_000)
+
+    close_session_stream(socket, server_name, session_id, session_pid, 2)
+    Process.sleep(20)
+
+    # Opening a fresh stream performs age eviction before the later resume.
+    {:ok, fresh_socket, %{status: 200}, _fresh_state} =
+      open_session_stream(port, session_id)
+
+    close_session_stream(fresh_socket, server_name, session_id, session_pid, 3)
+
+    {:ok, gone_socket, %{status: 410}, _gone_state} =
+      open_session_stream(port, session_id, first_id)
+
+    :ok = :gen_tcp.close(gone_socket)
+  end
+
+  test "GET does not receive an event that cannot be persisted for replay" do
+    server_name = "http-session-unretained-#{System.unique_integer([:positive])}"
+
+    assert {:ok, _pid} =
+             FastestMCP.start_server(FastestMCP.server(server_name),
+               session_idle_ttl: :infinity,
+               sse_replay_max_total_bytes: 1
+             )
+
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+
+    port = start_http(server_name, json_response: true)
+    session_id = initialize_session(port)
+    {:ok, session_pid} = Registry.lookup_session(server_name, session_id)
+    {:ok, socket, %{status: 200}, _stream_state} = open_session_stream(port, session_id)
+
+    try do
+      assert {:error, :sse_replay_unavailable} =
+               Session.send_envelope(server_name, session_id, replay_notification(1))
+
+      assert {:error, :timeout} = :gen_tcp.recv(socket, 0, 100)
+      assert :sys.get_state(session_pid).replay.total_bytes == 0
+    after
+      :ok = :gen_tcp.close(socket)
     end
   end
 
@@ -130,7 +478,7 @@ defmodule FastestMCP.StreamableHTTPEventStreamTest do
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
     port = start_http(server_name)
-    session_id = initialize_session(port)
+    session_id = initialize_session(port, %{"elicitation" => %{"form" => %{}}})
 
     create_response =
       post_json(
@@ -207,7 +555,10 @@ defmodule FastestMCP.StreamableHTTPEventStreamTest do
 
   defp start_http(server_name, opts \\ []) do
     plug_opts =
-      [server_name: server_name, unsafe_allow_any_host: true]
+      [
+        server_name: server_name,
+        allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]
+      ]
       |> Keyword.merge(opts)
 
     bandit =
@@ -219,11 +570,15 @@ defmodule FastestMCP.StreamableHTTPEventStreamTest do
     port
   end
 
-  defp initialize_session(port) do
+  defp initialize_session(port, capabilities \\ %{}) do
     initialize_response =
       post_json(
         port,
-        ProtocolTest.jsonrpc_request(1, "initialize", ProtocolTest.initialize_params())
+        ProtocolTest.jsonrpc_request(
+          1,
+          "initialize",
+          ProtocolTest.initialize_params(%{"capabilities" => capabilities})
+        )
       )
 
     assert initialize_response.status == 200
@@ -268,7 +623,7 @@ defmodule FastestMCP.StreamableHTTPEventStreamTest do
     |> IO.iodata_to_binary()
   end
 
-  defp open_session_stream(port, session_id) do
+  defp open_session_stream(port, session_id, last_event_id \\ nil) do
     open_stream(
       port,
       [
@@ -276,11 +631,15 @@ defmodule FastestMCP.StreamableHTTPEventStreamTest do
         "Host: 127.0.0.1\r\n",
         "Accept: text/event-stream\r\n",
         session_headers(session_id),
+        last_event_id_header(last_event_id),
         "Connection: keep-alive\r\n\r\n"
       ]
       |> IO.iodata_to_binary()
     )
   end
+
+  defp last_event_id_header(nil), do: []
+  defp last_event_id_header(last_event_id), do: ["Last-Event-ID: ", last_event_id, "\r\n"]
 
   defp session_headers(nil), do: []
 
@@ -382,6 +741,24 @@ defmodule FastestMCP.StreamableHTTPEventStreamTest do
     do_recv_stream_until(socket, decoded, raw, pattern, deadline)
   end
 
+  defp recv_stream_tail(socket, stream_state, timeout_ms) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    do_recv_stream_tail(socket, stream_state, deadline)
+  end
+
+  defp do_recv_stream_tail(socket, %{decoded: decoded, raw: raw} = stream_state, deadline) do
+    timeout_ms = max(deadline - System.monotonic_time(:millisecond), 1)
+
+    case :gen_tcp.recv(socket, 0, timeout_ms) do
+      {:ok, chunk} ->
+        {decoded, raw} = decode_available_chunked_body(raw <> chunk, decoded)
+        do_recv_stream_tail(socket, %{stream_state | decoded: decoded, raw: raw}, deadline)
+
+      {:error, reason} when reason in [:closed, :timeout] ->
+        decoded
+    end
+  end
+
   defp do_recv_stream_until(socket, decoded, raw, pattern, deadline) do
     if String.contains?(decoded, pattern) do
       {:ok, decoded, %{decoded: decoded, raw: raw}}
@@ -421,5 +798,38 @@ defmodule FastestMCP.StreamableHTTPEventStreamTest do
       [_incomplete] ->
         {acc, body}
     end
+  end
+
+  defp replay_notification(sequence) do
+    %{
+      "jsonrpc" => "2.0",
+      "method" => "notifications/replay-test",
+      "params" => %{"sequence" => sequence}
+    }
+  end
+
+  defp assert_eventually(fun, attempts \\ 100)
+
+  defp assert_eventually(fun, attempts) when attempts > 0 do
+    if fun.() do
+      :ok
+    else
+      Process.sleep(10)
+      assert_eventually(fun, attempts - 1)
+    end
+  end
+
+  defp assert_eventually(_fun, 0), do: flunk("condition did not become true")
+
+  defp close_session_stream(socket, server_name, session_id, session_pid, sequence) do
+    _ = :inet.setopts(socket, linger: {true, 0})
+    :ok = :gen_tcp.close(socket)
+    _ = Session.send_envelope(server_name, session_id, replay_notification(sequence))
+
+    assert_eventually(fn ->
+      :sys.get_state(session_pid).sinks
+      |> Map.values()
+      |> Enum.all?(&(&1.kind != :get))
+    end)
   end
 end

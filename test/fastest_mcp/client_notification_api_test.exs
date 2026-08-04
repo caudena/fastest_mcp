@@ -4,6 +4,26 @@ defmodule FastestMCP.ClientNotificationAPITest do
   alias FastestMCP.Client
   alias FastestMCP.Context
 
+  test "raw extension notifications reject malformed or reserved envelopes before delivery" do
+    context = %Context{}
+
+    invalid = [
+      %{"jsonrpc" => "1.0", "method" => "com.example/notification"},
+      %{"jsonrpc" => "2.0", "method" => "com.example/notification", "id" => 1},
+      %{"jsonrpc" => "2.0", "method" => "com.example/notification", "params" => nil},
+      %{"method" => "com.example/notification", :method => "com.example/other"},
+      %{"method" => ""}
+    ]
+
+    for notification <- invalid do
+      assert {:error, :invalid_notification} =
+               Context.send_notification(context, notification)
+    end
+
+    assert {:error, :reserved_method} =
+             Context.send_notification(context, %{method: "notifications/progress"})
+  end
+
   test "connected client receives a notification sent explicitly from context" do
     parent = self()
 
@@ -13,7 +33,7 @@ defmodule FastestMCP.ClientNotificationAPITest do
     server =
       FastestMCP.server(server_name)
       |> FastestMCP.add_tool("trigger_notification", fn _args, ctx ->
-        :ok = Context.send_notification(ctx, "notifications/tools/list_changed")
+        {:ok, _delivery} = Context.send_notification(ctx, "com.example/notification")
         %{ok: true}
       end)
 
@@ -21,7 +41,7 @@ defmodule FastestMCP.ClientNotificationAPITest do
 
     try do
       assert %{"ok" => true} = Client.call_tool(client, "trigger_notification", %{})
-      assert receive_notification_methods(1) == ["notifications/tools/list_changed"]
+      assert receive_notification_methods(1) == ["com.example/notification"]
     after
       cleanup.()
     end
@@ -36,9 +56,9 @@ defmodule FastestMCP.ClientNotificationAPITest do
     server =
       FastestMCP.server(server_name)
       |> FastestMCP.add_tool("trigger_all_notifications", fn _args, ctx ->
-        :ok = Context.send_notification(ctx, "notifications/tools/list_changed")
-        :ok = Context.send_notification(ctx, "notifications/resources/list_changed")
-        :ok = Context.send_notification(ctx, "notifications/prompts/list_changed")
+        {:ok, _} = Context.send_notification(ctx, "com.example/notification/first")
+        {:ok, _} = Context.send_notification(ctx, "com.example/notification/second")
+        {:ok, _} = Context.send_notification(ctx, "com.example/notification/third")
         %{ok: true}
       end)
 
@@ -48,9 +68,9 @@ defmodule FastestMCP.ClientNotificationAPITest do
       assert %{"ok" => true} = Client.call_tool(client, "trigger_all_notifications", %{})
 
       assert receive_notification_methods(3) == [
-               "notifications/tools/list_changed",
-               "notifications/resources/list_changed",
-               "notifications/prompts/list_changed"
+               "com.example/notification/first",
+               "com.example/notification/second",
+               "com.example/notification/third"
              ]
     after
       cleanup.()
@@ -65,7 +85,9 @@ defmodule FastestMCP.ClientNotificationAPITest do
         {Bandit,
          plug:
            {FastestMCP.Transport.HTTPApp,
-            server_name: server_name, path: "/mcp", unsafe_allow_any_host: true},
+            server_name: server_name,
+            path: "/mcp",
+            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
          scheme: :http,
          port: 0}
       )

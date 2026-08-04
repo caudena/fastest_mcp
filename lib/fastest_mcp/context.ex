@@ -74,6 +74,7 @@ defmodule FastestMCP.Context do
   global programming model.
   """
 
+  alias FastestMCP.Auth
   alias FastestMCP.Auth.Result
   alias FastestMCP.BackgroundTaskStore
   alias FastestMCP.ComponentVisibility
@@ -81,12 +82,15 @@ defmodule FastestMCP.Context do
   alias FastestMCP.EventBus
   alias FastestMCP.Error
   alias FastestMCP.HTTPRequest
+  alias FastestMCP.JSONValue
   alias FastestMCP.OperationPipeline
+  alias FastestMCP.PeerTask
+  alias FastestMCP.Protocol
+  alias FastestMCP.Protocol.Sampling, as: SamplingProtocol
   alias FastestMCP.RequestContext
   alias FastestMCP.SamplingTool
   alias FastestMCP.Session
   alias FastestMCP.SessionSupervisor
-  alias FastestMCP.TaskWire
   alias FastestMCP.TTLStore
 
   require Logger
@@ -103,6 +107,20 @@ defmodule FastestMCP.Context do
     "alert",
     "emergency"
   ]
+  @reserved_notification_methods MapSet.new([
+                                   "notifications/cancelled",
+                                   "notifications/elicitation/complete",
+                                   "notifications/initialized",
+                                   "notifications/message",
+                                   "notifications/progress",
+                                   "notifications/prompts/list_changed",
+                                   "notifications/resources/list_changed",
+                                   "notifications/resources/updated",
+                                   "notifications/roots/list_changed",
+                                   "notifications/tasks/status",
+                                   "notifications/tools/list_changed"
+                                 ])
+  @notification_envelope_keys MapSet.new(["jsonrpc", "method", "params"])
 
   defstruct [
     :server_name,
@@ -117,7 +135,10 @@ defmodule FastestMCP.Context do
     :principal,
     auth: %{},
     capabilities: [],
+    verified_audiences: [],
+    verified_scopes: [],
     client_capabilities: %{},
+    server_capabilities: %{},
     lifespan_context: %{},
     dependencies: %{},
     request_metadata: %{},
@@ -137,7 +158,10 @@ defmodule FastestMCP.Context do
           principal: any(),
           auth: map(),
           capabilities: [any()],
+          verified_audiences: [String.t()],
+          verified_scopes: [String.t()],
           client_capabilities: map(),
+          server_capabilities: map(),
           lifespan_context: map(),
           dependencies: map(),
           request_metadata: map(),
@@ -159,7 +183,10 @@ defmodule FastestMCP.Context do
     principal = Keyword.get(opts, :principal)
     auth = normalize_map(Keyword.get(opts, :auth, %{}))
     capabilities = normalize_capabilities(Keyword.get(opts, :capabilities, []))
+    verified_audiences = List.wrap(Keyword.get(opts, :verified_audiences, []))
+    verified_scopes = List.wrap(Keyword.get(opts, :verified_scopes, []))
     client_capabilities = normalize_map(Keyword.get(opts, :client_capabilities, %{}))
+    server_capabilities = normalize_map(Keyword.get(opts, :server_capabilities, %{}))
     negotiated_protocol_version = Keyword.get(opts, :negotiated_protocol_version)
     lifespan_context = Map.new(Keyword.get(opts, :lifespan_context, %{}))
     dependencies = normalize_dependencies(Keyword.get(opts, :dependencies, %{}))
@@ -178,7 +205,10 @@ defmodule FastestMCP.Context do
       principal: principal,
       auth: auth,
       capabilities: capabilities,
+      verified_audiences: verified_audiences,
+      verified_scopes: verified_scopes,
       client_capabilities: client_capabilities,
+      server_capabilities: server_capabilities,
       lifespan_context: lifespan_context,
       dependencies: dependencies,
       request_metadata: request_metadata,
@@ -408,11 +438,23 @@ defmodule FastestMCP.Context do
 
   @doc "Stores a resolved auth result on the context."
   def put_auth_result(%__MODULE__{} = context, %Result{} = result) do
+    audiences =
+      if result.audiences == [] and is_list(result.verified_audiences),
+        do: result.verified_audiences,
+        else: result.audiences
+
+    scopes =
+      if result.scopes == [] and is_list(result.verified_scopes),
+        do: result.verified_scopes,
+        else: result.scopes
+
     %{
       context
       | principal: result.principal,
         auth: normalize_map(result.auth),
-        capabilities: normalize_capabilities(result.capabilities)
+        capabilities: normalize_capabilities(result.capabilities),
+        verified_audiences: audiences,
+        verified_scopes: scopes
     }
   end
 
@@ -425,30 +467,22 @@ defmodule FastestMCP.Context do
   def log(%__MODULE__{} = context, level, data, opts \\ []) do
     level = normalize_log_level(level)
 
-    notification =
-      %{
-        "jsonrpc" => "2.0",
-        "method" => "notifications/message",
-        "params" =>
-          %{
-            "level" => level,
-            "data" => data
-          }
-          |> maybe_put_map("logger", Keyword.get(opts, :logger))
-      }
+    result = Session.log(context.server_name, context.session_id, level, data, opts)
 
-    send_client_notification(context, notification)
+    if result == :ok do
+      emit(
+        context,
+        [:log, :message],
+        %{count: 1},
+        %{
+          level: level,
+          logger: Keyword.get(opts, :logger),
+          data: data
+        }
+      )
+    end
 
-    emit(
-      context,
-      [:log, :message],
-      %{count: 1},
-      %{
-        level: level,
-        logger: Keyword.get(opts, :logger),
-        data: data
-      }
-    )
+    result
   end
 
   @doc "Sends a raw MCP notification to the connected client session stream."
@@ -456,18 +490,42 @@ defmodule FastestMCP.Context do
 
   def send_notification(%__MODULE__{} = context, method, params)
       when is_binary(method) and (is_map(params) or is_nil(params)) do
-    notification =
-      %{
-        "jsonrpc" => "2.0",
-        "method" => method
-      }
-      |> maybe_put_map("params", params)
+    cond do
+      MapSet.member?(@reserved_notification_methods, method) ->
+        {:error, :reserved_method}
 
-    send_client_notification(context, notification)
+      is_nil(params) ->
+        Session.send_envelope(
+          context.server_name,
+          context.session_id,
+          %{"jsonrpc" => "2.0", "method" => method},
+          session_delivery_opts(context, queue: true)
+        )
+
+      true ->
+        Session.send_notification(
+          context.server_name,
+          context.session_id,
+          method,
+          params,
+          session_delivery_opts(context, queue: true)
+        )
+    end
   end
 
   def send_notification(%__MODULE__{} = context, %{} = notification, _params) do
-    send_client_notification(context, Map.put_new(notification, "jsonrpc", "2.0"))
+    with {:ok, notification} <- normalize_extension_notification(notification),
+         false <- MapSet.member?(@reserved_notification_methods, notification["method"]) do
+      Session.send_envelope(
+        context.server_name,
+        context.session_id,
+        notification,
+        session_delivery_opts(context, queue: true)
+      )
+    else
+      true -> {:error, :reserved_method}
+      {:error, reason} -> {:error, reason}
+    end
   end
 
   @doc "Emits a debug log event from this context."
@@ -500,9 +558,11 @@ defmodule FastestMCP.Context do
   end
 
   def sample(%__MODULE__{} = context, messages, opts) when is_list(messages) do
+    messages = SamplingProtocol.validate_messages!(messages)
     tools = sampling_tool_definitions(Keyword.get(opts, :tools))
     include_context = normalize_sampling_include_context(Keyword.get(opts, :include_context))
     validate_sampling_capabilities!(context, tools, include_context)
+    validate_peer_task_capability!(context, opts, ["sampling", "createMessage"])
 
     params =
       %{
@@ -512,11 +572,13 @@ defmodule FastestMCP.Context do
       |> maybe_put_map("systemPrompt", Keyword.get(opts, :system_prompt))
       |> maybe_put_map("temperature", Keyword.get(opts, :temperature))
       |> maybe_put_map("stopSequences", Keyword.get(opts, :stop_sequences))
-      |> maybe_put_map("_meta", Keyword.get(opts, :meta, Keyword.get(opts, :metadata)))
+      |> maybe_put_map("_meta", Keyword.get(opts, :meta))
+      |> maybe_put_map("metadata", Keyword.get(opts, :metadata))
       |> maybe_put_map("modelPreferences", Keyword.get(opts, :model_preferences))
       |> maybe_put_map("includeContext", include_context)
       |> maybe_put_map("tools", tools)
       |> maybe_put_sampling_tool_choice(tools, Keyword.get(opts, :tool_choice, :auto))
+      |> maybe_put_task_request(opts)
 
     cond do
       is_background_task(context) ->
@@ -532,7 +594,7 @@ defmodule FastestMCP.Context do
                    Keyword.get(opts, :timeout_ms, 60_000)
                  ) do
               {:ok, result} ->
-                result
+                validate_sampling_result!(result, tools, opts)
 
               {:error, %Error{} = error} ->
                 raise error
@@ -545,13 +607,147 @@ defmodule FastestMCP.Context do
         end
 
       true ->
-        send_client_request(
-          context,
-          "sampling/createMessage",
-          params,
-          Keyword.get(opts, :timeout_ms, 60_000)
-        )
+        result =
+          send_client_request(
+            context,
+            "sampling/createMessage",
+            params,
+            Keyword.get(opts, :timeout_ms, 60_000),
+            opts
+          )
+
+        result = validate_sampling_result!(result, tools, opts)
+        normalize_peer_task_or_result(context, result, :sampling, "sampling/createMessage")
     end
+  end
+
+  @doc "Requests the current filesystem roots from the connected client."
+  def list_roots(%__MODULE__{} = context, opts \\ []) do
+    require_client_capability!(
+      context,
+      ["roots"],
+      "connected client did not declare roots support"
+    )
+
+    if not Keyword.get(opts, :refresh, false) do
+      case Session.cached_roots(context.server_name, context.session_id) do
+        roots when is_list(roots) -> roots
+        _other -> request_and_cache_roots(context, opts)
+      end
+    else
+      request_and_cache_roots(context, opts)
+    end
+  end
+
+  @doc "Returns the roots cached for this session, or nil before the first successful request."
+  def cached_roots(%__MODULE__{} = context) do
+    Session.cached_roots(context.server_name, context.session_id)
+  end
+
+  @doc "Lists tasks owned by the connected peer for this session."
+  def list_peer_tasks(%__MODULE__{} = context, opts \\ []) do
+    require_client_capability!(
+      context,
+      ["tasks", "list"],
+      "connected client did not declare tasks.list support"
+    )
+
+    params =
+      case Keyword.get(opts, :cursor) do
+        nil -> %{}
+        cursor when is_binary(cursor) -> %{"cursor" => cursor}
+        cursor -> raise ArgumentError, "cursor must be a string, got: #{inspect(cursor)}"
+      end
+
+    result =
+      send_client_request(
+        context,
+        "tasks/list",
+        params,
+        Keyword.get(opts, :timeout_ms, 60_000),
+        opts
+      )
+
+    %{
+      items: Map.fetch!(result, "tasks"),
+      next_cursor: Map.get(result, "nextCursor")
+    }
+  end
+
+  @doc "Sends an MCP ping request to the connected client."
+  def ping_peer(%__MODULE__{} = context, opts \\ []) do
+    case send_client_request(
+           context,
+           "ping",
+           %{},
+           Keyword.get(opts, :timeout_ms, 60_000),
+           opts
+         ) do
+      %{} = result when map_size(result) == 0 -> :ok
+      %{} -> {:error, :invalid_ping_result}
+    end
+  end
+
+  @doc "Runs a URL-mode elicitation with the connected client."
+  def elicit_url(%__MODULE__{} = context, message, url_or_builder, opts \\ []) do
+    require_client_capability!(
+      context,
+      ["elicitation", "url"],
+      "connected client did not declare elicitation.url support"
+    )
+
+    validate_peer_task_capability!(context, opts, ["elicitation", "create"])
+
+    elicitation = build_and_register_url_elicitation!(context, message, url_or_builder, opts)
+
+    result =
+      send_client_request(
+        context,
+        "elicitation/create",
+        elicitation
+        |> FastestMCP.Elicitation.URL.to_params()
+        |> maybe_put_task_request(opts),
+        Keyword.get(opts, :timeout_ms, 60_000),
+        opts
+      )
+
+    case normalize_peer_task_or_result(context, result, :elicitation, "elicitation/create") do
+      %PeerTask{} = task ->
+        task
+
+      %{"action" => action} = response ->
+        case Session.resolve_url_elicitation(
+               context.server_name,
+               context.session_id,
+               elicitation.elicitation_id,
+               action,
+               Map.get(response, "content")
+             ) do
+          {:ok, updated} ->
+            url_elicitation_result(updated)
+
+          {:error, reason} ->
+            raise Error,
+              code: :bad_request,
+              message: "invalid URL elicitation response",
+              details: %{reason: inspect(reason)}
+        end
+
+      _other ->
+        raise Error, code: :bad_request, message: "invalid URL elicitation response"
+    end
+  end
+
+  @doc "Registers URL elicitation descriptors and raises the standard -32042 error."
+  def require_url_elicitation!(%__MODULE__{} = context, message, url_or_builder, opts \\ []) do
+    require_client_capability!(
+      context,
+      ["elicitation", "url"],
+      "connected client did not declare elicitation.url support"
+    )
+
+    elicitation = build_and_register_url_elicitation!(context, message, url_or_builder, opts)
+    raise FastestMCP.Elicitation.URL.required_error([elicitation])
   end
 
   @doc "Returns the current access token available on the context."
@@ -698,9 +894,26 @@ defmodule FastestMCP.Context do
         :ok
     end
 
-    maybe_send_progress_notification(context, progress)
+    delivery =
+      case progress_token(context) do
+        nil ->
+          {:error, :missing_progress_token}
+
+        _token ->
+          Session.report_progress(
+            context.server_name,
+            context.session_id,
+            protocol_request_id(context),
+            %{
+              "progress" => current
+            }
+            |> maybe_put_map("total", total)
+            |> maybe_put_map("message", message)
+          )
+      end
 
     emit(context, [:task, :progress], progress, %{task_id: task_id(context)})
+    delivery
   end
 
   @doc "Requests interactive input for a background task."
@@ -734,32 +947,51 @@ defmodule FastestMCP.Context do
         end
 
       has_client_bridge?(context) ->
+        require_client_capability!(
+          context,
+          ["elicitation", "form"],
+          "connected client did not declare elicitation.form support"
+        )
+
+        validate_peer_task_capability!(context, opts, ["elicitation", "create"])
+
         response =
           send_client_request(
             context,
             "elicitation/create",
             %{
+              "mode" => "form",
               "message" => request.message,
               "requestedSchema" => request.requested_schema
-            },
-            request.timeout_ms
+            }
+            |> maybe_put_task_request(opts),
+            request.timeout_ms,
+            opts
           )
 
-        case Elicitation.resolve(
-               request,
-               Map.get(response, "action"),
-               Map.get(response, "content")
+        case normalize_peer_task_or_result(
+               context,
+               response,
+               :elicitation,
+               "elicitation/create"
              ) do
-          {:ok, result} ->
-            result
+          %PeerTask{} = task ->
+            task
 
-          {:error, %Error{} = error} ->
-            raise error
+          %{} = result ->
+            case Elicitation.resolve(
+                   request,
+                   Map.get(result, "action"),
+                   Map.get(result, "content")
+                 ) do
+              {:ok, resolved} -> resolved
+              {:error, %Error{} = error} -> raise error
+            end
         end
 
       true ->
         raise RuntimeError,
-              "elicitation is only supported in background task context or an active streamable HTTP request"
+              "elicitation requires a background task or an initialized deliverable MCP session"
     end
   end
 
@@ -815,19 +1047,8 @@ defmodule FastestMCP.Context do
   defp normalize_capabilities(nil), do: []
   defp normalize_capabilities(capability), do: List.wrap(capability)
 
-  defp context_state_scope(opts, request_metadata) do
-    requested =
-      Keyword.get_lazy(opts, :state_scope, fn ->
-        if Map.get(
-             request_metadata,
-             :stateless_http,
-             Map.get(request_metadata, "stateless_http", false)
-           ) do
-          :request
-        else
-          :session
-        end
-      end)
+  defp context_state_scope(opts, _request_metadata) do
+    requested = Keyword.get(opts, :state_scope, :session)
 
     if requested in [:request, :session] do
       requested
@@ -836,7 +1057,13 @@ defmodule FastestMCP.Context do
     end
   end
 
-  defp context_session_id(_opts, :request), do: nil
+  defp context_session_id(opts, :request) do
+    case Keyword.fetch(opts, :session_id) do
+      {:ok, nil} -> nil
+      {:ok, session_id} -> normalize_session_id!(session_id, :request)
+      :error -> nil
+    end
+  end
 
   defp context_session_id(opts, :session) do
     session_id =
@@ -845,8 +1072,14 @@ defmodule FastestMCP.Context do
         session_id -> to_string(session_id)
       end
 
+    normalize_session_id!(session_id, :session)
+  end
+
+  defp normalize_session_id!(session_id, scope) do
+    session_id = to_string(session_id)
+
     if session_id == "" do
-      raise ArgumentError, "session_id must not be empty for session-scoped context"
+      raise ArgumentError, "session_id must not be empty for #{scope}-scoped context"
     else
       session_id
     end
@@ -883,130 +1116,305 @@ defmodule FastestMCP.Context do
   end
 
   defp has_client_bridge?(%__MODULE__{} = context) do
-    is_pid(client_stream_pid(context)) and not is_nil(client_request_store(context))
-  end
-
-  defp client_stream_pid(%__MODULE__{} = context) do
-    request_metadata_value(context, :client_stream_pid)
-  end
-
-  defp client_request_store(%__MODULE__{} = context) do
-    request_metadata_value(context, :client_request_store)
+    is_binary(context.session_id) and
+      Session.deliverable?(context.server_name, context.session_id)
   end
 
   defp progress_token(%__MODULE__{} = context) do
     request_metadata_value(context, :progress_token)
   end
 
-  defp maybe_send_progress_notification(%__MODULE__{} = context, progress) do
-    case {client_stream_pid(context), progress_token(context)} do
-      {pid, token} when is_pid(pid) and not is_nil(token) ->
-        params =
-          %{
-            "progressToken" => token,
-            "progress" => Map.get(progress, :current, Map.get(progress, "current", 0))
-          }
-          |> maybe_put_map("total", Map.get(progress, :total, Map.get(progress, "total")))
-          |> maybe_put_map(
-            "message",
-            Map.get(progress, :message, Map.get(progress, "message"))
-          )
+  defp send_client_request(%__MODULE__{} = context, method, params, timeout_ms, opts) do
+    request_opts =
+      session_delivery_opts(context,
+        timeout_ms: timeout_ms,
+        on_progress: Keyword.get(opts, :on_progress),
+        progress_token: Keyword.get(opts, :progress_token)
+      )
+      |> maybe_put_related_task_delivery(context)
 
-        send(
-          pid,
-          {:client_bridge_notification,
-           %{
-             "jsonrpc" => "2.0",
-             "method" => "notifications/progress",
-             "params" => params
-           }}
-        )
+    params = attach_related_task_params(context, params)
 
-      _other ->
-        :ok
-    end
-  end
+    case Session.request_peer(
+           context.server_name,
+           context.session_id,
+           method,
+           params,
+           request_opts
+         ) do
+      {:ok, result} ->
+        validate_peer_result!(method, result)
 
-  defp send_client_notification(%__MODULE__{} = context, message) do
-    case client_stream_pid(context) do
-      pid when is_pid(pid) ->
-        send(pid, {:client_bridge_notification, message})
-        :ok
-
-      _other ->
-        :ok
-    end
-  end
-
-  defp send_client_request(%__MODULE__{} = context, method, params, timeout_ms) do
-    stream_pid =
-      case client_stream_pid(context) do
-        pid when is_pid(pid) ->
-          pid
-
-        _other ->
-          raise RuntimeError,
-                "#{method} requires an active streamable HTTP client request context"
-      end
-
-    store =
-      case client_request_store(context) do
-        pid when is_pid(pid) ->
-          pid
-
-        _other ->
-          raise RuntimeError,
-                "#{method} requires an active streamable HTTP client request store"
-      end
-
-    request_id = "srv-" <> Integer.to_string(System.unique_integer([:positive]))
-
-    send(
-      stream_pid,
-      {:client_bridge_request, self(), request_id,
-       client_request_payload(context, request_id, method, params), store, context.session_id,
-       timeout_ms}
-    )
-
-    receive do
-      {:client_bridge_response, ^request_id, {:ok, result}} ->
-        result
-
-      {:client_bridge_response, ^request_id, {:error, %Error{} = error}} ->
+      {:error, %Error{} = error} ->
         raise error
 
-      {:client_bridge_response, ^request_id, {:error, reason}} ->
-        raise Error,
-          code: :internal_error,
-          message: "#{method} failed",
-          details: %{reason: inspect(reason)}
-    after
-      timeout_ms ->
-        :ok = TTLStore.delete(store, request_id)
-
+      {:error, :timeout} ->
         raise Error,
           code: :timeout,
           message: "#{method} timed out",
           details: %{timeout_ms: timeout_ms}
+
+      {:error, reason} ->
+        raise Error,
+          code: :internal_error,
+          message: "#{method} failed",
+          details: %{reason: inspect(reason)}
     end
   end
 
-  defp client_request_payload(%__MODULE__{} = context, request_id, method, params) do
-    payload = %{
-      "jsonrpc" => "2.0",
-      "id" => request_id,
-      "method" => method,
-      "params" => params
-    }
-
+  defp maybe_put_related_task_delivery(opts, context) do
     case task_id(context) do
       task_id when is_binary(task_id) and task_id != "" ->
-        TaskWire.attach_related_task_meta(payload, task_id)
+        Keyword.put(opts, :protocol_related_task_id, task_id)
 
       _other ->
-        payload
+        opts
     end
   end
+
+  defp session_delivery_opts(%__MODULE__{} = context, opts) do
+    opts
+    |> Keyword.put_new(:sink_ref, request_metadata_value(context, :session_sink_ref))
+    |> Keyword.put_new(:origin_request_id, protocol_request_id(context))
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+  end
+
+  defp protocol_request_id(%__MODULE__{} = context) do
+    request_metadata_value(context, :jsonrpc_request_id) || context.request_id
+  end
+
+  defp attach_related_task_params(%__MODULE__{} = context, params) do
+    case task_id(context) do
+      task_id when is_binary(task_id) and task_id != "" ->
+        meta = Map.get(params, "_meta", %{})
+
+        Map.put(
+          params,
+          "_meta",
+          Map.put(meta, "io.modelcontextprotocol/related-task", %{"taskId" => task_id})
+        )
+
+      _other ->
+        params
+    end
+  end
+
+  defp validate_peer_result!("ping", %{} = result) when map_size(result) == 0, do: result
+
+  defp validate_peer_result!("roots/list", %{"roots" => roots} = result) when is_list(roots),
+    do: result
+
+  defp validate_peer_result!(method, %{"task" => %{} = task} = result)
+       when method in ["sampling/createMessage", "elicitation/create"] do
+    case Map.get(task, "taskId") do
+      task_id when is_binary(task_id) and task_id != "" -> result
+      _other -> raise Error, code: :bad_request, message: "peer task result is missing taskId"
+    end
+  end
+
+  defp validate_peer_result!("sampling/createMessage", %{} = result) do
+    role = Map.get(result, "role")
+    model = Map.get(result, "model")
+    content = Map.get(result, "content")
+
+    if role in ["user", "assistant"] and is_binary(model) and model != "" and
+         valid_sampling_content?(content) do
+      result
+    else
+      raise Error,
+        code: :bad_request,
+        message: "invalid sampling/createMessage result",
+        details: %{result: inspect(result, limit: 10)}
+    end
+  end
+
+  defp validate_peer_result!("elicitation/create", %{"action" => action} = result)
+       when action in ["accept", "decline", "cancel"] do
+    content? = Map.has_key?(result, "content")
+
+    if (action == "accept" and (not content? or is_map(result["content"]))) or
+         (action in ["decline", "cancel"] and not content?) do
+      result
+    else
+      raise Error, code: :bad_request, message: "invalid elicitation/create result"
+    end
+  end
+
+  defp validate_peer_result!(method, %{} = result)
+       when method in ["tasks/get", "tasks/result", "tasks/list", "tasks/cancel"],
+       do: result
+
+  defp validate_peer_result!(_method, %{} = result) do
+    if Map.has_key?(result, "task"), do: result, else: result
+  end
+
+  defp validate_peer_result!(method, result) do
+    raise Error,
+      code: :bad_request,
+      message: "invalid #{method} result",
+      details: %{result: inspect(result, limit: 10)}
+  end
+
+  defp valid_sampling_content?(content) when is_map(content), do: true
+
+  defp valid_sampling_content?(content) when is_list(content),
+    do: content != [] and Enum.all?(content, &is_map/1)
+
+  defp valid_sampling_content?(_content), do: false
+
+  defp validate_sampling_result!(%{"task" => %{}} = result, _tools, _opts),
+    do: result
+
+  defp validate_sampling_result!(result, tools, opts) do
+    tool_choice = if is_nil(tools), do: nil, else: Keyword.get(opts, :tool_choice, :auto)
+    SamplingProtocol.validate_result!(result, tool_choice)
+    result
+  end
+
+  defp normalize_peer_task_or_result(
+         %__MODULE__{} = context,
+         %{"task" => %{} = task},
+         kind,
+         target
+       ) do
+    task_id = Map.get(task, "taskId")
+
+    if is_binary(task_id) and task_id != "" do
+      PeerTask.new(
+        server_name: context.server_name,
+        session_id: context.session_id,
+        task_id: task_id,
+        kind: kind,
+        target: target
+      )
+    else
+      raise Error, code: :bad_request, message: "peer task result is missing taskId"
+    end
+  end
+
+  defp normalize_peer_task_or_result(_context, result, _kind, _target), do: result
+
+  defp maybe_put_task_request(params, opts) do
+    case Keyword.get(opts, :task, false) do
+      false ->
+        params
+
+      true ->
+        Map.put(params, "task", %{})
+
+      task_opts when is_list(task_opts) ->
+        task =
+          %{}
+          |> maybe_put_map("ttl", Keyword.get(task_opts, :ttl))
+
+        Map.put(params, "task", task)
+
+      other ->
+        raise ArgumentError,
+              "task must be true, false, or keyword options, got: #{inspect(other)}"
+    end
+  end
+
+  defp request_and_cache_roots(context, opts) do
+    result =
+      send_client_request(
+        context,
+        "roots/list",
+        %{},
+        Keyword.get(opts, :timeout_ms, 60_000),
+        opts
+      )
+
+    roots = Map.fetch!(result, "roots")
+
+    case Session.cache_roots(context.server_name, context.session_id, roots) do
+      {:ok, parsed} ->
+        parsed
+
+      {:error, reason} ->
+        raise Error,
+          code: :bad_request,
+          message: "invalid roots/list result",
+          details: %{reason: inspect(reason)}
+    end
+  end
+
+  defp require_client_capability!(%__MODULE__{} = context, path, message) do
+    if Protocol.capability?(context.client_capabilities, path) do
+      :ok
+    else
+      raise Error, code: :method_not_found, message: message
+    end
+  end
+
+  defp build_and_register_url_elicitation!(context, message, url_or_builder, opts) do
+    do_build_and_register_url_elicitation!(context, message, url_or_builder, opts, 8)
+  end
+
+  defp do_build_and_register_url_elicitation!(
+         context,
+         message,
+         url_or_builder,
+         opts,
+         attempts_remaining
+       ) do
+    elicitation = build_url_elicitation!(context, message, url_or_builder, opts)
+
+    case Session.register_url_elicitation(
+           context.server_name,
+           context.session_id,
+           elicitation
+         ) do
+      :ok ->
+        elicitation
+
+      {:error, :already_exists} when attempts_remaining > 1 ->
+        do_build_and_register_url_elicitation!(
+          context,
+          message,
+          url_or_builder,
+          opts,
+          attempts_remaining - 1
+        )
+
+      {:error, reason} ->
+        raise Error,
+          code: :internal_error,
+          message: "failed to claim URL elicitation id",
+          details: %{reason: inspect(reason)}
+    end
+  end
+
+  defp build_url_elicitation!(context, message, url_or_builder, opts) do
+    if is_nil(context.principal) do
+      raise Error,
+        code: :forbidden,
+        message: "URL elicitation requires a verified non-anonymous identity"
+    end
+
+    allowed_hosts =
+      Keyword.get(opts, :allowed_hosts) ||
+        (context.server && Map.get(context.server, :url_elicitation_allowed_hosts))
+
+    principal_fingerprint = Auth.identity_fingerprint(context.principal, context.auth)
+
+    FastestMCP.Elicitation.URL.new!(message, url_or_builder,
+      session_id: context.session_id,
+      principal_fingerprint: principal_fingerprint,
+      allowed_hosts: allowed_hosts,
+      ttl_ms: Keyword.get(opts, :ttl_ms, 15 * 60_000),
+      purpose: Keyword.get(opts, :purpose, :external_interaction)
+    )
+  end
+
+  defp url_elicitation_result(%{action: :accept} = elicitation),
+    do: %Elicitation.Accepted{
+      data: %{elicitation_id: elicitation.elicitation_id, url: elicitation.url}
+    }
+
+  defp url_elicitation_result(%{action: :decline}), do: %Elicitation.Declined{}
+  defp url_elicitation_result(%{action: :cancel}), do: %Elicitation.Cancelled{}
+  defp url_elicitation_result(_elicitation), do: %Elicitation.Cancelled{}
 
   defp request_metadata_value(%__MODULE__{} = context, key) do
     Map.get(context.request_metadata, key, Map.get(context.request_metadata, Atom.to_string(key)))
@@ -1020,6 +1428,8 @@ defmodule FastestMCP.Context do
       principal: context.principal,
       auth: context.auth,
       capabilities: context.capabilities,
+      verified_audiences: context.verified_audiences,
+      verified_scopes: context.verified_scopes,
       task_metadata: context.task_metadata
     ]
   end
@@ -1207,6 +1617,33 @@ defmodule FastestMCP.Context do
     end)
   end
 
+  defp normalize_extension_notification(notification) do
+    canonical_keys = Enum.map(Map.keys(notification), &canonical_notification_key/1)
+
+    with false <- Enum.any?(canonical_keys, &is_nil/1),
+         true <- length(canonical_keys) == MapSet.size(MapSet.new(canonical_keys)),
+         true <- MapSet.subset?(MapSet.new(canonical_keys), @notification_envelope_keys),
+         normalized <- JSONValue.stringify_keys(notification),
+         true <- Map.get(normalized, "jsonrpc", "2.0") == "2.0",
+         method when is_binary(method) and method != "" <- Map.get(normalized, "method"),
+         true <- valid_notification_params?(normalized) do
+      {:ok, Map.put(normalized, "jsonrpc", "2.0")}
+    else
+      _other -> {:error, :invalid_notification}
+    end
+  end
+
+  defp canonical_notification_key(key) when is_binary(key), do: key
+  defp canonical_notification_key(key) when is_atom(key), do: Atom.to_string(key)
+  defp canonical_notification_key(_key), do: nil
+
+  defp valid_notification_params?(notification) do
+    case Map.fetch(notification, "params") do
+      :error -> true
+      {:ok, params} -> is_map(params)
+    end
+  end
+
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
@@ -1237,6 +1674,11 @@ defmodule FastestMCP.Context do
 
   defp validate_sampling_capabilities!(context, tools, include_context) do
     cond do
+      not sampling_base_capability?(context) ->
+        raise Error,
+          code: :method_not_found,
+          message: "connected client did not declare sampling support"
+
       not is_nil(tools) and not client_sampling_capability?(context, "tools") ->
         raise Error,
           code: :bad_request,
@@ -1253,14 +1695,25 @@ defmodule FastestMCP.Context do
     end
   end
 
-  defp client_sampling_capability?(%__MODULE__{client_capabilities: capabilities}, key) do
-    case Map.get(capabilities, "sampling", Map.get(capabilities, :sampling)) do
-      %{} = sampling ->
-        Map.has_key?(sampling, key) or Map.has_key?(sampling, sampling_capability_atom(key))
+  defp sampling_base_capability?(%__MODULE__{client_capabilities: capabilities}) do
+    is_map(Map.get(capabilities, "sampling", Map.get(capabilities, :sampling)))
+  end
 
-      _other ->
-        false
+  defp validate_peer_task_capability!(context, opts, request_path) do
+    if Keyword.get(opts, :task, false) == false do
+      :ok
+    else
+      require_client_capability!(
+        context,
+        ["tasks", "requests" | request_path],
+        "connected client did not declare task support for #{Enum.join(request_path, "/")}"
+      )
     end
+  end
+
+  defp client_sampling_capability?(%__MODULE__{client_capabilities: capabilities}, key) do
+    Protocol.capability?(capabilities, ["sampling", key]) or
+      Protocol.capability?(capabilities, [:sampling, sampling_capability_atom(key)])
   end
 
   defp sampling_capability_atom("tools"), do: :tools

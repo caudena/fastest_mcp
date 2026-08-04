@@ -41,7 +41,11 @@ defmodule FastestMCP.TaskElicitationTest do
     assert %{
              requestId: request_id,
              message: "What is your name?",
-             requestedSchema: %{"type" => "string"}
+             requestedSchema: %{
+               "type" => "object",
+               "properties" => %{"value" => %{"type" => "string"}},
+               "required" => ["value"]
+             }
            } = notification.related_task.elicitation
 
     task = FastestMCP.fetch_task(handle)
@@ -55,7 +59,7 @@ defmodule FastestMCP.TaskElicitationTest do
     assert FastestMCP.await_task(handle, 1_000) == "Hello, Alice!"
   end
 
-  test "scalar elicitation schemas include response metadata and accept raw scalar input" do
+  test "scalar elicitation schemas wrap input and preserve field metadata" do
     server_name =
       "task-elicit-scalar-metadata-" <> Integer.to_string(System.unique_integer([:positive]))
 
@@ -83,12 +87,18 @@ defmodule FastestMCP.TaskElicitationTest do
     :ok = wait_for_input_required(server_name, handle.task_id)
 
     assert %{
-             "type" => "string",
-             "title" => "Name",
-             "description" => "The display name to use"
+             "type" => "object",
+             "properties" => %{
+               "value" => %{
+                 "type" => "string",
+                 "title" => "Name",
+                 "description" => "The display name to use"
+               }
+             },
+             "required" => ["value"]
            } = FastestMCP.fetch_task(handle).elicitation.requested_schema
 
-    _ = FastestMCP.send_task_input(server_name, handle.task_id, :accept, "Alice")
+    _ = FastestMCP.send_task_input(server_name, handle.task_id, :accept, %{"value" => "Alice"})
     assert FastestMCP.await_task(handle, 1_000) == "Hello, Alice!"
   end
 

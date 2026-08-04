@@ -7,6 +7,8 @@ defmodule FastestMCP.TaskMeta do
   direct API synchronous-by-default.
   """
 
+  alias FastestMCP.Protocol.Duration
+
   defstruct ttl: nil
 
   @type t :: %__MODULE__{
@@ -15,7 +17,12 @@ defmodule FastestMCP.TaskMeta do
 
   @doc "Builds a new value for this module from the supplied options."
   def new(opts \\ [])
-  def new(%__MODULE__{} = meta), do: validate!(meta)
+
+  def new(%__MODULE__{} = meta) do
+    %{meta | ttl: normalize_ttl(meta.ttl)}
+    |> validate!()
+  end
+
   def new(nil), do: %__MODULE__{}
 
   def new(opts) when is_list(opts) do
@@ -44,9 +51,5 @@ defmodule FastestMCP.TaskMeta do
   end
 
   defp normalize_ttl(nil), do: nil
-  defp normalize_ttl(ttl) when is_integer(ttl) and ttl > 0, do: ttl
-
-  defp normalize_ttl(ttl) do
-    raise ArgumentError, "task ttl must be a positive integer, got #{inspect(ttl)}"
-  end
+  defp normalize_ttl(ttl), do: Duration.positive_milliseconds!(ttl, "task ttl")
 end

@@ -4,6 +4,7 @@ defmodule FastestMCP.Runtime.BackgroundTaskTest do
   alias FastestMCP.BackgroundTask
   alias FastestMCP.Context
   alias FastestMCP.Error
+  alias FastestMCP.Registry
   alias FastestMCP.ServerRuntime
 
   defmodule TokenAuth do
@@ -169,14 +170,14 @@ defmodule FastestMCP.Runtime.BackgroundTaskTest do
         FastestMCP.call_tool(server_name, "sync_only", %{}, task: true)
       end
 
-    assert forbidden_error.code == :not_found
+    assert forbidden_error.code == :method_not_found
 
     required_error =
       assert_raise Error, fn ->
         FastestMCP.call_tool(server_name, "task_only", %{})
       end
 
-    assert required_error.code == :not_found
+    assert required_error.code == :method_not_found
 
     tools = FastestMCP.list_tools(server_name)
 
@@ -226,6 +227,43 @@ defmodule FastestMCP.Runtime.BackgroundTaskTest do
 
     send(first_pid, :release)
     assert FastestMCP.await_task(first, 1_000) == :ok
+  end
+
+  test "receiver task execution holds its originating session until terminal completion" do
+    parent = self()
+    server_name = "background-session-hold-#{System.unique_integer([:positive])}"
+    session_id = "task-session"
+
+    server =
+      FastestMCP.server(server_name)
+      |> FastestMCP.add_tool(
+        "wait",
+        fn _arguments, _context ->
+          send(parent, {:task_started, self()})
+
+          receive do
+            :release -> :done
+          end
+        end,
+        task: true
+      )
+
+    assert {:ok, _pid} = FastestMCP.start_server(server, session_idle_ttl: 30)
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+
+    handle = FastestMCP.call_tool(server_name, "wait", %{}, task: true, session_id: session_id)
+    assert_receive {:task_started, task_pid}, 1_000
+    assert {:ok, session_pid} = Registry.lookup_session(server_name, session_id)
+
+    Process.sleep(75)
+    assert Process.alive?(session_pid)
+    assert map_size(:sys.get_state(session_pid).receiver_tasks) == 1
+
+    monitor = Process.monitor(session_pid)
+    send(task_pid, :release)
+    assert :done = FastestMCP.await_task(handle, 1_000)
+
+    assert_receive {:DOWN, ^monitor, :process, ^session_pid, :normal}, 1_000
   end
 
   test "concurrent background tasks preserve isolated request and auth context" do

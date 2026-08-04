@@ -61,64 +61,28 @@ server =
   )
 ```
 
-By default, FastestMCP will coerce values when the schema makes that safe:
+FastestMCP validates JSON types exactly and does not coerce submitted values:
 
 ```elixir
-FastestMCP.call_tool("tools", "calculate_sum", %{"a" => "20", "b" => "22"})
+FastestMCP.call_tool("tools", "calculate_sum", %{"a" => 20, "b" => 22})
 # => 42
 ```
 
-If you want strict validation, enable it at the server level:
+Passing strings for `a` or `b` fails validation. The former
+`strict_input_validation` option has been removed because strict behavior is
+now the only behavior.
 
-```elixir
-server =
-  FastestMCP.server("strict-tools", strict_input_validation: true)
-  |> FastestMCP.add_tool(
-    "calculate_sum",
-    fn %{"a" => a, "b" => b}, _ctx -> a + b end,
-    input_schema: schema
-  )
-```
+## Schema References
 
-## Schema Dereferencing
+FastestMCP preserves `$ref` and `$defs` exactly as authored and compiles them
+through `FastestMCP.Schema`. The former handwritten dereferencing middleware
+and `dereference_schemas:` option are removed; supplying that option fails
+fast instead of expanding an incomplete or unsafe reference graph.
 
-By default, FastestMCP dereferences local `$ref` tool schemas before they are
-published through `tools/list`.
-
-If you want to preserve `$ref` and `$defs` exactly as authored, disable that
-middleware at the server level:
-
-```elixir
-server =
-  FastestMCP.server("ref-tools", dereference_schemas: false)
-  |> FastestMCP.add_tool(
-    "ship_order",
-    fn arguments, _ctx -> arguments end,
-    input_schema: %{
-      "$defs" => %{
-        "address" => %{
-          "type" => "object",
-          "properties" => %{
-            "city" => %{"type" => "string"}
-          },
-          "required" => ["city"]
-        }
-      },
-      "type" => "object",
-      "properties" => %{
-        "shipping" => %{"$ref" => "#/$defs/address"}
-      },
-      "required" => ["shipping"]
-    }
-  )
-```
-
-```elixir
-tool = Enum.find(FastestMCP.list_tools("ref-tools"), &(&1.name == "ship_order"))
-
-tool.input_schema["$defs"]["address"]["type"]
-# => "object"
-```
+Local and recursive references are handled by JSV. Remote references fail
+closed unless the application configures an explicit resolver through
+`schema_options:`. See [Schema Validation](schema-validation.md) for resolver
+security and limits.
 
 ## Required and Optional Arguments
 
@@ -212,7 +176,11 @@ FastestMCP.complete(
 ```
 
 Completion providers stay server-side. They are stripped from public tool
-metadata and do not leak into the transport-facing `inputSchema`.
+metadata and do not leak into the transport-facing `inputSchema`. Tool
+completion is an Elixir-native convenience only: MCP `2025-11-25`
+`completion/complete` accepts `ref/prompt` and `ref/resource` on the wire, so a
+remote `ref/tool` request is rejected and tool-only completion does not cause
+the completion capability to be advertised.
 
 ## Injected Arguments
 
@@ -503,6 +471,25 @@ server =
 That helper-type pattern keeps the content contract explicit and
 transport-safe.
 
+A resource-link content block keeps every standard field directly on the
+block; do not nest them under `resource` or a FastestMCP extension:
+
+```elixir
+%{
+  type: "resource_link",
+  uri: "memo://reports/42",
+  name: "report-42",
+  title: "Release report",
+  description: "Generated release evidence",
+  mimeType: "text/markdown",
+  size: 4_096,
+  _meta: %{"traceId" => "trace-42"}
+}
+```
+
+Content-level `_meta` is preserved. Only FastestMCP-specific fields are moved
+beneath `_meta.fastestmcp` during serialization.
+
 ## Error Handling
 
 Raise `FastestMCP.Error` when the tool should fail with a normalized MCP error:
@@ -585,36 +572,11 @@ server =
   )
 ```
 
-FastestMCP does not infer output schemas from Elixir types. The schema is an
-explicit part of the component metadata, which keeps the transport contract
-reviewable.
-
-If the root output schema is not an object, FastestMCP marks it for transport
-wrapping so connected clients keep the full MCP envelope instead of silently
-unwrapping the result:
-
-```elixir
-server =
-  FastestMCP.server("tool-output-wrap")
-  |> FastestMCP.add_tool(
-    "list_values",
-    fn _arguments, _ctx -> ["alpha", "beta"] end,
-    output_schema: %{
-      "type" => "array",
-      "items" => %{"type" => "string"}
-    }
-  )
-```
-
-Direct in-process calls still return the ergonomic Elixir value:
-
-```elixir
-FastestMCP.call_tool("tool-output-wrap", "list_values", %{})
-# => ["alpha", "beta"]
-```
-
-Transport clients receive `structuredContent.result` plus
-`_meta.fastestmcp.wrap_result = true`.
+FastestMCP does not infer output schemas from Elixir types. Input and output
+schemas must both declare `type: "object"` at the root, as required by MCP.
+When `output_schema` is present, the tool must return structured content and
+FastestMCP validates it before serialization. Invalid declarations fail while
+the component is built; invalid results fail as internal tool errors.
 
 ## Timeouts
 
@@ -757,7 +719,8 @@ Server-scoped visibility is authoritative. A session can narrow the visible set
 further, but it cannot re-expose a tool that the server already disabled.
 
 When the visible tool list changes, FastestMCP emits
-`notifications/tools/list_changed` to connected streamable HTTP sessions.
+`notifications/tools/list_changed` to connected initialized HTTP and stdio
+sessions.
 
 See [Versioning and Visibility](versioning-and-visibility.md) for selectors,
 version targeting, and session behavior.
@@ -878,7 +841,7 @@ FastestMCP can emit `notifications/tools/list_changed`.
 
 That notification path is session-aware:
 
-- it is delivered over active streamable HTTP session streams
+- it is delivered through one active HTTP or stdio session output sink
 - it is emitted only when the visible tool set actually changes for that
   session
 - session visibility changes can trigger it even when the global registry did

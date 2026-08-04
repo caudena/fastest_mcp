@@ -150,6 +150,10 @@ Message.new("I found three areas to review closely.", role: :assistant)
 Message.new(%{type: "resource", resource: %{uri: "file:///tmp/report.md"}}, role: :assistant)
 ```
 
+Each prompt message carries exactly one valid content block and a canonical
+`user` or `assistant` role. Return multiple messages when the prompt needs
+multiple blocks; a content array on one prompt message is rejected.
+
 Use `FastestMCP.Prompts.Result` when the prompt needs multiple messages or
 result-level metadata:
 
@@ -263,8 +267,8 @@ Prompt definitions participate in the same session-aware notification pipeline
 as tools and resources.
 
 When prompts are added, removed, enabled, disabled, or hidden for one session,
-FastestMCP can emit `notifications/prompts/list_changed` to active streamable
-HTTP session streams.
+FastestMCP can emit `notifications/prompts/list_changed` to active initialized
+HTTP or stdio sessions.
 
 The notification is only emitted when the visible prompt set actually changes
 for that session.

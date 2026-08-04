@@ -64,7 +64,7 @@ defmodule FastestMCP.Runtime.OverloadBackpressureTest do
     assert Task.await(other, 1_000) == :ok
   end
 
-  test "HTTP overload responses return 503 with retry-after" do
+  test "HTTP overload responses remain correlated JSON-RPC errors" do
     parent = self()
     server_name = "http-overload-" <> Integer.to_string(System.unique_integer([:positive]))
 
@@ -102,8 +102,8 @@ defmodule FastestMCP.Runtime.OverloadBackpressureTest do
         %{"name" => "wait", "arguments" => %{}}
       )
 
-    assert response.status == 503
-    assert Plug.Conn.get_resp_header(response, "retry-after") == ["1"]
+    assert response.status == 200
+    assert Plug.Conn.get_resp_header(response, "retry-after") == []
 
     assert %{
              "jsonrpc" => "2.0",

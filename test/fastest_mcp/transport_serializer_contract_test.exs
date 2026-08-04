@@ -24,16 +24,15 @@ defmodule FastestMCP.TransportSerializerContractTest do
     assert tool["_meta"] == %{
              "vendor" => %{"stable" => true},
              "fastestmcp" => %{
-               "execution" => %{"taskSupport" => "optional"},
                "hint" => "keep",
                "tags" => ["text", "utility"],
                "version" => "2.0.0"
              }
            }
 
-    refute Map.has_key?(tool, "execution")
     refute Map.has_key?(tool, "tags")
     refute Map.has_key?(tool, "version")
+    assert tool["execution"] == %{"taskSupport" => "optional"}
 
     template =
       Serializer.resource_template_metadata(%{
@@ -46,12 +45,9 @@ defmodule FastestMCP.TransportSerializerContractTest do
              "id" => %{"type" => "string"}
            }
 
-    assert get_in(template, ["_meta", "fastestmcp", "execution"]) == %{
-             "taskSupport" => "required"
-           }
-
-    refute Map.has_key?(template, "parameters")
     refute Map.has_key?(template, "execution")
+    refute Map.has_key?(template, "parameters")
+    refute get_in(template, ["_meta", "fastestmcp", "execution"])
   end
 
   test "content metadata is preserved and resource links use direct protocol fields" do
@@ -157,16 +153,72 @@ defmodule FastestMCP.TransportSerializerContractTest do
       Serializer.tool_result(%{content: "invalid", structuredContent: 42})
     end
 
-    wrapped =
-      Serializer.tool_result(["alpha", "beta"], %{
-        output_schema: %{"type" => "array", "items" => %{"type" => "string"}}
-      })
-
-    assert wrapped["structuredContent"] == %{"result" => ["alpha", "beta"]}
-    assert get_in(wrapped, ["_meta", "fastestmcp", "wrap_result"]) == true
+    list = Serializer.tool_result(["alpha", "beta"])
+    refute Map.has_key?(list, "structuredContent")
 
     scalar = Serializer.tool_result(42)
     refute Map.has_key?(scalar, "structuredContent")
+  end
+
+  test "media and embedded blobs are base64-encoded and valid base64 is preserved" do
+    result =
+      Serializer.tool_result(%{
+        content: [
+          %{type: "image", data: "plain image bytes", mimeType: "image/png"},
+          %{
+            type: "resource",
+            resource: %{uri: "memo://blob", blob: "plain blob bytes"}
+          }
+        ]
+      })
+
+    assert [image, embedded] = result["content"]
+    assert Base.decode64!(image["data"]) == "plain image bytes"
+    assert Base.decode64!(embedded["resource"]["blob"]) == "plain blob bytes"
+
+    encoded = Base.encode64("already encoded")
+
+    assert %{"content" => [%{"data" => ^encoded}]} =
+             Serializer.tool_result(%{
+               content: [%{type: "audio", data: encoded, mimeType: "audio/wav"}]
+             })
+  end
+
+  test "malformed explicit tool results fail deterministically" do
+    for result <- [
+          %{content: nil},
+          %{content: [], structuredContent: nil},
+          %{content: [], structuredContent: []},
+          %{content: [], isError: nil},
+          %{content: [], isError: "false"}
+        ] do
+      assert_raise Error, fn -> Serializer.tool_result(result) end
+    end
+
+    assert_raise Error, ~r/content block has unsupported type/, fn ->
+      Serializer.tool_result(%{content: [%{type: "vendor/unknown"}]})
+    end
+
+    assert_raise Error, ~r/text must be a string/, fn ->
+      Serializer.tool_result(%{content: [%{type: "text", text: 42}]})
+    end
+
+    assert_raise Error, ~r/media and blob data must be binary/, fn ->
+      Serializer.tool_result(%{
+        content: [%{type: "image", data: 42, mimeType: "image/png"}]
+      })
+    end
+
+    assert_raise Error, ~r/embedded resource content requires an object/, fn ->
+      Serializer.tool_result(%{content: [%{type: "resource", resource: nil}]})
+    end
+
+    assert_raise Error, ~r/duplicate normalized _meta key/, fn ->
+      Serializer.tool_result(%{
+        content: [],
+        _meta: %{"trace" => "string", trace: "atom"}
+      })
+    end
   end
 
   test "task extensions stay under _meta.fastestmcp and absent cursors are omitted" do

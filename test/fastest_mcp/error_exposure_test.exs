@@ -36,7 +36,7 @@ defmodule FastestMCP.ErrorExposureTest do
         "arguments" => %{}
       })
 
-    assert http_response.status == 400
+    assert http_response.status == 200
     assert get_in(json_body(http_response), ["error", "message"]) =~ "secret token 123"
 
     {connection_id, _initialize_response} = ProtocolTest.initialize_stdio(server_name)
@@ -59,8 +59,7 @@ defmodule FastestMCP.ErrorExposureTest do
 
     server =
       FastestMCP.server(server_name,
-        mask_error_details: true,
-        strict_input_validation: true
+        mask_error_details: true
       )
       |> FastestMCP.add_auth(FastestMCP.Auth.StaticToken,
         tokens: %{"valid-token" => %{client_id: "docs-client"}}
@@ -97,7 +96,7 @@ defmodule FastestMCP.ErrorExposureTest do
         [{"authorization", "Bearer valid-token"}]
       )
 
-    assert http_crash.status == 400
+    assert http_crash.status == 200
     assert get_in(json_body(http_crash), ["error", "message"]) == ~s(tool "explode" failed)
 
     auth_input = %{"token" => "valid-token"}
@@ -126,7 +125,19 @@ defmodule FastestMCP.ErrorExposureTest do
         [{"authorization", "Bearer valid-token"}]
       )
 
-    assert get_in(json_body(validation_response), ["error", "message"]) =~ "a must be an integer"
+    validation_error = json_body(validation_response)["error"]
+    assert validation_error["code"] == -32_602
+    assert get_in(validation_error, ["data", "fastestmcp", "code"]) == "bad_request"
+
+    assert is_list(
+             get_in(validation_error, [
+               "data",
+               "fastestmcp",
+               "details",
+               "schema",
+               "violations"
+             ])
+           )
 
     explicit_response =
       jsonrpc_http(
@@ -276,8 +287,7 @@ defmodule FastestMCP.ErrorExposureTest do
     assert get_in(json_body(http_result), [
              "error",
              "data",
-             "fastestmcp",
-             "meta",
+             "_meta",
              "io.modelcontextprotocol/related-task",
              "taskId"
            ]) ==
@@ -317,8 +327,7 @@ defmodule FastestMCP.ErrorExposureTest do
     assert get_in(stdio_result, [
              "error",
              "data",
-             "fastestmcp",
-             "meta",
+             "_meta",
              "io.modelcontextprotocol/related-task",
              "taskId"
            ]) == stdio_task_id
@@ -381,7 +390,7 @@ defmodule FastestMCP.ErrorExposureTest do
         String.downcase(to_string(key)) in ["mcp-session-id", "mcp-protocol-version"]
       end)
 
-    ProtocolTest.http_request(server_name, session_id, 1, method, params,
+    ProtocolTest.http_request(server_name, session_id, unique_request_id(), method, params,
       headers: request_headers
     )
   end
@@ -398,6 +407,8 @@ defmodule FastestMCP.ErrorExposureTest do
       if String.downcase(to_string(key)) == name, do: to_string(value)
     end)
   end
+
+  defp unique_request_id, do: System.unique_integer([:positive, :monotonic])
 
   defp json_body(conn), do: JSON.decode!(conn.resp_body)
 

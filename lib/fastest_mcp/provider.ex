@@ -14,6 +14,7 @@ defmodule FastestMCP.Provider do
   provider the same questions:
 
     * what components do you expose?
+    * can you return a bounded keyset page for wire list operations?
     * can you resolve this identifier directly?
     * for a concrete resource URI, what is the backing target?
     * do you expose extra HTTP routes?
@@ -28,6 +29,8 @@ defmodule FastestMCP.Provider do
 
   alias FastestMCP.Component
   alias FastestMCP.Components.ResourceTemplate
+  alias FastestMCP.Error
+  alias FastestMCP.Pagination
   alias FastestMCP.ProviderTransform
 
   defstruct [:inner, transforms: []]
@@ -63,6 +66,53 @@ defmodule FastestMCP.Provider do
     provider.inner
     |> do_list_components(component_type, operation)
     |> apply_transforms(provider.transforms, operation)
+  end
+
+  @doc "Returns whether this provider can perform a bounded source-level component page lookup."
+  def component_page_callback?(%__MODULE__{inner: %module{}, transforms: transforms}) do
+    transforms == [] and function_exported?(module, :list_component_page, 5)
+  end
+
+  @doc """
+  Reads one source-level component page.
+
+  The optional provider callback is `list_component_page/5` and receives the
+  provider value, component type, normalized stable after-key, requested limit,
+  and current operation. It must return `{:ok, %{items: components,
+  next_after: key_or_nil}}` (the outer `{:ok, ...}` may be omitted). Components
+  use `FastestMCP.Pagination.default_key/1` ordering. A non-nil `next_after`
+  declares that another source page is available. The callback returns source
+  candidates only; the shared pipeline still owns component transforms,
+  visibility, and authorization.
+
+  Provider transforms intentionally disable this callback because an arbitrary
+  rename can change ordering. Those providers retain the correct streaming
+  keyset fallback in `FastestMCP.OperationPipeline`.
+  """
+  def list_component_page(
+        %__MODULE__{inner: %module{}} = provider,
+        component_type,
+        after_key,
+        limit,
+        operation
+      )
+      when is_integer(limit) and limit > 0 do
+    unless component_page_callback?(provider) do
+      raise ArgumentError,
+            "provider #{inspect(module)} does not support source-level component pagination"
+    end
+
+    page =
+      provider.inner
+      |> module.list_component_page(
+        component_type,
+        Pagination.normalize_source_key(after_key),
+        limit,
+        operation
+      )
+      |> normalize_component_page!(limit, after_key)
+
+    %{page | items: apply_transforms(page.items, provider.transforms, operation)}
   end
 
   @doc "Resolves one component by type and identifier."
@@ -234,6 +284,72 @@ defmodule FastestMCP.Provider do
     provider
   end
 
+  defp normalize_component_page!({:ok, page}, limit, after_key),
+    do: normalize_component_page!(page, limit, after_key)
+
+  defp normalize_component_page!(%{items: items} = page, limit, after_key)
+       when is_list(items) do
+    if length(items) > limit do
+      invalid_component_page!("returned more than the requested #{limit} components")
+    end
+
+    keyed = Enum.map(items, &{Pagination.default_key(&1), &1})
+    normalized_after = Pagination.normalize_source_key(after_key)
+
+    unless Enum.all?(keyed, fn {key, _item} ->
+             is_nil(normalized_after) or
+               Pagination.normalize_source_key(key) > normalized_after
+           end) do
+      invalid_component_page!("returned a component at or before the requested after-key")
+    end
+
+    unless keyed == Enum.sort_by(keyed, fn {key, _item} -> key end) do
+      invalid_component_page!("returned components outside stable key order")
+    end
+
+    next_after =
+      page
+      |> Map.get(:next_after, Map.get(page, "next_after"))
+      |> Pagination.normalize_source_key()
+
+    if next_after && normalized_after && next_after <= normalized_after do
+      invalid_component_page!("returned a non-advancing next_after key")
+    end
+
+    last_item_key =
+      case List.last(keyed) do
+        nil -> nil
+        {key, _item} -> Pagination.normalize_source_key(key)
+      end
+
+    if next_after && last_item_key && next_after < last_item_key do
+      invalid_component_page!("returned next_after before its last component")
+    end
+
+    %{items: Enum.map(keyed, &elem(&1, 1)), next_after: next_after}
+  end
+
+  defp normalize_component_page!(%{"items" => items} = page, limit, after_key)
+       when is_list(items) do
+    normalize_component_page!(
+      %{items: items, next_after: Map.get(page, "next_after")},
+      limit,
+      after_key
+    )
+  end
+
+  defp normalize_component_page!(other, _limit, _after_key) do
+    invalid_component_page!(
+      "must return a page map with list items and an optional next_after key, got #{inspect(other)}"
+    )
+  end
+
+  defp invalid_component_page!(message) do
+    raise Error,
+      code: :internal_error,
+      message: "provider component page #{message}"
+  end
+
   defp apply_transforms(components, transforms, operation) when is_list(components) do
     components
     |> Enum.reduce([], fn component, acc ->
@@ -246,12 +362,30 @@ defmodule FastestMCP.Provider do
   end
 
   defp apply_transforms(component, transforms, operation) do
-    Enum.reduce(transforms, component, fn transform, current ->
+    transforms
+    |> Enum.reduce(component, fn transform, current ->
       if current,
         do: ProviderTransform.transform_component(transform, current, operation),
         else: nil
     end)
+    |> case do
+      nil ->
+        nil
+
+      transformed ->
+        Component.refresh_compiled_schemas(
+          transformed,
+          operation_schema_cache(operation),
+          operation_schema_options(operation)
+        )
+    end
   end
+
+  defp operation_schema_cache(%{schema_cache: cache}), do: cache
+  defp operation_schema_cache(_operation), do: nil
+
+  defp operation_schema_options(%{schema_options: options}) when is_list(options), do: options
+  defp operation_schema_options(_operation), do: []
 
   defp reverse_identifier(transforms, component_type, identifier, operation) do
     Enum.reduce_while(Enum.reverse(transforms), {:ok, identifier}, fn transform, {:ok, current} ->

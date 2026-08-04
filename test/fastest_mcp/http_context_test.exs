@@ -156,6 +156,7 @@ defmodule FastestMCP.HTTPContextTest do
       )
       |> put_req_header("content-type", "application/json")
       |> put_req_header("accept", "application/json, text/event-stream")
+      |> Map.put(:host, "localhost")
       |> put_req_header("x-demo-header", "ABC")
       |> put_req_header("authorization", "Bearer fresh-token")
       |> put_req_header("mcp-session-id", session_id)

@@ -29,14 +29,20 @@ mix deps.get
 
 FastestMCP 0.2.0 has one protocol boundary: MCP `2025-11-25` over JSON-RPC
 2.0. Streamable HTTP accepts one message per POST at `/mcp`; legacy
-method-specific routes and JSON-RPC batches are gone. Stateful clients must use
-the server-issued session id and complete the initialize lifecycle. Stateless
-HTTP is POST-only and has no sessions, subscriptions, or task augmentation.
+method-specific routes and JSON-RPC batches are gone. HTTP clients must use
+the server-issued session id and complete the initialize lifecycle. Zero-session
+HTTP and the `stateless_http:`/`stateless:` options are gone. Use
+`state_scope: :request` when handler state must reset for each operation; the
+MCP session, negotiated capabilities, subscriptions, and task ownership remain
+available.
 
 Remote task augmentation is standard `tools/call` only. Local Elixir prompt and
 resource tasks remain available, as does local `FastestMCP.send_task_input/5`,
 but the remote prompt/resource task extensions and wire `tasks/sendInput` method
-were removed. See the [0.2.0 changelog](CHANGELOG.md#020---2026-08-02) and
+were removed. Tool schemas are now strict JSON Schema values with object roots,
+and values are never coerced. The old `dereference_schemas:` path is removed;
+remote references require an explicit `schema_options:` resolver. See the
+[0.2.0 changelog](CHANGELOG.md#020---unreleased) and
 [transport migration notes](docs/transports.md#migrating-from-01) for the full
 checklist.
 
@@ -100,6 +106,7 @@ client call, lives in [docs/onboarding.md](docs/onboarding.md).
 - [Versioning and Visibility](docs/versioning-and-visibility.md)
 - [Testing](docs/testing.md)
 - [Runtime State and Storage](docs/runtime-state-and-storage.md)
+- [Schema Validation](docs/schema-validation.md)
 - [Compatibility and Scope](docs/compatibility-and-scope.md)
 
 ## Public API
@@ -115,11 +122,19 @@ FastestMCP keeps the public surface deliberately curated.
 - `FastestMCP.Auth`: auth contract and shared authenticator wrapper
 - `FastestMCP.Auth.Result`: normalized authenticator result
 - `FastestMCP.Auth.StaticToken`: hermetic bearer-token authenticator
+- `FastestMCP.Auth.ProtectedResource`: RFC 9728 protected-resource metadata
 - `FastestMCP.Middleware`: built-in middleware constructors
 - `FastestMCP.Provider`: provider contract for mounted and dynamic surfaces
 - `FastestMCP.ComponentManager`: runtime mutation for live servers
 - `FastestMCP.Sampling`: Elixir-friendly sampling helpers
 - `FastestMCP.Interact`: higher-level elicitation helpers
+- `FastestMCP.Root`: validated client-declared `file://` root and containment
+  helpers
+- `FastestMCP.PeerTask`: session-owned handle for sampling or elicitation work
+  delegated to the connected client
+- `FastestMCP.Schema`, `FastestMCP.Schema.Compiled`, and
+  `FastestMCP.Schema.Error`: strict compile-once JSON Schema boundary
+- `FastestMCP.Schema.HTTPResolver`: opt-in allowlisted HTTPS schema resolver
 - `FastestMCP.SessionStateStore` and `FastestMCP.SessionStateStore.Memory`:
   session-state backend contract and default backend
 - `FastestMCP.TaskBackend` and `FastestMCP.TaskBackend.Memory`: background-task
@@ -148,7 +163,8 @@ FastestMCP currently ships:
   HTTP state
 - `FastestMCP.Context.current!/0`, `request_context/1`, and `client_id/1` for
   narrow convenience helpers where needed
-- tool, prompt, and resource-template completion handlers
+- standard prompt/resource wire completion plus Elixir-native tool and
+  resource-template completion handlers
 - explicit tool, prompt, and resource helper structs for richer payload shaping
 - unified `on_duplicate:` handling for local server definitions, runtime
   component-manager mutations, and the local provider
@@ -160,6 +176,13 @@ FastestMCP currently ships:
 - a Plug-first HTTP embedding surface for Bandit, Phoenix, or custom Plug apps
 - a connected client for streamable HTTP and stdio
 - client-side sampling, elicitation, logging, and progress callbacks
+- server-originated roots, sampling, form and URL elicitation, ping, logging,
+  progress, cancellation, and requester-side peer tasks over HTTP and stdio
+- identity-bound URL elicitation completion and RFC 9728 protected-resource
+  discovery for configured HTTP servers
+- bounded SSE replay using `Last-Event-ID`
+- Draft 2020-12 and Draft 7 JSON Schema validation through JSV, with opt-in
+  allowlisted HTTPS reference resolution
 - runtime component mutation through `FastestMCP.ComponentManager`
 - OpenAPI-backed dynamic tool generation
 

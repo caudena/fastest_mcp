@@ -32,6 +32,11 @@ Use the helper when you want the runtime to track current state in one place.
 Use `report_progress/4` when you already know the values and just want to emit
 them directly.
 
+Only `progress` must strictly increase across notifications. `total` is
+optional, may be a floating-point value, and may be revised as the sender's
+estimate changes; it is not a fixed per-token contract. `message` is optional
+human-readable context.
+
 ## Basic Example
 
 ```elixir
@@ -69,6 +74,19 @@ Progress behaves differently depending on the execution mode:
 That means the same handler code can work for both in-process tests and remote
 interactive clients.
 
+Protocol progress tokens are owned by one active request. String and integer
+tokens remain distinct, duplicate active tokens are rejected, values must
+increase monotonically, and ordinary tokens are released when their request
+finishes. Task progress tokens remain live until the task reaches a terminal
+state. Unknown or late incoming progress is dropped.
+
+`Context.report_progress/4` returns explicit errors when a token is missing,
+inactive, decreasing, rate-limited, or cannot be delivered. The default
+outbound limit is 20 updates per second per token; incoming progress is bounded
+to 100 updates per second per session. Configure those runtime bounds with
+`max_progress_per_second:` and `max_inbound_progress_per_second:`. Client
+progress callbacks execute outside the session process.
+
 ## Client-side Consumption
 
 Connected clients can register a `progress_handler`:
@@ -96,7 +114,7 @@ task itself. That means you can:
 The stored progress includes:
 
 - current
-- total
+- the latest total, when one was reported
 - message
 - `reported_at`
 

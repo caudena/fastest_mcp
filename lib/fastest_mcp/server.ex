@@ -62,9 +62,10 @@ defmodule FastestMCP.Server do
   """
 
   alias FastestMCP.Auth
+  alias FastestMCP.Auth.ProtectedResource
   alias FastestMCP.Component
   alias FastestMCP.ComponentCompiler
-  alias FastestMCP.Middleware
+  alias FastestMCP.Elicitation.URL, as: URLElicitation
   alias FastestMCP.Provider
   alias FastestMCP.Providers.MountedServer, as: MountedServerProvider
   alias FastestMCP.TaskConfig
@@ -72,12 +73,14 @@ defmodule FastestMCP.Server do
   defstruct [
     :name,
     :auth,
-    strict_input_validation: false,
+    :protected_resource,
+    :url_elicitation_allowed_hosts,
     mask_error_details: false,
     on_duplicate: :error,
     metadata: %{},
     http_routes: [],
     tasks: %TaskConfig{},
+    schema_options: [],
     dependencies: %{},
     middleware: [],
     lifespans: [],
@@ -98,12 +101,14 @@ defmodule FastestMCP.Server do
   @type t :: %__MODULE__{
           name: String.t(),
           auth: Auth.t() | nil,
-          strict_input_validation: boolean(),
+          protected_resource: ProtectedResource.t() | nil,
+          url_elicitation_allowed_hosts: [String.t()] | nil,
           mask_error_details: boolean(),
           on_duplicate: :error | :warn | :ignore | :replace,
           metadata: map(),
           http_routes: [tuple()],
           tasks: struct(),
+          schema_options: keyword(),
           dependencies: %{optional(String.t()) => function()},
           middleware: [middleware_entry()],
           lifespans: [FastestMCP.Lifespan.t()],
@@ -117,10 +122,14 @@ defmodule FastestMCP.Server do
 
   @doc "Builds a new value for this module from the supplied options."
   def new(name, opts \\ []) do
+    validate_removed_options!(opts)
+
     %__MODULE__{
       name: normalize_name(name),
       auth: normalize_auth(Keyword.get(opts, :auth)),
-      strict_input_validation: Keyword.get(opts, :strict_input_validation, false),
+      protected_resource: normalize_protected_resource(Keyword.get(opts, :protected_resource)),
+      url_elicitation_allowed_hosts:
+        normalize_url_elicitation_allowed_hosts(Keyword.get(opts, :url_elicitation_allowed_hosts)),
       mask_error_details: Keyword.get(opts, :mask_error_details, false),
       on_duplicate:
         Component.normalize_duplicate_policy!(Keyword.get(opts, :on_duplicate, :error)),
@@ -128,9 +137,11 @@ defmodule FastestMCP.Server do
         opts
         |> Keyword.get(:metadata, %{})
         |> Map.new()
-        |> put_experimental_capabilities(Keyword.get(opts, :experimental_capabilities)),
+        |> put_experimental_capabilities(Keyword.get(opts, :experimental_capabilities))
+        |> validate_experimental_capabilities!(),
       http_routes: [],
       tasks: normalize_tasks(Keyword.get(opts, :tasks, false)),
+      schema_options: normalize_schema_options(Keyword.get(opts, :schema_options, [])),
       dependencies: normalize_dependencies(Keyword.get(opts, :dependencies, %{})),
       middleware: normalize_middleware(opts),
       lifespans:
@@ -279,7 +290,36 @@ defmodule FastestMCP.Server do
     |> Map.put(:capabilities, capabilities)
   end
 
-  defp put_experimental_capabilities(metadata, _experimental), do: metadata
+  defp put_experimental_capabilities(_metadata, experimental) do
+    raise ArgumentError,
+          "experimental_capabilities must be a map of capability names to objects, got #{inspect(experimental)}"
+  end
+
+  defp validate_experimental_capabilities!(metadata) do
+    experimental =
+      metadata
+      |> map_value(:capabilities, %{})
+      |> map_value(:experimental, nil)
+
+    case experimental do
+      nil ->
+        metadata
+
+      %{} ->
+        Enum.each(experimental, fn {name, value} ->
+          unless is_map(value) do
+            raise ArgumentError,
+                  "experimental capability #{inspect(name)} must be an object, got #{inspect(value)}"
+          end
+        end)
+
+        metadata
+
+      value ->
+        raise ArgumentError,
+              "metadata capabilities.experimental must be an object, got #{inspect(value)}"
+    end
+  end
 
   defp normalize_string_key_map(map) when is_map(map) do
     Map.new(map, fn {key, value} ->
@@ -306,7 +346,62 @@ defmodule FastestMCP.Server do
   defp normalize_auth(provider) when is_function(provider, 2), do: Auth.new(provider)
   defp normalize_auth(provider) when is_function(provider, 3), do: Auth.new(provider)
   defp normalize_auth(provider) when is_atom(provider), do: Auth.new(provider)
+
+  defp normalize_protected_resource(nil), do: nil
+
+  defp normalize_protected_resource(%ProtectedResource{} = protected_resource) do
+    protected_resource
+    |> Map.from_struct()
+    |> ProtectedResource.new!()
+  end
+
+  defp normalize_protected_resource(options) when is_list(options) or is_map(options) do
+    ProtectedResource.new!(options)
+  end
+
+  defp normalize_protected_resource(other) do
+    raise ArgumentError,
+          "protected_resource must be FastestMCP.Auth.ProtectedResource or constructor options, got #{inspect(other)}"
+  end
+
+  defp normalize_url_elicitation_allowed_hosts(nil), do: nil
+
+  defp normalize_url_elicitation_allowed_hosts(hosts) do
+    case URLElicitation.validate_allowed_hosts(hosts) do
+      {:ok, normalized} ->
+        normalized
+
+      {:error, reason} ->
+        raise ArgumentError,
+              "url_elicitation_allowed_hosts must be a non-empty list of concrete HTTPS hosts, got #{inspect(hosts)}: #{inspect(reason)}"
+    end
+  end
+
   defp normalize_tasks(tasks), do: TaskConfig.new(tasks)
+
+  defp normalize_schema_options(options) when is_list(options) do
+    if Keyword.keyword?(options) do
+      options
+    else
+      raise ArgumentError, "schema_options must be a keyword list, got #{inspect(options)}"
+    end
+  end
+
+  defp normalize_schema_options(options) do
+    raise ArgumentError, "schema_options must be a keyword list, got #{inspect(options)}"
+  end
+
+  defp validate_removed_options!(opts) do
+    if Keyword.has_key?(opts, :strict_input_validation) do
+      raise ArgumentError,
+            "strict_input_validation was removed; JSON Schema validation is always non-coercing"
+    end
+
+    if Keyword.has_key?(opts, :dereference_schemas) do
+      raise ArgumentError,
+            "dereference_schemas was removed because rewriting JSON Schema references is unsafe; preserve references and configure schema_options resolver support when remote schemas are required"
+    end
+  end
 
   defp normalize_dependencies(dependencies) when is_list(dependencies) or is_map(dependencies) do
     dependencies
@@ -339,17 +434,10 @@ defmodule FastestMCP.Server do
   defp normalize_lifespans(lifespan), do: [FastestMCP.Lifespan.new(lifespan)]
 
   defp normalize_middleware(opts) do
-    middleware =
-      opts
-      |> Keyword.get(:middleware, [])
-      |> List.wrap()
-      |> Enum.map(&normalize_middleware_entry/1)
-
-    if Keyword.get(opts, :dereference_schemas, true) do
-      middleware ++ [normalize_middleware_entry(Middleware.dereference_refs())]
-    else
-      middleware
-    end
+    opts
+    |> Keyword.get(:middleware, [])
+    |> List.wrap()
+    |> Enum.map(&normalize_middleware_entry/1)
   end
 
   defp normalize_middleware_entry(middleware) when is_function(middleware, 2), do: middleware
@@ -364,11 +452,9 @@ defmodule FastestMCP.Server do
   end
 
   defp component_opts(server, opts) do
-    if Keyword.has_key?(opts, :task) do
-      opts
-    else
-      Keyword.put(opts, :task, server.tasks)
-    end
+    opts
+    |> Keyword.put_new(:task, server.tasks)
+    |> Keyword.put_new(:schema_options, server.schema_options)
   end
 
   defp put_component(%__MODULE__{} = server, key, component) do

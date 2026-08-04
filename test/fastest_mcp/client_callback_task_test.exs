@@ -5,11 +5,25 @@ defmodule FastestMCP.ClientCallbackTaskTest do
 
   alias FastestMCP.Client
   alias FastestMCP.Error
+  alias FastestMCP.SamplingTool
 
   defmodule FakeCallbackServer do
     import Plug.Conn
 
     @session_id "fake-callback-session"
+    @server_fixture %{
+      capabilities: %{
+        "tools" => %{},
+        "tasks" => %{"requests" => %{"tools" => %{"call" => %{}}}}
+      },
+      tools: [
+        %{
+          "name" => "background",
+          "inputSchema" => %{"type" => "object", "additionalProperties" => false},
+          "execution" => %{"taskSupport" => "required"}
+        }
+      ]
+    }
 
     def init(opts), do: opts
 
@@ -37,6 +51,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
     def call(conn, opts) do
       state = Keyword.fetch!(opts, :state)
       test_pid = Keyword.fetch!(opts, :test_pid)
+      fixture = server_fixture()
 
       case {conn.method, conn.request_path} do
         {"POST", "/mcp"} ->
@@ -52,10 +67,44 @@ defmodule FastestMCP.ClientCallbackTaskTest do
                   "id" => id,
                   "result" => %{
                     "protocolVersion" => FastestMCP.Protocol.current_version(),
-                    "capabilities" => %{},
+                    "capabilities" => fixture.capabilities,
                     "serverInfo" => %{"name" => "fake-callback-server", "version" => "1.0.0"}
                   }
                 })
+
+              conn
+              |> put_resp_header("content-type", "application/json")
+              |> put_resp_header("mcp-session-id", @session_id)
+              |> send_resp(200, response)
+
+            %{"method" => "tools/list", "id" => id} ->
+              response =
+                JSON.encode!(%{
+                  "jsonrpc" => "2.0",
+                  "id" => id,
+                  "result" => %{"tools" => fixture.tools}
+                })
+
+              conn
+              |> put_resp_header("content-type", "application/json")
+              |> put_resp_header("mcp-session-id", @session_id)
+              |> send_resp(200, response)
+
+            %{"method" => "tools/call", "id" => id} ->
+              response =
+                JSON.encode!(%{
+                  "jsonrpc" => "2.0",
+                  "id" => id,
+                  "result" => %{"task" => remote_task("working")}
+                })
+
+              conn
+              |> put_resp_header("content-type", "application/json")
+              |> put_resp_header("mcp-session-id", @session_id)
+              |> send_resp(200, response)
+
+            %{"method" => "ping", "id" => id} ->
+              response = JSON.encode!(%{"jsonrpc" => "2.0", "id" => id, "result" => %{}})
 
               conn
               |> put_resp_header("content-type", "application/json")
@@ -103,6 +152,19 @@ defmodule FastestMCP.ClientCallbackTaskTest do
           stream_loop(conn, state)
       end
     end
+
+    def remote_task(status) do
+      %{
+        "taskId" => "http-progress-task",
+        "status" => status,
+        "ttl" => 60_000,
+        "createdAt" => "2026-08-03T00:00:00Z",
+        "lastUpdatedAt" => "2026-08-03T00:00:00Z",
+        "pollInterval" => 100
+      }
+    end
+
+    defp server_fixture, do: @server_fixture
   end
 
   test "client advertises callback task list and cancel capabilities during initialize" do
@@ -111,7 +173,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
 
     client =
       connect_client!(bandit,
-        sampling_handler: fn _messages, _params -> %{"text" => "draft"} end,
+        sampling_handler: fn _messages, _params -> sampling_result("draft") end,
         elicitation_handler: fn _message, _params -> {:accept, %{"ok" => true}} end
       )
 
@@ -130,6 +192,510 @@ defmodule FastestMCP.ClientCallbackTaskTest do
     assert task_capabilities["cancel"] == %{}
     assert get_in(task_capabilities, ["requests", "sampling", "createMessage"]) == %{}
     assert get_in(task_capabilities, ["requests", "elicitation", "create"]) == %{}
+  end
+
+  test "client answers ping and roots/list and emits roots/list_changed on material updates" do
+    state = start_supervised!({Agent, fn -> %{} end})
+    bandit = start_callback_server!(state)
+
+    client =
+      connect_client!(bandit,
+        session_stream: true,
+        roots: [FastestMCP.Root.new("file:///workspace", name: "workspace")]
+      )
+
+    on_exit(fn ->
+      if Client.connected?(client), do: Client.disconnect(client)
+    end)
+
+    assert_receive {:fake_callback_server_post,
+                    %{
+                      "method" => "initialize",
+                      "params" => %{
+                        "capabilities" => %{"roots" => %{"listChanged" => true}}
+                      }
+                    }},
+                   2_000
+
+    FakeCallbackServer.push(state, %{
+      "jsonrpc" => "2.0",
+      "id" => "client-ping",
+      "method" => "ping",
+      "params" => %{}
+    })
+
+    assert_receive {:fake_callback_server_post, %{"id" => "client-ping", "result" => %{}}},
+                   2_000
+
+    FakeCallbackServer.push(state, %{
+      "jsonrpc" => "2.0",
+      "id" => "roots-list",
+      "method" => "roots/list",
+      "params" => %{}
+    })
+
+    assert_receive {:fake_callback_server_post,
+                    %{
+                      "id" => "roots-list",
+                      "result" => %{
+                        "roots" => [
+                          %{"uri" => "file:///workspace", "name" => "workspace"}
+                        ]
+                      }
+                    }},
+                   2_000
+
+    :ok = Client.set_roots(client, [FastestMCP.Root.new("file:///workspace-2")])
+
+    assert_receive {:fake_callback_server_post,
+                    %{"method" => "notifications/roots/list_changed"}},
+                   2_000
+
+    :ok = Client.set_roots(client, [FastestMCP.Root.new("file:///workspace-2")])
+
+    refute_receive {:fake_callback_server_post,
+                    %{"method" => "notifications/roots/list_changed"}},
+                   100
+  end
+
+  test "server callback request ids cannot be reused across methods or overwrite in-flight state" do
+    parent = self()
+    state = start_supervised!({Agent, fn -> %{} end})
+    bandit = start_callback_server!(state)
+
+    client =
+      connect_client!(bandit,
+        session_stream: true,
+        sampling_handler: fn _messages, _params ->
+          send(parent, {:reused_id_sampling_started, self()})
+
+          receive do
+            :release -> sampling_result("original")
+          end
+        end
+      )
+
+    on_exit(fn ->
+      if Client.connected?(client), do: Client.disconnect(client)
+    end)
+
+    wait_for_post("initialize")
+
+    FakeCallbackServer.push(state, %{
+      "jsonrpc" => "2.0",
+      "id" => "server-reused-id",
+      "method" => "sampling/createMessage",
+      "params" => %{
+        "messages" => [
+          %{"role" => "user", "content" => %{"type" => "text", "text" => "hello"}}
+        ],
+        "maxTokens" => 128
+      }
+    })
+
+    assert_receive {:reused_id_sampling_started, callback_pid}, 2_000
+
+    assert %{direction: :server_to_client, method: "sampling/createMessage"} =
+             :sys.get_state(client.pid).callback_requests["server-reused-id"]
+
+    FakeCallbackServer.push(state, %{
+      "jsonrpc" => "2.0",
+      "id" => "server-reused-id",
+      "method" => "ping",
+      "params" => %{}
+    })
+
+    assert_receive {:fake_callback_server_post,
+                    %{
+                      "id" => "server-reused-id",
+                      "error" => %{"code" => -32600}
+                    }},
+                   2_000
+
+    assert :sys.get_state(client.pid).callback_requests["server-reused-id"].pid == callback_pid
+
+    send(callback_pid, :release)
+
+    assert_receive {:fake_callback_server_post,
+                    %{
+                      "id" => "server-reused-id",
+                      "result" => %{
+                        "role" => "assistant",
+                        "model" => "test-model",
+                        "content" => %{"type" => "text", "text" => "original"}
+                      }
+                    }},
+                   2_000
+  end
+
+  test "server callback request-id history is bounded and terminates after the overload reply" do
+    state = start_supervised!({Agent, fn -> %{} end})
+    bandit = start_callback_server!(state)
+
+    client =
+      connect_client!(bandit,
+        session_stream: true,
+        max_callback_request_ids: 1
+      )
+
+    on_exit(fn ->
+      if Client.connected?(client), do: Client.disconnect(client)
+    end)
+
+    wait_for_post("initialize")
+
+    FakeCallbackServer.push(state, %{
+      "jsonrpc" => "2.0",
+      "id" => "callback-capacity-1",
+      "method" => "ping",
+      "params" => %{}
+    })
+
+    assert_receive {:fake_callback_server_post,
+                    %{"id" => "callback-capacity-1", "result" => %{}}},
+                   2_000
+
+    FakeCallbackServer.push(state, %{
+      "jsonrpc" => "2.0",
+      "id" => "callback-capacity-2",
+      "method" => "ping",
+      "params" => %{}
+    })
+
+    assert_receive {:fake_callback_server_post,
+                    %{
+                      "id" => "callback-capacity-2",
+                      "error" => %{
+                        "code" => -32002,
+                        "data" => %{
+                          "fastestmcp" => %{"code" => "overloaded"},
+                          "resource" => "request_ids"
+                        }
+                      }
+                    }},
+                   2_000
+
+    assert_eventually(fn -> not Client.connected?(client) end)
+  end
+
+  test "HTTP task responses retain progress ownership until terminal status" do
+    parent = self()
+    state = start_supervised!({Agent, fn -> %{} end})
+    bandit = start_callback_server!(state)
+
+    client =
+      connect_client!(bandit,
+        session_stream: true,
+        progress_handler: fn params -> send(parent, {:http_task_progress, params}) end,
+        notification_handler: fn message -> send(parent, {:http_task_notification, message}) end
+      )
+
+    on_exit(fn ->
+      if Client.connected?(client), do: Client.disconnect(client)
+    end)
+
+    wait_for_post("initialize")
+
+    assert %FastestMCP.Client.Task{task_id: "http-progress-task"} =
+             Client.call_tool(client, "background", %{},
+               task: true,
+               progress_token: "http-retained-progress"
+             )
+
+    FakeCallbackServer.push(state, %{
+      "jsonrpc" => "2.0",
+      "method" => "notifications/progress",
+      "params" => %{
+        "progressToken" => "http-retained-progress",
+        "progress" => 1,
+        "total" => 2
+      }
+    })
+
+    assert_receive {:http_task_progress,
+                    %{
+                      "progressToken" => "http-retained-progress",
+                      "progress" => 1,
+                      "total" => 2
+                    }},
+                   2_000
+
+    error =
+      assert_raise Error, fn ->
+        Client.request_async(client, "ping", %{
+          "_meta" => %{"progressToken" => "http-retained-progress"}
+        })
+      end
+
+    assert error.code == :invalid_params
+
+    FakeCallbackServer.push(state, %{
+      "jsonrpc" => "2.0",
+      "method" => "notifications/tasks/status",
+      "params" => FakeCallbackServer.remote_task("completed")
+    })
+
+    assert_receive {:http_task_notification,
+                    %{
+                      "method" => "notifications/tasks/status",
+                      "params" => %{"taskId" => "http-progress-task", "status" => "completed"}
+                    }},
+                   2_000
+
+    request =
+      Client.request_async(client, "ping", %{
+        "_meta" => %{"progressToken" => "http-retained-progress"}
+      })
+
+    assert %{} = Client.await(request)
+  end
+
+  test "form elicitation applies property defaults while preserving explicit values" do
+    state = start_supervised!({Agent, fn -> %{} end})
+    bandit = start_callback_server!(state)
+
+    client =
+      connect_client!(bandit,
+        session_stream: true,
+        elicitation_handler: fn _message, _params ->
+          {:accept, %{"environment" => "production"}}
+        end
+      )
+
+    on_exit(fn ->
+      if Client.connected?(client), do: Client.disconnect(client)
+    end)
+
+    wait_for_post("initialize")
+
+    FakeCallbackServer.push(state, %{
+      "jsonrpc" => "2.0",
+      "id" => "form-defaults",
+      "method" => "elicitation/create",
+      "params" => %{
+        "mode" => "form",
+        "message" => "Choose deployment settings",
+        "requestedSchema" => %{
+          "type" => "object",
+          "properties" => %{
+            "environment" => %{"type" => "string", "default" => "staging"},
+            "replicas" => %{"type" => "integer", "default" => 3}
+          },
+          "required" => ["environment", "replicas"]
+        }
+      }
+    })
+
+    assert_receive {:fake_callback_server_post,
+                    %{
+                      "id" => "form-defaults",
+                      "result" => %{
+                        "action" => "accept",
+                        "content" => %{"environment" => "production", "replicas" => 3}
+                      }
+                    }},
+                   2_000
+  end
+
+  test "URL elicitation requires consent and completion is delivered exactly once" do
+    parent = self()
+    state = start_supervised!({Agent, fn -> %{} end})
+    bandit = start_callback_server!(state)
+
+    client =
+      connect_client!(bandit,
+        session_stream: true,
+        url_elicitation_handler: fn request, _context ->
+          send(parent, {:url_elicitation, request})
+          :accept
+        end,
+        elicitation_complete_handler: fn request ->
+          send(parent, {:url_elicitation_complete, request.elicitation_id})
+        end
+      )
+
+    on_exit(fn ->
+      if Client.connected?(client), do: Client.disconnect(client)
+    end)
+
+    assert_receive {:fake_callback_server_post,
+                    %{
+                      "method" => "initialize",
+                      "params" => %{
+                        "capabilities" => %{"elicitation" => %{"url" => %{}}}
+                      }
+                    }},
+                   2_000
+
+    request = %{
+      "jsonrpc" => "2.0",
+      "id" => "url-elicit",
+      "method" => "elicitation/create",
+      "params" => %{
+        "mode" => "url",
+        "elicitationId" => "url-1",
+        "url" => "https://accounts.example.test/connect",
+        "message" => "Connect your account"
+      }
+    }
+
+    FakeCallbackServer.push(state, request)
+
+    assert_receive {:url_elicitation,
+                    %FastestMCP.Client.URLElicitation{
+                      elicitation_id: "url-1",
+                      origin: "https://accounts.example.test"
+                    }},
+                   2_000
+
+    assert_receive {:fake_callback_server_post,
+                    %{"id" => "url-elicit", "result" => %{"action" => "accept"}}},
+                   2_000
+
+    completion = %{
+      "jsonrpc" => "2.0",
+      "method" => "notifications/elicitation/complete",
+      "params" => %{"elicitationId" => "url-1"}
+    }
+
+    FakeCallbackServer.push(state, completion)
+    assert_receive {:url_elicitation_complete, "url-1"}, 2_000
+
+    FakeCallbackServer.push(state, completion)
+    refute_receive {:url_elicitation_complete, "url-1"}, 100
+
+    assert {:error, %Error{code: :bad_request}} =
+             FastestMCP.Client.URLElicitation.parse(%{
+               "mode" => "url",
+               "elicitationId" => "bad-scheme",
+               "url" => "file:///tmp/secret",
+               "message" => "Open a local file"
+             })
+
+    :ok =
+      Client.set_url_elicitation_handler(client, fn _request, _context ->
+        {:accept, %{"must" => "not be returned"}}
+      end)
+
+    FakeCallbackServer.push(
+      state,
+      request
+      |> put_in(["id"], "url-content")
+      |> put_in(["params", "elicitationId"], "url-2")
+    )
+
+    assert_receive {:fake_callback_server_post,
+                    %{"id" => "url-content", "error" => %{"code" => -32603}}},
+                   2_000
+  end
+
+  test "callback context accepts advisory totals, enforces monotonic progress, and suppresses a cancelled response" do
+    parent = self()
+    state = start_supervised!({Agent, fn -> %{} end})
+    bandit = start_callback_server!(state)
+
+    client =
+      connect_client!(bandit,
+        session_stream: true,
+        sampling_tools: [{fn arguments -> arguments end, [name: "lookup"]}],
+        sampling_context: %{source: "test"},
+        sampling_handler: fn _messages, _params, context ->
+          :ok = FastestMCP.Client.CallbackContext.report_progress(context, 1, total: 2)
+          :ok = FastestMCP.Client.CallbackContext.report_progress(context, 1.5, total: 3)
+          :ok = FastestMCP.Client.CallbackContext.report_progress(context, 3)
+
+          try do
+            FastestMCP.Client.CallbackContext.report_progress(context, 2)
+          rescue
+            error in Error -> send(parent, {:callback_progress_error, error})
+          end
+
+          send(parent, {:callback_waiting, context, self()})
+          Process.sleep(:infinity)
+        end
+      )
+
+    on_exit(fn ->
+      if Client.connected?(client), do: Client.disconnect(client)
+    end)
+
+    wait_for_post("initialize")
+
+    FakeCallbackServer.push(state, %{
+      "jsonrpc" => "2.0",
+      "id" => "cancel-sampling",
+      "method" => "sampling/createMessage",
+      "params" => %{
+        "messages" => [
+          %{"role" => "user", "content" => %{"type" => "text", "text" => "hello"}}
+        ],
+        "maxTokens" => 128,
+        "_meta" => %{"progressToken" => "callback-progress"}
+      }
+    })
+
+    assert_receive {:fake_callback_server_post,
+                    %{
+                      "method" => "notifications/progress",
+                      "params" => %{
+                        "progressToken" => "callback-progress",
+                        "progress" => 1,
+                        "total" => 2
+                      }
+                    }},
+                   2_000
+
+    assert_receive {:fake_callback_server_post,
+                    %{
+                      "method" => "notifications/progress",
+                      "params" => %{
+                        "progressToken" => "callback-progress",
+                        "progress" => 1.5,
+                        "total" => 3
+                      }
+                    }},
+                   2_000
+
+    assert_receive {:fake_callback_server_post,
+                    %{
+                      "method" => "notifications/progress",
+                      "params" => %{
+                        "progressToken" => "callback-progress",
+                        "progress" => 3
+                      }
+                    }},
+                   2_000
+
+    assert_receive {:callback_progress_error,
+                    %Error{
+                      code: :invalid_params,
+                      details: %{reason: :non_increasing_progress}
+                    }},
+                   2_000
+
+    assert_receive {:callback_waiting,
+                    %FastestMCP.Client.CallbackContext{
+                      request_id: "cancel-sampling",
+                      method: "sampling/createMessage",
+                      progress_token: "callback-progress",
+                      sampling_tools: [%SamplingTool{name: "lookup"}],
+                      sampling_context: %{source: "test"},
+                      cancelled?: false
+                    } = context, callback_pid},
+                   2_000
+
+    FakeCallbackServer.push(state, %{
+      "jsonrpc" => "2.0",
+      "method" => "notifications/cancelled",
+      "params" => %{"requestId" => "cancel-sampling", "reason" => "no longer needed"}
+    })
+
+    assert_eventually(fn ->
+      FastestMCP.Client.CallbackContext.cancelled?(context) and
+        not Process.alive?(callback_pid)
+    end)
+
+    refute_receive {:fake_callback_server_post, %{"id" => "cancel-sampling"}}, 200
   end
 
   test "unsupported client callbacks use method-not-found without conflating missing data" do
@@ -186,7 +752,8 @@ defmodule FastestMCP.ClientCallbackTaskTest do
       "id" => "sync-sampling-error",
       "method" => "sampling/createMessage",
       "params" => %{
-        "messages" => [%{"role" => "user", "content" => %{"type" => "text", "text" => "hello"}}]
+        "messages" => [%{"role" => "user", "content" => %{"type" => "text", "text" => "hello"}}],
+        "maxTokens" => 128
       }
     })
 
@@ -229,7 +796,11 @@ defmodule FastestMCP.ClientCallbackTaskTest do
       "method" => "elicitation/create",
       "params" => %{
         "message" => "Deploy to production?",
-        "requestedSchema" => %{"type" => "boolean"}
+        "requestedSchema" => %{
+          "type" => "object",
+          "properties" => %{"approved" => %{"type" => "boolean"}},
+          "required" => ["approved"]
+        }
       }
     })
 
@@ -256,7 +827,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
         sampling_handler: fn _messages, _params ->
           Process.sleep(150)
           send(parent, :sampling_handler_completed)
-          %{"text" => "hello from client"}
+          sampling_result("hello from client")
         end
       )
 
@@ -272,6 +843,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
       "method" => "sampling/createMessage",
       "params" => %{
         "messages" => [%{"role" => "user", "content" => %{"type" => "text", "text" => "hello"}}],
+        "maxTokens" => 128,
         "task" => %{}
       }
     })
@@ -326,7 +898,14 @@ defmodule FastestMCP.ClientCallbackTaskTest do
     })
 
     assert_receive {:fake_callback_server_post,
-                    %{"id" => "sampling-result", "result" => %{"text" => "hello from client"}}},
+                    %{
+                      "id" => "sampling-result",
+                      "result" => %{
+                        "role" => "assistant",
+                        "model" => "test-model",
+                        "content" => %{"type" => "text", "text" => "hello from client"}
+                      }
+                    }},
                    2_000
   end
 
@@ -342,7 +921,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
           send(parent, {:sampling_handler_waiting, self()})
 
           receive do
-            :release_sampling -> %{"text" => "hello from client"}
+            :release_sampling -> sampling_result("hello from client")
           end
         end
       )
@@ -359,6 +938,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
       "method" => "sampling/createMessage",
       "params" => %{
         "messages" => [%{"role" => "user", "content" => %{"type" => "text", "text" => "hello"}}],
+        "maxTokens" => 128,
         "task" => %{}
       }
     })
@@ -385,7 +965,12 @@ defmodule FastestMCP.ClientCallbackTaskTest do
                     %{
                       "id" => "sampling-blocking-result",
                       "result" => %{
-                        "text" => "hello from client",
+                        "role" => "assistant",
+                        "model" => "test-model",
+                        "content" => %{
+                          "type" => "text",
+                          "text" => "hello from client"
+                        },
                         "_meta" => %{
                           "io.modelcontextprotocol/related-task" => %{"taskId" => ^task_id}
                         }
@@ -428,7 +1013,11 @@ defmodule FastestMCP.ClientCallbackTaskTest do
       "method" => "elicitation/create",
       "params" => %{
         "message" => "Deploy to production?",
-        "requestedSchema" => %{"type" => "boolean"},
+        "requestedSchema" => %{
+          "type" => "object",
+          "properties" => %{"approved" => %{"type" => "boolean"}},
+          "required" => ["approved"]
+        },
         "task" => %{}
       }
     })
@@ -468,7 +1057,11 @@ defmodule FastestMCP.ClientCallbackTaskTest do
     assert Enum.any?(tasks, &(&1["taskId"] == task_id and &1["status"] == "working"))
 
     assert_receive {:elicitation_handler_completed, "Deploy to production?",
-                    %{"type" => "boolean"}},
+                    %{
+                      "type" => "object",
+                      "properties" => %{"approved" => %{"type" => "boolean"}},
+                      "required" => ["approved"]
+                    }},
                    2_000
 
     assert_receive {:fake_callback_server_post,
@@ -522,7 +1115,11 @@ defmodule FastestMCP.ClientCallbackTaskTest do
       "method" => "elicitation/create",
       "params" => %{
         "message" => "Deploy to production?",
-        "requestedSchema" => %{"type" => "boolean"},
+        "requestedSchema" => %{
+          "type" => "object",
+          "properties" => %{"approved" => %{"type" => "boolean"}},
+          "required" => ["approved"]
+        },
         "task" => %{}
       }
     })
@@ -590,6 +1187,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
       "method" => "sampling/createMessage",
       "params" => %{
         "messages" => [%{"role" => "user", "content" => %{"type" => "text", "text" => "hello"}}],
+        "maxTokens" => 128,
         "task" => %{}
       }
     })
@@ -693,6 +1291,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
       "method" => "sampling/createMessage",
       "params" => %{
         "messages" => [%{"role" => "user", "content" => %{"type" => "text", "text" => "hello"}}],
+        "maxTokens" => 128,
         "task" => %{}
       }
     })
@@ -740,13 +1339,13 @@ defmodule FastestMCP.ClientCallbackTaskTest do
     client =
       connect_client!(bandit,
         session_stream: true,
-        sampling_handler: fn _messages, _params ->
-          send(parent, :cancel_sampling_started)
+        sampling_handler: fn _messages, _params, context ->
+          send(parent, {:cancel_sampling_started, self(), context})
 
           receive do
-            :release -> %{"text" => "released"}
+            :release -> sampling_result("released")
           after
-            5_000 -> %{"text" => "timed out"}
+            5_000 -> sampling_result("timed out")
           end
         end
       )
@@ -763,6 +1362,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
       "method" => "sampling/createMessage",
       "params" => %{
         "messages" => [%{"role" => "user", "content" => %{"type" => "text", "text" => "cancel"}}],
+        "maxTokens" => 128,
         "task" => %{}
       }
     })
@@ -772,7 +1372,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
                    2_000
 
     task_id = task["taskId"]
-    assert_receive :cancel_sampling_started, 2_000
+    assert_receive {:cancel_sampling_started, callback_pid, context}, 2_000
 
     FakeCallbackServer.push(state, %{
       "jsonrpc" => "2.0",
@@ -786,6 +1386,9 @@ defmodule FastestMCP.ClientCallbackTaskTest do
 
     assert cancelled["taskId"] == task_id
     assert cancelled["status"] == "cancelled"
+
+    assert FastestMCP.Client.CallbackContext.cancelled?(context)
+    refute Process.alive?(callback_pid)
 
     assert_receive {:fake_callback_server_post,
                     %{
@@ -807,7 +1410,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
           send(parent, {:cancel_waiting, self()})
 
           receive do
-            :release -> %{"text" => "released"}
+            :release -> sampling_result("released")
           end
         end
       )
@@ -824,6 +1427,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
       "method" => "sampling/createMessage",
       "params" => %{
         "messages" => [%{"role" => "user", "content" => %{"type" => "text", "text" => "cancel"}}],
+        "maxTokens" => 128,
         "task" => %{}
       }
     })
@@ -890,4 +1494,25 @@ defmodule FastestMCP.ClientCallbackTaskTest do
   defp wait_for_post(expected_method) do
     assert_receive {:fake_callback_server_post, %{"method" => ^expected_method}}, 2_000
   end
+
+  defp sampling_result(text) do
+    %{
+      "role" => "assistant",
+      "model" => "test-model",
+      "content" => %{"type" => "text", "text" => text}
+    }
+  end
+
+  defp assert_eventually(fun, attempts \\ 50)
+
+  defp assert_eventually(fun, attempts) when attempts > 0 do
+    if fun.() do
+      :ok
+    else
+      Process.sleep(20)
+      assert_eventually(fun, attempts - 1)
+    end
+  end
+
+  defp assert_eventually(fun, 0), do: assert(fun.())
 end

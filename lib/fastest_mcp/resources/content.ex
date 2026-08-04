@@ -18,9 +18,10 @@ defmodule FastestMCP.Resources.Content do
   alias FastestMCP.JSONValue
   alias FastestMCP.MIME
 
-  defstruct content: nil, mime_type: nil, meta: nil
+  defstruct uri: nil, content: nil, mime_type: nil, meta: nil
 
   @type t :: %__MODULE__{
+          uri: String.t() | nil,
           content: String.t() | binary(),
           mime_type: String.t(),
           meta: map() | nil
@@ -31,6 +32,7 @@ defmodule FastestMCP.Resources.Content do
     {normalized_content, inferred_mime_type} = normalize_content(content, opts)
 
     %__MODULE__{
+      uri: normalize_optional_uri(Keyword.get(opts, :uri)),
       content: normalized_content,
       mime_type: Keyword.get(opts, :mime_type, inferred_mime_type),
       meta: normalize_optional_map(Keyword.get(opts, :meta))
@@ -72,6 +74,13 @@ defmodule FastestMCP.Resources.Content do
 
   defp normalize_optional_map(other) do
     raise ArgumentError, "resource content meta must be a map, got #{inspect(other)}"
+  end
+
+  defp normalize_optional_uri(nil), do: nil
+  defp normalize_optional_uri(uri) when is_binary(uri) and uri != "", do: uri
+
+  defp normalize_optional_uri(other) do
+    raise ArgumentError, "resource content uri must be a non-empty string, got #{inspect(other)}"
   end
 
   defp binary_mime_type?(mime_type), do: MIME.binary?(mime_type)

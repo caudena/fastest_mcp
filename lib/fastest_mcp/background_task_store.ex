@@ -23,6 +23,7 @@ defmodule FastestMCP.BackgroundTaskStore do
   alias FastestMCP.Error
   alias FastestMCP.EventBus
   alias FastestMCP.Operation
+  alias FastestMCP.Session
   alias FastestMCP.TaskBackend.Memory, as: MemoryTaskBackend
   alias FastestMCP.TaskId
   alias FastestMCP.TaskOwner
@@ -98,6 +99,7 @@ defmodule FastestMCP.BackgroundTaskStore do
       state = %{
         server_name: Keyword.fetch!(opts, :server_name),
         event_bus: Keyword.get(opts, :event_bus, EventBus),
+        relay_task_supervisor: Keyword.get(opts, :relay_task_supervisor),
         backend: backend,
         mask_error_details: Keyword.get(opts, :mask_error_details, false),
         task_monitors: %{},
@@ -105,7 +107,8 @@ defmodule FastestMCP.BackgroundTaskStore do
         waiters: %{},
         result_waiters: %{},
         interaction_waiters: %{},
-        relay_requests: %{}
+        relay_requests: %{},
+        session_task_activity: %{}
       }
 
       with {:ok, _expired_ids} <-
@@ -193,10 +196,13 @@ defmodule FastestMCP.BackgroundTaskStore do
                 submitted_at: submitted_at
               }
 
-              next_state = %{
-                state
-                | task_monitors: put_task_monitor(state.task_monitors, task_id, pid, monitor_ref)
-              }
+              next_state =
+                %{
+                  state
+                  | task_monitors:
+                      put_task_monitor(state.task_monitors, task_id, pid, monitor_ref)
+                }
+                |> hold_session_for_task(task, operation.context)
 
               emit_status_notification(next_state, task, "working", "Task submitted")
 
@@ -486,7 +492,8 @@ defmodule FastestMCP.BackgroundTaskStore do
                 |> Map.update!(:task_monitors, &drop_task_monitor(&1, task.monitor_ref))
 
               emit_status_notification(next_state, cancelled, "cancelled", "Task cancelled")
-              {:reply, {:ok, public_task(cancelled)}, next_state}
+
+              {:reply, {:ok, public_task(cancelled)}, release_session_task(next_state, task_id)}
 
             {:error, reason} ->
               {:reply, {:error, reason}, fail_task_orchestration(state, task_id, reason)}
@@ -608,14 +615,12 @@ defmodule FastestMCP.BackgroundTaskStore do
     end
   end
 
-  def handle_info({:client_bridge_response, relay_request_id, response}, state) do
-    case Map.pop(state.relay_requests, relay_request_id) do
+  def handle_info({relay_request_id, response}, state) when is_reference(relay_request_id) do
+    case pop_relay_request(state, relay_request_id, terminate?: false) do
       {nil, _relay_requests} ->
         {:noreply, state}
 
-      {task_id, relay_requests} ->
-        state = %{state | relay_requests: relay_requests}
-
+      {%{task_id: task_id}, state} ->
         case {Map.get(state.interaction_waiters, task_id), fetch_task(state, task_id, [])} do
           {%{relay_request_id: ^relay_request_id, type: :elicitation} = waiter, {:ok, task}} ->
             resolved =
@@ -652,37 +657,63 @@ defmodule FastestMCP.BackgroundTaskStore do
   end
 
   def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
-    case Map.pop(state.task_monitors, ref) do
-      {nil, _task_monitors} ->
-        handle_waiter_down(ref, state)
+    case Map.fetch(state.relay_requests, ref) do
+      {:ok, %{task_id: task_id}} ->
+        {_relay, state} = pop_relay_request(state, ref, demonitor?: false, terminate?: false)
+        relay_error = relay_error({:worker_exit, reason})
 
-      {{task_id, _task_pid}, task_monitors} ->
-        state = %{state | task_monitors: task_monitors}
+        case {Map.get(state.interaction_waiters, task_id), fetch_task(state, task_id, [])} do
+          {%{relay_request_id: ^ref}, {:ok, task}} ->
+            finish_interaction_resolution(state, task, task_id, {:error, relay_error})
 
-        case fetch_task(state, task_id, []) do
-          {:ok, %{status: status}} when status in [:completed, :failed, :cancelled] ->
+          {_waiter, {:error, fetch_reason}} ->
+            {:noreply, fail_task_orchestration(state, task_id, fetch_reason)}
+
+          _other ->
             {:noreply, state}
+        end
 
-          {:ok, task} ->
-            error =
-              %Error{
-                code: :component_crash,
-                message:
-                  "background task #{inspect(task_id)} exited: #{Exception.format_exit(reason)}",
-                exposure: %{
-                  mask_error_details: true,
-                  component_type: task.component_type,
-                  identifier: task.target
-                }
-              }
+      :error ->
+        case Map.pop(state.task_monitors, ref) do
+          {nil, _task_monitors} ->
+            handle_waiter_down(ref, state)
 
-            state = drop_interaction_waiter(state, task_id, {:error, error})
+          {{task_id, _task_pid}, task_monitors} ->
+            state = %{state | task_monitors: task_monitors}
 
-            {:noreply,
-             complete_task(state, task_id, :failed, nil, error, :request_error, error.message)}
+            case fetch_task(state, task_id, []) do
+              {:ok, %{status: status}} when status in [:completed, :failed, :cancelled] ->
+                {:noreply, release_session_task(state, task_id)}
 
-          {:error, reason} ->
-            {:noreply, fail_task_orchestration(state, task_id, reason)}
+              {:ok, task} ->
+                error =
+                  %Error{
+                    code: :component_crash,
+                    message:
+                      "background task #{inspect(task_id)} exited: #{Exception.format_exit(reason)}",
+                    exposure: %{
+                      mask_error_details: true,
+                      component_type: task.component_type,
+                      identifier: task.target
+                    }
+                  }
+
+                state = drop_interaction_waiter(state, task_id, {:error, error})
+
+                {:noreply,
+                 complete_task(
+                   state,
+                   task_id,
+                   :failed,
+                   nil,
+                   error,
+                   :request_error,
+                   error.message
+                 )}
+
+              {:error, fetch_reason} ->
+                {:noreply, fail_task_orchestration(state, task_id, fetch_reason)}
+            end
         end
     end
   end
@@ -792,14 +823,14 @@ defmodule FastestMCP.BackgroundTaskStore do
               |> Map.update!(:task_monitors, &drop_task_monitor(&1, task.monitor_ref))
 
             emit_status_notification(next_state, updated_task, nil, nil)
-            next_state
+            release_session_task(next_state, task_id)
 
           {:error, reason} ->
             fail_task_orchestration(state, task_id, reason)
         end
 
       {:error, :not_found} ->
-        state
+        release_session_task(state, task_id)
 
       {:error, reason} ->
         fail_task_orchestration(state, task_id, reason)
@@ -905,6 +936,7 @@ defmodule FastestMCP.BackgroundTaskStore do
             |> drop_interaction_waiter(task_id, {:error, :not_found})
             |> drop_task_monitor_for(task_id)
             |> drop_relay_requests_for(task_id)
+            |> release_session_task(task_id)
           end)
 
         {:ok, next_state}
@@ -1278,32 +1310,34 @@ defmodule FastestMCP.BackgroundTaskStore do
   defp maybe_start_interaction_relay(state, %{id: task_id} = task) do
     case {Map.get(state.interaction_waiters, task_id), first_bridge_waiter(state, task_id)} do
       {%{relay_request_id: nil} = waiter, %{bridge: bridge, ref: bridge_waiter_ref}}
-      when is_map(bridge) and bridge.stream_pid != nil and bridge.client_request_store != nil ->
-        relay_request_id = "srv-" <> Integer.to_string(System.unique_integer([:positive]))
+      when is_map(bridge) and is_binary(bridge.session_id) ->
+        params =
+          TaskWire.attach_related_task_meta(waiter.relay_params, task_id, %{
+            status: "input_required",
+            statusMessage: TaskWire.task(task).statusMessage,
+            elicitation: Map.get(TaskWire.task(task), :elicitation)
+          })
 
-        message =
-          %{
-            "jsonrpc" => "2.0",
-            "id" => relay_request_id,
-            "method" => waiter.relay_method,
-            "params" =>
-              TaskWire.attach_related_task_meta(waiter.relay_params, task_id, %{
-                status: "input_required",
-                statusMessage: TaskWire.task(task).statusMessage,
-                elicitation: Map.get(TaskWire.task(task), :elicitation)
-              })
-          }
+        case start_relay_request(state, waiter.relay_method, params, bridge, task_id) do
+          {:ok, relay_request_id, relay, state} ->
+            state
+            |> put_in([:interaction_waiters, task_id, :relay_request_id], relay_request_id)
+            |> put_in([:interaction_waiters, task_id, :relay_waiter_ref], bridge_waiter_ref)
+            |> put_in([:relay_requests, relay_request_id], relay)
 
-        send(
-          bridge.stream_pid,
-          {:client_bridge_request, self(), relay_request_id, message, bridge.client_request_store,
-           bridge.session_id, interaction_timeout(state, task_id)}
-        )
+          {:error, reason, state} ->
+            relay_request_id = make_ref()
 
-        state
-        |> put_in([:interaction_waiters, task_id, :relay_request_id], relay_request_id)
-        |> put_in([:interaction_waiters, task_id, :relay_waiter_ref], bridge_waiter_ref)
-        |> put_in([:relay_requests, relay_request_id], task_id)
+            send(self(), {relay_request_id, {:error, relay_error(reason)}})
+
+            state
+            |> put_in([:interaction_waiters, task_id, :relay_request_id], relay_request_id)
+            |> put_in([:interaction_waiters, task_id, :relay_waiter_ref], bridge_waiter_ref)
+            |> put_in([:relay_requests, relay_request_id], %{
+              task_id: task_id,
+              worker_pid: nil
+            })
+        end
 
       _other ->
         state
@@ -1314,8 +1348,8 @@ defmodule FastestMCP.BackgroundTaskStore do
     state.result_waiters
     |> Map.get(task_id, [])
     |> Enum.find(fn
-      %{bridge: %{stream_pid: pid, client_request_store: store}}
-      when is_pid(pid) and is_pid(store) ->
+      %{bridge: %{session_id: session_id, sink_ref: sink_ref}}
+      when is_binary(session_id) and is_reference(sink_ref) ->
         true
 
       _other ->
@@ -1327,14 +1361,49 @@ defmodule FastestMCP.BackgroundTaskStore do
     metadata = opts[:request_metadata] || %{}
 
     %{
-      stream_pid: Map.get(metadata, :client_stream_pid, Map.get(metadata, "client_stream_pid")),
-      client_request_store:
-        Map.get(
-          metadata,
-          :client_request_store,
-          Map.get(metadata, "client_request_store")
-        ),
+      sink_ref: Map.get(metadata, :session_sink_ref, Map.get(metadata, "session_sink_ref")),
+      origin_request_id:
+        Map.get(metadata, :jsonrpc_request_id, Map.get(metadata, "jsonrpc_request_id")),
       session_id: opts[:session_id] && to_string(opts[:session_id])
+    }
+  end
+
+  defp start_relay_request(state, method, params, bridge, task_id) do
+    case state.relay_task_supervisor do
+      supervisor when is_pid(supervisor) ->
+        try do
+          task =
+            Task.Supervisor.async_nolink(supervisor, fn ->
+              state.server_name
+              |> Session.request_peer(bridge.session_id, method, params,
+                sink_ref: bridge.sink_ref,
+                origin_request_id: bridge.origin_request_id,
+                protocol_related_task_id: task_id,
+                timeout_ms: interaction_timeout(state, task_id)
+              )
+              |> normalize_relay_response()
+            end)
+
+          {:ok, task.ref, %{task_id: task_id, worker_pid: task.pid}, state}
+        catch
+          :exit, reason -> {:error, {:relay_start_failed, reason}, state}
+        end
+
+      _other ->
+        {:error, :relay_task_supervisor_unavailable, state}
+    end
+  end
+
+  defp normalize_relay_response({:ok, %{} = result}), do: {:ok, result}
+  defp normalize_relay_response({:error, %Error{} = error}), do: {:error, error}
+  defp normalize_relay_response({:error, reason}), do: {:error, relay_error(reason)}
+  defp normalize_relay_response(other), do: {:error, relay_error({:invalid_response, other})}
+
+  defp relay_error(reason) do
+    %Error{
+      code: :internal_error,
+      message: "client interaction relay failed",
+      details: %{reason: inspect(reason)}
     }
   end
 
@@ -1346,8 +1415,27 @@ defmodule FastestMCP.BackgroundTaskStore do
 
   defp maybe_drop_relay_request(state, nil), do: state
 
-  defp maybe_drop_relay_request(state, relay_request_id),
-    do: update_in(state.relay_requests, &Map.delete(&1, relay_request_id))
+  defp maybe_drop_relay_request(state, relay_request_id) do
+    {_relay, state} = pop_relay_request(state, relay_request_id)
+    state
+  end
+
+  defp pop_relay_request(state, relay_request_id, opts \\ []) do
+    case Map.pop(state.relay_requests, relay_request_id) do
+      {nil, relay_requests} ->
+        {nil, %{state | relay_requests: relay_requests}}
+
+      {relay, relay_requests} ->
+        if Keyword.get(opts, :demonitor?, true), do: Process.demonitor(relay_request_id, [:flush])
+
+        if Keyword.get(opts, :terminate?, true) and is_pid(relay.worker_pid) and
+             Process.alive?(relay.worker_pid) do
+          Process.exit(relay.worker_pid, :shutdown)
+        end
+
+        {relay, %{state | relay_requests: relay_requests}}
+    end
+  end
 
   defp drop_task_monitor_for(state, task_id) do
     monitor =
@@ -1368,6 +1456,7 @@ defmodule FastestMCP.BackgroundTaskStore do
     |> drop_interaction_waiter(task_id, {:error, reason})
     |> drop_waiter_monitors_for(task_id)
     |> drop_relay_requests_for(task_id)
+    |> release_session_task(task_id)
   end
 
   defp fail_all_task_orchestration(state, reason) do
@@ -1390,9 +1479,10 @@ defmodule FastestMCP.BackgroundTaskStore do
       Map.keys(state.waiters),
       Map.keys(state.result_waiters),
       Map.keys(state.interaction_waiters),
+      Map.keys(state.session_task_activity),
       monitor_task_ids,
       waiter_monitor_task_ids,
-      Map.values(state.relay_requests)
+      Enum.map(state.relay_requests, fn {_ref, relay} -> relay.task_id end)
     ]
     |> List.flatten()
     |> Enum.uniq()
@@ -1431,12 +1521,77 @@ defmodule FastestMCP.BackgroundTaskStore do
   end
 
   defp drop_relay_requests_for(state, task_id) do
-    relay_requests =
-      state.relay_requests
-      |> Enum.reject(fn {_request_id, tracked_task_id} -> tracked_task_id == task_id end)
-      |> Map.new()
+    state.relay_requests
+    |> Enum.reduce(state, fn
+      {relay_request_id, %{task_id: ^task_id}}, acc ->
+        maybe_drop_relay_request(acc, relay_request_id)
 
-    %{state | relay_requests: relay_requests}
+      {_relay_request_id, _relay}, acc ->
+        acc
+    end)
+  end
+
+  defp hold_session_for_task(state, task, context) do
+    session_id = task.session_id
+    request_id = protocol_request_id(context)
+    progress_token = request_metadata_value(context, :progress_token)
+
+    if is_binary(session_id) and session_id != "" and
+         (is_binary(request_id) or is_integer(request_id)) do
+      activity = %{
+        session_id: session_id,
+        request_id: request_id,
+        progress_token: progress_token
+      }
+
+      case Session.receiver_task_started(
+             state.server_name,
+             session_id,
+             task.id,
+             request_id,
+             progress_token
+           ) do
+        :ok ->
+          %{
+            state
+            | session_task_activity: Map.put(state.session_task_activity, task.id, activity)
+          }
+
+        {:error, :already_started} ->
+          %{
+            state
+            | session_task_activity: Map.put(state.session_task_activity, task.id, activity)
+          }
+
+        _session_unavailable ->
+          state
+      end
+    else
+      state
+    end
+  end
+
+  defp release_session_task(state, task_id) do
+    case Map.pop(state.session_task_activity, task_id) do
+      {nil, activity} ->
+        %{state | session_task_activity: activity}
+
+      {%{session_id: session_id}, activity} ->
+        _ = Session.receiver_task_finished(state.server_name, session_id, task_id)
+        %{state | session_task_activity: activity}
+    end
+  end
+
+  defp protocol_request_id(context) do
+    request_metadata_value(context, :jsonrpc_request_id) || context.request_id
+  end
+
+  defp request_metadata_value(context, key) do
+    Map.get(
+      context.request_metadata,
+      key,
+      Map.get(context.request_metadata, Atom.to_string(key))
+    )
   end
 
   defp task_metadata(context) do

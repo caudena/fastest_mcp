@@ -27,23 +27,14 @@ defmodule FastestMCP.Runtime.SessionLifecycleTest do
     assert {:error, {:invalid_transition, :new}} =
              Session.mark_initialized(server_name, session_id)
 
-    assert {:error, {:unsupported_protocol_version, "2025-03-26"}} =
-             Session.begin_initialization(
-               server_name,
-               session_id,
-               "2025-03-26",
-               %{},
-               %{"name" => "client", "version" => "1"}
-             )
-
-    capabilities = %{"roots" => %{"listChanged" => true}}
+    capabilities = %{}
     client_info = %{"name" => "client", "version" => "1"}
 
     assert :ok =
              Session.begin_initialization(
                server_name,
                session_id,
-               "2025-11-25",
+               "2025-03-26",
                capabilities,
                client_info
              )

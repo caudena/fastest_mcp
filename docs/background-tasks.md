@@ -21,6 +21,13 @@ MCP `2025-11-25` standardizes task augmentation for `tools/call` together with:
 - `tasks/cancel`
 - `notifications/tasks/status`
 
+These receiver-side `%FastestMCP.BackgroundTask{}` values are work owned by the
+FastestMCP server. They are distinct from `%FastestMCP.PeerTask{}` values
+returned when the server delegates task-augmented sampling or elicitation to
+the connected client. Peer-task handles are scoped to the originating server
+session and expose `fetch/2`, `wait/2`, `result/2`, `cancel/2`, and
+`on_status_change/2` through `FastestMCP.PeerTask`.
+
 FastestMCP supports that wire contract without prompt/resource task extensions
 or `tasks/sendInput`. The standard MCP path for interactive remote work is
 `tasks/result`; it can block, relay elicitation or sampling over the connected
@@ -72,6 +79,11 @@ Task modes:
 - `:required`
 
 `task: true` is shorthand for `task: [mode: :optional]`.
+
+For tools, the transport serializer advertises this as the standard direct
+`execution.taskSupport` field. Task execution data is not placed in a
+FastestMCP metadata extension, and prompt/resource task settings are never
+advertised remotely.
 
 Enable tasks across the whole server with `tasks: true`. Over MCP, only tools
 can be task-augmented; the prompt and resource settings below apply to local
@@ -246,6 +258,12 @@ This calls the supervised task runtime directly. It does not expose or send a
 
 ## Task Result Semantics
 
+Every task envelope is validated before it crosses the wire. That includes
+`CreateTaskResult`, `tasks/get`, `tasks/list`, `tasks/cancel`, status
+notifications, and the final `tasks/result`. The final result is validated both
+as a Tasks payload and as the result type of the original augmented method, so
+a completed `tools/call` task cannot return a method-invalid payload.
+
 Terminal task outcomes are mapped deliberately:
 
 - successful MCP result -> task status `completed`
@@ -276,6 +294,11 @@ result = FastestMCP.task_result(task)
 Request-level task failures preserve the same related-task metadata on the wire
 for JSON-RPC and stdio task-result error responses. That keeps failed
 `tasks/result` envelopes task-associated in the same way as successful ones.
+
+The original request's progress token remains owned by the task after the
+initial `CreateTaskResult` and is released only when the task becomes
+`completed`, `failed`, or `cancelled`. Duplicate tokens, decreasing progress,
+inconsistent totals, and late or unknown updates are rejected or isolated.
 
 ## Session and Auth Scoping
 
@@ -314,6 +337,11 @@ This pass does not add cross-node task routing or an external broker. The
 extension point for future distribution is the task backend, not a separate
 queue API.
 
+`FastestMCP.TaskBackend.Memory` is intentionally process-local. A host that
+requires task recovery across application restarts, deployments, or nodes must
+provide a durable `FastestMCP.TaskBackend` and the associated routing and
+retention policy.
+
 ## Capabilities
 
 FastestMCP advertises task capabilities as a first-class part of server
@@ -332,7 +360,15 @@ initialization:
 ```
 
 `tools.call` is the only advertised remote task request surface. Passing task
-metadata to remote `prompts/get` or `resources/read` is rejected.
+metadata to a wire method that does not support augmentation is ignored by the
+server, as required by MCP; the connected Elixir client does not offer task
+options for those remote calls.
+
+On the client side, `tasks.requests.sampling.createMessage` and
+`tasks.requests.elicitation.create` are advertised only when the matching
+callback handler exists. Those callbacks run in supervised workers and expose
+`tasks/get`, `tasks/list`, `tasks/result`, and `tasks/cancel` on the same
+connection.
 
 ## Related Guides
 

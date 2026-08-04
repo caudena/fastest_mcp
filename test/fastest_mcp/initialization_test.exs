@@ -96,6 +96,18 @@ defmodule FastestMCP.InitializationTest do
     assert get_in(result, ["capabilities", "experimental", "feature_flags", "alpha"]) == true
   end
 
+  test "experimental capability entries must be objects" do
+    assert_raise ArgumentError, ~r/experimental capability "scalar" must be an object/, fn ->
+      FastestMCP.server("invalid-experimental", experimental_capabilities: %{scalar: true})
+    end
+
+    assert_raise ArgumentError, ~r/capabilities.experimental must be an object/, fn ->
+      FastestMCP.server("invalid-experimental-metadata",
+        metadata: %{capabilities: %{experimental: "invalid"}}
+      )
+    end
+  end
+
   test "initialize keeps protocol and standard capabilities canonical" do
     server_name = "initialize-canonical-#{System.unique_integer([:positive])}"
 
@@ -123,25 +135,28 @@ defmodule FastestMCP.InitializationTest do
     assert get_in(result, ["capabilities", "experimental", "feature_flags", "beta"]) == true
   end
 
-  test "stateless HTTP initialize omits session-dependent capabilities" do
-    server_name = "initialize-stateless-#{System.unique_integer([:positive])}"
+  test "request-scoped HTTP state retains a normal session and session capabilities" do
+    server_name = "initialize-request-state-#{System.unique_integer([:positive])}"
 
-    assert {:ok, _pid} = FastestMCP.start_server(FastestMCP.server(server_name))
+    server =
+      FastestMCP.server(server_name)
+      |> FastestMCP.add_resource("config://app", fn _arguments, _context -> "ready" end)
+      |> FastestMCP.add_tool("slow", fn _arguments, _context -> :ok end, task: true)
+
+    assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    result =
-      FastestMCP.initialize(
-        server_name,
-        %{"clientInfo" => %{"name" => "stateless-client"}},
-        transport: :streamable_http,
-        request_metadata: %{stateless_http: true}
-      )
+    {session_id, response} =
+      ProtocolTest.http_initialize(server_name, state_scope: :request, json_response: true)
 
-    refute Map.has_key?(result["capabilities"], "resources")
-    refute Map.has_key?(result["capabilities"], "tasks")
+    result = JSON.decode!(response.resp_body)["result"]
+
+    assert is_binary(session_id) and session_id != ""
+    assert result["capabilities"]["resources"] == %{"listChanged" => true, "subscribe" => true}
+    assert get_in(result, ["capabilities", "tasks", "requests", "tools", "call"]) == %{}
   end
 
-  test "initialize advertises completion when tools expose completion sources" do
+  test "initialize does not advertise completion for local-only tool completion sources" do
     server_name =
       "initialize-tool-completion-" <> Integer.to_string(System.unique_integer([:positive]))
 
@@ -164,7 +179,7 @@ defmodule FastestMCP.InitializationTest do
 
     result = FastestMCP.initialize(server_name, %{})
 
-    assert %{} = result["capabilities"]["completions"]
+    refute Map.has_key?(result["capabilities"], "completions")
   end
 
   test "stdio and HTTP initialize requests use the shared engine" do
@@ -216,6 +231,88 @@ defmodule FastestMCP.InitializationTest do
     assert %{} == FastestMCP.ping(server_name)
   end
 
+  test "callback capabilities require a real JSON-RPC connection" do
+    server_name = "initialize-no-connection-#{System.unique_integer([:positive])}"
+
+    server =
+      FastestMCP.server(server_name)
+      |> FastestMCP.add_tool("slow", fn _arguments, _context -> :ok end, task: true)
+      |> FastestMCP.add_resource("config://app", fn _arguments, _context -> "ready" end)
+      |> FastestMCP.add_prompt("greet", fn _arguments, _context -> "hello" end)
+
+    assert {:ok, _pid} = FastestMCP.start_server(server)
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+
+    result = FastestMCP.initialize(server_name, %{}, transport: :stdio)
+
+    refute Map.has_key?(result["capabilities"], "logging")
+    refute Map.has_key?(result["capabilities"], "tasks")
+    assert result["capabilities"]["tools"] == %{}
+    assert result["capabilities"]["resources"] == %{}
+    assert result["capabilities"]["prompts"] == %{}
+  end
+
+  test "wire capability projection omits invisible families and client-only features" do
+    server_name = "initialize-visible-capabilities-#{System.unique_integer([:positive])}"
+
+    server =
+      FastestMCP.server(server_name)
+      |> FastestMCP.add_tool("hidden-tool", fn _arguments, _context -> :ok end,
+        enabled: false,
+        task: true
+      )
+      |> FastestMCP.add_resource(
+        "hidden://resource",
+        fn _arguments, _context -> "hidden" end,
+        enabled: false
+      )
+      |> FastestMCP.add_prompt(
+        "hidden-prompt",
+        fn _arguments, _context -> "hidden" end,
+        enabled: false,
+        arguments: [%{name: "name", completion: ["Ada"]}]
+      )
+
+    assert {:ok, _pid} = FastestMCP.start_server(server)
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+
+    client_capabilities = %{
+      "roots" => %{"listChanged" => true},
+      "sampling" => %{"tools" => %{}, "context" => %{}},
+      "elicitation" => %{"form" => %{}, "url" => %{}}
+    }
+
+    {_session_id, http_response} =
+      ProtocolTest.http_initialize(server_name, [], %{"capabilities" => client_capabilities})
+
+    http_capabilities = JSON.decode!(http_response.resp_body)["result"]["capabilities"]
+
+    assert http_capabilities == %{"logging" => %{}}
+
+    {_connection_id, stdio_response} =
+      ProtocolTest.initialize_stdio(server_name,
+        params: %{"capabilities" => client_capabilities}
+      )
+
+    assert get_in(stdio_response, ["result", "capabilities"]) == %{"logging" => %{}}
+  end
+
+  test "empty elicitation capability is stored as effective form support" do
+    server_name = "initialize-legacy-elicitation-#{System.unique_integer([:positive])}"
+    server = FastestMCP.server(server_name)
+
+    assert {:ok, _pid} = FastestMCP.start_server(server)
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+
+    session_id =
+      ProtocolTest.initialize_session(server_name, "legacy-elicitation-session", %{
+        "capabilities" => %{"elicitation" => %{}}
+      })
+
+    assert {:ok, lifecycle} = FastestMCP.Session.lifecycle(server_name, session_id)
+    assert lifecycle.client_capabilities["elicitation"] == %{"form" => %{}}
+  end
+
   test "connected clients advertise task callback capabilities when handlers are installed" do
     parent = self()
     server_name = "client-init-caps-" <> Integer.to_string(System.unique_integer([:positive]))
@@ -241,7 +338,9 @@ defmodule FastestMCP.InitializationTest do
         {Bandit,
          plug:
            {FastestMCP.Transport.HTTPApp,
-            server_name: server_name, path: "/mcp", unsafe_allow_any_host: true},
+            server_name: server_name,
+            path: "/mcp",
+            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
          scheme: :http,
          port: 0}
       )
@@ -264,7 +363,7 @@ defmodule FastestMCP.InitializationTest do
 
     assert_receive {:client_capabilities, capabilities}, 1_000
     assert capabilities["sampling"] == %{}
-    assert capabilities["elicitation"] == %{}
+    assert capabilities["elicitation"] == %{"form" => %{}}
     assert get_in(capabilities, ["tasks", "requests", "sampling", "createMessage"]) == %{}
     assert get_in(capabilities, ["tasks", "requests", "elicitation", "create"]) == %{}
   end
@@ -294,7 +393,9 @@ defmodule FastestMCP.InitializationTest do
         {Bandit,
          plug:
            {FastestMCP.Transport.HTTPApp,
-            server_name: server_name, path: "/mcp", unsafe_allow_any_host: true},
+            server_name: server_name,
+            path: "/mcp",
+            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
          scheme: :http,
          port: 0}
       )
@@ -304,6 +405,7 @@ defmodule FastestMCP.InitializationTest do
     client =
       Client.connect!("http://127.0.0.1:#{port}/mcp",
         auto_initialize: false,
+        roots: [],
         sampling_handler: fn _messages, _params ->
           %{"content" => [%{"type" => "text", "text" => "sampled"}]}
         end,
@@ -325,7 +427,7 @@ defmodule FastestMCP.InitializationTest do
     assert_receive {:merged_client_capabilities, capabilities}, 1_000
     assert capabilities["roots"] == %{"listChanged" => true}
     assert capabilities["sampling"] == %{}
-    assert capabilities["elicitation"] == %{}
+    assert capabilities["elicitation"] == %{"form" => %{}}
     assert get_in(capabilities, ["tasks", "requests", "sampling", "createMessage"]) == %{}
     assert get_in(capabilities, ["tasks", "requests", "elicitation", "create"]) == %{}
   end

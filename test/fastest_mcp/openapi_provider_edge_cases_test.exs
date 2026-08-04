@@ -165,7 +165,7 @@ defmodule FastestMCP.OpenAPIProviderEdgeCasesTest do
     assert {"cookie", "session=abc+123"} in cookie_opts[:headers]
   end
 
-  test "circular component refs remain unresolved instead of recursing" do
+  test "circular component refs become valid standalone local definitions" do
     spec = %{
       "openapi" => "3.0.0",
       "info" => %{"title" => "Circular", "version" => "1.0.0"},
@@ -205,8 +205,58 @@ defmodule FastestMCP.OpenAPIProviderEdgeCasesTest do
 
     [tool] = server.providers |> hd() |> Map.fetch!(:inner) |> Map.fetch!(:tools)
 
-    assert get_in(tool.output_schema, ["properties", "child", "$ref"]) ==
-             "#/components/schemas/Node"
+    assert get_in(tool.output_schema, ["properties", "child", "$ref"]) == "#/$defs/Node"
+    assert get_in(tool.output_schema, ["$defs", "Node", "type"]) == "object"
+
+    assert {:ok, _nested_node} =
+             FastestMCP.Schema.validate(tool.compiled_output_schema, %{
+               "child" => %{"child" => %{"child" => %{}}}
+             })
+  end
+
+  test "non-object response schemas use an advertised object result" do
+    server_name = "openapi-array-result-" <> Integer.to_string(System.unique_integer([:positive]))
+
+    spec = %{
+      "openapi" => "3.0.0",
+      "info" => %{"title" => "Array result", "version" => "1.0.0"},
+      "servers" => [%{"url" => "https://array.example.com"}],
+      "paths" => %{
+        "/values" => %{
+          "get" => %{
+            "operationId" => "list_values",
+            "responses" => %{
+              "200" => %{
+                "description" => "OK",
+                "content" => %{
+                  "application/json" => %{
+                    "schema" => %{"type" => "array", "items" => %{"type" => "integer"}}
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    server =
+      FastestMCP.from_openapi(spec,
+        name: server_name,
+        requester: fn _method, _url, _opts ->
+          {:ok, 200, [{"content-type", "application/json"}], JSON.encode!([1, 2, 3])}
+        end
+      )
+
+    [tool] = server.providers |> hd() |> Map.fetch!(:inner) |> Map.fetch!(:tools)
+    assert tool.output_schema["type"] == "object"
+    assert get_in(tool.output_schema, ["properties", "result", "type"]) == "array"
+
+    assert {:ok, _pid} = FastestMCP.start_server(server)
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+
+    assert %{"result" => [1, 2, 3]} ==
+             FastestMCP.call_tool(server_name, "list_values", %{})
   end
 
   test "operation parameters override path parameters and schema defaults are serialized" do

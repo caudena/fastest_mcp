@@ -24,6 +24,7 @@ defmodule FastestMCP.Components.Resource do
     :task,
     :timeout,
     :mime_type,
+    :size,
     :compiled,
     authorization: [],
     policy_state: %{},

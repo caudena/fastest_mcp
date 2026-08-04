@@ -39,11 +39,8 @@ defmodule FastestMCP.ToolAnnotationsTest do
                    "openWorldHint" => false,
                    "destructiveHint" => false
                  },
-                 "_meta" => %{
-                   "fastestmcp" => %{
-                     "execution" => %{"taskSupport" => "optional"}
-                   }
-                 }
+                 "execution" => %{"taskSupport" => "optional"},
+                 "_meta" => %{"fastestmcp" => %{"tags" => []}}
                }
              ]
            } =
@@ -86,8 +83,7 @@ defmodule FastestMCP.ToolAnnotationsTest do
                    "fastestmcp" => %{
                      "hint" => "keep",
                      "tags" => ["math", "utility"],
-                     "version" => "2.0.0",
-                     "execution" => %{}
+                     "version" => "2.0.0"
                    }
                  }
                }
@@ -120,7 +116,9 @@ defmodule FastestMCP.ToolAnnotationsTest do
         {Bandit,
          plug:
            {FastestMCP.Transport.HTTPApp,
-            server_name: server_name, path: "/mcp", unsafe_allow_any_host: true},
+            server_name: server_name,
+            path: "/mcp",
+            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
          scheme: :http,
          port: 0}
       )
@@ -147,8 +145,7 @@ defmodule FastestMCP.ToolAnnotationsTest do
                    "fastestmcp" => %{
                      "hint" => "keep",
                      "tags" => ["math", "utility"],
-                     "version" => "2.0.0",
-                     "execution" => %{}
+                     "version" => "2.0.0"
                    }
                  }
                }
@@ -217,7 +214,6 @@ defmodule FastestMCP.ToolAnnotationsTest do
     assert report["_meta"] == %{
              "vendor" => %{"stable" => true},
              "fastestmcp" => %{
-               "execution" => %{"taskSupport" => "optional"},
                "hint" => "keep",
                "tags" => ["docs", "utility"],
                "version" => "2.0.0"
@@ -231,7 +227,6 @@ defmodule FastestMCP.ToolAnnotationsTest do
     assert %{
              "vendor" => %{"stable" => true},
              "fastestmcp" => %{
-               "execution" => %{"taskSupport" => "optional"},
                "hint" => "keep",
                "parameters" => %{},
                "tags" => ["docs", "utility"],

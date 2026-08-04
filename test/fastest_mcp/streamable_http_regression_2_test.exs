@@ -37,14 +37,17 @@ defmodule FastestMCP.StreamableHTTPRegression2Test do
 
     assert {400, body} = request(port, request)
 
+    payload = JSON.decode!(body)
+
     assert %{
              "jsonrpc" => "2.0",
-             "id" => nil,
              "error" => %{
                "code" => -32_700,
                "data" => %{"fastestmcp" => %{"code" => "parse_error"}}
              }
-           } = JSON.decode!(body)
+           } = payload
+
+    refute Map.has_key?(payload, "id")
   end
 
   defp request(port, payload) do

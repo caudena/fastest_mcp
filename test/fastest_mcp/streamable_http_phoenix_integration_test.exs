@@ -33,6 +33,7 @@ defmodule FastestMCP.StreamableHTTPPhoenixIntegrationTest do
 
     response =
       conn(:post, "/mcp", "")
+      |> Map.put(:host, "localhost")
       |> Map.put(:body_params, payload)
       |> Plug.Conn.put_req_header("content-type", "application/json")
       |> Plug.Conn.put_req_header("accept", "application/json, text/event-stream")
@@ -122,6 +123,7 @@ defmodule FastestMCP.StreamableHTTPPhoenixIntegrationTest do
           ProtocolTest.jsonrpc_request(11, "initialize", ProtocolTest.initialize_params())
         ])
       )
+      |> Map.put(:host, "localhost")
       |> Plug.Conn.put_req_header("content-type", "application/json")
       |> Plug.Conn.put_req_header("accept", "application/json, text/event-stream")
       |> Plug.Parsers.call(
@@ -139,18 +141,22 @@ defmodule FastestMCP.StreamableHTTPPhoenixIntegrationTest do
     assert response.status == 400
     assert Plug.Conn.get_resp_header(response, "mcp-session-id") == []
 
+    body = JSON.decode!(response.resp_body)
+
     assert %{
              "jsonrpc" => "2.0",
-             "id" => nil,
              "error" => %{
                "code" => -32_600,
                "message" => "JSON-RPC batch requests are not supported"
              }
-           } = JSON.decode!(response.resp_body)
+           } = body
+
+    refute Map.has_key?(body, "id")
   end
 
   defp forwarded_request(server_name, payload, session_id \\ nil) do
     conn(:post, "/internal/mcp", JSON.encode!(payload))
+    |> Map.put(:host, "localhost")
     |> Map.put(:script_name, ["internal", "mcp"])
     |> Plug.Conn.put_req_header("content-type", "application/json")
     |> Plug.Conn.put_req_header("accept", "application/json, text/event-stream")

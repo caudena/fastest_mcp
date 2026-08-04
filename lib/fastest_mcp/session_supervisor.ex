@@ -34,6 +34,9 @@ defmodule FastestMCP.SessionSupervisor do
        sessions: sessions,
        draining?: false,
        session_idle_ttl: session_idle_ttl(opts),
+       max_request_ids: max_request_ids(opts),
+       coordinator_opts: coordinator_opts(opts),
+       runtime_quota: Keyword.fetch!(opts, :runtime_quota),
        session_state_store: Keyword.fetch!(opts, :session_state_store)
      }}
   end
@@ -79,7 +82,10 @@ defmodule FastestMCP.SessionSupervisor do
             server_name,
             session_id,
             state.session_idle_ttl,
-            state.session_state_store
+            state.session_state_store,
+            state.max_request_ids,
+            state.runtime_quota,
+            state.coordinator_opts
           )
       end
 
@@ -130,18 +136,29 @@ defmodule FastestMCP.SessionSupervisor do
     end
   end
 
-  defp start_session(supervisor, server_name, session_id, session_idle_ttl, session_state_store) do
+  defp start_session(
+         supervisor,
+         server_name,
+         session_id,
+         session_idle_ttl,
+         session_state_store,
+         max_request_ids,
+         runtime_quota,
+         coordinator_opts
+       ) do
     spec = %{
       id: {FastestMCP.Session, {to_string(server_name), to_string(session_id)}},
       start:
         {FastestMCP.Session, :start_link,
          [
-           %{
+           Map.merge(coordinator_opts, %{
              server_name: server_name,
              session_id: session_id,
              idle_ttl_ms: session_idle_ttl,
-             session_state_store: session_state_store
-           }
+             session_state_store: session_state_store,
+             max_request_ids: max_request_ids,
+             runtime_quota: runtime_quota
+           })
          ]},
       restart: :transient
     }
@@ -183,10 +200,44 @@ defmodule FastestMCP.SessionSupervisor do
     end
   end
 
+  defp max_request_ids(opts) do
+    case Keyword.get(opts, :max_request_ids, 100_000) do
+      value when is_integer(value) and value > 0 ->
+        value
+
+      other ->
+        raise ArgumentError,
+              "max_request_ids must be a positive integer, got: #{inspect(other)}"
+    end
+  end
+
   defp supervisor_options(opts) do
     case Keyword.get(opts, :name) do
       nil -> Keyword.delete(opts, :name)
       _name -> opts
     end
+  end
+
+  defp coordinator_opts(opts) do
+    opts
+    |> Keyword.take([
+      :max_pending_requests,
+      :max_active_requests,
+      :max_peer_tasks,
+      :max_peer_task_callbacks,
+      :max_queued_messages,
+      :max_queued_bytes,
+      :request_timeout_ms,
+      :max_progress_per_second,
+      :max_inbound_progress_per_second,
+      :max_logs_per_second,
+      :redaction_opts,
+      :sse_replay_max_events,
+      :sse_replay_max_stream_bytes,
+      :sse_replay_max_total_bytes,
+      :sse_replay_ttl_ms,
+      :task_supervisor
+    ])
+    |> Map.new()
   end
 end

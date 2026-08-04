@@ -34,6 +34,7 @@ defmodule FastestMCP.ServerRuntime do
   alias FastestMCP.Provider
   alias FastestMCP.Providers.MountedServer
   alias FastestMCP.Registry
+  alias FastestMCP.RuntimeQuota
   alias FastestMCP.Server
   alias FastestMCP.SessionNotificationSupervisor
   alias FastestMCP.SessionStateStore.Memory, as: SessionStateStoreMemory
@@ -41,8 +42,6 @@ defmodule FastestMCP.ServerRuntime do
   alias FastestMCP.TaskNotificationSupervisor
   alias FastestMCP.TTLStore
   alias FastestMCP.SessionSupervisor
-
-  @session_stream_owner_ttl_ms 90_000
 
   @doc "Starts the runtime or application process owned by this module."
   def start(%Server{} = server, opts \\ []) do
@@ -100,9 +99,16 @@ defmodule FastestMCP.ServerRuntime do
   @impl true
   @doc "Initializes the state used by this module before it starts processing work."
   def init({%Server{} = server, opts}) do
+    opts = notify_stdio_cleanup_guardian(opts)
     Process.flag(:trap_exit, true)
 
-    initial = %{server: server, opts: opts, rollback: []}
+    initial = %{
+      server: server,
+      opts: opts,
+      rollback: [],
+      pagination_cursor_secret: :crypto.strong_rand_bytes(32),
+      runtime_generation: random_runtime_generation()
+    }
 
     case start_runtime(initial) do
       {:ok, state} ->
@@ -138,7 +144,6 @@ defmodule FastestMCP.ServerRuntime do
   def terminate(reason, state) do
     cleanup_steps([
       fn -> demonitor_registry(state) end,
-      fn -> terminate_session_streams(state) end,
       fn -> drain_sessions(state, reason) end,
       fn -> shutdown_server_runtime(Map.get(state, :server)) end,
       fn -> Lifespan.cleanup_all(Map.get(state, :lifespan_cleanups, [])) end,
@@ -156,19 +161,19 @@ defmodule FastestMCP.ServerRuntime do
          {:ok, state} <- start_lifespans(state),
          {:ok, state} <- start_component_manager(state),
          {:ok, state} <- materialize_runtime(state),
+         {:ok, state} <- start_schema_cache(state),
          {:ok, state} <- start_session_state_store_step(state),
+         {:ok, state} <- start_stream_task_supervisor(state),
+         {:ok, state} <- start_runtime_quota(state),
          {:ok, state} <- start_session_supervisor_step(state),
          {:ok, state} <- start_terminated_session_store(state),
          {:ok, state} <- start_call_supervisor(state),
-         {:ok, state} <- start_stream_task_supervisor(state),
          {:ok, state} <- start_event_bus(state),
          {:ok, state} <- start_task_supervisor(state),
          {:ok, state} <- start_task_backend_step(state),
          {:ok, state} <- start_task_store(state),
          {:ok, state} <- start_task_notification_supervisor(state),
          {:ok, state} <- start_session_notification_supervisor(state),
-         {:ok, state} <- start_client_request_store(state),
-         {:ok, state} <- start_session_stream_store(state),
          {:ok, state} <- register_components(state) do
       {:ok, state}
     end
@@ -302,12 +307,46 @@ defmodule FastestMCP.ServerRuntime do
     )
   end
 
+  defp start_schema_cache(state) do
+    table =
+      :ets.new(:fastest_mcp_schema_cache, [
+        :set,
+        :public,
+        read_concurrency: true,
+        write_concurrency: true
+      ])
+
+    {:ok, Map.put(state, :schema_cache, table)}
+  end
+
   defp start_session_supervisor_step(state) do
     start_process_step(state, :session_supervisor, fn ->
-      SessionSupervisor.start_link(
+      state.opts
+      |> session_coordinator_opts(state.stream_task_supervisor)
+      |> Keyword.merge(
         max_sessions: max_sessions(state.opts),
         session_idle_ttl: session_idle_ttl(state.opts),
-        session_state_store: state.session_state_store
+        max_request_ids: max_request_ids(state.opts),
+        session_state_store: state.session_state_store,
+        runtime_quota: state.runtime_quota
+      )
+      |> SessionSupervisor.start_link()
+    end)
+  end
+
+  defp start_runtime_quota(state) do
+    start_process_step(state, :runtime_quota, fn ->
+      RuntimeQuota.start_link(
+        max_pending_requests:
+          positive_runtime_limit(state.opts, :max_runtime_pending_requests, 10_000),
+        max_active_requests:
+          positive_runtime_limit(state.opts, :max_runtime_active_requests, 10_000),
+        max_sse_replay_bytes:
+          positive_runtime_limit(
+            state.opts,
+            :sse_replay_max_total_bytes,
+            64 * 1_024 * 1_024
+          )
       )
     end)
   end
@@ -356,6 +395,7 @@ defmodule FastestMCP.ServerRuntime do
         server_name: state.server.name,
         event_bus: state.event_bus,
         backend: state.task_backend,
+        relay_task_supervisor: state.stream_task_supervisor,
         mask_error_details: state.server.mask_error_details
       )
     end)
@@ -375,18 +415,6 @@ defmodule FastestMCP.ServerRuntime do
       :session_notification_supervisor,
       &SessionNotificationSupervisor.start_link/0
     )
-  end
-
-  defp start_client_request_store(state) do
-    start_process_step(state, :client_request_store, fn ->
-      TTLStore.start_link(ttl_ms: client_request_ttl(state.opts))
-    end)
-  end
-
-  defp start_session_stream_store(state) do
-    start_process_step(state, :session_stream_store, fn ->
-      TTLStore.start_link(ttl_ms: @session_stream_owner_ttl_ms)
-    end)
   end
 
   defp register_components(state) do
@@ -426,6 +454,23 @@ defmodule FastestMCP.ServerRuntime do
     error -> {:error, error}
   catch
     kind, reason -> {:error, {kind, reason}}
+  end
+
+  defp random_runtime_generation do
+    16
+    |> :crypto.strong_rand_bytes()
+    |> Base.url_encode64(padding: false)
+  end
+
+  defp notify_stdio_cleanup_guardian(opts) do
+    case Keyword.pop(opts, :__stdio_cleanup_lease__) do
+      {{guardian, token}, opts} when is_pid(guardian) and is_reference(token) ->
+        send(guardian, {:stdio_owned_runtime_started, token, self()})
+        opts
+
+      {_other, opts} ->
+        opts
+    end
   end
 
   defp add_rollback(state, cleanup), do: Map.update!(state, :rollback, &[cleanup | &1])
@@ -540,6 +585,41 @@ defmodule FastestMCP.ServerRuntime do
     end
   end
 
+  defp max_request_ids(opts) do
+    case Keyword.get(opts, :max_request_ids, 100_000) do
+      value when is_integer(value) and value > 0 ->
+        value
+
+      other ->
+        raise ArgumentError,
+              "max_request_ids must be a positive integer, got: #{inspect(other)}"
+    end
+  end
+
+  defp session_coordinator_opts(opts, task_supervisor) do
+    keys = [
+      :max_pending_requests,
+      :max_active_requests,
+      :max_peer_tasks,
+      :max_peer_task_callbacks,
+      :max_queued_messages,
+      :max_queued_bytes,
+      :request_timeout_ms,
+      :max_progress_per_second,
+      :max_inbound_progress_per_second,
+      :max_logs_per_second,
+      :redaction_opts,
+      :sse_replay_max_events,
+      :sse_replay_max_stream_bytes,
+      :sse_replay_max_total_bytes,
+      :sse_replay_ttl_ms
+    ]
+
+    opts
+    |> Keyword.take(keys)
+    |> Keyword.put(:task_supervisor, task_supervisor)
+  end
+
   defp max_background_tasks(opts) do
     case Keyword.get(opts, :max_background_tasks, :infinity) do
       value when is_integer(value) and value > 0 ->
@@ -551,6 +631,17 @@ defmodule FastestMCP.ServerRuntime do
       other ->
         raise ArgumentError,
               "max_background_tasks must be a positive integer or :infinity, got: #{inspect(other)}"
+    end
+  end
+
+  defp positive_runtime_limit(opts, key, default) do
+    case Keyword.get(opts, key, default) do
+      value when is_integer(value) and value > 0 ->
+        value
+
+      other ->
+        raise ArgumentError,
+              "#{key} must be a positive integer, got: #{inspect(other)}"
     end
   end
 
@@ -639,20 +730,6 @@ defmodule FastestMCP.ServerRuntime do
       other ->
         raise ArgumentError,
               "max_event_subscribers_per_server must be a positive integer or :infinity, got: #{inspect(other)}"
-    end
-  end
-
-  defp client_request_ttl(opts) do
-    case Keyword.get(opts, :client_request_ttl, 60_000) do
-      value when is_integer(value) and value > 0 ->
-        value
-
-      :infinity ->
-        :infinity
-
-      other ->
-        raise ArgumentError,
-              "client_request_ttl must be a positive integer or :infinity, got: #{inspect(other)}"
     end
   end
 
@@ -814,24 +891,6 @@ defmodule FastestMCP.ServerRuntime do
   end
 
   defp shutdown_provider_runtime(_provider), do: :ok
-
-  defp terminate_session_streams(%{session_stream_store: store}) when is_pid(store) do
-    store
-    |> TTLStore.keys()
-    |> Enum.each(fn session_id ->
-      case TTLStore.get(store, session_id) do
-        {:ok, %{owner: owner} = stream_owner} when is_pid(owner) ->
-          send(owner, :session_stream_replaced)
-          _ = TTLStore.delete_if(store, session_id, stream_owner)
-          :ok
-
-        _other ->
-          :ok
-      end
-    end)
-  end
-
-  defp terminate_session_streams(_state), do: :ok
 
   defp drain_sessions(%{session_supervisor: supervisor}, reason) when is_pid(supervisor) do
     if orderly_shutdown_reason?(reason) and Process.alive?(supervisor) do

@@ -28,6 +28,16 @@ defmodule FastestMCP.TestSupport.ProtocolTestHelper do
     params = initialize_params(overrides)
     {:ok, runtime} = ServerRuntime.fetch(server_name)
 
+    initialize_result =
+      FastestMCP.initialize(server_name, params,
+        transport: :stdio,
+        session_id: session_id,
+        request_metadata: %{
+          jsonrpc_envelope: jsonrpc_request(1, "initialize", params)
+        },
+        wire: true
+      )
+
     {:ok, _pid} =
       SessionSupervisor.ensure_session(runtime.session_supervisor, server_name, session_id)
 
@@ -37,7 +47,9 @@ defmodule FastestMCP.TestSupport.ProtocolTestHelper do
         session_id,
         params["protocolVersion"],
         params["capabilities"],
-        params["clientInfo"]
+        params["clientInfo"],
+        :unbound,
+        Map.get(initialize_result, "capabilities", %{})
       )
 
     :ok = Session.mark_initialized(server_name, session_id)
@@ -86,6 +98,7 @@ defmodule FastestMCP.TestSupport.ProtocolTestHelper do
       )
       |> Plug.Conn.put_req_header("content-type", "application/json")
       |> Plug.Conn.put_req_header("accept", @post_accept)
+      |> Map.put(:host, "localhost")
       |> put_headers(headers)
       |> StreamableHTTP.call(call_opts)
 
@@ -121,6 +134,7 @@ defmodule FastestMCP.TestSupport.ProtocolTestHelper do
     |> Plug.Test.conn(path, JSON.encode!(payload))
     |> Plug.Conn.put_req_header("content-type", "application/json")
     |> Plug.Conn.put_req_header("accept", @post_accept)
+    |> Map.put(:host, "localhost")
     |> maybe_put_header("mcp-session-id", session_id)
     |> maybe_put_header("mcp-protocol-version", @version)
     |> put_headers(headers)

@@ -274,15 +274,15 @@ defmodule FastestMCP.TaskSpecParityTest do
     assert initialized_response.status == 202
 
     response =
-      ProtocolTest.http_request(server_name, session_id, 1, "tasks/get", %{
+      ProtocolTest.http_request(server_name, session_id, 2, "tasks/get", %{
         "taskId" => "task-missing"
       })
 
-    assert response.status == 400
+    assert response.status == 200
 
     assert %{
              "jsonrpc" => "2.0",
-             "id" => 1,
+             "id" => 2,
              "error" => %{
                "code" => -32602,
                "message" => "Invalid taskId: task-missing not found"

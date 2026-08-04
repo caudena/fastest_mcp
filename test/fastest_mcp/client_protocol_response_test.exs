@@ -34,7 +34,7 @@ defmodule FastestMCP.TestSupport.ClientProtocolResponsePlug do
         "id" => id,
         "result" => %{
           "protocolVersion" => FastestMCP.Protocol.current_version(),
-          "capabilities" => %{},
+          "capabilities" => %{"logging" => %{}, "tools" => %{}},
           "serverInfo" => %{"name" => "all-sse", "version" => "1.0.0"}
         }
       },
@@ -46,12 +46,43 @@ defmodule FastestMCP.TestSupport.ClientProtocolResponsePlug do
     send_sse(conn, %{
       "jsonrpc" => "2.0",
       "id" => id,
-      "result" => %{"tools" => [%{"name" => "from-sse"}]}
+      "result" => %{
+        "tools" => [
+          %{"name" => "from-sse", "inputSchema" => %{"type" => "object"}}
+        ]
+      }
     })
   end
 
   defp respond(conn, :sse, %{"id" => id, "method" => "ping"}) do
     send_sse(conn, %{"jsonrpc" => "2.0", "id" => id, "result" => %{}})
+  end
+
+  defp respond(conn, :sse, %{"id" => id, "method" => "logging/setLevel"}) do
+    send_sse(conn, %{"jsonrpc" => "2.0", "id" => id, "result" => %{}})
+  end
+
+  defp respond(conn, mode, %{"method" => "notifications/initialized"})
+       when mode in [:invalid_envelopes, :error_semantics] do
+    send_resp(conn, 202, "")
+  end
+
+  defp respond(conn, mode, %{"id" => id, "method" => "initialize"})
+       when mode in [:invalid_envelopes, :error_semantics] do
+    send_json(conn, %{
+      "jsonrpc" => "2.0",
+      "id" => id,
+      "result" => %{
+        "protocolVersion" => FastestMCP.Protocol.current_version(),
+        "capabilities" => %{
+          "tools" => %{},
+          "resources" => %{},
+          "prompts" => %{},
+          "tasks" => %{}
+        },
+        "serverInfo" => %{"name" => Atom.to_string(mode), "version" => "1.0.0"}
+      }
+    })
   end
 
   defp respond(conn, :invalid_envelopes, %{"id" => id, "method" => "ping"}) do
@@ -147,6 +178,134 @@ defmodule FastestMCP.TestSupport.ClientProtocolResponsePlug do
     )
   end
 
+  defp respond(conn, :invalid_initialize, %{"id" => id, "method" => "initialize"}) do
+    send_json(conn, %{
+      "jsonrpc" => "2.0",
+      "id" => id,
+      "result" => %{
+        "protocolVersion" => FastestMCP.Protocol.current_version(),
+        "capabilities" => %{},
+        "serverInfo" => %{"name" => "missing-required-version"}
+      }
+    })
+  end
+
+  defp respond(conn, :invalid_method_schema, %{"method" => "notifications/initialized"}) do
+    send_resp(conn, 202, "")
+  end
+
+  defp respond(conn, :invalid_method_schema, %{"id" => id, "method" => "initialize"}) do
+    send_json(conn, %{
+      "jsonrpc" => "2.0",
+      "id" => id,
+      "result" => %{
+        "protocolVersion" => FastestMCP.Protocol.current_version(),
+        "capabilities" => %{"tools" => %{}},
+        "serverInfo" => %{"name" => "invalid-method-server", "version" => "1.0.0"}
+      }
+    })
+  end
+
+  defp respond(conn, :invalid_method_schema, %{"id" => id, "method" => "tools/list"}) do
+    send_json(conn, %{
+      "jsonrpc" => "2.0",
+      "id" => id,
+      "result" => %{"tools" => [%{"name" => "missing-input-schema"}]}
+    })
+  end
+
+  defp respond(conn, :invalid_media, %{"method" => "notifications/initialized"}) do
+    send_resp(conn, 202, "")
+  end
+
+  defp respond(conn, :invalid_media, %{"id" => id, "method" => "initialize"}) do
+    send_json(conn, %{
+      "jsonrpc" => "2.0",
+      "id" => id,
+      "result" => %{
+        "protocolVersion" => FastestMCP.Protocol.current_version(),
+        "capabilities" => %{"tools" => %{}},
+        "serverInfo" => %{"name" => "invalid-media-server", "version" => "1.0.0"}
+      }
+    })
+  end
+
+  defp respond(conn, :invalid_media, %{"id" => id, "method" => "tools/list"}) do
+    conn
+    |> put_resp_header("content-type", "application/problem+json")
+    |> send_resp(
+      200,
+      JSON.encode!(%{
+        "jsonrpc" => "2.0",
+        "id" => id,
+        "result" => %{"tools" => []}
+      })
+    )
+  end
+
+  defp respond(conn, mode, %{"method" => "notifications/initialized"})
+       when mode in [:duplicate_same_media, :duplicate_conflicting_media] do
+    send_resp(conn, 202, "")
+  end
+
+  defp respond(conn, mode, %{"id" => id, "method" => "initialize"})
+       when mode in [:duplicate_same_media, :duplicate_conflicting_media] do
+    send_json(conn, %{
+      "jsonrpc" => "2.0",
+      "id" => id,
+      "result" => %{
+        "protocolVersion" => FastestMCP.Protocol.current_version(),
+        "capabilities" => %{"tools" => %{}},
+        "serverInfo" => %{"name" => "duplicate-media-server", "version" => "1.0.0"}
+      }
+    })
+  end
+
+  defp respond(conn, mode, %{"id" => id, "method" => "tools/list"})
+       when mode in [:duplicate_same_media, :duplicate_conflicting_media] do
+    media_types =
+      case mode do
+        :duplicate_same_media -> ["application/json", "application/json"]
+        :duplicate_conflicting_media -> ["application/json", "text/event-stream"]
+      end
+
+    conn
+    |> prepend_resp_headers(Enum.map(media_types, &{"content-type", &1}))
+    |> send_resp(
+      200,
+      JSON.encode!(%{
+        "jsonrpc" => "2.0",
+        "id" => id,
+        "result" => %{"tools" => []}
+      })
+    )
+  end
+
+  defp respond(conn, :delayed_request, %{"method" => "notifications/initialized"}) do
+    send_resp(conn, 202, "")
+  end
+
+  defp respond(conn, :delayed_request, %{"method" => "notifications/cancelled"}) do
+    send_resp(conn, 202, "")
+  end
+
+  defp respond(conn, :delayed_request, %{"id" => id, "method" => "initialize"}) do
+    send_json(conn, %{
+      "jsonrpc" => "2.0",
+      "id" => id,
+      "result" => %{
+        "protocolVersion" => FastestMCP.Protocol.current_version(),
+        "capabilities" => %{},
+        "serverInfo" => %{"name" => "delayed-server", "version" => "1.0.0"}
+      }
+    })
+  end
+
+  defp respond(conn, :delayed_request, %{"id" => id, "method" => "ping"}) do
+    Process.sleep(1_000)
+    send_json(conn, %{"jsonrpc" => "2.0", "id" => id, "result" => %{}})
+  end
+
   defp send_json(conn, payload, headers \\ []) do
     conn
     |> put_headers(headers)
@@ -176,6 +335,7 @@ defmodule FastestMCP.ClientProtocolResponseTest do
   use ExUnit.Case, async: false
 
   alias FastestMCP.Client
+  alias FastestMCP.Client.ProtocolError
   alias FastestMCP.Error
 
   test "all HTTP request families accept bounded SSE responses" do
@@ -184,13 +344,24 @@ defmodule FastestMCP.ClientProtocolResponseTest do
     on_exit(fn -> disconnect_if_alive(client) end)
 
     assert Client.session_id(client) == "all-sse-session"
-    assert %{items: [%{"name" => "from-sse"}], next_cursor: nil} = Client.list_tools(client)
+
+    assert %{
+             items: [
+               %{"name" => "from-sse", "inputSchema" => %{"type" => "object"}}
+             ],
+             next_cursor: nil
+           } = Client.list_tools(client)
+
     assert %{} = Client.ping(client)
+    assert :ok = Client.set_log_level(client, :warning)
+
+    request = Client.request_async(client, "ping")
+    assert %{} = Client.await(request, 2_000)
   end
 
   test "HTTP JSON and SSE responses require valid correlated JSON-RPC envelopes" do
     url = start_protocol_server(:invalid_envelopes)
-    client = Client.connect!(url, auto_initialize: false)
+    client = Client.connect!(url)
     on_exit(fn -> disconnect_if_alive(client) end)
 
     error = assert_raise Error, fn -> Client.ping(client) end
@@ -221,9 +392,121 @@ defmodule FastestMCP.ClientProtocolResponseTest do
     refute_receive {:client_protocol_request, %{"method" => "notifications/initialized"}}, 100
   end
 
+  test "supported_protocol_versions cannot override the single supported baseline" do
+    url = start_protocol_server(:unsupported_initialize)
+
+    assert {:error, %Error{} = error} =
+             Client.connect(url,
+               supported_protocol_versions: [
+                 FastestMCP.Protocol.current_version(),
+                 "2025-03-26"
+               ]
+             )
+
+    assert error.code == :invalid_params
+    assert error.message =~ "is not configurable"
+  end
+
+  test "invalid InitializeResult aborts connection with its method-specific ProtocolError" do
+    url = start_protocol_server(:invalid_initialize, test_pid: self())
+
+    assert {:error, %ProtocolError{} = error} = Client.connect(url)
+    assert error.method == "initialize"
+    assert error.direction == :server_to_client
+    assert error.kind == :response
+    assert error.errors != []
+
+    assert_receive {:client_protocol_request, %{"method" => "initialize"}}
+    refute_receive {:client_protocol_request, %{"method" => "notifications/initialized"}}, 100
+
+    assert_raise ProtocolError, fn -> Client.connect!(url) end
+  end
+
+  test "method-specific response schemas reject structurally invalid results" do
+    url = start_protocol_server(:invalid_method_schema)
+    client = Client.connect!(url)
+    on_exit(fn -> disconnect_if_alive(client) end)
+
+    error = assert_raise ProtocolError, fn -> Client.list_tools(client) end
+    assert error.method == "tools/list"
+    assert error.direction == :server_to_client
+    assert error.kind == :response
+    assert is_binary(error.request_id)
+    assert error.errors != []
+    assert error.errors == error.violations
+    assert error.violations != []
+  end
+
+  test "MCP responses reject non-protocol structured JSON media types" do
+    url = start_protocol_server(:invalid_media)
+    client = Client.connect!(url)
+    on_exit(fn -> disconnect_if_alive(client) end)
+
+    error = assert_raise Error, fn -> Client.list_tools(client) end
+    assert error.code == :bad_request
+    assert error.message == "HTTP MCP response has an unsupported Content-Type"
+    assert error.details.content_type == "application/problem+json"
+  end
+
+  test "MCP responses reject duplicate Content-Type fields" do
+    for mode <- [:duplicate_same_media, :duplicate_conflicting_media] do
+      url = start_protocol_server(mode)
+      client = Client.connect!(url)
+
+      error = assert_raise Error, fn -> Client.list_tools(client) end
+      assert error.code == :bad_request
+      assert error.message == "HTTP MCP response has an unsupported Content-Type"
+      assert length(error.details.content_type) == 2
+
+      disconnect_if_alive(client)
+    end
+  end
+
+  test "initialize rejects standard capabilities that the client cannot serve" do
+    url = start_protocol_server(:sse)
+    client = Client.connect!(url, auto_initialize: false)
+    on_exit(fn -> disconnect_if_alive(client) end)
+
+    error =
+      assert_raise Error, fn ->
+        Client.initialize(client, %{"capabilities" => %{"roots" => %{"listChanged" => true}}})
+      end
+
+    assert error.code == :invalid_params
+    assert error.details.capability == "roots"
+  end
+
+  test "asynchronous requests can be explicitly cancelled with a protocol notification" do
+    url = start_protocol_server(:delayed_request, test_pid: self())
+    client = Client.connect!(url)
+    on_exit(fn -> disconnect_if_alive(client) end)
+
+    request = Client.request_async(client, "ping", %{}, timeout_ms: 5_000)
+    assert_receive {:client_protocol_request, %{"id" => request_id, "method" => "ping"}}, 1_000
+    assert request.request_id == request_id
+
+    assert %{direction: :client_to_server, method: "ping", request_id: ^request_id} =
+             :sys.get_state(client.pid).in_flight[request.ref]
+
+    assert :ok = Client.cancel(request, "user cancelled")
+
+    assert_receive {:client_protocol_request,
+                    %{
+                      "method" => "notifications/cancelled",
+                      "params" => %{
+                        "requestId" => ^request_id,
+                        "reason" => "user cancelled"
+                      }
+                    }},
+                   1_000
+
+    error = assert_raise Error, fn -> Client.await(request, 1_000) end
+    assert error.code == :cancelled
+  end
+
   test "client decodes standard and FastestMCP JSON-RPC error semantics" do
     url = start_protocol_server(:error_semantics)
-    client = Client.connect!(url, auto_initialize: false)
+    client = Client.connect!(url)
     on_exit(fn -> disconnect_if_alive(client) end)
 
     assert_error_code(:method_not_found, fn -> Client.ping(client) end)

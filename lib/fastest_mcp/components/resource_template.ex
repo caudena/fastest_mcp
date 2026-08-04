@@ -2,15 +2,12 @@ defmodule FastestMCP.Components.ResourceTemplate do
   @moduledoc """
   Defines the runtime struct used for resource-template components and their URI matcher helpers.
 
-  These structs are the compiled component shapes used by the runtime. The
-  builder APIs, providers, registry, serializers, and transports all agree
-  on this explicit representation so they do not need to keep the original
-  DSL input around.
-
-  Applications usually do not construct these structs by hand. Prefer the
-  corresponding `FastestMCP.Server` or provider helpers and let compilation
-  produce the runtime shape for you.
+  Resource templates are parsed and expanded as RFC 6570 level 1-4 templates.
+  Matching is deterministic, but necessarily lossy: RFC 6570 defines expansion,
+  and distinct input values can expand to the same URI.
   """
+
+  alias FastestMCP.Components.ResourceTemplate.Matcher
 
   defstruct [
     :server_name,
@@ -25,6 +22,7 @@ defmodule FastestMCP.Components.ResourceTemplate do
     :task,
     :timeout,
     :parameters,
+    :compiled_parameters,
     :mime_type,
     :compiled,
     :matcher,
@@ -38,22 +36,26 @@ defmodule FastestMCP.Components.ResourceTemplate do
     meta: %{}
   ]
 
-  @expression ~r{\{([+#./;?&]?)([a-zA-Z_][a-zA-Z0-9_-]*\*?(?:,[a-zA-Z_][a-zA-Z0-9_-]*\*?)*)\}}
-
-  @doc "Compiles the given URI template into a matcher."
+  @doc "Compiles the given RFC 6570 URI template into a matcher."
   def compile_matcher!(template) when is_binary(template) do
-    if String.contains?(template, "#") do
-      raise ArgumentError, "resource-template fragments are not supported"
-    end
+    Matcher.compile!(template)
+  end
 
-    {source, variables, query_variables, query_variable_sources} = regex_source(template)
+  @doc "Expands this resource template with RFC 6570 variables."
+  def expand(%__MODULE__{matcher: matcher}, variables) do
+    expand_compiled(matcher, variables)
+  end
 
-    {%{
-       template: template,
-       regex: Regex.compile!("^" <> source <> "$"),
-       query_variables: query_variables,
-       query_variable_sources: query_variable_sources
-     }, variables, query_variables}
+  @doc "Expands a compiled resource template with RFC 6570 variables."
+  def expand_compiled(%{parsed: parsed}, variables) do
+    variables =
+      variables
+      |> Map.new()
+      |> Map.new(fn {name, value} -> {name, normalize_template_value(value)} end)
+
+    parsed.parts
+    |> Enum.map(&render_part(&1, variables))
+    |> IO.iodata_to_binary()
   end
 
   @doc "Matches a concrete URI against the compiled template."
@@ -62,179 +64,94 @@ defmodule FastestMCP.Components.ResourceTemplate do
   end
 
   @doc "Matches a concrete URI against a compiled matcher."
-  def match_compiled(
-        %{regex: regex, query_variable_sources: query_variable_sources},
-        uri
-      ) do
-    {path, query_params} = split_uri(uri)
-
-    case Regex.named_captures(regex, path) do
-      nil ->
-        nil
-
-      captures ->
-        captures =
-          Map.new(captures, fn {key, value} ->
-            {key, URI.decode(value)}
-          end)
-
-        query_captures =
-          query_variable_sources
-          |> Enum.reduce(%{}, fn {source_name, input_name}, acc ->
-            cond do
-              Map.has_key?(captures, input_name) ->
-                acc
-
-              Map.has_key?(query_params, source_name) ->
-                Map.put(acc, input_name, Map.fetch!(query_params, source_name))
-
-              true ->
-                acc
-            end
-          end)
-
-        Map.merge(query_captures, captures)
-    end
+  def match_compiled(matcher, uri) do
+    Matcher.match(matcher, uri)
   end
 
-  def match_compiled(%{regex: regex, query_variables: query_variables}, uri) do
-    match_compiled(
-      %{regex: regex, query_variable_sources: Enum.map(query_variables, &{&1, &1})},
-      uri
-    )
+  # Texture represents an RFC 6570 associative value as an ordered list of
+  # key/value tuples. Accept ordinary Elixir maps at FastestMCP's public
+  # boundary and sort their keys so expansion is deterministic across VMs.
+  defp normalize_template_value(%{} = value) do
+    value
+    |> Enum.sort_by(fn {key, _value} -> to_string(key) end)
+    |> Enum.map(fn {key, nested} -> {to_string(key), normalize_template_value(nested)} end)
   end
 
-  defp split_uri(uri) do
-    uri =
-      case String.split(uri, "#", parts: 2) do
-        [without_fragment | _rest] -> without_fragment
-      end
-
-    case String.split(uri, "?", parts: 2) do
-      [path] -> {path, %{}}
-      [path, query] -> {path, URI.decode_query(query)}
-    end
-  end
-
-  defp regex_source(template) do
-    matches = Regex.scan(@expression, template, return: :index)
-
-    {source, variables, query_variables, offset} =
-      Enum.reduce(matches, {"", [], [], 0}, fn
-        [{start, length}, {operator_start, operator_length}, {vars_start, vars_length}],
-        {source, variables, query_variables, offset} ->
-          literal = String.slice(template, offset, start - offset)
-          operator = String.slice(template, operator_start, operator_length)
-          variables_source = String.slice(template, vars_start, vars_length)
-
-          {fragment, path_variables, expression_query_variables} =
-            expression_fragment(operator, variables_source)
-
-          {source <> Regex.escape(literal) <> fragment, variables ++ path_variables,
-           query_variables ++ expression_query_variables, start + length}
-      end)
-
-    rest = String.slice(template, offset, String.length(template) - offset)
-    validate_variable_collisions!(variables ++ query_variables)
-
-    {
-      source <> Regex.escape(rest),
-      normalized_variable_names(variables),
-      normalized_variable_names(query_variables),
-      query_variable_sources(query_variables)
-    }
-  end
-
-  defp expression_fragment(operator, variables_source) do
-    varspecs = Enum.map(String.split(variables_source, ",", trim: true), &parse_varspec/1)
-
-    case operator do
-      "" ->
-        {join_expression(varspecs, ",", :simple), varspecs, []}
-
-      "+" ->
-        {join_expression(varspecs, ",", :reserved), varspecs, []}
-
-      "." ->
-        {"\\." <> join_expression(varspecs, "\\.", :label), varspecs, []}
-
-      "/" ->
-        {"/" <> join_expression(varspecs, "/", :path), varspecs, []}
-
-      ";" ->
-        {";" <> join_matrix_expression(varspecs), varspecs, []}
-
-      "?" ->
-        {"", [], varspecs}
-
-      "&" ->
-        {"", [], varspecs}
-
-      "#" ->
-        {"#" <> join_expression(varspecs, ",", :reserved), varspecs, []}
-
-      other ->
-        raise ArgumentError, "unsupported resource-template operator #{inspect(other)}"
-    end
-  end
-
-  defp parse_varspec(spec) do
-    exploded? = String.ends_with?(spec, "*")
-    source_name = if exploded?, do: String.trim_trailing(spec, "*"), else: spec
-    {source_name, normalize_variable_name(source_name), exploded?}
-  end
-
-  defp join_expression(varspecs, separator, kind) do
-    Enum.map_join(varspecs, separator, fn {_source_name, input_name, exploded?} ->
-      "(?<#{input_name}>#{value_pattern(kind, exploded?)})"
+  defp normalize_template_value(value) when is_list(value) do
+    Enum.map(value, fn
+      {key, nested} -> {to_string(key), normalize_template_value(nested)}
+      nested -> normalize_template_value(nested)
     end)
   end
 
-  defp join_matrix_expression(varspecs) do
-    Enum.map_join(varspecs, ";", fn {source_name, input_name, exploded?} ->
-      escaped_name = Regex.escape(source_name)
-      "#{escaped_name}=(?<#{input_name}>#{value_pattern(:matrix, exploded?)})"
+  defp normalize_template_value(value), do: value
+
+  defp render_part({:lit, literal}, _variables), do: literal
+  defp render_part(:eos, _variables), do: ""
+
+  defp render_part({:expr, operator, variable_specs} = expression, variables) do
+    validate_prefix_values!(variable_specs, variables)
+
+    rendered =
+      Texture.UriTemplate.render(
+        %Texture.UriTemplate{parts: [expression, :eos], raw: ""},
+        variables
+      )
+      |> restore_percent_encoded_variable_names(operator, variable_specs)
+
+    if operator in ["+", "#"] do
+      # RFC 6570 reserved expansion preserves already-valid pct-encoded
+      # triplets while still escaping a bare or malformed percent sign.
+      Regex.replace(~r/%25([0-9A-Fa-f]{2})/, rendered, "%\\1")
+    else
+      rendered
+    end
+  end
+
+  defp validate_prefix_values!(variable_specs, variables) do
+    Enum.each(variable_specs, fn
+      {:var, name, {:prefix, _length}} ->
+        case fetch_variable(variables, name) do
+          {:ok, value} when is_list(value) or is_map(value) ->
+            raise ArgumentError,
+                  "RFC 6570 prefix modifiers cannot be applied to composite variable #{inspect(name)}"
+
+          _other ->
+            :ok
+        end
+
+      _other ->
+        :ok
     end)
   end
 
-  defp validate_variable_collisions!(varspecs) do
-    varspecs
-    |> Enum.group_by(fn {_source_name, input_name, _exploded?} -> input_name end)
-    |> Enum.each(fn {input_name, grouped} ->
-      source_names =
-        grouped
-        |> Enum.map(fn {source_name, _input_name, _exploded?} -> source_name end)
-        |> Enum.uniq()
+  defp fetch_variable(variables, name) do
+    case Map.fetch(variables, name) do
+      {:ok, value} ->
+        {:ok, value}
 
-      if length(source_names) > 1 do
-        raise ArgumentError,
-              "resource-template parameters #{inspect(source_names)} collide as #{inspect(input_name)}"
+      :error ->
+        try do
+          Map.fetch(variables, String.to_existing_atom(name))
+        rescue
+          ArgumentError -> :error
+        end
+    end
+  end
+
+  defp restore_percent_encoded_variable_names(rendered, operator, variable_specs)
+       when operator in [";", "?", "&"] do
+    Enum.reduce(variable_specs, rendered, fn {:var, name, _modifier}, rendered ->
+      encoded_name = URI.encode(name, &URI.char_unreserved?/1)
+
+      if encoded_name == name do
+        rendered
+      else
+        pattern = Regex.compile!("(^|[?&;])#{Regex.escape(encoded_name)}(?==|[?&;]|$)")
+        Regex.replace(pattern, rendered, fn _match, prefix -> prefix <> name end)
       end
     end)
   end
 
-  defp normalized_variable_names(varspecs) do
-    varspecs
-    |> Enum.map(fn {_source_name, input_name, _exploded?} -> input_name end)
-    |> Enum.uniq()
-  end
-
-  defp query_variable_sources(varspecs) do
-    varspecs
-    |> Enum.map(fn {source_name, input_name, _exploded?} -> {source_name, input_name} end)
-    |> Enum.uniq()
-  end
-
-  defp normalize_variable_name(name), do: String.replace(name, "-", "_")
-
-  defp value_pattern(:simple, false), do: "[^/?#&,]+"
-  defp value_pattern(:simple, true), do: "[^?#]+"
-  defp value_pattern(:reserved, false), do: "[^?#,]+"
-  defp value_pattern(:reserved, true), do: "[^?#]+"
-  defp value_pattern(:label, false), do: "[^./?#&,;]+"
-  defp value_pattern(:label, true), do: "[^?#]+"
-  defp value_pattern(:path, false), do: "[^/?#&,;]+"
-  defp value_pattern(:path, true), do: "[^?#]+"
-  defp value_pattern(:matrix, false), do: "[^;/?#&]+"
-  defp value_pattern(:matrix, true), do: "[^?#]+"
+  defp restore_percent_encoded_variable_names(rendered, _operator, _variable_specs), do: rendered
 end

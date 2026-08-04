@@ -44,7 +44,11 @@ defmodule FastestMCP.PromptHelpersTest do
         Result.new(
           [
             Message.new("Review this file"),
-            Message.new(%{type: "resource", resource: %{uri: "file:///tmp/report.md"}},
+            Message.new(
+              %{
+                type: "resource",
+                resource: %{uri: "file:///tmp/report.md", text: "# Report"}
+              },
               role: :assistant
             )
           ],
@@ -63,7 +67,10 @@ defmodule FastestMCP.PromptHelpersTest do
                %{role: "user", content: %{type: "text", text: "Review this file"}},
                %{
                  role: "assistant",
-                 content: %{type: "resource", resource: %{uri: "file:///tmp/report.md"}}
+                 content: %{
+                   type: "resource",
+                   resource: %{uri: "file:///tmp/report.md", text: "# Report"}
+                 }
                }
              ]
            } = FastestMCP.render_prompt(server_name, "review", %{})
@@ -78,7 +85,7 @@ defmodule FastestMCP.PromptHelpersTest do
                  "role" => "assistant",
                  "content" => %{
                    "type" => "resource",
-                   "resource" => %{"uri" => "file:///tmp/report.md"}
+                   "resource" => %{"uri" => "file:///tmp/report.md", "text" => "# Report"}
                  }
                }
              ],

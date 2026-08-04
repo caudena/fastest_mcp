@@ -55,13 +55,23 @@ It does not change `call_tool`, `read_resource`, or `render_prompt`.
 
 ## Transport Behavior
 
-The transport protocol uses the same capability with JSON payload keys:
+The MCP wire is intentionally different from the Elixir convenience option:
 
-- `pageSize`
-- `cursor`
-- `nextCursor`
+- the server owns a page size of 100
+- a first request omits `cursor`
+- continuation sends only the opaque `cursor`
+- the result includes `nextCursor` only when another page exists
+- a legacy top-level `pageSize` field is ignored and never controls server work
 
-That means streamable HTTP, stdio, and in-process list operations stay aligned.
+Wire cursors are signed and bound to the list method, runtime generation,
+principal/visibility/filter fingerprint, and last stable component identity.
+They are limited to 4 KiB and use keyset continuation rather than offset
+slicing. A cursor cannot be moved between methods, sessions with different
+visibility, principals, or runtime generations.
+
+Providers may implement the optional page callback to filter and limit at the
+source. Existing providers use the streaming fallback, so the wire contract
+does not require every provider to change at once.
 
 ## Example
 
@@ -89,6 +99,10 @@ Pagination raises a normalized bad-request error when:
 
 - `page_size` is not a positive integer
 - the cursor is invalid
+
+The transport also rejects signed cursors that are tampered with or belong to a
+different method, runtime generation, principal, visibility/filter scope, or
+stable keyset.
 
 That makes list behavior consistent with the rest of the runtime.
 

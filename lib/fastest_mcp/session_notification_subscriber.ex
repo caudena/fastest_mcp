@@ -7,12 +7,13 @@ defmodule FastestMCP.SessionNotificationSubscriber do
 
     * task status notifications for tasks owned by the session
     * list-changed notifications when the visible tool/resource/prompt set changes
-    * resource-updated notifications for exact or template-style resource subscriptions
+    * resource-updated notifications for exact resource subscriptions
   """
 
   use GenServer
 
   alias FastestMCP.EventBus
+  alias FastestMCP.Protocol
   alias FastestMCP.Session
 
   @list_changed_methods %{
@@ -55,8 +56,7 @@ defmodule FastestMCP.SessionNotificationSubscriber do
            owner: owner,
            owner_ref: Process.monitor(owner),
            target: Keyword.get(opts, :target, owner),
-           handler: Keyword.get(opts, :handler),
-           visible_sets: visible_sets(server_name, session_id)
+           handler: Keyword.get(opts, :handler)
          }}
 
       {:error, :overloaded} ->
@@ -74,7 +74,8 @@ defmodule FastestMCP.SessionNotificationSubscriber do
          %{notification: notification} = metadata},
         %{server_name: server_name} = state
       ) do
-    if task_belongs_to_session?(state, metadata) do
+    if task_belongs_to_session?(state, metadata) and
+         session_capability?(state, ["tasks"]) do
       emit_to_target(state, notification)
       {:noreply, invoke_handler(state, notification)}
     else
@@ -87,10 +88,10 @@ defmodule FastestMCP.SessionNotificationSubscriber do
         %{server_name: server_name} = state
       ) do
     if component_change_targets_session?(state, metadata) do
-      {notifications, visible_sets} = list_changed_notifications(state, metadata)
+      notifications = list_changed_notifications(state, metadata)
 
       state =
-        Enum.reduce(notifications, %{state | visible_sets: visible_sets}, fn notification, acc ->
+        Enum.reduce(notifications, state, fn notification, acc ->
           emit_to_target(acc, notification)
           invoke_handler(acc, notification)
         end)
@@ -107,7 +108,8 @@ defmodule FastestMCP.SessionNotificationSubscriber do
       ) do
     uri = map_value(metadata, :uri)
 
-    if is_binary(uri) and Session.subscribed_to_resource?(server_name, state.session_id, uri) do
+    if is_binary(uri) and session_capability?(state, ["resources", "subscribe"]) and
+         Session.subscribed_to_resource?(server_name, state.session_id, uri) do
       notification = %{
         "jsonrpc" => "2.0",
         "method" => "notifications/resources/updated",
@@ -141,19 +143,16 @@ defmodule FastestMCP.SessionNotificationSubscriber do
 
   defp list_changed_notifications(state, metadata) do
     families = normalize_families(map_value(metadata, :families))
-    next_visible_sets = visible_sets(state.server_name, state.session_id)
+    capabilities = initialized_server_capabilities(state)
 
-    notifications =
-      Enum.reduce(families, [], fn family, acc ->
-        if Map.get(state.visible_sets, family, []) != Map.get(next_visible_sets, family, []) do
-          [list_changed_notification(family) | acc]
-        else
-          acc
-        end
-      end)
-      |> Enum.reverse()
+    families
+    |> Enum.filter(fn family ->
+      key = Atom.to_string(family)
 
-    {notifications, next_visible_sets}
+      Protocol.capability?(capabilities, [key]) and
+        Protocol.capability_flag?(capabilities, [key, "listChanged"])
+    end)
+    |> Enum.map(&list_changed_notification/1)
   end
 
   defp list_changed_notification(family) do
@@ -176,10 +175,20 @@ defmodule FastestMCP.SessionNotificationSubscriber do
     end)
   end
 
-  defp visible_sets(server_name, session_id) do
-    FastestMCP.OperationPipeline.visible_component_sets(server_name, session_id: session_id)
-  rescue
-    _error -> %{tools: [], resources: [], prompts: []}
+  defp session_capability?(state, path) do
+    state
+    |> initialized_server_capabilities()
+    |> Protocol.capability?(path)
+  end
+
+  defp initialized_server_capabilities(state) do
+    case Session.lifecycle(state.server_name, state.session_id) do
+      {:ok, %{state: :initialized, server_capabilities: capabilities}} ->
+        capabilities || %{}
+
+      _other ->
+        %{}
+    end
   end
 
   defp emit_to_target(%{target: nil}, _notification), do: :ok

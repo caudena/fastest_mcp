@@ -251,7 +251,9 @@ defmodule FastestMCP.ClientTaskTest do
       {Bandit,
        plug:
          {FastestMCP.Transport.HTTPApp,
-          server_name: server_name, path: "/mcp", unsafe_allow_any_host: true},
+          server_name: server_name,
+          path: "/mcp",
+          allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
        scheme: :http,
        port: 0}
     )

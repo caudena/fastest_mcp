@@ -37,6 +37,7 @@ defmodule FastestMCP.TaskWire do
     task = ErrorExposure.public_task(task, opts)
 
     %{
+      jsonrpc: "2.0",
       method: "notifications/tasks/status",
       params: task_payload(task, status_override, status_message_override)
     }

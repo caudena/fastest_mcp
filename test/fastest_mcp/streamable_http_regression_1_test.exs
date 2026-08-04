@@ -22,7 +22,9 @@ defmodule FastestMCP.StreamableHTTPRegression1Test do
         {Bandit,
          plug:
            {FastestMCP.Transport.HTTPApp,
-            server_name: server_name, unsafe_allow_any_host: true, json_response: true},
+            server_name: server_name,
+            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"],
+            json_response: true},
          scheme: :http,
          port: 0}
       )

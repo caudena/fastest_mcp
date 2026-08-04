@@ -223,15 +223,23 @@ defmodule FastestMCP.MiddlewareResponseLimitingTest do
     assert text =~ "[Response truncated"
   end
 
-  test "output-schema wrapping is included in the response-size decision" do
+  test "structured output schemas are included in the response-size decision" do
     middleware = Middleware.response_limiting(max_size: 200)
     server_name = "response-limit-schema-#{System.unique_integer([:positive])}"
 
     server =
       FastestMCP.server(server_name)
       |> FastestMCP.add_middleware(middleware)
-      |> FastestMCP.add_tool("values", fn _arguments, _context -> Enum.to_list(1..30) end,
-        output_schema: %{"type" => "array", "items" => %{"type" => "integer"}}
+      |> FastestMCP.add_tool(
+        "values",
+        fn _arguments, _context -> %{"values" => Enum.to_list(1..30)} end,
+        output_schema: %{
+          "type" => "object",
+          "properties" => %{
+            "values" => %{"type" => "array", "items" => %{"type" => "integer"}}
+          },
+          "required" => ["values"]
+        }
       )
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
@@ -249,8 +257,70 @@ defmodule FastestMCP.MiddlewareResponseLimitingTest do
 
     assert conn.status == 200
     %{"result" => result} = JSON.decode!(conn.resp_body)
-    assert %{"content" => [%{"type" => "text", "text" => text}]} = result
+
+    assert %{
+             "content" => [%{"type" => "text", "text" => text}],
+             "structuredContent" => %{"values" => values}
+           } = result
+
+    assert values == Enum.to_list(1..30)
     assert text =~ "[Response truncated"
     assert byte_size(JSON.encode!(result)) <= 200
+  end
+
+  test "a structured result that cannot fit returns a bounded error instead of invalid output" do
+    middleware = Middleware.response_limiting(max_size: 200)
+    server_name = "response-limit-unrepresentable-#{System.unique_integer([:positive])}"
+
+    server =
+      FastestMCP.server(server_name)
+      |> FastestMCP.add_middleware(middleware)
+      |> FastestMCP.add_tool(
+        "values",
+        fn _arguments, _context -> %{"values" => Enum.to_list(1..200)} end,
+        output_schema: %{
+          "type" => "object",
+          "properties" => %{
+            "values" => %{"type" => "array", "items" => %{"type" => "integer"}}
+          },
+          "required" => ["values"]
+        }
+      )
+
+    assert {:ok, _pid} = FastestMCP.start_server(server)
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    ProtocolTest.initialize_session(server_name, "response-limit-unrepresentable-session")
+
+    conn =
+      ProtocolTest.http_request(
+        server_name,
+        "response-limit-unrepresentable-session",
+        1,
+        "tools/call",
+        %{"name" => "values", "arguments" => %{}}
+      )
+
+    assert conn.status == 200
+
+    assert %{
+             "error" => %{
+               "code" => -32_603,
+               "message" => "tool response exceeds the configured size limit",
+               "data" => %{
+                 "fastestmcp" => %{
+                   "code" => "internal_error",
+                   "details" => %{
+                     "actual_bytes" => actual_bytes,
+                     "maximum_bytes" => 200,
+                     "minimum_valid_result_bytes" => minimum_bytes
+                   }
+                 }
+               }
+             }
+           } = JSON.decode!(conn.resp_body)
+
+    assert actual_bytes > minimum_bytes
+    assert minimum_bytes > 200
+    assert byte_size(conn.resp_body) < 512
   end
 end

@@ -32,6 +32,7 @@ defmodule FastestMCP.OperationPipeline do
   alias FastestMCP.Error
   alias FastestMCP.Middleware
   alias FastestMCP.Operation
+  alias FastestMCP.Protocol.Duration
   alias FastestMCP.Pagination
   alias FastestMCP.Provider
   alias FastestMCP.Protocol
@@ -91,6 +92,23 @@ defmodule FastestMCP.OperationPipeline do
   def list_prompts(server_name, opts \\ []), do: list(server_name, :prompt, "prompts/list", opts)
 
   @doc false
+  def wire_list_page(server_name, component_type, opts, pagination_opts)
+      when component_type in [:tool, :resource, :resource_template, :prompt] and
+             is_list(opts) and is_list(pagination_opts) do
+    method = visible_component_method(component_type)
+    cursor = Keyword.get(pagination_opts, :cursor)
+    arguments = if is_nil(cursor), do: %{}, else: %{"cursor" => cursor}
+
+    Pagination.wire_page(pagination_opts, fn after_key, limit ->
+      run(server_name, component_type, method, nil, arguments, opts, fn server, operation ->
+        server
+        |> visible_component_page(component_type, operation, after_key, limit)
+        |> Enum.map(&Component.metadata/1)
+      end)
+    end)
+  end
+
+  @doc false
   def visible_component_keys(server_name, component_type, opts \\ []) do
     with_visible_snapshot(
       server_name,
@@ -118,8 +136,8 @@ defmodule FastestMCP.OperationPipeline do
 
   @doc "Resolves completion values for a prompt argument or resource-template parameter."
   def complete(server_name, ref, argument, opts \\ []) do
-    ref = normalize_completion_ref(ref)
-    argument = normalize_completion_argument(argument)
+    ref = normalize_completion_ref(ref, Keyword.get(opts, :wire, false))
+    argument = normalize_completion_argument(argument, Keyword.get(opts, :wire, false))
 
     run(
       server_name,
@@ -230,7 +248,10 @@ defmodule FastestMCP.OperationPipeline do
             })
 
           nil ->
-            raise Error, code: :not_found, message: "unknown resource #{inspect(target)}"
+            raise Error,
+              code: :not_found,
+              message: "unknown resource #{inspect(target)}",
+              details: %{jsonrpc_code: -32_002}
         end
     end)
   end
@@ -312,6 +333,13 @@ defmodule FastestMCP.OperationPipeline do
               run_middleware(runtime.server.middleware, operation, fn updated_operation ->
                 executor.(runtime.server, updated_operation)
               end)
+
+            result =
+              validate_post_middleware_result(
+                operation,
+                Context.get_request_state(context, @resolved_component_key),
+                result
+              )
 
             Context.emit(
               operation.context,
@@ -407,7 +435,8 @@ defmodule FastestMCP.OperationPipeline do
   end
 
   defp maybe_authenticate_operation(server, operation, opts, run_opts) do
-    if Keyword.get(run_opts, :authenticate?, true) do
+    if Keyword.get(run_opts, :authenticate?, true) and
+         not Keyword.get(opts, :transport_authenticated, false) do
       authenticate_operation(server, operation, opts)
     else
       operation
@@ -430,6 +459,8 @@ defmodule FastestMCP.OperationPipeline do
       call_supervisor: runtime.call_supervisor,
       task_supervisor: Map.get(runtime, :task_supervisor),
       task_store: Map.get(runtime, :task_store),
+      schema_cache: Map.get(runtime, :schema_cache),
+      schema_options: runtime.server.schema_options,
       task_request: task_request,
       task_ttl_ms: task_ttl_ms,
       arguments: arguments
@@ -453,14 +484,19 @@ defmodule FastestMCP.OperationPipeline do
   defp maybe_attach_initialize_client_info(context, _method, _arguments), do: context
 
   defp task_request_opts(opts) do
+    task_ttl_ms = normalize_task_ttl(opts[:task_ttl_ms])
+
     case TaskMeta.normalize(Keyword.get(opts, :task_meta)) do
       %TaskMeta{} = task_meta ->
-        {true, task_meta.ttl || opts[:task_ttl_ms]}
+        {true, task_meta.ttl || task_ttl_ms}
 
       nil ->
-        {!!Keyword.get(opts, :task, false), opts[:task_ttl_ms]}
+        {!!Keyword.get(opts, :task, false), task_ttl_ms}
     end
   end
+
+  defp normalize_task_ttl(nil), do: nil
+  defp normalize_task_ttl(value), do: Duration.positive_milliseconds!(value, "task ttl")
 
   defp authenticate_operation(%{auth: nil}, operation, _opts), do: operation
 
@@ -511,12 +547,25 @@ defmodule FastestMCP.OperationPipeline do
     end)
   end
 
+  defp validate_post_middleware_result(
+         %{method: "tools/call", task_request: false},
+         component,
+         result
+       ) do
+    Component.validate_normalized_output(component, result)
+  end
+
+  defp validate_post_middleware_result(_operation, _component, result), do: result
+
   defp apply_component_policy(components, server, operation) do
     components
     |> Enum.reduce([], fn component, acc ->
       case ComponentPolicy.apply_result(server, component, operation) do
-        {:ok, updated} -> [updated | acc]
-        {:error, _error} -> acc
+        {:ok, updated} ->
+          if negotiated_component_visible?(updated, operation), do: [updated | acc], else: acc
+
+        {:error, _error} ->
+          acc
       end
     end)
     |> Enum.reverse()
@@ -553,21 +602,13 @@ defmodule FastestMCP.OperationPipeline do
   defp normalize_arguments(arguments) when is_list(arguments), do: Enum.into(arguments, %{})
   defp normalize_arguments(nil), do: %{}
 
-  defp completion_capability(visible_tools, visible_prompts, visible_templates) do
-    if Enum.any?(visible_tools, &tool_has_completion?/1) or
-         Enum.any?(visible_prompts, &prompt_has_completion?/1) or
+  defp completion_capability(visible_prompts, visible_templates) do
+    if Enum.any?(visible_prompts, &prompt_has_completion?/1) or
          Enum.any?(visible_templates, &template_has_completion?/1) do
       %{}
     else
       nil
     end
-  end
-
-  defp tool_has_completion?(component) do
-    map_size(Map.get(component, :completions, %{})) > 0 or
-      Enum.any?(parameter_completion_sources(component), fn {_name, provider} ->
-        not is_nil(provider)
-      end)
   end
 
   defp prompt_has_completion?(component) do
@@ -621,21 +662,29 @@ defmodule FastestMCP.OperationPipeline do
     do: provider.(partial || "", context)
 
   defp normalize_completion_result(%{} = value) do
-    values =
-      value
-      |> Map.get(:values, Map.get(value, "values", []))
-      |> List.wrap()
-      |> Enum.map(&to_string/1)
+    values = Map.get(value, :values, Map.get(value, "values", []))
+    validate_completion_values!(values)
 
-    %{}
-    |> Map.put(:values, values)
-    |> maybe_put(:total, Map.get(value, :total, Map.get(value, "total", length(values))))
-    |> maybe_put(:has_more, Map.get(value, :has_more, Map.get(value, "hasMore")))
+    total = Map.get(value, :total, Map.get(value, "total", length(values)))
+    has_more = Map.get(value, :has_more, Map.get(value, "hasMore", length(values) > 100))
+    validate_completion_total!(total)
+    validate_completion_has_more!(has_more)
+
+    %{
+      values: Enum.take(values, 100),
+      total: total,
+      has_more: has_more or length(values) > 100
+    }
   end
 
   defp normalize_completion_result(values) when is_list(values) do
-    values = Enum.map(values, &to_string/1)
-    %{values: values, total: length(values)}
+    validate_completion_values!(values)
+
+    %{
+      values: Enum.take(values, 100),
+      total: length(values),
+      has_more: length(values) > 100
+    }
   end
 
   defp normalize_completion_result(nil), do: %{values: [], total: 0}
@@ -646,64 +695,138 @@ defmodule FastestMCP.OperationPipeline do
       message: "completion providers must return a list or map, got #{inspect(other)}"
   end
 
-  defp normalize_completion_ref(%{} = ref) do
+  defp normalize_completion_ref(%{} = ref, wire?) do
     type = Map.get(ref, :type, Map.get(ref, "type"))
 
-    case type do
-      "ref/tool" ->
-        %{component_type: :tool, target: Map.get(ref, :name, Map.get(ref, "name"))}
+    normalized =
+      case type do
+        "ref/tool" ->
+          %{component_type: :tool, target: Map.get(ref, :name, Map.get(ref, "name"))}
 
-      "tool" ->
-        %{component_type: :tool, target: Map.get(ref, :name, Map.get(ref, "name"))}
+        "tool" when not wire? ->
+          %{component_type: :tool, target: Map.get(ref, :name, Map.get(ref, "name"))}
 
-      "ref/prompt" ->
-        %{component_type: :prompt, target: Map.get(ref, :name, Map.get(ref, "name"))}
+        "ref/prompt" ->
+          %{component_type: :prompt, target: Map.get(ref, :name, Map.get(ref, "name"))}
 
-      "prompt" ->
-        %{component_type: :prompt, target: Map.get(ref, :name, Map.get(ref, "name"))}
+        "prompt" when not wire? ->
+          %{component_type: :prompt, target: Map.get(ref, :name, Map.get(ref, "name"))}
 
-      "ref/resourceTemplate" ->
-        %{
-          component_type: :resource_template,
-          target: Map.get(ref, :uriTemplate, Map.get(ref, "uriTemplate"))
-        }
+        "ref/resource" ->
+          %{
+            component_type: :resource_template,
+            target: Map.get(ref, :uri, Map.get(ref, "uri"))
+          }
 
-      "ref/resource_template" ->
-        %{
-          component_type: :resource_template,
-          target: Map.get(ref, :uri_template, Map.get(ref, "uri_template"))
-        }
+        "ref/resourceTemplate" when not wire? ->
+          %{
+            component_type: :resource_template,
+            target: Map.get(ref, :uriTemplate, Map.get(ref, "uriTemplate"))
+          }
 
-      "resourceTemplate" ->
-        %{
-          component_type: :resource_template,
-          target: Map.get(ref, :uriTemplate, Map.get(ref, "uriTemplate"))
-        }
+        "ref/resource_template" when not wire? ->
+          %{
+            component_type: :resource_template,
+            target: Map.get(ref, :uri_template, Map.get(ref, "uri_template"))
+          }
 
-      "resource_template" ->
-        %{
-          component_type: :resource_template,
-          target: Map.get(ref, :uri_template, Map.get(ref, "uri_template"))
-        }
+        "resourceTemplate" when not wire? ->
+          %{
+            component_type: :resource_template,
+            target: Map.get(ref, :uriTemplate, Map.get(ref, "uriTemplate"))
+          }
 
-      other ->
+        "resource_template" when not wire? ->
+          %{
+            component_type: :resource_template,
+            target: Map.get(ref, :uri_template, Map.get(ref, "uri_template"))
+          }
+
+        other ->
+          raise Error,
+            code: :bad_request,
+            message: "unsupported completion ref #{inspect(other)}"
+      end
+
+    case normalized do
+      %{component_type: component_type, target: target}
+      when is_binary(target) and target != "" ->
+        if wire? and component_type == :tool do
+          raise Error,
+            code: :bad_request,
+            message: "completion/complete does not support tool references"
+        end
+
+        normalized
+
+      _other ->
         raise Error,
           code: :bad_request,
-          message: "unsupported completion ref #{inspect(other)}"
+          message: "completion/complete reference is missing its identifier"
     end
   end
 
-  defp normalize_completion_argument(%{} = argument) do
-    name = Map.get(argument, :name, Map.get(argument, "name"))
+  defp normalize_completion_ref(other, _wire?) do
+    raise Error,
+      code: :bad_request,
+      message: "completion/complete ref must be an object, got #{inspect(other)}"
+  end
 
-    if is_nil(name) do
+  defp normalize_completion_argument(%{} = argument, wire?) do
+    name = Map.get(argument, :name, Map.get(argument, "name"))
+    value = Map.get(argument, :value, Map.get(argument, "value", ""))
+
+    if is_nil(name) or (wire? and (not is_binary(name) or name == "")) do
       raise Error, code: :bad_request, message: "completion/complete requires argument.name"
+    end
+
+    if wire? and not is_binary(value) do
+      raise Error,
+        code: :bad_request,
+        message: "completion/complete argument.value must be a string"
     end
 
     %{
       name: to_string(name),
-      value: Map.get(argument, :value, Map.get(argument, "value", ""))
+      value: value
     }
+  end
+
+  defp normalize_completion_argument(other, _wire?) do
+    raise Error,
+      code: :bad_request,
+      message: "completion/complete argument must be an object, got #{inspect(other)}"
+  end
+
+  defp validate_completion_values!(values)
+       when is_list(values) do
+    unless Enum.all?(values, &is_binary/1) do
+      raise Error,
+        code: :internal_error,
+        message: "completion provider values must all be strings"
+    end
+  end
+
+  defp validate_completion_values!(_values) do
+    raise Error,
+      code: :internal_error,
+      message: "completion provider values must be a list of strings"
+  end
+
+  defp validate_completion_total!(total) when is_integer(total) and total >= 0, do: :ok
+
+  defp validate_completion_total!(_total) do
+    raise Error,
+      code: :internal_error,
+      message: "completion provider total must be a non-negative integer"
+  end
+
+  defp validate_completion_has_more!(value) when is_boolean(value), do: :ok
+
+  defp validate_completion_has_more!(_value) do
+    raise Error,
+      code: :internal_error,
+      message: "completion provider hasMore must be a boolean"
   end
 
   defp parameter_completion_sources(component) do
@@ -757,6 +880,8 @@ defmodule FastestMCP.OperationPipeline do
     %{}
     |> maybe_put("name", server.name)
     |> maybe_put("version", server_version(server))
+    |> maybe_put("title", metadata_value(server.metadata, :title))
+    |> maybe_put("description", metadata_value(server.metadata, :description))
     |> maybe_put("icons", metadata_value(server.metadata, :icons))
     |> maybe_put("websiteUrl", website_url(server.metadata))
   end
@@ -795,7 +920,7 @@ defmodule FastestMCP.OperationPipeline do
     )
     |> maybe_put(
       "completions",
-      completion_capability(visible_tools, visible_prompts, visible_templates)
+      completion_capability(visible_prompts, visible_templates)
     )
     |> maybe_put("tasks", task_capabilities(operation, visible_tools))
     |> maybe_put("experimental", configured_experimental_capabilities(server))
@@ -805,7 +930,7 @@ defmodule FastestMCP.OperationPipeline do
   defp capability_if_visible(_components, capability), do: capability
 
   defp component_capabilities(operation) do
-    if stateful_streaming_http?(operation) do
+    if callback_transport?(operation) do
       %{"listChanged" => true}
     else
       %{}
@@ -813,7 +938,7 @@ defmodule FastestMCP.OperationPipeline do
   end
 
   defp resource_capabilities(operation) do
-    if stateful_streaming_http?(operation) do
+    if callback_transport?(operation) do
       %{"subscribe" => true, "listChanged" => true}
     else
       %{}
@@ -821,11 +946,11 @@ defmodule FastestMCP.OperationPipeline do
   end
 
   defp logging_capability(operation) do
-    if stateful_streaming_http?(operation), do: %{}
+    if callback_transport?(operation), do: %{}
   end
 
   defp task_capabilities(operation, visible_tools) do
-    if stateless_http?(operation) or not Enum.any?(visible_tools, &tool_supports_tasks?/1) do
+    if not task_transport?(operation) or not Enum.any?(visible_tools, &tool_supports_tasks?/1) do
       nil
     else
       %{
@@ -857,15 +982,17 @@ defmodule FastestMCP.OperationPipeline do
     end
   end
 
-  defp stateless_http?(operation) do
-    metadata = operation.context.request_metadata
-
-    operation.transport == :streamable_http and
-      (Map.get(metadata, :stateless_http) == true or Map.get(metadata, "stateless_http") == true)
+  defp callback_transport?(operation) do
+    operation.transport in [:streamable_http, :stdio] and
+      jsonrpc_connection?(operation.context)
   end
 
-  defp stateful_streaming_http?(operation) do
-    operation.transport == :streamable_http and not stateless_http?(operation)
+  defp task_transport?(%{transport: :in_process}), do: true
+  defp task_transport?(operation), do: callback_transport?(operation)
+
+  defp jsonrpc_connection?(%Context{session_id: session_id, request_metadata: metadata}) do
+    is_binary(session_id) and session_id != "" and
+      is_map(Map.get(metadata, :jsonrpc_envelope, Map.get(metadata, "jsonrpc_envelope")))
   end
 
   defp website_url(metadata) do
@@ -903,6 +1030,141 @@ defmodule FastestMCP.OperationPipeline do
        list_provider_components(server.providers, component_type, operation))
     |> apply_component_policy(server, operation)
     |> Enum.sort_by(&component_sort_key/1)
+  end
+
+  defp visible_component_page(server, component_type, operation, after_key, limit) do
+    local_page =
+      server.name
+      |> Registry.list_components(component_type)
+      |> visible_fallback_page(server, operation, after_key, limit)
+
+    provider_pages =
+      Enum.map(server.providers, fn provider ->
+        if server.transforms == [] and Provider.component_page_callback?(provider) do
+          visible_provider_callback_page(
+            provider,
+            component_type,
+            server,
+            operation,
+            after_key,
+            limit
+          )
+        else
+          provider
+          |> Provider.list_components(component_type, operation)
+          |> visible_fallback_page(server, operation, after_key, limit)
+        end
+      end)
+
+    [local_page | provider_pages]
+    |> List.flatten()
+    |> Pagination.source_page(after_key, limit)
+    |> Map.fetch!(:items)
+  end
+
+  defp visible_provider_callback_page(
+         provider,
+         component_type,
+         server,
+         operation,
+         after_key,
+         limit
+       ) do
+    collect_visible_provider_page(
+      provider,
+      component_type,
+      server,
+      operation,
+      after_key,
+      limit,
+      []
+    )
+  end
+
+  defp collect_visible_provider_page(
+         _provider,
+         _component_type,
+         _server,
+         _operation,
+         _after_key,
+         limit,
+         collected
+       )
+       when length(collected) >= limit,
+       do: Enum.take(collected, limit)
+
+  defp collect_visible_provider_page(
+         provider,
+         component_type,
+         server,
+         operation,
+         after_key,
+         limit,
+         collected
+       ) do
+    remaining = limit - length(collected)
+
+    page =
+      Provider.list_component_page(
+        provider,
+        component_type,
+        after_key,
+        remaining,
+        operation
+      )
+
+    visible = apply_component_policy(page.items, server, operation)
+    collected = collected ++ visible
+
+    cond do
+      length(collected) >= limit ->
+        Enum.take(collected, limit)
+
+      is_nil(page.next_after) ->
+        collected
+
+      true ->
+        collect_visible_provider_page(
+          provider,
+          component_type,
+          server,
+          operation,
+          page.next_after,
+          limit,
+          collected
+        )
+    end
+  end
+
+  defp visible_fallback_page(components, %{transforms: []} = server, operation, after_key, limit) do
+    components
+    |> Enum.sort_by(&pagination_component_key/1)
+    |> Stream.drop_while(fn component ->
+      not is_nil(after_key) and pagination_component_key(component) <= after_key
+    end)
+    |> Stream.flat_map(fn component ->
+      case ComponentPolicy.apply_result(server, component, operation) do
+        {:ok, updated} ->
+          if negotiated_component_visible?(updated, operation), do: [updated], else: []
+
+        {:error, _error} ->
+          []
+      end
+    end)
+    |> Enum.take(limit)
+  end
+
+  defp visible_fallback_page(components, server, operation, after_key, limit) do
+    components
+    |> apply_component_policy(server, operation)
+    |> Pagination.source_page(after_key, limit)
+    |> Map.fetch!(:items)
+  end
+
+  defp pagination_component_key(component) do
+    component
+    |> Pagination.default_key()
+    |> Pagination.normalize_source_key()
   end
 
   defp visible_component_keys_for(server, component_type, operation) do
@@ -1005,7 +1267,11 @@ defmodule FastestMCP.OperationPipeline do
     |> Enum.reduce_while(nil, fn component, first_error ->
       case ComponentPolicy.apply_result(server, component, operation) do
         {:ok, visible_component} ->
-          {:halt, {:ok, visible_component}}
+          if negotiated_component_visible?(visible_component, operation) do
+            {:halt, {:ok, visible_component}}
+          else
+            {:cont, first_error}
+          end
 
         {:error, %Error{} = error} ->
           case error.code do
@@ -1024,6 +1290,21 @@ defmodule FastestMCP.OperationPipeline do
       nil -> nil
     end
   end
+
+  defp negotiated_component_visible?(_component, %{method: "initialize"}), do: true
+
+  defp negotiated_component_visible?(%FastestMCP.Components.Tool{} = tool, operation) do
+    task_config = Map.get(tool, :task, TaskConfig.new(false))
+
+    task_config.mode != :required or
+      operation.transport == :in_process or
+      Protocol.capability?(
+        operation.context.server_capabilities,
+        ["tasks", "requests", "tools", "call"]
+      )
+  end
+
+  defp negotiated_component_visible?(_component, _operation), do: true
 
   defp select_template_candidate([], _server, _operation), do: nil
 

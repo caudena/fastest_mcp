@@ -8,6 +8,9 @@ defmodule FastestMCP.Runtime.TaskStoreBackendFailureTest do
   alias FastestMCP.Elicitation
   alias FastestMCP.EventBus
   alias FastestMCP.Operation
+  alias FastestMCP.RuntimeQuota
+  alias FastestMCP.Session
+  alias FastestMCP.SessionStateStore.Memory, as: SessionStateStore
   alias FastestMCP.TaskConfig
 
   defmodule FailureBackend do
@@ -122,21 +125,54 @@ defmodule FastestMCP.Runtime.TaskStoreBackendFailureTest do
   end
 
   setup do
+    server_name = "backend-failure-#{System.unique_integer([:positive])}"
+    session_id = "backend-failure-session"
     backend = start_supervised!(FailureBackend)
     event_bus = start_supervised!(EventBus)
     task_supervisor = start_supervised!(BackgroundTaskSupervisor)
+    relay_task_supervisor = start_supervised!(Task.Supervisor)
+    session_state_store = start_supervised!(SessionStateStore)
+    runtime_quota = start_supervised!(RuntimeQuota)
+
+    session =
+      start_supervised!(
+        {Session,
+         %{
+           server_name: server_name,
+           session_id: session_id,
+           idle_ttl_ms: :infinity,
+           session_state_store: session_state_store,
+           task_supervisor: relay_task_supervisor,
+           runtime_quota: runtime_quota
+         }}
+      )
+
+    :ok =
+      Session.begin_initialization(
+        server_name,
+        session_id,
+        FastestMCP.Protocol.current_version(),
+        %{"elicitation" => %{"form" => %{}}},
+        %{"name" => "backend failure test", "version" => "1"}
+      )
+
+    :ok = Session.mark_initialized(server_name, session_id)
 
     store =
       start_supervised!(
         {BackgroundTaskStore,
-         server_name: "backend-failure",
+         server_name: server_name,
          event_bus: event_bus,
-         backend: %{module: FailureBackend, store: backend}}
+         backend: %{module: FailureBackend, store: backend},
+         relay_task_supervisor: relay_task_supervisor}
       )
 
     %{
+      server_name: server_name,
+      session_id: session_id,
       backend: backend,
       event_bus: event_bus,
+      session: session,
       store: store,
       task_supervisor: task_supervisor
     }
@@ -210,7 +246,6 @@ defmodule FastestMCP.Runtime.TaskStoreBackendFailureTest do
 
   defp task_with_waiters(context) do
     parent = self()
-    store = context.store
 
     assert {:ok, handle} =
              submit_task(context, fn operation ->
@@ -236,42 +271,38 @@ defmodule FastestMCP.Runtime.TaskStoreBackendFailureTest do
       Map.has_key?(:sys.get_state(context.store).interaction_waiters, task_id)
     end)
 
-    bridge_pid =
-      spawn(fn ->
-        receive do
-          message ->
-            send(parent, {:bridge_request, message})
+    assert {:ok, sink} =
+             Session.attach_sink(context.server_name, context.session_id, self(),
+               kind: :post,
+               origin_request_id: 55
+             )
 
-            receive do
-              :stop -> :ok
-            end
-        end
-      end)
-
-    on_exit(fn ->
-      if Process.alive?(bridge_pid), do: send(bridge_pid, :stop)
-    end)
+    sink_ref = sink.sink_ref
 
     result_pid =
       spawn(fn ->
         reply =
           BackgroundTaskStore.result(context.store, task_id,
             timeout: 10_000,
+            session_id: context.session_id,
             request_metadata: %{
-              client_stream_pid: bridge_pid,
-              client_request_store: parent
+              session_sink_ref: sink_ref,
+              jsonrpc_request_id: 55
             }
           )
 
         send(parent, {:result_reply, reply})
       end)
 
-    assert_receive {:bridge_request,
-                    {:client_bridge_request, ^store, relay_id, _message, ^parent, _session_id,
-                     10_000}},
+    assert_receive {:fastest_mcp_session_message, ^sink_ref, _event_id,
+                    %{
+                      "jsonrpc" => "2.0",
+                      "id" => wire_request_id,
+                      "method" => "elicitation/create"
+                    }},
                    1_000
 
-    assert is_binary(relay_id)
+    assert is_binary(wire_request_id)
 
     await_pid =
       spawn(fn ->
@@ -287,10 +318,18 @@ defmodule FastestMCP.Runtime.TaskStoreBackendFailureTest do
         length(Map.get(state.waiters, task_id, [])) == 1 and
         length(Map.get(state.result_waiters, task_id, [])) == 1 and
         Map.has_key?(state.interaction_waiters, task_id) and
-        state.relay_requests == %{relay_id => task_id}
+        map_size(state.relay_requests) == 1 and
+        Enum.all?(state.relay_requests, fn
+          {relay_id, %{task_id: ^task_id, worker_pid: worker_pid}} ->
+            is_reference(relay_id) and is_pid(worker_pid)
+
+          _other ->
+            false
+        end)
     end)
 
     state = :sys.get_state(context.store)
+    [{_relay_id, relay}] = Map.to_list(state.relay_requests)
 
     timer_refs =
       [
@@ -302,6 +341,8 @@ defmodule FastestMCP.Runtime.TaskStoreBackendFailureTest do
     %{
       task_id: task_id,
       worker_pid: worker_pid,
+      relay_worker_pid: relay.worker_pid,
+      session_pid: context.session,
       caller_pids: [interaction_pid, result_pid, await_pid],
       timer_refs: timer_refs
     }
@@ -309,8 +350,9 @@ defmodule FastestMCP.Runtime.TaskStoreBackendFailureTest do
 
   defp submit_task(context, executor) do
     {:ok, request_context} =
-      Context.build("backend-failure",
+      Context.build(context.server_name,
         state_scope: :request,
+        session_id: context.session_id,
         transport: :in_process,
         event_bus: context.event_bus
       )
@@ -351,6 +393,13 @@ defmodule FastestMCP.Runtime.TaskStoreBackendFailureTest do
     end)
 
     assert_eventually(fn -> not Process.alive?(task.worker_pid) end)
+    assert_eventually(fn -> not Process.alive?(task.relay_worker_pid) end)
+
+    assert_eventually(fn ->
+      session_state = :sys.get_state(task.session_pid)
+      session_state.pending_requests == %{} and session_state.pending_monitors == %{}
+    end)
+
     assert_clean_state(store)
 
     Enum.each(task.timer_refs, fn timer_ref ->

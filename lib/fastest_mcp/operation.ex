@@ -23,6 +23,8 @@ defmodule FastestMCP.Operation do
     :call_supervisor,
     :task_supervisor,
     :task_store,
+    :schema_cache,
+    :schema_options,
     task_request: false,
     task_ttl_ms: nil,
     arguments: %{}
@@ -41,6 +43,8 @@ defmodule FastestMCP.Operation do
           call_supervisor: pid() | atom(),
           task_supervisor: pid() | atom() | nil,
           task_store: pid() | atom() | nil,
+          schema_cache: :ets.tid() | nil,
+          schema_options: keyword(),
           task_request: boolean(),
           task_ttl_ms: pos_integer() | nil,
           arguments: map()

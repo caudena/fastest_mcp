@@ -27,10 +27,20 @@ defmodule FastestMCP.Providers.OpenAPI do
     cookie: ~w(form)
   }
 
-  defstruct [:name, :spec, :base_url, :requester, timeout_ms: 5_000, tools: []]
+  defstruct [
+    :name,
+    :spec,
+    :base_url,
+    :requester,
+    timeout_ms: 5_000,
+    schema_options: [],
+    tools: []
+  ]
 
   @doc "Builds a new value for this module from the supplied options."
   def new(opts) when is_list(opts) do
+    schema_options = normalize_schema_options!(Keyword.get(opts, :schema_options, []))
+
     spec =
       opts
       |> Keyword.fetch!(:openapi_spec)
@@ -55,7 +65,8 @@ defmodule FastestMCP.Providers.OpenAPI do
       spec: spec,
       base_url: base_url && String.trim_trailing(to_string(base_url), "/"),
       requester: requester,
-      timeout_ms: Keyword.get(opts, :timeout_ms, 5_000)
+      timeout_ms: Keyword.get(opts, :timeout_ms, 5_000),
+      schema_options: schema_options
     }
 
     %{provider | tools: build_tools(provider)}
@@ -90,8 +101,12 @@ defmodule FastestMCP.Providers.OpenAPI do
     parameter_bindings =
       build_parameter_bindings(path_parameters, operation, body_schema, body_required?)
 
-    input_schema = build_input_schema(parameter_bindings)
-    output_schema = response_schema(operation)
+    input_schema = parameter_bindings |> build_input_schema() |> standalone_schema(provider.spec)
+
+    {output_schema, wrap_output?} =
+      operation
+      |> response_schema()
+      |> prepare_output_schema(provider.spec)
 
     ComponentCompiler.compile(
       :tool,
@@ -107,12 +122,13 @@ defmodule FastestMCP.Providers.OpenAPI do
           body_schema,
           body_content_type,
           body_required?,
-          output_schema
+          wrap_output?
         )
       end,
       description: operation_description(operation),
       input_schema: input_schema,
-      output_schema: output_schema
+      output_schema: output_schema,
+      schema_options: provider.schema_options
     )
   end
 
@@ -125,7 +141,7 @@ defmodule FastestMCP.Providers.OpenAPI do
          body_schema,
          body_content_type,
          body_required?,
-         _output_schema
+         wrap_output?
        ) do
     args = stringify_keys(arguments)
 
@@ -173,7 +189,9 @@ defmodule FastestMCP.Providers.OpenAPI do
 
     case HTTP.request(method, url, request_opts) do
       {:ok, status, response_headers, response_body} when status in 200..299 ->
-        normalize_response(response_headers, response_body)
+        response_headers
+        |> normalize_response(response_body)
+        |> maybe_wrap_output(wrap_output?)
 
       {:ok, status, response_headers, response_body} ->
         raise Error,
@@ -410,6 +428,25 @@ defmodule FastestMCP.Providers.OpenAPI do
           |> schema_for_json_content()
       end
     end)
+  end
+
+  # MCP tool output schemas and structuredContent are object-rooted. Preserve
+  # object OpenAPI responses directly and give scalar/array responses an
+  # explicit, advertised object representation.
+  defp prepare_output_schema(nil, _spec), do: {nil, false}
+
+  defp prepare_output_schema(%{"type" => "object"} = schema, spec) do
+    {standalone_schema(schema, spec), false}
+  end
+
+  defp prepare_output_schema(schema, spec) do
+    wrapped = %{
+      "type" => "object",
+      "properties" => %{"result" => schema},
+      "required" => ["result"]
+    }
+
+    {standalone_schema(wrapped, spec), true}
   end
 
   defp schema_for_request_body_content(content) when is_map(content) do
@@ -715,6 +752,9 @@ defmodule FastestMCP.Providers.OpenAPI do
     end
   end
 
+  defp maybe_wrap_output(value, true), do: %{"result" => value}
+  defp maybe_wrap_output(value, false), do: value
+
   defp normalize_response_headers(headers) do
     Enum.map(headers, fn {key, value} ->
       {key |> to_string() |> String.downcase(), to_string(value)}
@@ -862,6 +902,83 @@ defmodule FastestMCP.Providers.OpenAPI do
     |> Map.merge(Map.delete(value, "$ref"))
   end
 
+  # Schemas extracted from an OpenAPI document must remain valid standalone
+  # JSON Schemas. Inlining deliberately stops at cycles, so move any remaining
+  # component references into a local $defs closure rather than advertising
+  # dangling #/components/... pointers.
+  defp standalone_schema(nil, _spec), do: nil
+  defp standalone_schema(schema, _spec) when is_boolean(schema), do: schema
+
+  defp standalone_schema(schema, spec) when is_map(schema) do
+    {schema, referenced_names} = rewrite_component_schema_refs(schema, MapSet.new())
+    definitions = collect_component_definitions(referenced_names, spec, %{})
+
+    case definitions do
+      definitions when map_size(definitions) == 0 ->
+        schema
+
+      definitions ->
+        Map.update(schema, "$defs", definitions, &Map.merge(&1, definitions))
+    end
+  end
+
+  defp rewrite_component_schema_refs(value, names) when is_map(value) do
+    Enum.reduce(value, {%{}, names}, fn
+      {"$ref", "#/components/schemas/" <> pointer}, {result, names} ->
+        name = decode_json_pointer_segment(pointer)
+        ref = "#/$defs/" <> encode_json_pointer_segment(name)
+        {Map.put(result, "$ref", ref), MapSet.put(names, name)}
+
+      {key, child}, {result, names} ->
+        {child, names} = rewrite_component_schema_refs(child, names)
+        {Map.put(result, key, child), names}
+    end)
+  end
+
+  defp rewrite_component_schema_refs(value, names) when is_list(value) do
+    Enum.map_reduce(value, names, &rewrite_component_schema_refs/2)
+  end
+
+  defp rewrite_component_schema_refs(value, names), do: {value, names}
+
+  defp collect_component_definitions(names, spec, definitions) do
+    case Enum.find(names, &(not Map.has_key?(definitions, &1))) do
+      nil ->
+        definitions
+
+      name ->
+        case get_in(spec, ["components", "schemas", name]) do
+          nil ->
+            # The rewritten reference stays unresolved so the shared schema
+            # compiler fails closed instead of weakening validation.
+            collect_component_definitions(MapSet.delete(names, name), spec, definitions)
+
+          definition ->
+            {definition, discovered_names} =
+              definition
+              |> stringify_keys()
+              |> rewrite_component_schema_refs(MapSet.new())
+
+            names
+            |> MapSet.delete(name)
+            |> MapSet.union(discovered_names)
+            |> collect_component_definitions(spec, Map.put(definitions, name, definition))
+        end
+    end
+  end
+
+  defp decode_json_pointer_segment(segment) do
+    segment
+    |> String.replace("~1", "/")
+    |> String.replace("~0", "~")
+  end
+
+  defp encode_json_pointer_segment(segment) do
+    segment
+    |> String.replace("~", "~0")
+    |> String.replace("/", "~1")
+  end
+
   defp stringify_keys(%_{} = struct), do: stringify_keys(Map.from_struct(struct))
 
   defp stringify_keys(value) when is_map(value) do
@@ -873,4 +990,16 @@ defmodule FastestMCP.Providers.OpenAPI do
   end
 
   defp stringify_keys(value), do: value
+
+  defp normalize_schema_options!(options) when is_list(options) do
+    if Keyword.keyword?(options) do
+      options
+    else
+      raise ArgumentError, "schema_options must be a keyword list"
+    end
+  end
+
+  defp normalize_schema_options!(_options) do
+    raise ArgumentError, "schema_options must be a keyword list"
+  end
 end

@@ -22,6 +22,7 @@ defmodule FastestMCP.Registry do
   @components_table :fastest_mcp_components
   @templates_table :fastest_mcp_resource_templates
   @sessions_table :fastest_mcp_sessions
+  @url_elicitations_table :fastest_mcp_url_elicitations
   @server_owners_table :fastest_mcp_server_owners
   @middleware_runtime_table :fastest_mcp_middleware_runtime
   @middleware_runtime_instances_table :fastest_mcp_middleware_runtime_instances
@@ -38,6 +39,7 @@ defmodule FastestMCP.Registry do
     create_table(@components_table, :bag)
     create_table(@templates_table, :bag)
     create_table(@sessions_table, :set)
+    create_table(@url_elicitations_table, :set)
     create_table(@server_owners_table, :set)
     create_table(@middleware_runtime_table, :set)
     create_table(@middleware_runtime_instances_table, :bag)
@@ -217,6 +219,68 @@ defmodule FastestMCP.Registry do
       [{^key, {pid, _generation}}] when is_pid(pid) -> alive_pid(pid)
       [{^key, pid}] when is_pid(pid) -> alive_pid(pid)
       _ -> {:error, :not_found}
+    end
+  end
+
+  @doc false
+  def list_sessions(server_name) do
+    server_name = to_string(server_name)
+
+    @sessions_table
+    |> match_object({{server_name, :_}, :_})
+    |> Enum.reduce([], fn
+      {{^server_name, session_id}, {pid, _generation}}, acc when is_pid(pid) ->
+        if Process.alive?(pid), do: [{session_id, pid} | acc], else: acc
+
+      {{^server_name, session_id}, pid}, acc when is_pid(pid) ->
+        if Process.alive?(pid), do: [{session_id, pid} | acc], else: acc
+
+      _entry, acc ->
+        acc
+    end)
+    |> Enum.reverse()
+  end
+
+  @doc false
+  def register_url_elicitation(server_name, elicitation_id, session_id, pid)
+      when is_binary(elicitation_id) and elicitation_id != "" and is_binary(session_id) and
+             session_id != "" and is_pid(pid) do
+    case claim(
+           :url_elicitation,
+           {to_string(server_name), elicitation_id},
+           pid,
+           session_id
+         ) do
+      :ok -> :ok
+      {:error, {:already_registered, _owner}} -> {:error, :already_exists}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  @doc false
+  def unregister_url_elicitation(server_name, elicitation_id, session_id, pid)
+      when is_binary(elicitation_id) and is_binary(session_id) and is_pid(pid) do
+    release(
+      :url_elicitation,
+      {to_string(server_name), elicitation_id},
+      pid,
+      session_id
+    )
+  end
+
+  @doc false
+  def lookup_url_elicitation(server_name, elicitation_id) when is_binary(elicitation_id) do
+    key = {to_string(server_name), elicitation_id}
+
+    case lookup(@url_elicitations_table, key) do
+      [{^key, {session_id, pid}}] when is_binary(session_id) and is_pid(pid) ->
+        case alive_pid(pid) do
+          {:ok, ^pid} -> {:ok, session_id, pid}
+          {:error, :not_found} -> {:error, :not_found}
+        end
+
+      _other ->
+        {:error, :not_found}
     end
   end
 
@@ -463,14 +527,21 @@ defmodule FastestMCP.Registry do
   defp insert_claim(:session, key, pid, token),
     do: :ets.insert(@sessions_table, {key, {pid, token}})
 
+  defp insert_claim(:url_elicitation, key, pid, session_id),
+    do: :ets.insert(@url_elicitations_table, {key, {session_id, pid}})
+
   defp delete_claim_record(:server, key) do
     :ets.delete(@servers_table, key)
     :ets.match_delete(@components_table, {{key, :_, :_, :_}, :_})
     :ets.match_delete(@templates_table, {{key, :_, :_}, :_})
+    :ets.match_delete(@url_elicitations_table, {{key, :_}, :_})
   end
 
   defp delete_claim_record(:server_owner, key), do: :ets.delete(@server_owners_table, key)
   defp delete_claim_record(:session, key), do: :ets.delete(@sessions_table, key)
+
+  defp delete_claim_record(:url_elicitation, key),
+    do: :ets.delete(@url_elicitations_table, key)
 
   defp pick_template([]), do: nil
 

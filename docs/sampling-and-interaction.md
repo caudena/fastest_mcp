@@ -86,6 +86,13 @@ FastestMCP.Sampling.run!(ctx, "Use a tool if useful",
 )
 ```
 
+`Context.sample/3` keeps provider `metadata:` at the standard top-level
+`metadata` request field and maps protocol `meta:` to `_meta`; the two maps are
+not merged. A client response must be a complete `CreateMessageResult` with
+`role`, `model`, and valid sampling `content`, plus optional `stopReason` and
+`_meta`. FastestMCP validates that whole result and preserves assistant/content
+metadata through later tool rounds.
+
 ### Normalized Response
 
 `FastestMCP.Sampling.run!/3` returns a normalized response struct with:
@@ -99,6 +106,12 @@ That keeps the common case simple without hiding the full protocol payload.
 ## Interaction and Elicitation
 
 Elicitation asks the client for structured human input.
+
+Form mode normally uses the negotiated `elicitation.form` capability. For the
+backwards-compatible spelling retained by the tagged specification, a client
+that sends exactly `elicitation: {}` is normalized to effective form support.
+That legacy shape never enables URL mode; URL elicitation still requires the
+exact `elicitation.url` capability.
 
 The low-level API is `Context.elicit/4`, which returns explicit elicitation
 result structs. The higher-level API is `FastestMCP.Interact`, which turns the
@@ -148,8 +161,11 @@ FastestMCP.Context.elicit(ctx, "How many copies?", :integer,
 )
 ```
 
-Scalar responses accept either the raw scalar value or `%{"value" => value}`
-from the client-side elicitation handler.
+The MCP wire always carries an object-root `requestedSchema` and accepted
+content object. Scalar Elixir conveniences use one required `"value"` property
+and unwrap it after validation. Declined and cancelled results must omit
+content. Form schemas that request passwords, credentials, tokens, or similar
+sensitive data are rejected.
 
 ### Choose
 
@@ -173,6 +189,95 @@ FastestMCP.Interact.form(
     {:owner, [type: :string, required: false]}
   ]
 )
+```
+
+### URL Elicitation
+
+URL mode coordinates an interaction that must happen outside the MCP client:
+
+```elixir
+server =
+  FastestMCP.server("interaction",
+    url_elicitation_allowed_hosts: ["connect.example.com"]
+  )
+
+case FastestMCP.Interact.url(
+       ctx,
+       "Connect the document service",
+       fn elicitation_id ->
+         "https://connect.example.com/start?elicitationId=#{elicitation_id}"
+       end,
+       purpose: :external_authorization
+     ) do
+  {:ok, _data} -> %{status: "accepted"}
+  :declined -> %{status: "declined"}
+  :cancelled -> %{status: "cancelled"}
+  %FastestMCP.PeerTask{} = task -> task
+end
+```
+
+URL elicitation requires a verified non-anonymous principal, a normal
+initialized session, negotiated `elicitation.url`, HTTPS, and the server's
+non-empty `url_elicitation_allowed_hosts:` list. Prefer the builder function
+because it receives the random `elicitationId`. Query strings containing
+credentials or common personal-data keys are rejected, as are wildcard hosts,
+URL fragments, userinfo, and use for authorizing access to the MCP server
+itself. A call-specific `allowed_hosts:` override remains available for
+applications that select a narrower tenant allowlist at runtime. Records expire
+after 15 minutes by default; `ttl_ms:` may override that lifetime up to the
+bounded 24-hour maximum.
+
+An application callback completes the out-of-band work with the same verified
+identity:
+
+```elixir
+FastestMCP.complete_elicitation(
+  MyApp.MCPServer,
+  elicitation_id,
+  principal: current_user,
+  auth: %{provider: :my_app}
+)
+```
+
+You may pass `auth_result: %FastestMCP.Auth.Result{}` instead. Completion is
+looked up atomically across the server and returns explicit `:not_found`,
+`:forbidden`, `:expired`, or `:already_completed` errors. The corresponding
+`notifications/elicitation/complete` notification goes only to the originating
+session. `Context.require_url_elicitation!/4` registers the same bound records
+and raises the standard JSON-RPC `-32042` error with canonical descriptors.
+
+## Peer-owned Tasks
+
+Sampling and both elicitation modes return immediate results by default. Pass
+`task: true` only when the client negotiated the exact requester task
+capability:
+
+```elixir
+peer_task = Context.sample(ctx, "Prepare a report", task: true)
+
+{:ok, status} = FastestMCP.PeerTask.fetch(peer_task)
+{:ok, terminal} = FastestMCP.PeerTask.wait(peer_task, timeout_ms: 30_000)
+{:ok, result} = FastestMCP.PeerTask.result(peer_task)
+```
+
+`PeerTask.cancel/2` requests cancellation and
+`PeerTask.on_status_change/2` observes standard status notifications. A handle
+is valid only for the originating server and session; it is deliberately
+different from local `%FastestMCP.BackgroundTask{}` and standalone-client
+`%FastestMCP.Client.Task{}` handles. By default, one session may track 128 peer
+tasks and 128 status callbacks. The coordinator monitors the caller that
+registered each callback and removes the callback when its caller dies or the
+task reaches a terminal status; adjust the bounds with `max_peer_tasks:` and
+`max_peer_task_callbacks:` in the server runtime startup options.
+
+List the connected peer's tasks when `tasks.list` was negotiated:
+
+```elixir
+%{items: peer_tasks, next_cursor: cursor} = Context.list_peer_tasks(ctx)
+
+if cursor do
+  Context.list_peer_tasks(ctx, cursor: cursor)
+end
 ```
 
 ## Background Tasks and Interaction
@@ -209,7 +314,13 @@ For client-driven tests or local tools, pass handlers when connecting:
 client =
   FastestMCP.Client.connect!("http://127.0.0.1:4100/mcp",
     client_info: %{"name" => "docs-client", "version" => "1.0.0"},
-    sampling_handler: fn _messages, _params -> %{"text" => "sampled"} end,
+    sampling_handler: fn _messages, _params ->
+      %{
+        "role" => "assistant",
+        "model" => "my-model",
+        "content" => %{"type" => "text", "text" => "sampled"}
+      }
+    end,
     sampling_tools: FastestMCP.prepare_sampling_tools(MyApp.MCPServer),
     elicitation_handler: fn _message, _params -> {:accept, %{"confirmed" => true}} end
   )

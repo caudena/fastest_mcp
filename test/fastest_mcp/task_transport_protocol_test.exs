@@ -154,7 +154,7 @@ defmodule FastestMCP.TaskTransportProtocolTest do
     assert result._meta["io.modelcontextprotocol/related-task"].taskId == task_id
   end
 
-  test "tasks/list paginates with opaque cursors and rejects invalid cursors" do
+  test "tasks/list uses the server-owned wire page size and rejects invalid cursors" do
     server_name = "task-list-page-" <> Integer.to_string(System.unique_integer([:positive]))
 
     server =
@@ -163,7 +163,7 @@ defmodule FastestMCP.TaskTransportProtocolTest do
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
 
-    for value <- 1..3 do
+    for value <- 1..101 do
       Engine.dispatch!(server_name, %Request{
         method: "tools/call",
         transport: :stdio,
@@ -183,7 +183,7 @@ defmodule FastestMCP.TaskTransportProtocolTest do
         request_metadata: %{session_id_provided: true}
       })
 
-    assert length(first_page.tasks) == 2
+    assert length(first_page.tasks) == 100
     assert is_binary(first_page.nextCursor)
 
     second_page =
@@ -306,7 +306,7 @@ defmodule FastestMCP.TaskTransportProtocolTest do
       ProtocolTest.http_request(
         server_name,
         session_id,
-        1,
+        2,
         "tools/call",
         %{
           "name" => "echo",
@@ -319,7 +319,7 @@ defmodule FastestMCP.TaskTransportProtocolTest do
 
     %{
       "jsonrpc" => "2.0",
-      "id" => 1,
+      "id" => 2,
       "result" => %{
         "task" => %{"taskId" => task_id, "ttl" => 30_000, "pollInterval" => 125},
         "_meta" => %{"io.modelcontextprotocol/related-task" => %{"taskId" => task_id}}
@@ -327,7 +327,7 @@ defmodule FastestMCP.TaskTransportProtocolTest do
     } = JSON.decode!(create_conn.resp_body)
 
     status_conn =
-      ProtocolTest.http_request(server_name, session_id, 2, "tasks/get", %{
+      ProtocolTest.http_request(server_name, session_id, 3, "tasks/get", %{
         "taskId" => task_id
       })
 
@@ -341,7 +341,7 @@ defmodule FastestMCP.TaskTransportProtocolTest do
     wait_for_http_task_completion(server_name, session_id, task_id)
 
     result_conn =
-      ProtocolTest.http_request(server_name, session_id, 3, "tasks/result", %{
+      ProtocolTest.http_request(server_name, session_id, 4, "tasks/result", %{
         "taskId" => task_id
       })
 
@@ -349,7 +349,7 @@ defmodule FastestMCP.TaskTransportProtocolTest do
 
     assert %{
              "jsonrpc" => "2.0",
-             "id" => 3,
+             "id" => 4,
              "result" => %{
                "structuredContent" => %{"echo" => "hi"},
                "_meta" => %{
@@ -404,7 +404,7 @@ defmodule FastestMCP.TaskTransportProtocolTest do
         %{"taskId" => task_id}
       )
 
-    assert response.status == 400
+    assert response.status == 200
 
     assert %{
              "jsonrpc" => "2.0",
@@ -413,11 +413,11 @@ defmodule FastestMCP.TaskTransportProtocolTest do
                "code" => -32602,
                "message" => "boom",
                "data" => %{
+                 "_meta" => %{
+                   "io.modelcontextprotocol/related-task" => %{"taskId" => ^task_id}
+                 },
                  "fastestmcp" => %{
-                   "code" => "bad_request",
-                   "meta" => %{
-                     "io.modelcontextprotocol/related-task" => %{"taskId" => ^task_id}
-                   }
+                   "code" => "bad_request"
                  }
                }
              }
@@ -469,11 +469,11 @@ defmodule FastestMCP.TaskTransportProtocolTest do
                "code" => -32602,
                "message" => "boom",
                "data" => %{
+                 "_meta" => %{
+                   "io.modelcontextprotocol/related-task" => %{"taskId" => ^task_id}
+                 },
                  "fastestmcp" => %{
-                   "code" => "bad_request",
-                   "meta" => %{
-                     "io.modelcontextprotocol/related-task" => %{"taskId" => ^task_id}
-                   }
+                   "code" => "bad_request"
                  }
                }
              }
@@ -489,12 +489,12 @@ defmodule FastestMCP.TaskTransportProtocolTest do
 
   defp wait_for_http_task_completion(server_name, session_id, task_id, timeout \\ 1_000) do
     deadline = System.monotonic_time(:millisecond) + timeout
-    do_wait_for_http_task_completion(server_name, session_id, task_id, deadline)
+    do_wait_for_http_task_completion(server_name, session_id, task_id, deadline, 99)
   end
 
-  defp do_wait_for_http_task_completion(server_name, session_id, task_id, deadline) do
+  defp do_wait_for_http_task_completion(server_name, session_id, task_id, deadline, request_id) do
     status_conn =
-      ProtocolTest.http_request(server_name, session_id, 99, "tasks/get", %{
+      ProtocolTest.http_request(server_name, session_id, request_id, "tasks/get", %{
         "taskId" => task_id
       })
 
@@ -510,7 +510,14 @@ defmodule FastestMCP.TaskTransportProtocolTest do
           flunk("timed out waiting for HTTP task #{inspect(task_id)} to complete")
         else
           Process.sleep(10)
-          do_wait_for_http_task_completion(server_name, session_id, task_id, deadline)
+
+          do_wait_for_http_task_completion(
+            server_name,
+            session_id,
+            task_id,
+            deadline,
+            request_id + 1
+          )
         end
 
       %{"result" => %{"status" => status}} ->

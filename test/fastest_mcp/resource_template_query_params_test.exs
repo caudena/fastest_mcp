@@ -21,13 +21,13 @@ defmodule FastestMCP.ResourceTemplateQueryParamsTest do
              FastestMCP.read_resource(server_name, "data://123?format=xml&limit=10&ignored=true")
   end
 
-  test "resource templates support wildcard path captures" do
+  test "resource templates support reserved path captures" do
     server_name =
       "resource-template-wildcard-" <> Integer.to_string(System.unique_integer([:positive]))
 
     server =
       FastestMCP.server(server_name)
-      |> FastestMCP.add_resource_template("files://{path*}", fn arguments, _ctx -> arguments end)
+      |> FastestMCP.add_resource_template("files://{+path}", fn arguments, _ctx -> arguments end)
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
 
@@ -66,7 +66,7 @@ defmodule FastestMCP.ResourceTemplateQueryParamsTest do
     assert %{"path" => "guides/http/intro.md"} ==
              FastestMCP.read_resource(server_name, "docs://guides/http/intro.md")
 
-    assert %{"path" => "lib/fastest_mcp/context.ex"} ==
+    assert %{"path" => ["lib", "fastest_mcp", "context.ex"]} ==
              FastestMCP.read_resource(server_name, "repo://tree/lib/fastest_mcp/context.ex")
 
     assert %{"format" => "json"} ==
@@ -79,25 +79,25 @@ defmodule FastestMCP.ResourceTemplateQueryParamsTest do
              FastestMCP.read_resource(server_name, "search://items?q=mcp&limit=10&page=2")
   end
 
-  test "hyphenated params normalize to underscores and preserve blank query values" do
+  test "RFC variable names are preserved and blank query values remain explicit" do
     server_name =
       "resource-template-hyphen-" <> Integer.to_string(System.unique_integer([:positive]))
 
     server =
       FastestMCP.server(server_name)
       |> FastestMCP.add_resource_template(
-        "data://{user-id}{?include-details}",
+        "data://{user.id}{?include_details}",
         fn arguments, _ctx -> arguments end
       )
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    assert %{"user_id" => "42", "include_details" => ""} ==
-             FastestMCP.read_resource(server_name, "data://42?include-details=")
+    assert %{"user.id" => "42", "include_details" => ""} ==
+             FastestMCP.read_resource(server_name, "data://42?include_details=")
   end
 
-  test "query captures do not clobber path captures and hyphen collisions are rejected" do
+  test "query captures do not clobber path captures and malformed names are rejected" do
     server_name =
       "resource-template-precedence-" <> Integer.to_string(System.unique_integer([:positive]))
 
@@ -112,21 +112,30 @@ defmodule FastestMCP.ResourceTemplateQueryParamsTest do
 
     assert %{"id" => "path"} == FastestMCP.read_resource(server_name, "data://path?id=query")
 
-    assert_raise ArgumentError, ~r/collide/, fn ->
+    assert_raise ArgumentError, ~r/invalid RFC 6570 resource template/, fn ->
       FastestMCP.server("resource-template-collision")
       |> FastestMCP.add_resource_template("data://{user-id}/{user_id}", fn args, _ctx -> args end)
     end
   end
 
-  test "resource templates reject fragments" do
-    assert_raise ArgumentError, ~r/fragments are not supported/, fn ->
-      FastestMCP.server("resource-template-fragment")
-      |> FastestMCP.add_resource_template("data://items/{id}#details", fn args, _ctx -> args end)
-    end
+  test "resource templates support literal and expanded fragments" do
+    server_name =
+      "resource-template-fragment-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    assert_raise ArgumentError, ~r/fragments are not supported/, fn ->
-      FastestMCP.server("resource-template-fragment-expression")
-      |> FastestMCP.add_resource_template("data://items/{#fragment}", fn args, _ctx -> args end)
-    end
+    server =
+      FastestMCP.server(server_name)
+      |> FastestMCP.add_resource_template("data://items/{id}#details", fn args, _ctx -> args end)
+      |> FastestMCP.add_resource_template("data://chapters/{id}{#fragment}", fn args, _ctx ->
+        args
+      end)
+
+    assert {:ok, _pid} = FastestMCP.start_server(server)
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+
+    assert %{"id" => "42"} ==
+             FastestMCP.read_resource(server_name, "data://items/42#details")
+
+    assert %{"fragment" => "section/2", "id" => "guide"} ==
+             FastestMCP.read_resource(server_name, "data://chapters/guide#section/2")
   end
 end

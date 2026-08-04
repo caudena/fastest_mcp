@@ -56,7 +56,6 @@ Order matters. Middleware added earlier wraps middleware added later.
 - rate limiting and sliding-window rate limiting
 - response caching
 - response limiting
-- schema dereferencing
 - tool injection
 - ping and session keepalive support
 
@@ -89,11 +88,25 @@ Use middleware for cross-cutting execution policy:
 
 ```elixir
 FastestMCP.Middleware.rate_limiting(max_requests_per_second: 20.0, burst_capacity: 40)
-FastestMCP.Middleware.sliding_window_rate_limiting(max_requests: 100, window_minutes: 1)
+FastestMCP.Middleware.sliding_window_rate_limiting(
+  max_requests: 100,
+  window_minutes: 1,
+  max_clients: 10_000
+)
 FastestMCP.Middleware.response_caching()
 FastestMCP.Middleware.response_limiting(max_size: 100_000)
 FastestMCP.Middleware.retry(max_retries: 3)
 ```
+
+Both rate limiters default to `max_clients: 10_000` and return `:overloaded`
+when live client cardinality remains full after semantic expiry. Each client
+has one expiry record; the sliding-window limiter uses a queue rather than
+rebuilding the entire history on every request.
+
+Response limiting validates `max_size:` when it is constructed. A value below
+the smallest valid tool-result envelope is rejected rather than producing an
+invalid truncated response; mandatory `structuredContent`, `isError`, and
+metadata fields are preserved when a bounded response can be represented.
 
 The response cache is local to the runtime. See
 [Runtime State and Storage](runtime-state-and-storage.md) for the current

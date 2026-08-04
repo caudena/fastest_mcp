@@ -28,8 +28,8 @@ defmodule FastestMCP.InputValidationTest do
     "required" => ["profile"]
   }
 
-  test "tool arguments are coerced by default when input_schema is provided" do
-    server_name = "input-coerce-" <> Integer.to_string(System.unique_integer([:positive]))
+  test "tool arguments must already have the declared JSON types" do
+    server_name = "input-types-" <> Integer.to_string(System.unique_integer([:positive]))
 
     server =
       FastestMCP.server(server_name)
@@ -40,27 +40,22 @@ defmodule FastestMCP.InputValidationTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    assert 30 == FastestMCP.call_tool(server_name, "add", %{"a" => "10", "b" => "20"})
-  end
+    assert 30 == FastestMCP.call_tool(server_name, "add", %{"a" => 10, "b" => 20})
 
-  test "strict_input_validation rejects coercion" do
-    server_name = "input-strict-" <> Integer.to_string(System.unique_integer([:positive]))
-
-    server =
-      FastestMCP.server(server_name, strict_input_validation: true)
-      |> FastestMCP.add_tool("add", fn %{"a" => a, "b" => b}, _ctx -> a + b end,
-        input_schema: @numeric_schema
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
-
-    assert_raise Error, ~r/a must be an integer/, fn ->
+    assert_raise Error, ~r/#\/a value has an invalid JSON type/, fn ->
       FastestMCP.call_tool(server_name, "add", %{"a" => "10", "b" => 20})
     end
   end
 
-  test "nested object values accept stringified json in non-strict mode" do
+  test "the removed strict_input_validation option fails with migration guidance" do
+    assert_raise ArgumentError,
+                 ~r/strict_input_validation was removed; JSON Schema validation is always non-coercing/,
+                 fn ->
+                   FastestMCP.server("removed-strict-option", strict_input_validation: true)
+                 end
+  end
+
+  test "nested objects are validated without parsing stringified JSON" do
     server_name = "input-nested-" <> Integer.to_string(System.unique_integer([:positive]))
 
     server =
@@ -76,21 +71,26 @@ defmodule FastestMCP.InputValidationTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    profile =
-      JSON.encode!(%{"name" => "Alice", "age" => "30", "email" => "alice@example.com"})
+    profile = %{"name" => "Alice", "age" => 30, "email" => "alice@example.com"}
 
     assert "Alice:30:alice@example.com" ==
              FastestMCP.call_tool(server_name, "create_user", %{"profile" => profile})
+
+    encoded = JSON.encode!(profile)
+
+    assert_raise Error, ~r/#\/profile value has an invalid JSON type/, fn ->
+      FastestMCP.call_tool(server_name, "create_user", %{"profile" => encoded})
+    end
   end
 
-  test "resource template parameters are coerced through parameters schema" do
+  test "resource template parameters retain their URI string representation" do
     server_name = "template-params-" <> Integer.to_string(System.unique_integer([:positive]))
 
     schema = %{
       "type" => "object",
       "properties" => %{
-        "id" => %{"type" => "integer"},
-        "enabled" => %{"type" => "boolean"}
+        "id" => %{"type" => "string", "pattern" => "^[0-9]+$"},
+        "enabled" => %{"type" => "string", "enum" => ["true", "false"]}
       },
       "required" => ["id"]
     }
@@ -108,7 +108,7 @@ defmodule FastestMCP.InputValidationTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    assert %{id: 41, enabled: true} ==
+    assert %{id: "41", enabled: "true"} ==
              FastestMCP.read_resource(server_name, "item://41?enabled=true")
   end
 
@@ -129,7 +129,7 @@ defmodule FastestMCP.InputValidationTest do
     end
   end
 
-  test "nullable type unions accept nil in strict mode" do
+  test "nullable type unions accept nil and strings" do
     server_name = "input-nullable-" <> Integer.to_string(System.unique_integer([:positive]))
 
     schema = %{
@@ -140,7 +140,7 @@ defmodule FastestMCP.InputValidationTest do
     }
 
     server =
-      FastestMCP.server(server_name, strict_input_validation: true)
+      FastestMCP.server(server_name)
       |> FastestMCP.add_tool("echo_category", fn %{"category" => category}, _ctx -> category end,
         input_schema: schema
       )
@@ -152,7 +152,7 @@ defmodule FastestMCP.InputValidationTest do
     assert "books" == FastestMCP.call_tool(server_name, "echo_category", %{"category" => "books"})
   end
 
-  test "anyOf accepts the first matching coercible schema in non-strict mode" do
+  test "anyOf preserves the matching submitted type" do
     server_name = "input-anyof-" <> Integer.to_string(System.unique_integer([:positive]))
 
     schema = %{
@@ -177,11 +177,11 @@ defmodule FastestMCP.InputValidationTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    assert 41 == FastestMCP.call_tool(server_name, "echo_value", %{"value" => "41"})
-    assert "alpha" == FastestMCP.call_tool(server_name, "echo_value", %{"value" => "alpha"})
+    assert 41 == FastestMCP.call_tool(server_name, "echo_value", %{"value" => 41})
+    assert "41" == FastestMCP.call_tool(server_name, "echo_value", %{"value" => "41"})
   end
 
-  test "oneOf rejects ambiguous matches in strict mode" do
+  test "oneOf rejects values that match multiple branches" do
     server_name = "input-oneof-" <> Integer.to_string(System.unique_integer([:positive]))
 
     schema = %{
@@ -198,7 +198,7 @@ defmodule FastestMCP.InputValidationTest do
     }
 
     server =
-      FastestMCP.server(server_name, strict_input_validation: true)
+      FastestMCP.server(server_name)
       |> FastestMCP.add_tool("echo_value", fn %{"value" => value}, _ctx -> value end,
         input_schema: schema
       )
@@ -206,12 +206,12 @@ defmodule FastestMCP.InputValidationTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    assert_raise Error, ~r/must match exactly one allowed shape/, fn ->
+    assert_raise Error, ~r/does not match exactly one allowed schema/, fn ->
       FastestMCP.call_tool(server_name, "echo_value", %{"value" => 7})
     end
   end
 
-  test "boolean schemas and additionalProperties false are enforced" do
+  test "boolean property schemas and additionalProperties false are enforced" do
     server_name =
       "input-boolean-schema-" <> Integer.to_string(System.unique_integer([:positive]))
 
@@ -225,7 +225,7 @@ defmodule FastestMCP.InputValidationTest do
     }
 
     server =
-      FastestMCP.server(server_name, strict_input_validation: true)
+      FastestMCP.server(server_name)
       |> FastestMCP.add_tool("echo", fn args, _ctx -> args end, input_schema: schema)
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
@@ -236,11 +236,11 @@ defmodule FastestMCP.InputValidationTest do
                "anything" => %{"nested" => "value"}
              })
 
-    assert_raise Error, ~r/blocked does not match schema/, fn ->
+    assert_raise Error, ~r/#\/blocked/, fn ->
       FastestMCP.call_tool(server_name, "echo", %{"blocked" => "nope"})
     end
 
-    assert_raise Error, ~r/extra is not allowed/, fn ->
+    assert_raise Error, ~r/additional properties are not allowed/, fn ->
       FastestMCP.call_tool(server_name, "echo", %{"extra" => "nope"})
     end
   end

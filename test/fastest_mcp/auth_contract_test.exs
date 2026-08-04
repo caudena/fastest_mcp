@@ -331,6 +331,7 @@ defmodule FastestMCP.AuthContractTest do
       |> FastestMCP.Transport.StreamableHTTP.call(
         server_name: server_name,
         auth_assigns: [:current_user],
+        allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"],
         json_response: true
       )
 
@@ -362,6 +363,7 @@ defmodule FastestMCP.AuthContractTest do
       |> FastestMCP.Transport.StreamableHTTP.call(
         server_name: server_name,
         auth_assigns: [:current_user],
+        allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"],
         json_response: true
       )
 

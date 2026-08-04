@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## 0.2.0 - 2026-08-02
+## 0.2.0 - Unreleased
 
 This is a breaking protocol and lifecycle release. Applications upgrading from
 0.1.x should review the migration notes below before deploying.
@@ -24,8 +24,8 @@ This is a breaking protocol and lifecycle release. Applications upgrading from
   `text/event-stream` in `Accept`
 - return `202 Accepted` with no response body for JSON-RPC notifications
 - pin the official server conformance runner to
-  `@modelcontextprotocol/conformance@0.1.16` and run it without expected-failure
-  allowances
+  `@modelcontextprotocol/conformance@0.1.16` as a release gate without
+  expected-failure allowances
 
 ### Sessions and request lifecycle
 
@@ -36,11 +36,12 @@ This is a breaking protocol and lifecycle release. Applications upgrading from
   requests, both for stateful HTTP sessions and each stdio connection
 - require `MCP-Protocol-Version: 2025-11-25` on stateful HTTP requests after
   initialization, and reject unknown or terminated sessions
-- make stateless HTTP POST-only and request-scoped: it creates no session,
-  advertises no task or subscription capability, and rejects task augmentation,
-  resource subscriptions, GET, and DELETE
-- add explicit context `state_scope`, negotiated protocol, and client
-  capability fields; `Context.session_id` is now `nil` for stateless requests
+- remove zero-session HTTP and reject the former `stateless_http:` and
+  `stateless:` options; use `state_scope: :request` for request-local handler
+  state while retaining a normal server-issued MCP session
+- add explicit context `state_scope`, negotiated protocol, client capability,
+  and client information fields; request-scoped HTTP contexts keep their stable
+  non-null session id
 - remove the client's initial `session_id:` option and add `sampling_tools:`,
   `sampling_context:`, and a 1 MiB default `max_sse_event_bytes:` limit
 
@@ -64,14 +65,21 @@ This is a breaking protocol and lifecycle release. Applications upgrading from
 - forward listener configuration through `bandit_options:` and add a supervised
   streamed-request timeout through `stream_request_timeout_ms:` (60 seconds by
   default)
-- remove `allowed_hosts: :any`; use a non-empty concrete host list, or set
-  `unsafe_allow_any_host: true` as an explicit opt-out
-- require non-loopback listeners to configure concrete allowed hosts unless the
-  unsafe opt-out is explicit
+- remove `allowed_hosts: :any` and `unsafe_allow_any_host`; use a non-empty
+  concrete host list for every non-loopback listener
 - expose `FastestMCP.Auth.Result`, `FastestMCP.Auth.StaticToken`,
   `FastestMCP.TaskBackend`, and `FastestMCP.TaskBackend.Memory` in HexDocs
 - source the ExDoc module filter and module groups from one shared public-module
   catalog so published docs cannot drift from the navigation groups
+- authenticate every inbound HTTP message and control request, bind initialized
+  sessions to the authenticated identity, and apply Host/Origin validation at
+  the shared public Streamable HTTP entrypoint
+- reject malformed, opaque, combined, and repeated Origin headers before
+  authentication; accepted origins are serialized HTTP(S) origins whose host
+  is present in `allowed_hosts`
+- add optional RFC 9728 Protected Resource Metadata on the MCP resource origin,
+  authoritative `resource_metadata`/`scope` bearer challenges, query-token
+  rejection, and expected-resource/scope input for application authenticators
 - add provider candidate callbacks for deterministic all-version resolution,
   including lower-version fallback after visibility or policy filtering
 - centralize duplicate component policy and preserve `:warn` as
@@ -82,6 +90,19 @@ This is a breaking protocol and lifecycle release. Applications upgrading from
 
 ### Schema, sampling, providers, and middleware
 
+- add JSV `0.21.x` as the sole new runtime dependency and make
+  `FastestMCP.Schema` the compile-once validation boundary for Draft 2020-12
+  and Draft 7; validation is non-coercing, bounded, and redacted
+- vendor the immutable MCP `2025-11-25` schema from source commit
+  `38c84e9f93ad191d9eb26d92b945d17bd0efcaf3` with a checked SHA-256, and cover
+  the FastestMCP schema boundary with focused dialect, resolver, and limit tests
+- keep those vendored bytes unchanged while applying a versioned compiled-view
+  erratum for `NumberSchema.minimum`, `maximum`, and `default`: authoritative
+  `schema.ts` and the elicitation specification define numbers, while the
+  tagged generated JSON artifact emitted integers
+- fail remote JSON Schema references closed by default; applications may opt in
+  to an explicit resolver or the allowlisted HTTPS resolver with verified TLS,
+  redirect refusal, and timeout/body limits
 - canonicalize wire serialization around `_meta`, direct `resource_link`
   fields, object-only structured tool content, and resource templates listed
   exclusively by `resources/templates/list`; FastestMCP-only task elicitation
@@ -104,6 +125,77 @@ This is a breaking protocol and lifecycle release. Applications upgrading from
   now reuse a runtime-owned metadata cache and hash only changed files
 - deduplicate injected tools by component identity and use indexed exact
   Registry and atomic exact-or-template component lookups
+
+### Bidirectional sessions and optional MCP facilities
+
+- extend the session coordinator to own lifecycle, both request-id namespaces,
+  active work, callback requests, output sinks, queued messages, progress
+  tokens, logging thresholds, roots, peer tasks, URL elicitation, and SSE replay
+- run inbound HTTP and stdio work under the runtime `Task.Supervisor`; support
+  bidirectional cancellation and keep detached non-cancelled work supervised
+  after an HTTP client disconnects
+- make stdio concurrently read client responses and notifications while one
+  serialized writer owns stdout; all diagnostics remain on stderr
+- add `FastestMCP.Root`, `Context.list_roots/2`, cached roots, canonical
+  `file://` validation, and roots-list-change refresh
+- add standard form and URL elicitation, identity-bound completion through
+  `FastestMCP.complete_elicitation/3`, `-32042` descriptors, HTTPS host
+  allowlists through `url_elicitation_allowed_hosts:`, and completion
+  notifications to the originating session only
+- normalize the specification's backwards-compatible client capability
+  `elicitation: {}` to effective `elicitation.form` support; URL mode still
+  requires explicit `elicitation.url`
+- add `FastestMCP.PeerTask` for task-augmented sampling and elicitation, with
+  fetch, wait, result, cancel, and status-change helpers scoped to the exact
+  originating server session, plus `Context.list_peer_tasks/2` for negotiated
+  requester task listing
+- add outbound ping, full sampling result validation and tool rounds, incoming
+  progress callbacks, RFC 5424 logging thresholds, and bounded event rates
+- add bounded logical SSE streams and same-stream `Last-Event-ID` replay; replay
+  state is session-local and cleared on termination or runtime restart
+
+### New default limits
+
+- retain a 60-second request timeout and bound each session to 100,000 used
+  request ids per direction, 128 pending callbacks, 128 active requests, 128
+  peer tasks, 128 peer-task status callbacks, 1,024 queued peer messages, and
+  16 MiB of queued message data
+- bound each runtime to 10,000 pending callbacks, 10,000 active requests, and
+  64 MiB of SSE replay data
+- retain at most 256 replay events and 4 MiB per logical stream for five
+  minutes; URL elicitation records expire after 15 minutes
+- rate-limit outbound progress to 20 updates per second per token and inbound
+  progress/logs to 100 updates per second per session
+- cap JSON Schema sources at 1 MiB and nesting at 128 levels/256 references,
+  with five-second compilation and one-second validation deadlines; cap opaque
+  cursors at 4 KiB
+
+### 0.1.x migration checklist
+
+- remove `stateless_http:`, `stateless:`, `strict_input_validation:`,
+  `dereference_schemas:`, initial client `session_id:`, `allowed_hosts: :any`,
+  legacy REST-shaped MCP routes, batch requests, and remote `tasks/sendInput`
+- use `state_scope: :request` when handler state must reset, while preserving
+  the server-issued session id and initialize/initialized lifecycle
+- send one JSON-RPC object per POST or stdio line; require object params and
+  results, use only string/integer ids, and do not reuse ids within a session
+- change tool input/output schemas to object-root JSON Schema and return
+  schema-valid object `structuredContent`; values are no longer coerced
+- move standard tool execution metadata to `execution.taskSupport`, keep only
+  FastestMCP extensions under `_meta.fastestmcp`, and use direct standard fields
+  on resource links and content blocks
+- update sampling handlers to return complete `CreateMessageResult` objects
+  with `role`, `content`, and `model`; form elicitation accepted content must be
+  an object conforming to the requested schema
+- continue list operations using the opaque `cursor` only; wire `pageSize` no
+  longer controls the server-owned page size
+- update custom task backends to the fallible fetch/expiry contracts described
+  above and treat callback/progress/log delivery helpers as fallible operations
+- configure concrete `allowed_hosts` for public mounts and, when RFC 9728
+  discovery is needed, an exact `protected_resource:` plus an application-owned
+  authenticator
+
+Publishing and tagging 0.2.0 remain separate release actions.
 
 ## 0.1.2 - 2026-05-27
 

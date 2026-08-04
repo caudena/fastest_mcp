@@ -80,6 +80,15 @@ session header, retain the server-issued id, send `notifications/initialized`,
 then include both the session id and `MCP-Protocol-Version: 2025-11-25` on later
 requests. Each POST must contain one JSON-RPC message rather than a batch.
 
+The repository's `test/support/raw_peer.ex` is a minimal spec-shaped peer used
+by `raw_peer_acceptance_matrix_test.exs` to run one shared roots, sampling,
+form/URL elicitation, requester-task, and ping workflow over unprotected HTTP
+JSON + GET SSE, unprotected POST SSE, protected-resource HTTP JSON + GET SSE,
+and stdio. Richer raw-peer tests add progress, cancellation, task status, and
+failure cases. The emulator is intentionally lower-level than
+`FastestMCP.Client`, so a client helper cannot accidentally hide a server wire
+defect.
+
 ## 3. Background Task and Interaction Tests
 
 Background task behavior is testable through the same public API:
@@ -128,6 +137,34 @@ Use transport or client tests for:
 This repo also keeps a docs fixture and a docs example test lane so guide
 snippets keep matching real runtime behavior. That is worth copying into your
 own application when your server becomes a shared internal platform.
+
+The 0.2 release gate pins
+`@modelcontextprotocol/conformance@0.1.16` in
+`test/conformance/package-lock.json`, installs it with `npm ci`, and invokes it
+with `npx --no-install` plus explicit `--spec-version 2025-11-25`. Conformance
+is split into independently visible lanes:
+
+1. native ExUnit and real subprocess/TCP tests
+2. all 32 official server scenarios through a narrowly scoped test-only runner
+   compatibility adapter
+3. all 18 official client scenarios through a test-only adapter that calls public
+   `FastestMCP.Client` APIs
+
+Runner `0.1.16` advertises its new SSE scenarios for `2025-11-25` but sends
+`MCP-Protocol-Version: 2025-03-26` on their manually constructed follow-up
+requests. Its client `sse-retry` scenario also returns `2025-03-26` from
+`initialize` despite being selected as `2025-11-25`. Production continues to
+reject that stale protocol version. The test-only adapters change only those
+exact runner values, and unit tests prove current, absent, unrelated, and later
+response values remain untouched. Both official lanes require the exact
+scenario count, one evidence file per scenario, no skipped scenario, no failure
+or warning status, and a zero exit status. No expected-failure baseline or
+manual failure allowance is part of the release gate.
+
+A green shimmed runner is not evidence of full support. Native feature tests,
+raw-peer transport tests, schema checksum verification, docs with warnings as
+errors, and fresh-package consumer smoke tests remain
+independent release requirements.
 
 ## Why This Shape
 

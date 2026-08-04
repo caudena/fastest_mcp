@@ -2,8 +2,9 @@ defmodule FastestMCP.ResourceSubscriptionPatternsTest do
   use ExUnit.Case, async: false
 
   alias FastestMCP.Client
+  alias FastestMCP.Session
 
-  test "session streams deliver resource-updated notifications for template subscriptions" do
+  test "session streams deliver resource-updated notifications for concrete URI subscriptions" do
     parent = self()
 
     server_name =
@@ -23,7 +24,9 @@ defmodule FastestMCP.ResourceSubscriptionPatternsTest do
         {Bandit,
          plug:
            {FastestMCP.Transport.HTTPApp,
-            server_name: server_name, path: "/mcp", unsafe_allow_any_host: true},
+            server_name: server_name,
+            path: "/mcp",
+            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
          scheme: :http,
          port: 0}
       )
@@ -44,7 +47,13 @@ defmodule FastestMCP.ResourceSubscriptionPatternsTest do
     end)
 
     assert wait_for_session_stream(client) == :ok
-    assert %{} = Client.subscribe_resource(client, "users://{id}{?format}")
+    session_id = Client.session_id(client)
+    assert %{} = Client.subscribe_resource(client, "users://42?format=json")
+
+    assert :ok = Session.subscribe_resource(server_name, session_id, "users://{id}")
+
+    FastestMCP.notify_resource_updated(server_name, "users://99")
+    refute_receive {:resource_notification, _payload}, 250
 
     FastestMCP.notify_resource_updated(server_name, "users://42?format=json")
 
@@ -55,7 +64,7 @@ defmodule FastestMCP.ResourceSubscriptionPatternsTest do
                     }},
                    1_000
 
-    assert %{} = Client.unsubscribe_resource(client, "users://{id}{?format}")
+    assert %{} = Client.unsubscribe_resource(client, "users://42?format=json")
 
     FastestMCP.notify_resource_updated(server_name, "users://42?format=json")
 

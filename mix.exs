@@ -32,10 +32,13 @@ defmodule FastestMCP.MixProject do
     [
       {:bandit, "~> 1.5"},
       {:ex_doc, "~> 0.40", only: :dev, runtime: false},
+      {:jsv, "~> 0.21.2"},
+      {:mint, "~> 1.9"},
       {:opentelemetry, "~> 1.6", only: :test},
       {:opentelemetry_api, "~> 1.5"},
       {:plug, "~> 1.16"},
-      {:telemetry, "~> 1.2"}
+      {:telemetry, "~> 1.2"},
+      {:texture, "~> 1.2"}
     ]
   end
 
@@ -78,11 +81,15 @@ defmodule FastestMCP.MixProject do
         "docs/versioning-and-visibility.md",
         "docs/testing.md",
         "docs/runtime-state-and-storage.md",
+        "docs/schema-validation.md",
         "docs/compatibility-and-scope.md"
       ],
       groups_for_extras: [
         "Start Here": ["README.md", "CHANGELOG.md", "docs/onboarding.md"],
-        Explanation: ["docs/why-fastest-mcp.md", "docs/compatibility-and-scope.md"],
+        Explanation: [
+          "docs/why-fastest-mcp.md",
+          "docs/compatibility-and-scope.md"
+        ],
         Features: [
           "docs/components.md",
           "docs/tools.md",
@@ -106,14 +113,22 @@ defmodule FastestMCP.MixProject do
           "docs/transforms.md",
           "docs/versioning-and-visibility.md",
           "docs/testing.md",
-          "docs/runtime-state-and-storage.md"
+          "docs/runtime-state-and-storage.md",
+          "docs/schema-validation.md"
         ]
       ],
       groups_for_modules: module_groups,
       skip_code_autolink_to: [
         "FastestMCP.BackgroundTaskStore",
+        "FastestMCP.Client.Task",
         "FastestMCP.EventBus",
-        "FastestMCP.HTTP.request/3"
+        "FastestMCP.HTTP.request/3",
+        "FastestMCP.OperationPipeline",
+        "FastestMCP.Pagination.default_key/1",
+        "FastestMCP.Session",
+        "FastestMCP.Session.verify_identity/3",
+        "FastestMCP.Transport.HTTPCommon",
+        "FastestMCP.Transport.JSONRPC"
       ],
       filter_modules: fn module, _metadata -> module in public_modules end
     ]
@@ -128,10 +143,23 @@ defmodule FastestMCP.MixProject do
         FastestMCP.Server,
         FastestMCP.Context,
         FastestMCP.RequestContext,
-        FastestMCP.BackgroundTask
+        FastestMCP.BackgroundTask,
+        FastestMCP.PeerTask,
+        FastestMCP.Root
       ],
       "Client and Transport": [
         FastestMCP.Client,
+        FastestMCP.Client.CallbackContext,
+        FastestMCP.Client.OAuth,
+        FastestMCP.Client.OAuth.AuthorizationHandler,
+        FastestMCP.Client.OAuth.AuthorizationHandler.Request,
+        FastestMCP.Client.OAuth.Error,
+        FastestMCP.Client.OAuth.TokenStore,
+        FastestMCP.Client.OAuth.TokenStore.Memory,
+        FastestMCP.Client.ProtocolError,
+        FastestMCP.Client.Request,
+        FastestMCP.Client.Task,
+        FastestMCP.Client.URLElicitation,
         FastestMCP.Protocol,
         FastestMCP.Transport.HTTPApp,
         FastestMCP.Transport.StreamableHTTP,
@@ -139,6 +167,7 @@ defmodule FastestMCP.MixProject do
       ],
       "Runtime Features": [
         FastestMCP.Auth,
+        FastestMCP.Auth.ProtectedResource,
         FastestMCP.Auth.Result,
         FastestMCP.Auth.StaticToken,
         FastestMCP.ComponentManager,
@@ -148,6 +177,10 @@ defmodule FastestMCP.MixProject do
         FastestMCP.Operation,
         FastestMCP.Provider,
         FastestMCP.Sampling,
+        FastestMCP.Schema,
+        FastestMCP.Schema.Compiled,
+        FastestMCP.Schema.Error,
+        FastestMCP.Schema.HTTPResolver,
         FastestMCP.SessionStateStore,
         FastestMCP.SessionStateStore.Memory,
         FastestMCP.TaskBackend,
@@ -179,7 +212,8 @@ defmodule FastestMCP.MixProject do
         "config",
         "docs",
         "lib",
-        "mix.exs"
+        "mix.exs",
+        "priv"
       ],
       licenses: ["Apache-2.0"],
       links: %{

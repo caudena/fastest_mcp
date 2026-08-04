@@ -7,6 +7,7 @@ defmodule FastestMCP.Auth.StaticToken do
       %{
         "token-value" => %{
           client_id: "service-a",
+          audiences: ["https://mcp.example.com/mcp"],
           scopes: ["tools:call"],
           principal: %{"sub" => "service-a"}
         }
@@ -52,7 +53,9 @@ defmodule FastestMCP.Auth.StaticToken do
            %Result{
              principal: principal_for(token_config),
              auth: auth_for(token, token_config, scopes),
-             capabilities: normalize_list(fetch_field(token_config, :capabilities, scopes))
+             capabilities: normalize_list(fetch_field(token_config, :capabilities, scopes)),
+             audiences: verified_audiences(token_config),
+             scopes: scopes
            }}
         else
           {:error,
@@ -87,6 +90,12 @@ defmodule FastestMCP.Auth.StaticToken do
     |> Map.put_new(:token, token)
     |> maybe_put_new(:client_id, fetch_field(token_config, :client_id))
     |> Map.put_new(:scopes, scopes)
+  end
+
+  defp verified_audiences(token_config) do
+    token_config
+    |> fetch_field(:audiences, fetch_field(token_config, :audience, []))
+    |> normalize_list()
   end
 
   defp expired?(nil), do: false

@@ -3,13 +3,22 @@ defmodule FastestMCP.SSEDecoderTest do
 
   alias FastestMCP.Transport.SSEDecoder
 
-  test "decodes LF and CRLF event delimiters" do
+  test "decodes LF, CRLF, CR, and mixed event delimiters" do
     decoder = SSEDecoder.new()
 
-    assert {:ok, [%{"line" => "lf"}, %{"line" => "crlf"}], decoder} =
+    assert {:ok,
+            [
+              %{"line" => "lf"},
+              %{"line" => "crlf"},
+              %{"line" => "cr"},
+              %{"line" => "mixed"}
+            ], decoder} =
              SSEDecoder.feed(
                decoder,
-               "data: {\"line\":\"lf\"}\n\ndata: {\"line\":\"crlf\"}\r\n\r\n"
+               "data: {\"line\":\"lf\"}\n\n" <>
+                 "data: {\"line\":\"crlf\"}\r\n\r\n" <>
+                 "data: {\"line\":\"cr\"}\r\r" <>
+                 "data: {\"line\":\"mixed\"}\r\n\n"
              )
 
     assert :ok = SSEDecoder.finish(decoder)
@@ -27,6 +36,81 @@ defmodule FastestMCP.SSEDecoderTest do
     assert :ok = SSEDecoder.finish(decoder)
   end
 
+  test "retains event ids and retry intervals for HTTP stream resumption" do
+    assert {:ok, [%{"sequence" => 1}], decoder} =
+             SSEDecoder.feed(
+               SSEDecoder.new(),
+               "id: stream-a:1\nretry: 1500\nevent: message\ndata: {\"sequence\":1}\n\n"
+             )
+
+    assert SSEDecoder.last_event_id(decoder) == "stream-a:1"
+    assert SSEDecoder.retry_ms(decoder) == 1_500
+
+    assert {:ok, [%{"sequence" => 2}], decoder} =
+             SSEDecoder.feed(decoder, "data: {\"sequence\":2}\n\n")
+
+    assert SSEDecoder.last_event_id(decoder) == "stream-a:1"
+    assert SSEDecoder.retry_ms(decoder) == 1_500
+
+    assert {:ok, [], decoder} =
+             SSEDecoder.feed(decoder, "id: stream-a:primed\nretry: 2500\ndata:\n\n")
+
+    assert SSEDecoder.last_event_id(decoder) == "stream-a:primed"
+    assert SSEDecoder.retry_ms(decoder) == 2_500
+  end
+
+  test "ignores invalid retry fields and event ids containing null bytes" do
+    decoder = %{SSEDecoder.new() | last_event_id: "stream-a:1", retry_ms: 1_000}
+
+    assert {:ok, [%{"ok" => true}], decoder} =
+             SSEDecoder.feed(
+               decoder,
+               "id: bad\0id\nretry: 1.5\ndata: {\"ok\":true}\n\n"
+             )
+
+    assert SSEDecoder.last_event_id(decoder) == "stream-a:1"
+    assert SSEDecoder.retry_ms(decoder) == 1_000
+  end
+
+  test "parses retry without constructing unbounded integers" do
+    assert {:ok, [], zero} =
+             SSEDecoder.feed(SSEDecoder.new(), "retry: #{String.duplicate("0", 10_000)}\n\n")
+
+    assert SSEDecoder.retry_ms(zero) == 0
+
+    assert {:ok, [], bounded} =
+             SSEDecoder.feed(SSEDecoder.new(), "retry: 4294967295\n\n")
+
+    assert SSEDecoder.retry_ms(bounded) == 4_294_967_295
+
+    assert {:ok, [], saturated} =
+             SSEDecoder.feed(
+               SSEDecoder.new(max_event_bytes: 20_000),
+               "retry: #{String.duplicate("9", 10_000)}\n\n"
+             )
+
+    assert SSEDecoder.retry_ms(saturated) == :infinity
+  end
+
+  test "suppresses replayed data events by event id while retaining later ids" do
+    decoder = SSEDecoder.new(max_seen_event_ids: 2)
+
+    assert {:ok, [%{"sequence" => 1}], decoder} =
+             SSEDecoder.feed(decoder, "id: one\ndata: {\"sequence\":1}\n\n")
+
+    assert {:ok, [], decoder} =
+             SSEDecoder.feed(decoder, "id: one\ndata: {\"sequence\":1}\n\n")
+
+    assert {:ok, [%{"sequence" => 2}, %{"sequence" => 3}], decoder} =
+             SSEDecoder.feed(
+               decoder,
+               "id: two\ndata: {\"sequence\":2}\n\nid: three\ndata: {\"sequence\":3}\n\n"
+             )
+
+    assert {:ok, [%{"sequence" => 1}], _decoder} =
+             SSEDecoder.feed(decoder, "id: one\ndata: {\"sequence\":1}\n\n")
+  end
+
   test "decodes events fragmented at every byte boundary" do
     encoded =
       "id: 1\r\nevent: message\r\ndata: {\"first\":1}\r\n\r\n" <>
@@ -41,6 +125,16 @@ defmodule FastestMCP.SSEDecoderTest do
       end)
 
     assert events == [%{"first" => 1}, %{"second" => 2}]
+    assert :ok = SSEDecoder.finish(decoder)
+  end
+
+  test "ignores a UTF-8 byte-order mark even when it is fragmented" do
+    assert {:ok, [], decoder} = SSEDecoder.feed(SSEDecoder.new(), <<0xEF>>)
+    assert {:ok, [], decoder} = SSEDecoder.feed(decoder, <<0xBB>>)
+
+    assert {:ok, [%{"ready" => true}], decoder} =
+             SSEDecoder.feed(decoder, <<0xBF>> <> "data: {\"ready\":true}\n\n")
+
     assert :ok = SSEDecoder.finish(decoder)
   end
 
@@ -88,6 +182,9 @@ defmodule FastestMCP.SSEDecoderTest do
     assert {:error, error} = SSEDecoder.finish(decoder)
     assert error.code == :bad_request
     assert error.message == "SSE stream ended with an incomplete event"
+
+    assert {:ok, [], partial_bom} = SSEDecoder.feed(SSEDecoder.new(), <<0xEF>>)
+    assert {:error, %FastestMCP.Error{code: :bad_request}} = SSEDecoder.finish(partial_bom)
   end
 end
 
@@ -109,7 +206,7 @@ defmodule FastestMCP.TestSupport.PrimedSSEPlug do
           "id" => request["id"],
           "result" => %{
             "protocolVersion" => FastestMCP.Protocol.current_version(),
-            "capabilities" => %{},
+            "capabilities" => %{"tools" => %{}},
             "serverInfo" => %{"name" => "primed-sse", "version" => "1.0.0"}
           }
         }
@@ -121,6 +218,19 @@ defmodule FastestMCP.TestSupport.PrimedSSEPlug do
 
       "notifications/initialized" ->
         send_resp(conn, 202, "")
+
+      "tools/list" ->
+        payload = %{
+          "jsonrpc" => "2.0",
+          "id" => request["id"],
+          "result" => %{
+            "tools" => [%{"name" => "echo", "inputSchema" => %{"type" => "object"}}]
+          }
+        }
+
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(200, JSON.encode!(payload))
 
       "tools/call" ->
         payload = %{
@@ -164,7 +274,9 @@ defmodule FastestMCP.SSEClientCleanupTest do
         {Bandit,
          plug:
            {FastestMCP.Transport.HTTPApp,
-            server_name: server_name, unsafe_allow_any_host: true, json_response: true},
+            server_name: server_name,
+            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"],
+            json_response: true},
          scheme: :http,
          port: 0}
       )

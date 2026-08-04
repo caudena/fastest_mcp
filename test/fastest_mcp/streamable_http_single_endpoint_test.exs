@@ -49,6 +49,7 @@ defmodule FastestMCP.StreamableHTTPSingleEndpointTest do
   test "only the exact configured MCP path is routed", %{server_name: server_name} do
     response =
       conn(:get, "/mcp/")
+      |> Map.put(:host, "localhost")
       |> StreamableHTTP.call(server_name: server_name)
 
     assert response.status == 404
@@ -85,6 +86,7 @@ defmodule FastestMCP.StreamableHTTPSingleEndpointTest do
       )
       |> Plug.Conn.put_req_header("content-type", "application/json")
       |> Plug.Conn.put_req_header("accept", "application/json, text/event-stream")
+      |> Map.put(:host, "localhost")
       |> StreamableHTTP.call(server_name: server_name)
 
     assert initialize_response.status == 200
@@ -94,6 +96,7 @@ defmodule FastestMCP.StreamableHTTPSingleEndpointTest do
 
     delete_response =
       conn(:delete, "/mcp?session_id=#{session_id}")
+      |> Map.put(:host, "localhost")
       |> Plug.Conn.put_req_header("mcp-protocol-version", ProtocolTest.protocol_version())
       |> StreamableHTTP.call(server_name: server_name)
 
@@ -131,35 +134,33 @@ defmodule FastestMCP.StreamableHTTPSingleEndpointTest do
       )
       |> Plug.Conn.put_req_header("content-type", "application/json")
       |> Plug.Conn.put_req_header("accept", "application/json, text/event-stream")
+      |> Map.put(:host, "localhost")
       |> StreamableHTTP.call(server_name: server_name)
 
     assert response.status == 400
     assert Plug.Conn.get_resp_header(response, "mcp-session-id") == []
 
+    body = JSON.decode!(response.resp_body)
+
     assert %{
              "jsonrpc" => "2.0",
-             "id" => nil,
              "error" => %{
                "code" => -32_600,
                "message" => "JSON-RPC batch requests are not supported"
              }
-           } = JSON.decode!(response.resp_body)
+           } = body
+
+    refute Map.has_key?(body, "id")
   end
 
-  test "stateless streamable HTTP only allows POST", %{server_name: server_name} do
-    response =
-      conn(:get, "/mcp")
-      |> StreamableHTTP.call(server_name: server_name, stateless_http: true)
-
-    assert response.status == 405
-    assert Plug.Conn.get_resp_header(response, "allow") == ["POST"]
-
-    assert %{
-             "error" => %{
-               "code" => "method_not_allowed",
-               "message" => "stateless HTTP only supports POST"
-             }
-           } = JSON.decode!(response.resp_body)
+  test "legacy stateless streamable HTTP options fail fast", %{server_name: server_name} do
+    assert_raise ArgumentError,
+                 "stateless HTTP is no longer supported; use state_scope: :request for request-local handler state",
+                 fn ->
+                   conn(:get, "/mcp")
+                   |> Map.put(:host, "localhost")
+                   |> StreamableHTTP.call(server_name: server_name, stateless_http: true)
+                 end
   end
 
   test "DELETE /mcp terminates a session and rejects later reuse", %{server_name: server_name} do
@@ -170,6 +171,7 @@ defmodule FastestMCP.StreamableHTTPSingleEndpointTest do
 
     delete_response =
       conn(:delete, "/mcp")
+      |> Map.put(:host, "localhost")
       |> Plug.Conn.put_req_header("mcp-session-id", session_id)
       |> Plug.Conn.put_req_header("mcp-protocol-version", ProtocolTest.protocol_version())
       |> StreamableHTTP.call(server_name: server_name)

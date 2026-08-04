@@ -11,7 +11,6 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
   import Plug.Conn
 
   alias FastestMCP.Error
-  alias FastestMCP.JSONValue
   alias FastestMCP.MIME
   alias FastestMCP.Transport.HTTPCommon
   alias FastestMCP.Transport.JSONRPC
@@ -27,20 +26,29 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
     base_path =
       normalize_base_path(Keyword.get(opts, :path) || forwarded_base_path(conn) || "/mcp")
 
-    stateless_http = stateless_http?(opts)
-    request_opts = request_context_opts(conn, opts, base_path, stateless_http)
+    request_opts = request_context_opts(conn, opts, base_path)
 
-    case route(conn.method, conn.request_path, base_path, stateless_http) do
+    case route(conn.method, conn.request_path, base_path) do
       :post ->
         with :ok <- validate_post_headers(conn),
              {:ok, payload} <- read_json(conn),
              {:ok, decoded} <- JSONRPC.decode(payload) do
-          build_jsonrpc_message(conn, decoded, request_opts)
+          build_jsonrpc_message(
+            conn,
+            decoded,
+            Keyword.put(request_opts, :jsonrpc_envelope, payload)
+          )
         end
 
       :get ->
-        with :ok <- require_event_stream_accept(conn) do
-          {:ok, build_get_request(conn, request_opts)}
+        if Keyword.get(opts, :enable_get_streaming, true) do
+          with :ok <- require_event_stream_accept(conn) do
+            {:ok, build_get_request(conn, request_opts)}
+          end
+        else
+          {:response, 405,
+           %{error: %{code: :method_not_allowed, message: "GET streaming is disabled"}},
+           [{"allow", "POST, DELETE"}]}
         end
 
       :delete ->
@@ -48,9 +56,6 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
 
       {:response, status, payload} ->
         {:response, status, payload}
-
-      {:response, status, payload, headers} ->
-        {:response, status, payload, headers}
     end
   end
 
@@ -75,17 +80,11 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
   @doc "Encodes a JSON-RPC success payload."
   def encode_jsonrpc_success(%Request{} = request, payload), do: JSONRPC.success(request, payload)
 
-  defp route("POST", path, path, _stateless_http), do: :post
-  defp route("GET", path, path, false), do: :get
-  defp route("DELETE", path, path, false), do: :delete
+  defp route("POST", path, path), do: :post
+  defp route("GET", path, path), do: :get
+  defp route("DELETE", path, path), do: :delete
 
-  defp route(method, path, path, true) when method in ["GET", "DELETE"] do
-    {:response, 405,
-     %{error: %{code: :method_not_allowed, message: "stateless HTTP only supports POST"}},
-     [{"allow", "POST"}]}
-  end
-
-  defp route(_method, _request_path, _base_path, _stateless_http) do
+  defp route(_method, _request_path, _base_path) do
     {:response, 404, %{error: %{code: :not_found, message: "unknown route"}}}
   end
 
@@ -120,14 +119,9 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
   defp build_request(conn, method, payload, opts) do
     headers = request_headers(conn)
     provided_session_id = headers["mcp-session-id"]
-    stateless_http = Keyword.fetch!(opts, :stateless_http)
 
     session_id =
-      cond do
-        stateless_http -> nil
-        method == "initialize" -> generate_session_id()
-        true -> provided_session_id
-      end
+      if method == "initialize", do: generate_session_id(), else: provided_session_id
 
     %Request{
       method: method,
@@ -146,15 +140,16 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
           query_params: conn.query_params,
           session_id: session_id,
           session_id_provided: not is_nil(provided_session_id),
-          stateless_http: stateless_http,
           protocol_version: headers["mcp-protocol-version"],
+          jsonrpc_request_id: Keyword.fetch!(opts, :request_id),
+          jsonrpc_envelope: Keyword.get(opts, :jsonrpc_envelope),
           jsonrpc_notification:
             Keyword.fetch!(opts, :protocol) == :jsonrpc and
               is_nil(Keyword.fetch!(opts, :request_id)),
           progress_token: get_in(payload, ["_meta", "progressToken"])
         }
         |> put_request_context(opts),
-      auth_input: auth_input(conn, headers, opts)
+      auth_input: HTTPCommon.auth_input(conn, opts)
     }
   end
 
@@ -176,11 +171,10 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
           query_params: conn.query_params,
           session_id: session_id,
           session_id_provided: not is_nil(session_id),
-          stateless_http: false,
           protocol_version: headers["mcp-protocol-version"]
         }
         |> put_request_context(opts),
-      auth_input: auth_input(conn, headers, opts)
+      auth_input: HTTPCommon.auth_input(conn, opts)
     }
   end
 
@@ -202,29 +196,33 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
           query_params: conn.query_params,
           session_id: session_id,
           session_id_provided: not is_nil(session_id),
-          stateless_http: false,
           protocol_version: headers["mcp-protocol-version"]
         }
         |> put_request_context(opts),
-      auth_input: auth_input(conn, headers, opts)
+      auth_input: HTTPCommon.auth_input(conn, opts)
     }
   end
 
   defp validate_post_headers(conn) do
-    content_type = conn |> get_req_header("content-type") |> List.first()
+    content_types = get_req_header(conn, "content-type")
     accept = get_req_header(conn, "accept")
 
     cond do
-      not (is_binary(content_type) and MIME.normalize(content_type) == "application/json") ->
+      not valid_json_content_type?(content_types) ->
         {:error,
-         %Error{code: :bad_request, message: "MCP POST requests require application/json"}}
+         %Error{
+           code: :unsupported_media_type,
+           message: "MCP POST requests require application/json",
+           details: %{jsonrpc_code: -32_600}
+         }}
 
       not MIME.accepts?(accept, "application/json") or
           not MIME.accepts?(accept, "text/event-stream") ->
         {:error,
          %Error{
-           code: :bad_request,
-           message: "MCP POST Accept header must include application/json and text/event-stream"
+           code: :not_acceptable,
+           message: "MCP POST Accept header must include application/json and text/event-stream",
+           details: %{jsonrpc_code: -32_600}
          }}
 
       true ->
@@ -232,22 +230,28 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
     end
   end
 
+  defp valid_json_content_type?([content_type]) when is_binary(content_type),
+    do: MIME.content_type?(content_type, "application/json")
+
+  defp valid_json_content_type?(_content_types), do: false
+
   defp require_event_stream_accept(conn) do
     if conn |> get_req_header("accept") |> MIME.accepts?("text/event-stream") do
       :ok
     else
-      {:error, %Error{code: :bad_request, message: "MCP GET requires text/event-stream"}}
+      {:error,
+       %Error{
+         code: :not_acceptable,
+         message: "MCP GET requires text/event-stream",
+         details: %{jsonrpc_code: -32_600}
+       }}
     end
   end
 
-  defp validate_session_header(method, conn, opts) do
+  defp validate_session_header(method, conn, _opts) do
     session_header? = get_req_header(conn, "mcp-session-id") != []
 
     cond do
-      stateless_http?(opts) and session_header? ->
-        {:error,
-         %Error{code: :bad_request, message: "stateless HTTP does not accept MCP-Session-Id"}}
-
       method == "initialize" and session_header? ->
         {:error,
          %Error{code: :bad_request, message: "initialize must not include MCP-Session-Id"}}
@@ -257,52 +261,14 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
     end
   end
 
-  defp request_context_opts(conn, opts, base_path, stateless_http) do
+  defp request_context_opts(conn, opts, base_path) do
     http_context = HTTPCommon.http_context(conn, %{}, Keyword.put(opts, :path, base_path))
 
     [
-      stateless_http: stateless_http,
       base_url: http_context.base_url,
       mcp_base_path: http_context.mcp_base_path,
       auth_assigns: Keyword.get(opts, :auth_assigns, false)
     ]
-  end
-
-  defp auth_input(conn, headers, opts) do
-    %{"authorization" => headers["authorization"], "headers" => headers}
-    |> maybe_put("assigns", selected_auth_assigns(conn.assigns, Keyword.get(opts, :auth_assigns)))
-  end
-
-  defp selected_auth_assigns(_assigns, value) when value in [false, nil], do: nil
-
-  defp selected_auth_assigns(assigns, :all) when is_map(assigns) do
-    assigns
-    |> Map.new(fn {key, value} -> {to_string(key), value} end)
-    |> non_empty_map()
-  end
-
-  defp selected_auth_assigns(assigns, keys) when is_map(assigns) and is_list(keys) do
-    keys
-    |> Enum.reduce(%{}, fn key, selected ->
-      string_key = to_string(key)
-
-      cond do
-        Map.has_key?(assigns, key) ->
-          Map.put(selected, string_key, Map.fetch!(assigns, key))
-
-        Map.has_key?(assigns, string_key) ->
-          Map.put(selected, string_key, Map.fetch!(assigns, string_key))
-
-        true ->
-          selected
-      end
-    end)
-    |> non_empty_map()
-  end
-
-  defp selected_auth_assigns(_assigns, other) do
-    raise ArgumentError,
-          "auth_assigns must be false, nil, :all, or a list of assign keys, got #{inspect(other)}"
   end
 
   defp put_request_context(metadata, opts) do
@@ -352,13 +318,8 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
   defp forwarded_base_path(%Plug.Conn{script_name: []}), do: nil
   defp forwarded_base_path(%Plug.Conn{script_name: names}), do: "/" <> Enum.join(names, "/")
 
-  defp stateless_http?(opts),
-    do: Keyword.get(opts, :stateless_http, Keyword.get(opts, :stateless, false))
-
-  defp session_response_headers(%Request{session_id: session_id, request_metadata: metadata}) do
-    if is_binary(session_id) and not metadata[:stateless_http],
-      do: [{"mcp-session-id", session_id}],
-      else: []
+  defp session_response_headers(%Request{session_id: session_id}) do
+    if is_binary(session_id), do: [{"mcp-session-id", session_id}], else: []
   end
 
   defp generate_session_id do
@@ -366,10 +327,4 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
     |> :crypto.strong_rand_bytes()
     |> Base.url_encode64(padding: false)
   end
-
-  defp non_empty_map(map) when map_size(map) == 0, do: nil
-  defp non_empty_map(map), do: map
-
-  defp maybe_put(map, _key, nil), do: map
-  defp maybe_put(map, key, value), do: Map.put(map, key, JSONValue.normalize(value))
 end

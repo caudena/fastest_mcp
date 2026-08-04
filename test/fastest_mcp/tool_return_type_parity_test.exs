@@ -129,16 +129,19 @@ defmodule FastestMCP.ToolReturnTypeParityTest do
     assert Base.decode64!(transport_image) == image_bytes
   end
 
-  test "non-object output schemas advertise wrap-result metadata and preserve the envelope" do
+  test "object output schemas preserve structured results across immediate and task calls" do
     server_name =
-      "tool-wrap-result-" <> Integer.to_string(System.unique_integer([:positive]))
+      "tool-output-schema-" <> Integer.to_string(System.unique_integer([:positive]))
 
     server =
       FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("list_values", fn _args, _ctx -> ["alpha", "beta"] end,
+      |> FastestMCP.add_tool("list_values", fn _args, _ctx -> %{values: ["alpha", "beta"]} end,
         output_schema: %{
-          "type" => "array",
-          "items" => %{"type" => "string"}
+          "type" => "object",
+          "properties" => %{
+            "values" => %{"type" => "array", "items" => %{"type" => "string"}}
+          },
+          "required" => ["values"]
         },
         task: true
       )
@@ -150,7 +153,9 @@ defmodule FastestMCP.ToolReturnTypeParityTest do
         {Bandit,
          plug:
            {FastestMCP.Transport.HTTPApp,
-            server_name: server_name, path: "/mcp", unsafe_allow_any_host: true},
+            server_name: server_name,
+            path: "/mcp",
+            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
          scheme: :http,
          port: 0}
       )
@@ -173,9 +178,11 @@ defmodule FastestMCP.ToolReturnTypeParityTest do
                %{
                  "name" => "list_values",
                  "outputSchema" => %{
-                   "type" => "array",
-                   "items" => %{"type" => "string"},
-                   "x-fastestmcp-wrap-result" => true
+                   "type" => "object",
+                   "properties" => %{
+                     "values" => %{"type" => "array", "items" => %{"type" => "string"}}
+                   },
+                   "required" => ["values"]
                  }
                }
              ]
@@ -186,8 +193,7 @@ defmodule FastestMCP.ToolReturnTypeParityTest do
              })
 
     assert %{
-             "structuredContent" => %{"result" => ["alpha", "beta"]},
-             "_meta" => %{"fastestmcp" => %{"wrap_result" => true}}
+             "structuredContent" => %{"values" => ["alpha", "beta"]}
            } =
              Engine.dispatch!(server_name, %Request{
                method: "tools/call",
@@ -195,18 +201,17 @@ defmodule FastestMCP.ToolReturnTypeParityTest do
                payload: %{"name" => "list_values", "arguments" => %{}}
              })
 
-    assert %{
-             "content" => [%{"type" => "text"}],
-             "structuredContent" => %{"result" => ["alpha", "beta"]},
-             "_meta" => %{"fastestmcp" => %{"wrap_result" => true}}
-           } = Client.call_tool(client, "list_values", %{})
+    assert %{"values" => ["alpha", "beta"]} =
+             Client.call_tool(client, "list_values", %{})
 
     task = Client.call_tool(client, "list_values", %{}, task: true)
+    task_id = task.task_id
 
     assert %{
-             "content" => [%{"type" => "text"}],
-             "structuredContent" => %{"result" => ["alpha", "beta"]},
-             "_meta" => %{"fastestmcp" => %{"wrap_result" => true}}
+             "structuredContent" => %{"values" => ["alpha", "beta"]},
+             "_meta" => %{
+               "io.modelcontextprotocol/related-task" => %{"taskId" => ^task_id}
+             }
            } = Client.task_result(client, task.task_id)
   end
 
@@ -216,12 +221,15 @@ defmodule FastestMCP.ToolReturnTypeParityTest do
 
     server =
       FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("calc", fn _args, _ctx -> ["alpha"] end,
+      |> FastestMCP.add_tool("calc", fn _args, _ctx -> %{values: ["alpha"]} end,
         version: "1.0.0",
         task: true,
         output_schema: %{
-          "type" => "array",
-          "items" => %{"type" => "string"}
+          "type" => "object",
+          "properties" => %{
+            "values" => %{"type" => "array", "items" => %{"type" => "string"}}
+          },
+          "required" => ["values"]
         }
       )
       |> FastestMCP.add_tool("calc", fn _args, _ctx -> %{value: 2} end,
@@ -264,9 +272,8 @@ defmodule FastestMCP.ToolReturnTypeParityTest do
 
     assert %{
              "content" => [%{"type" => "text"}],
-             "structuredContent" => %{"result" => ["alpha"]},
-             "_meta" => %{
-               "fastestmcp" => %{"wrap_result" => true},
+             "structuredContent" => %{"values" => ["alpha"]},
+             :_meta => %{
                "io.modelcontextprotocol/related-task" => %{taskId: ^task_id}
              }
            } =

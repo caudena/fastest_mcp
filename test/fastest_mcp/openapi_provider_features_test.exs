@@ -133,7 +133,17 @@ defmodule FastestMCP.OpenAPIProviderFeaturesTest do
 
     requester = fn method, url, opts ->
       send(parent, {:request, method, url, opts})
-      {:ok, 200, [{"content-type", "application/json"}], JSON.encode!(%{"ok" => true})}
+
+      response =
+        case {method, url} do
+          {:put, "https://features.example.com/users/123"} ->
+            %{"id" => 123, "name" => "Nate", "email" => "nate@example.com"}
+
+          _other ->
+            %{"ok" => true}
+        end
+
+      {:ok, 200, [{"content-type", "application/json"}], JSON.encode!(response)}
     end
 
     server = FastestMCP.from_openapi(feature_spec(), name: server_name, requester: requester)
@@ -163,7 +173,7 @@ defmodule FastestMCP.OpenAPIProviderFeaturesTest do
     assert parameter_docs.input_schema["properties"]["user_id"]["description"] == "The user ID"
     refute String.contains?(parameter_docs.description, "user ID")
 
-    assert %{"ok" => true} ==
+    assert %{"id" => 123, "name" => "Nate", "email" => "nate@example.com"} ==
              FastestMCP.call_tool(server_name, "update_user", %{
                "id__path" => 123,
                "id" => 456,

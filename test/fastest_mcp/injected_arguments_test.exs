@@ -27,7 +27,7 @@ defmodule FastestMCP.InjectedArgumentsTest do
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
     [tool] = FastestMCP.list_tools(server_name)
-    refute Map.has_key?(tool.input_schema.properties, "session_id")
+    refute Map.has_key?(tool.input_schema["properties"], "session_id")
 
     assert %{"session_id" => "real-session", "value" => 7} ==
              FastestMCP.call_tool(

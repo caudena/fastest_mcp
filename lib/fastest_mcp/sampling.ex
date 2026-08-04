@@ -72,7 +72,7 @@ defmodule FastestMCP.Sampling do
       validate_max_tool_rounds!(Keyword.get(sample_opts, :max_tool_rounds, @max_tool_rounds))
 
     context
-    |> run_tool_rounds(input, sample_opts, tools, max_rounds, 0)
+    |> run_tool_rounds(input, sample_opts, tools, max_rounds, 0, MapSet.new())
     |> response()
   end
 
@@ -115,7 +115,7 @@ defmodule FastestMCP.Sampling do
     Context.sample(context, normalize_messages(messages), opts)
   end
 
-  defp run_tool_rounds(context, input, opts, tools, max_rounds, round) do
+  defp run_tool_rounds(context, input, opts, tools, max_rounds, round, seen_tool_use_ids) do
     raw = apply_sample(context, input, opts)
     tool_uses = extract_tool_uses(raw)
 
@@ -130,14 +130,23 @@ defmodule FastestMCP.Sampling do
           details: %{max_tool_rounds: max_rounds}
 
       true ->
-        validate_tool_uses!(tool_uses, tools)
+        seen_tool_use_ids = validate_tool_uses!(tool_uses, tools, seen_tool_use_ids)
         results = Enum.map(tool_uses, &execute_tool_use(&1, tools))
+        next_opts = continue_sampling_opts(opts)
 
         next_messages =
           normalize_sampling_input(input) ++
             [assistant_tool_message(raw), %{"role" => "user", "content" => results}]
 
-        run_tool_rounds(context, next_messages, opts, tools, max_rounds, round + 1)
+        run_tool_rounds(
+          context,
+          next_messages,
+          next_opts,
+          tools,
+          max_rounds,
+          round + 1,
+          seen_tool_use_ids
+        )
     end
   end
 
@@ -159,10 +168,10 @@ defmodule FastestMCP.Sampling do
     end)
   end
 
-  defp validate_tool_uses!(tool_uses, tools) do
+  defp validate_tool_uses!(tool_uses, tools, seen_tool_use_ids) do
     known = Map.new(tools, &{&1.name, &1})
 
-    Enum.reduce(tool_uses, MapSet.new(), fn tool_use, seen_ids ->
+    Enum.reduce(tool_uses, seen_tool_use_ids, fn tool_use, seen_ids ->
       id = Map.get(tool_use, "id", Map.get(tool_use, :id))
       name = Map.get(tool_use, "name", Map.get(tool_use, :name))
       input = Map.get(tool_use, "input", Map.get(tool_use, :input))
@@ -202,8 +211,6 @@ defmodule FastestMCP.Sampling do
           MapSet.put(seen_ids, id)
       end
     end)
-
-    :ok
   end
 
   defp execute_tool_use(tool_use, tools) do
@@ -266,6 +273,7 @@ defmodule FastestMCP.Sampling do
       "role" => Map.get(raw, "role", Map.get(raw, :role, "assistant")),
       "content" => Map.get(raw, "content", Map.get(raw, :content, []))
     }
+    |> maybe_put_map("_meta", Map.get(raw, "_meta", Map.get(raw, :_meta)))
   end
 
   defp normalize_runtime_tools(nil), do: []
@@ -285,6 +293,12 @@ defmodule FastestMCP.Sampling do
   defp validate_max_tool_rounds!(value) do
     raise ArgumentError,
           "max_tool_rounds must be an integer between 0 and #{@max_tool_rounds}, got #{inspect(value)}"
+  end
+
+  defp continue_sampling_opts(opts) do
+    if Keyword.get(opts, :tool_choice, :auto) == :required,
+      do: Keyword.put(opts, :tool_choice, :auto),
+      else: opts
   end
 
   defp maybe_put_map(map, _key, nil), do: map

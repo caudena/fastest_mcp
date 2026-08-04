@@ -84,6 +84,8 @@ defmodule FastestMCP do
 
   alias FastestMCP.BackgroundTask
   alias FastestMCP.BackgroundTaskStore
+  alias FastestMCP.Auth
+  alias FastestMCP.Auth.Result, as: AuthResult
   alias FastestMCP.ComponentManager
   alias FastestMCP.ComponentVisibility
   alias FastestMCP.Context
@@ -92,11 +94,13 @@ defmodule FastestMCP do
   alias FastestMCP.Provider
   alias FastestMCP.Providers.OpenAPI
   alias FastestMCP.Protocol
+  alias FastestMCP.Registry
   alias FastestMCP.Sampling
   alias FastestMCP.Server
   alias FastestMCP.TaskNotificationSupervisor
   alias FastestMCP.TaskOwner
   alias FastestMCP.ServerRuntime
+  alias FastestMCP.Session
 
   @doc "Builds a new server definition."
   defdelegate server(name, opts \\ []), to: Server, as: :new
@@ -128,7 +132,7 @@ defmodule FastestMCP do
     provider = OpenAPI.new(Keyword.put(opts, :openapi_spec, openapi_spec))
     server_name = Keyword.get(opts, :name, provider.name)
 
-    server(server_name)
+    server(server_name, schema_options: Keyword.get(opts, :schema_options, []))
     |> add_provider(provider)
   end
 
@@ -193,6 +197,36 @@ defmodule FastestMCP do
   @doc "Stops a running server runtime."
   def stop_server(server_name) do
     ServerRuntime.stop(server_name)
+  end
+
+  @doc "Completes one identity-bound URL elicitation for a running server."
+  def complete_elicitation(server_name, elicitation_id, opts)
+      when is_binary(elicitation_id) and is_list(opts) do
+    with {:ok, fingerprint} <- completion_identity_fingerprint(opts),
+         {:ok, session_id} <- find_elicitation_session(server_name, elicitation_id) do
+      Session.complete_url_elicitation(
+        server_name,
+        session_id,
+        elicitation_id,
+        fingerprint
+      )
+      |> case do
+        {:ok, elicitation} ->
+          {:ok, elicitation}
+
+        {:error, reason} when reason in [:forbidden, :expired, :already_completed] ->
+          {:error, reason}
+
+        {:error, :declined} ->
+          {:error, :not_found}
+
+        {:error, :not_found} ->
+          {:error, :not_found}
+
+        {:error, _reason} ->
+          {:error, :forbidden}
+      end
+    end
   end
 
   @doc "Lists visible tools."
@@ -433,7 +467,8 @@ defmodule FastestMCP do
           server_name: server_name,
           session_id: session_id,
           event_bus: runtime.event_bus,
-          task_store: runtime.task_store
+          task_store: runtime.task_store,
+          task_supervisor: runtime.stream_task_supervisor
         ],
         opts
       )
@@ -446,6 +481,29 @@ defmodule FastestMCP do
     |> fetch_runtime!()
     |> Map.fetch!(:task_notification_supervisor)
     |> TaskNotificationSupervisor.subscriber_count()
+  end
+
+  defp completion_identity_fingerprint(opts) do
+    case Keyword.get(opts, :auth_result) do
+      %AuthResult{principal: principal, auth: auth} when not is_nil(principal) ->
+        {:ok, Auth.identity_fingerprint(principal, auth)}
+
+      _other ->
+        case Keyword.fetch(opts, :principal) do
+          {:ok, principal} when not is_nil(principal) ->
+            {:ok, Auth.identity_fingerprint(principal, Keyword.get(opts, :auth, %{}))}
+
+          _other ->
+            {:error, :forbidden}
+        end
+    end
+  end
+
+  defp find_elicitation_session(server_name, elicitation_id) do
+    case Registry.lookup_url_elicitation(server_name, elicitation_id) do
+      {:ok, session_id, _session_pid} -> {:ok, session_id}
+      {:error, :not_found} -> {:error, :not_found}
+    end
   end
 
   defp fetch_runtime!(server_name) do

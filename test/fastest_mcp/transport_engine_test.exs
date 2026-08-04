@@ -96,30 +96,24 @@ defmodule FastestMCP.TransportEngineTest do
                }
              })
 
-    assert_raise FastestMCP.Error,
-                 "resource subscriptions are only supported for streamable HTTP clients",
-                 fn ->
-                   Engine.dispatch!(server_name, %Request{
-                     method: "resources/subscribe",
-                     transport: :stdio,
-                     session_id: "transport-session",
-                     payload: %{"uri" => "config://app"}
-                   })
-                 end
+    assert %{} =
+             Engine.dispatch!(server_name, %Request{
+               method: "resources/subscribe",
+               transport: :stdio,
+               session_id: "transport-session",
+               payload: %{"uri" => "config://app"}
+             })
 
-    assert_raise FastestMCP.Error,
-                 "resource subscriptions are only supported for streamable HTTP clients",
-                 fn ->
-                   Engine.dispatch!(server_name, %Request{
-                     method: "resources/unsubscribe",
-                     transport: :stdio,
-                     session_id: "transport-session",
-                     payload: %{"uri" => "config://app"}
-                   })
-                 end
+    assert %{} =
+             Engine.dispatch!(server_name, %Request{
+               method: "resources/unsubscribe",
+               transport: :stdio,
+               session_id: "transport-session",
+               payload: %{"uri" => "config://app"}
+             })
   end
 
-  test "stdio initialize omits async session capabilities" do
+  test "stdio initialize advertises its deliverable session capabilities" do
     server_name =
       "transport-engine-capabilities-" <> Integer.to_string(System.unique_integer([:positive]))
 
@@ -132,20 +126,14 @@ defmodule FastestMCP.TransportEngineTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    result =
-      Engine.dispatch!(server_name, %Request{
-        method: "initialize",
-        transport: :stdio,
-        payload: ProtocolTest.initialize_params()
-      })
+    {_connection_id, %{"result" => result}} = ProtocolTest.initialize_stdio(server_name)
 
     assert %{
-             "tools" => %{},
-             "resources" => %{},
-             "prompts" => %{}
+             "logging" => %{},
+             "tools" => %{"listChanged" => true},
+             "resources" => %{"listChanged" => true, "subscribe" => true},
+             "prompts" => %{"listChanged" => true}
            } = result["capabilities"]
-
-    refute Map.has_key?(result["capabilities"], "logging")
   end
 
   test "tools/list keeps zero-arity tool inputSchema as an object" do
@@ -230,25 +218,6 @@ defmodule FastestMCP.TransportEngineTest do
                 }
               }
             }} = StreamableHTTPAdapter.decode(conn)
-  end
-
-  test "HTTP adapter carries stateless mode into request metadata" do
-    conn =
-      conn(
-        :post,
-        "/mcp",
-        JSON.encode!(%{
-          "jsonrpc" => "2.0",
-          "id" => 2,
-          "method" => "ping"
-        })
-      )
-      |> put_req_header("content-type", "application/json")
-      |> put_req_header("accept", "application/json, text/event-stream")
-      |> put_req_header("mcp-protocol-version", ProtocolTest.protocol_version())
-
-    assert {:ok, %Request{request_metadata: %{stateless_http: true}}} =
-             StreamableHTTPAdapter.decode(conn, stateless_http: true)
   end
 
   test "HTTP adapter ignores query-string session ids for streamable HTTP requests" do

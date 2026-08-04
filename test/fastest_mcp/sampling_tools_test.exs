@@ -36,6 +36,31 @@ defmodule FastestMCP.SamplingToolsTest do
            } = SamplingTool.definition(tool)
   end
 
+  test "sampling tool schemas are canonical objects and reject scalar roots" do
+    tool =
+      SamplingTool.from_function(fn arguments -> arguments end,
+        name: "canonical",
+        parameters: %{
+          type: "object",
+          properties: %{query: %{type: "string"}},
+          required: ["query"]
+        }
+      )
+
+    assert tool.parameters == %{
+             "type" => "object",
+             "properties" => %{"query" => %{"type" => "string"}},
+             "required" => ["query"]
+           }
+
+    assert_raise ArgumentError, ~r/inputSchema must have an object root/, fn ->
+      SamplingTool.from_function(fn value -> value end,
+        name: "scalar",
+        parameters: %{"type" => "string"}
+      )
+    end
+  end
+
   test "prepare_sampling_tools accepts bare function captures and infers a default schema" do
     [tool] = Sampling.prepare_tools([&__MODULE__.double/1])
 

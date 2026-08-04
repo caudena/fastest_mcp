@@ -15,6 +15,8 @@ defmodule FastestMCP.ProtocolMatrixTest do
     server =
       FastestMCP.server(server_name)
       |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+      |> FastestMCP.add_resource("existing://resource", fn _arguments, _ctx -> "ok" end)
+      |> FastestMCP.add_prompt("existing-prompt", fn _arguments, _ctx -> "ok" end)
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
@@ -119,15 +121,15 @@ defmodule FastestMCP.ProtocolMatrixTest do
       "method_not_found"
     )
 
-    for {id, method, params, symbolic_code} <- [
-          {3, "tools/call", %{"name" => "missing-tool"}, "not_found"},
-          {4, "resources/read", %{"uri" => "missing://resource"}, "not_found"},
-          {5, "prompts/get", %{"name" => "missing-prompt"}, "not_found"},
-          {6, "tasks/get", %{"taskId" => "missing-task"}, "invalid_task_id"}
+    for {id, method, params, standard_code, symbolic_code} <- [
+          {3, "tools/call", %{"name" => "missing-tool"}, -32_602, "not_found"},
+          {4, "resources/read", %{"uri" => "missing://resource"}, -32_002, "not_found"},
+          {5, "prompts/get", %{"name" => "missing-prompt"}, -32_602, "not_found"},
+          {6, "tasks/get", %{"taskId" => "missing-task"}, -32_602, "invalid_task_id"}
         ] do
       assert_jsonrpc_error(
         ProtocolTest.stdio_request(server_name, connection_id, id, method, params),
-        -32_602,
+        standard_code,
         symbolic_code
       )
     end
@@ -140,7 +142,7 @@ defmodule FastestMCP.ProtocolMatrixTest do
     method_response =
       ProtocolTest.http_request(server_name, session_id, 7, "missing/method")
 
-    assert method_response.status == 404
+    assert method_response.status == 200
 
     assert_jsonrpc_error(
       JSON.decode!(method_response.resp_body),
@@ -153,7 +155,7 @@ defmodule FastestMCP.ProtocolMatrixTest do
         "name" => "missing-tool"
       })
 
-    assert tool_response.status == 404
+    assert tool_response.status == 200
     assert_jsonrpc_error(JSON.decode!(tool_response.resp_body), -32_602, "not_found")
   end
 
@@ -189,7 +191,7 @@ defmodule FastestMCP.ProtocolMatrixTest do
         ProtocolTest.jsonrpc_notification("missing/method")
       )
 
-    assert missing_method_notification.status == 404
+    assert missing_method_notification.status == 202
     assert missing_method_notification.resp_body == ""
 
     invalid_handler_notification =
@@ -199,7 +201,7 @@ defmodule FastestMCP.ProtocolMatrixTest do
         ProtocolTest.jsonrpc_notification("logging/setLevel", %{"level" => "verbose"})
       )
 
-    assert invalid_handler_notification.status == 400
+    assert invalid_handler_notification.status == 202
     assert invalid_handler_notification.resp_body == ""
 
     accepted_notification =
@@ -276,27 +278,39 @@ defmodule FastestMCP.ProtocolMatrixTest do
     server_name: server_name
   } do
     stdio_parse_error = Stdio.dispatch(server_name, "{not-json")
-    assert %{"jsonrpc" => "2.0", "id" => nil, "error" => %{"code" => -32_700}} = stdio_parse_error
+    assert %{"jsonrpc" => "2.0", "error" => %{"code" => -32_700}} = stdio_parse_error
+    refute Map.has_key?(stdio_parse_error, "id")
 
-    invalid_message = %{"jsonrpc" => "2.0", "method" => 123}
+    invalid_message = %{"jsonrpc" => "2.0", "id" => 5, "method" => 123}
     stdio_invalid_request = Stdio.dispatch(server_name, invalid_message)
 
-    assert %{"jsonrpc" => "2.0", "id" => nil, "error" => %{"code" => -32_600}} =
+    assert %{"jsonrpc" => "2.0", "id" => 5, "error" => %{"code" => -32_600}} =
              stdio_invalid_request
+
+    assert :no_response = Stdio.dispatch(server_name, %{"jsonrpc" => "2.0", "method" => 123})
+
+    malformed_http_notification =
+      raw_http_post(server_name, JSON.encode!(%{"jsonrpc" => "2.0", "method" => 123}))
+
+    assert malformed_http_notification.status == 400
+    assert malformed_http_notification.resp_body == ""
 
     http_parse_error = raw_http_post(server_name, "{not-json")
     assert http_parse_error.status == 400
 
-    assert %{"jsonrpc" => "2.0", "id" => nil, "error" => %{"code" => -32_700}} =
-             JSON.decode!(http_parse_error.resp_body)
+    http_parse_error_body = JSON.decode!(http_parse_error.resp_body)
+    assert %{"jsonrpc" => "2.0", "error" => %{"code" => -32_700}} = http_parse_error_body
+    refute Map.has_key?(http_parse_error_body, "id")
 
     http_invalid_request =
       raw_http_post(server_name, JSON.encode!(invalid_message))
 
     assert http_invalid_request.status == 400
 
-    assert %{"jsonrpc" => "2.0", "id" => nil, "error" => %{"code" => -32_600}} =
-             JSON.decode!(http_invalid_request.resp_body)
+    http_invalid_request_body = JSON.decode!(http_invalid_request.resp_body)
+
+    assert %{"jsonrpc" => "2.0", "id" => 5, "error" => %{"code" => -32_600}} =
+             http_invalid_request_body
   end
 
   test "initialize notifications create no HTTP or stdio session", %{server_name: server_name} do
@@ -306,7 +320,7 @@ defmodule FastestMCP.ProtocolMatrixTest do
       ProtocolTest.jsonrpc_notification("initialize", ProtocolTest.initialize_params())
 
     http_response = ProtocolTest.http_post(server_name, nil, initialize_notification)
-    assert http_response.status == 400
+    assert http_response.status == 202
     assert http_response.resp_body == ""
     assert Plug.Conn.get_resp_header(http_response, "mcp-session-id") == []
     assert registered_sessions(server_name) == sessions_before
@@ -332,6 +346,7 @@ defmodule FastestMCP.ProtocolMatrixTest do
       )
       |> Plug.Conn.put_req_header("content-type", "application/json")
       |> Plug.Conn.put_req_header("accept", "application/json, text/event-stream")
+      |> Map.put(:host, "localhost")
       |> Plug.Conn.put_req_header("mcp-session-id", session_id)
       |> Plug.Conn.put_req_header("mcp-protocol-version", "2025-03-26")
       |> StreamableHTTP.call(server_name: server_name, json_response: true)
@@ -352,14 +367,40 @@ defmodule FastestMCP.ProtocolMatrixTest do
   } do
     initialize = ProtocolTest.jsonrpc_request(1, "initialize", ProtocolTest.initialize_params())
 
-    assert raw_http_post(server_name, JSON.encode!(initialize), content_type: "application/jsonx").status ==
-             400
+    assert raw_http_post(server_name, JSON.encode!(initialize), content_type: nil).status == 415
 
-    assert raw_http_post(server_name, JSON.encode!(initialize), accept: "*/*").status == 400
+    assert raw_http_post(server_name, JSON.encode!(initialize), content_type: "application/jsonx").status ==
+             415
+
+    duplicate_content_type =
+      :post
+      |> conn("/mcp", JSON.encode!(initialize))
+      |> Map.put(:host, "localhost")
+      |> Plug.Conn.put_req_header("content-type", "application/json")
+      |> Plug.Conn.prepend_req_headers([{"content-type", "text/plain"}])
+      |> Plug.Conn.put_req_header("accept", "application/json, text/event-stream")
+      |> StreamableHTTP.call(server_name: server_name, json_response: true)
+
+    assert duplicate_content_type.status == 415
+
+    assert raw_http_post(server_name, JSON.encode!(initialize), accept: nil).status == 406
+
+    wildcard = raw_http_post(server_name, JSON.encode!(initialize), accept: "*/*")
+    assert wildcard.status == 200
+
+    assert raw_http_post(server_name, JSON.encode!(initialize), accept: "application/*, text/*").status ==
+             200
+
+    assert raw_http_post(server_name, JSON.encode!(initialize), accept: "application/*").status ==
+             406
 
     assert raw_http_post(server_name, JSON.encode!(initialize),
              accept: "application/json;q=0, text/event-stream"
-           ).status == 400
+           ).status == 406
+
+    assert raw_http_post(server_name, JSON.encode!(initialize),
+             accept: "*/*;q=1, application/json;q=0"
+           ).status == 406
 
     initialized =
       raw_http_post(server_name, JSON.encode!(initialize),
@@ -389,79 +430,23 @@ defmodule FastestMCP.ProtocolMatrixTest do
     assert Plug.Conn.get_resp_header(streamed, "content-type") == ["text/event-stream"]
   end
 
-  test "stateless HTTP rejects incoming session identifiers", %{server_name: server_name} do
-    initialize = ProtocolTest.jsonrpc_request(1, "initialize", ProtocolTest.initialize_params())
-
-    initialize_response =
-      raw_http_post(server_name, JSON.encode!(initialize),
-        session_id: "caller-session",
-        transport_opts: [stateless_http: true, json_response: true]
-      )
-
-    assert initialize_response.status == 400
-    assert Plug.Conn.get_resp_header(initialize_response, "mcp-session-id") == []
-
-    list_response =
-      raw_http_post(server_name, JSON.encode!(ProtocolTest.jsonrpc_request(2, "tools/list")),
-        session_id: "caller-session",
-        transport_opts: [stateless_http: true, json_response: true]
-      )
-
-    assert list_response.status == 400
-    assert registered_sessions(server_name) == 0
-  end
-
-  test "stateless HTTP rejects task augmentation and resource subscriptions", %{
-    server_name: server_name
-  } do
-    transport_opts = [stateless_http: true, json_response: true]
-
-    task_response =
-      raw_http_post(
-        server_name,
-        JSON.encode!(
-          ProtocolTest.jsonrpc_request(3, "tools/call", %{
-            "name" => "echo",
-            "arguments" => %{},
-            "task" => %{}
-          })
-        ),
-        protocol_version: ProtocolTest.protocol_version(),
-        transport_opts: transport_opts
-      )
-
-    assert task_response.status == 400
-
-    assert %{
-             "jsonrpc" => "2.0",
-             "id" => 3,
-             "error" => %{
-               "code" => -32_602,
-               "message" => "stateless HTTP does not support task augmentation",
-               "data" => %{"fastestmcp" => %{"code" => "bad_request"}}
-             }
-           } = JSON.decode!(task_response.resp_body)
-
-    for {id, method} <- [{4, "resources/subscribe"}, {5, "resources/unsubscribe"}] do
-      response =
-        raw_http_post(
-          server_name,
-          JSON.encode!(ProtocolTest.jsonrpc_request(id, method, %{"uri" => "test://resource"})),
-          protocol_version: ProtocolTest.protocol_version(),
-          transport_opts: transport_opts
-        )
-
-      assert response.status == 400
-
-      assert %{
-               "jsonrpc" => "2.0",
-               "id" => ^id,
-               "error" => %{
-                 "code" => -32_602,
-                 "message" => "stateless HTTP does not support subscriptions",
-                 "data" => %{"fastestmcp" => %{"code" => "bad_request"}}
-               }
-             } = JSON.decode!(response.resp_body)
+  test "legacy stateless HTTP options fail fast", %{server_name: server_name} do
+    for option <- [:stateless_http, :stateless] do
+      assert_raise ArgumentError,
+                   "stateless HTTP is no longer supported; use state_scope: :request for request-local handler state",
+                   fn ->
+                     raw_http_post(
+                       server_name,
+                       JSON.encode!(
+                         ProtocolTest.jsonrpc_request(
+                           1,
+                           "initialize",
+                           ProtocolTest.initialize_params()
+                         )
+                       ),
+                       transport_opts: [{option, true}, {:json_response, true}]
+                     )
+                   end
     end
 
     assert registered_sessions(server_name) == 0
@@ -486,11 +471,12 @@ defmodule FastestMCP.ProtocolMatrixTest do
   defp raw_http_post(server_name, body, opts \\ []) do
     conn =
       conn(:post, "/mcp", body)
-      |> Plug.Conn.put_req_header(
+      |> Map.put(:host, "localhost")
+      |> maybe_put_header(
         "content-type",
         Keyword.get(opts, :content_type, "application/json")
       )
-      |> Plug.Conn.put_req_header(
+      |> maybe_put_header(
         "accept",
         Keyword.get(opts, :accept, "application/json, text/event-stream")
       )

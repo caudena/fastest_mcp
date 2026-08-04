@@ -8,8 +8,13 @@ defmodule FastestMCP.TestSupport.ConformanceProtocolShim do
 
   def call(conn, opts) do
     conn
-    |> repair_runner_protocol_header()
+    |> repair_runner_request()
     |> FastestMCP.Transport.HTTPApp.call(opts)
+  end
+
+  @doc false
+  def repair_runner_request(conn) do
+    repair_runner_protocol_header(conn)
   end
 
   # @modelcontextprotocol/conformance 0.1.16 advertises its SSE scenarios for

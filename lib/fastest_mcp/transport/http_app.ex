@@ -7,8 +7,11 @@ defmodule FastestMCP.Transport.HTTPApp do
   application without forking the transport implementation.
   """
 
+  alias FastestMCP.Auth.ProtectedResource
+  alias FastestMCP.Error
   alias FastestMCP.Transport.StreamableHTTP
   alias FastestMCP.Transport.HTTPCommon
+  alias FastestMCP.Transport.WellKnownHTTP
   alias FastestMCP.Provider
   alias FastestMCP.ServerRuntime
 
@@ -21,6 +24,7 @@ defmodule FastestMCP.Transport.HTTPApp do
 
   @doc "Builds a child specification for supervising this module."
   def child_spec(opts) do
+    opts = StreamableHTTP.validate_options!(opts)
     server_name = Keyword.fetch!(opts, :server_name)
     port = Keyword.get(opts, :port, 4_000)
 
@@ -32,7 +36,7 @@ defmodule FastestMCP.Transport.HTTPApp do
       |> Keyword.put_new(:ip, :loopback)
       |> Keyword.put(:plug, {__MODULE__, opts})
 
-    validate_listener_security!(bandit_options, opts)
+    HTTPCommon.validate_listener_security!(bandit_options, opts)
 
     %{
       id: {__MODULE__, server_name, port},
@@ -41,33 +45,34 @@ defmodule FastestMCP.Transport.HTTPApp do
   end
 
   @doc "Initializes the state used by this module before it starts processing work."
-  def init(opts), do: opts
+  def init(opts), do: StreamableHTTP.validate_options!(opts)
 
   @doc "Runs the main entrypoint for this module."
   def call(conn, opts) do
     middleware = Keyword.get(opts, :middleware, [])
-    routes = Keyword.get(opts, :routes, []) ++ runtime_routes(Keyword.fetch!(opts, :server_name))
 
-    case HTTPCommon.validate_dns_rebinding(conn, opts) do
-      :ok ->
-        run_middleware(conn, middleware, fn conn ->
-          case dispatch_route(conn, routes) do
-            {:handled, handled_conn} ->
-              handled_conn
+    with :ok <- HTTPCommon.validate_dns_rebinding(conn, opts),
+         :ok <- HTTPCommon.reject_query_access_token(conn) do
+      runtime = fetch_runtime(Keyword.fetch!(opts, :server_name))
+      routes = Keyword.get(opts, :routes, []) ++ runtime_routes(runtime)
 
-            :pass ->
-              StreamableHTTP.call(conn, Keyword.drop(opts, [:middleware, :routes]))
-          end
-        end)
+      case WellKnownHTTP.dispatch(conn, opts, runtime_protected_resource(runtime)) do
+        {:handled, handled_conn} ->
+          handled_conn
 
-      {:error, %FastestMCP.Error{} = error} ->
-        HTTPCommon.json(conn, 403, %{
-          error: %{
-            code: error.code,
-            message: error.message,
-            details: error.details
-          }
-        })
+        :pass ->
+          run_middleware(conn, middleware, fn conn ->
+            case dispatch_route(conn, routes) do
+              {:handled, handled_conn} ->
+                handled_conn
+
+              :pass ->
+                StreamableHTTP.call(conn, Keyword.drop(opts, [:middleware, :routes]))
+            end
+          end)
+      end
+    else
+      {:error, %Error{} = error} -> render_public_error(conn, opts, error)
     end
   end
 
@@ -127,35 +132,27 @@ defmodule FastestMCP.Transport.HTTPApp do
     plug.call(conn, plug.init(plug_opts))
   end
 
-  defp runtime_routes(server_name) do
-    with {:ok, runtime} <- ServerRuntime.fetch(server_name) do
-      runtime.server.http_routes ++
-        Enum.flat_map(runtime.server.providers, &Provider.http_routes/1)
-    else
-      _other -> []
+  defp fetch_runtime(server_name) do
+    case ServerRuntime.fetch(server_name) do
+      {:ok, runtime} -> runtime
+      _other -> nil
     end
   end
 
-  defp validate_listener_security!(bandit_options, opts) do
-    ip = Keyword.fetch!(bandit_options, :ip)
-
-    if loopback_listener?(ip) or concrete_allowed_hosts?(opts) do
-      :ok
-    else
-      raise ArgumentError,
-            "external HTTP listeners require a concrete allowed_hosts list"
-    end
+  defp runtime_routes(%{server: server}) do
+    server.http_routes ++ Enum.flat_map(server.providers, &Provider.http_routes/1)
   end
 
-  defp loopback_listener?(:loopback), do: true
-  defp loopback_listener?({127, _b, _c, _d}), do: true
-  defp loopback_listener?({0, 0, 0, 0, 0, 0, 0, 1}), do: true
-  defp loopback_listener?(_ip), do: false
+  defp runtime_routes(_runtime), do: []
 
-  defp concrete_allowed_hosts?(opts) do
-    case Keyword.get(opts, :allowed_hosts) do
-      hosts when is_list(hosts) and hosts != [] -> true
-      _other -> Keyword.get(opts, :unsafe_allow_any_host, false) == true
-    end
+  defp runtime_protected_resource(%{
+         server: %{protected_resource: %ProtectedResource{} = protected_resource}
+       }),
+       do: protected_resource
+
+  defp runtime_protected_resource(_runtime), do: nil
+
+  defp render_public_error(conn, opts, error) do
+    HTTPCommon.render_error(conn, error, nil, HTTPCommon.http_context(conn, %{}, opts))
   end
 end

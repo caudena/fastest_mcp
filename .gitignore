@@ -7,6 +7,9 @@
 # The directory Mix downloads your dependencies sources to.
 /deps/
 
+# Node dependencies installed for the pinned MCP conformance runner.
+/test/conformance/node_modules/
+
 # Where third-party dependencies like ExDoc output generated docs.
 /doc/
 

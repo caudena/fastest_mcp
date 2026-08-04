@@ -139,9 +139,9 @@ FastestMCP emits list-changed notifications when the visible catalog changes:
 - `notifications/resources/list_changed`
 - `notifications/prompts/list_changed`
 
-Those notifications are delivered to connected streamable HTTP session streams.
-Server-scoped visibility updates reuse the same notification path as session
-visibility updates.
+Those notifications are delivered through connected initialized HTTP or stdio
+session output sinks. Server-scoped visibility updates reuse the same
+notification path as session visibility updates.
 
 ## When To Use These Features
 

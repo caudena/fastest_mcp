@@ -155,7 +155,7 @@ defmodule FastestMCP.MiddlewareRateLimitingTest do
     assert :ok == RateLimiting.close(middleware)
   end
 
-  test "http transport renders rate-limited errors as 429 with retry-after" do
+  test "http transport renders rate-limited JSON-RPC errors on HTTP 200" do
     middleware = Middleware.rate_limiting(max_requests_per_second: 1.0, burst_capacity: 1)
     on_exit(fn -> RateLimiting.close(middleware) end)
 
@@ -189,16 +189,23 @@ defmodule FastestMCP.MiddlewareRateLimitingTest do
         %{"name" => "echo", "arguments" => %{"message" => "second"}}
       )
 
-    assert second.status == 429
-    assert Plug.Conn.get_resp_header(second, "retry-after") != []
+    assert second.status == 200
+    assert Plug.Conn.get_resp_header(second, "retry-after") == []
 
     assert %{
              "jsonrpc" => "2.0",
              "id" => 2,
              "error" => %{
-               "data" => %{"fastestmcp" => %{"code" => "rate_limited"}}
+               "data" => %{
+                 "fastestmcp" => %{
+                   "code" => "rate_limited",
+                   "details" => %{"retry_after_seconds" => retry_after_seconds}
+                 }
+               }
              }
            } = JSON.decode!(second.resp_body)
+
+    assert retry_after_seconds >= 1
   end
 
   test "reusing one limiter config across servers keeps runtime state isolated" do

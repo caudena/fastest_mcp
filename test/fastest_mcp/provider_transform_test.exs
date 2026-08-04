@@ -2,6 +2,7 @@ defmodule FastestMCP.ProviderTransformTest do
   use ExUnit.Case, async: false
 
   alias FastestMCP.ComponentCompiler
+  alias FastestMCP.Error
   alias FastestMCP.Provider
   alias FastestMCP.Providers.MountedServer, as: MountedServerProvider
   alias FastestMCP.ProviderTransforms.Namespace
@@ -28,6 +29,18 @@ defmodule FastestMCP.ProviderTransformTest do
       provider
       |> get_component(component_type, identifier, operation)
       |> List.wrap()
+    end
+  end
+
+  defmodule SchemaTransform do
+    defstruct [:kind]
+
+    def transform_component(%__MODULE__{kind: :input}, tool, _operation) do
+      %{tool | input_schema: %{"type" => "array"}}
+    end
+
+    def transform_component(%__MODULE__{kind: :output}, tool, _operation) do
+      %{tool | output_schema: %{"type" => "array"}}
     end
   end
 
@@ -129,6 +142,190 @@ defmodule FastestMCP.ProviderTransformTest do
         "tool_a" => %{name: "same"},
         "tool_b" => %{name: "same"}
       })
+    end
+  end
+
+  test "provider and transformed tool schemas enforce the shared object-root contract" do
+    base_tool =
+      ComponentCompiler.compile(
+        :tool,
+        "schema-provider",
+        "dynamic_echo",
+        fn arguments, _context -> arguments end,
+        input_schema: %{"type" => "object"}
+      )
+
+    invalid_provider_tool = %{
+      base_tool
+      | input_schema: %{"type" => "array"},
+        compiled_input_schema: nil
+    }
+
+    invalid_provider = %CountingProvider{pid: self(), tool: invalid_provider_tool}
+
+    invalid_provider_server =
+      "provider-invalid-schema-#{System.unique_integer([:positive])}"
+
+    assert {:ok, _pid} =
+             invalid_provider_server
+             |> FastestMCP.server()
+             |> FastestMCP.add_provider(invalid_provider)
+             |> FastestMCP.start_server()
+
+    on_exit(fn -> FastestMCP.stop_server(invalid_provider_server) end)
+
+    error =
+      assert_raise Error, fn ->
+        FastestMCP.initialize(invalid_provider_server)
+      end
+
+    assert error.code == :internal_error
+    assert error.message =~ "tool input_schema must be a JSON Schema object"
+
+    invalid_transform_server =
+      "provider-invalid-transform-schema-#{System.unique_integer([:positive])}"
+
+    transformed_provider =
+      %CountingProvider{pid: self(), tool: base_tool}
+      |> Provider.new()
+      |> Provider.add_transform(%SchemaTransform{kind: :output})
+
+    assert {:ok, _pid} =
+             invalid_transform_server
+             |> FastestMCP.server()
+             |> FastestMCP.add_provider(transformed_provider)
+             |> FastestMCP.start_server()
+
+    on_exit(fn -> FastestMCP.stop_server(invalid_transform_server) end)
+
+    error =
+      assert_raise Error, fn ->
+        FastestMCP.initialize(invalid_transform_server)
+      end
+
+    assert error.code == :internal_error
+    assert error.message =~ "tool output_schema must be a JSON Schema object"
+  end
+
+  test "provider schema refresh uses runtime schema options and the digest cache" do
+    target = "https://schemas.example/provider-value"
+    parent = self()
+
+    resolver = fn
+      ^target ->
+        send(parent, {:provider_schema_resolved, target})
+        {:ok, %{"$id" => target, "type" => "integer"}}
+
+      _other ->
+        {:error, :not_found}
+    end
+
+    input_schema = %{
+      "type" => "object",
+      "properties" => %{"value" => %{"$ref" => target}},
+      "required" => ["value"]
+    }
+
+    provider_tool =
+      ComponentCompiler.compile(
+        :tool,
+        "schema-options-provider",
+        "dynamic_echo",
+        fn arguments, _context -> arguments end,
+        input_schema: %{"type" => "object"}
+      )
+      |> Map.replace!(:input_schema, input_schema)
+      |> Map.replace!(:compiled_input_schema, nil)
+
+    provider = %CountingProvider{pid: self(), tool: provider_tool}
+    server_name = "provider-schema-options-#{System.unique_integer([:positive])}"
+
+    server =
+      FastestMCP.server(server_name, schema_options: [resolver: resolver])
+      |> FastestMCP.add_provider(provider)
+
+    assert {:ok, _pid} = FastestMCP.start_server(server)
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+
+    assert [%{name: "dynamic_echo", input_schema: ^input_schema}] =
+             FastestMCP.list_tools(server_name)
+
+    assert drain_schema_resolutions(target) > 0
+
+    assert [%{name: "dynamic_echo"}] = FastestMCP.list_tools(server_name)
+    refute_receive {:provider_schema_resolved, ^target}, 50
+
+    assert %{"value" => 3} =
+             FastestMCP.call_tool(server_name, "dynamic_echo", %{"value" => 3})
+
+    error =
+      assert_raise Error, fn ->
+        FastestMCP.call_tool(server_name, "dynamic_echo", %{"value" => "3"})
+      end
+
+    assert error.code == :bad_request
+  end
+
+  test "schema-preserving transforms reuse provider-compiled validators" do
+    target = "https://schemas.example/provider-owned-value"
+    parent = self()
+
+    resolver = fn
+      ^target ->
+        send(parent, {:provider_schema_resolved, target})
+        {:ok, %{"$id" => target, "type" => "integer"}}
+
+      _other ->
+        {:error, :not_found}
+    end
+
+    input_schema = %{
+      "type" => "object",
+      "properties" => %{"value" => %{"$ref" => target}},
+      "required" => ["value"]
+    }
+
+    provider_tool =
+      ComponentCompiler.compile(
+        :tool,
+        "provider-owned-schema",
+        "dynamic_echo",
+        fn arguments, _context -> arguments end,
+        input_schema: input_schema,
+        schema_options: [resolver: resolver]
+      )
+
+    assert drain_schema_resolutions(target) > 0
+
+    provider =
+      %CountingProvider{pid: self(), tool: provider_tool}
+      |> Provider.new()
+      |> Provider.add_transform(Namespace.new("ns"))
+
+    server_name = "provider-schema-reuse-#{System.unique_integer([:positive])}"
+
+    assert {:ok, _pid} =
+             server_name
+             |> FastestMCP.server()
+             |> FastestMCP.add_provider(provider)
+             |> FastestMCP.start_server()
+
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+
+    assert [%{name: "ns_dynamic_echo", input_schema: ^input_schema}] =
+             FastestMCP.list_tools(server_name)
+
+    refute_receive {:provider_schema_resolved, ^target}, 50
+
+    assert %{"value" => 7} =
+             FastestMCP.call_tool(server_name, "ns_dynamic_echo", %{"value" => 7})
+  end
+
+  defp drain_schema_resolutions(target, count \\ 0) do
+    receive do
+      {:provider_schema_resolved, ^target} -> drain_schema_resolutions(target, count + 1)
+    after
+      0 -> count
     end
   end
 end

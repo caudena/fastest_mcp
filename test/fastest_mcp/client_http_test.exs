@@ -7,6 +7,7 @@ defmodule FastestMCP.ClientHTTPTest do
   alias FastestMCP.Elicitation.Accepted
   alias FastestMCP.Error
   alias FastestMCP.Protocol
+  alias FastestMCP.Session
 
   test "connected client initializes and works against a live streamable HTTP server" do
     test_pid = self()
@@ -29,7 +30,9 @@ defmodule FastestMCP.ClientHTTPTest do
         {Bandit,
          plug:
            {FastestMCP.Transport.HTTPApp,
-            server_name: server_name, path: "/mcp", unsafe_allow_any_host: true},
+            server_name: server_name,
+            path: "/mcp",
+            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
          scheme: :http,
          port: 0}
       )
@@ -117,7 +120,9 @@ defmodule FastestMCP.ClientHTTPTest do
         {Bandit,
          plug:
            {FastestMCP.Transport.HTTPApp,
-            server_name: server_name, path: "/mcp", unsafe_allow_any_host: true},
+            server_name: server_name,
+            path: "/mcp",
+            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
          scheme: :http,
          port: 0}
       )
@@ -139,7 +144,6 @@ defmodule FastestMCP.ClientHTTPTest do
              "_meta" => %{
                "vendor" => %{"stable" => true},
                "fastestmcp" => %{
-                 "execution" => %{"taskSupport" => "optional"},
                  "hint" => "keep",
                  "tags" => ["docs", "utility"],
                  "version" => "2.0.0"
@@ -157,7 +161,6 @@ defmodule FastestMCP.ClientHTTPTest do
              "_meta" => %{
                "vendor" => %{"stable" => true},
                "fastestmcp" => %{
-                 "execution" => %{"taskSupport" => "optional"},
                  "hint" => "keep",
                  "parameters" => %{},
                  "tags" => ["docs", "utility"],
@@ -212,7 +215,9 @@ defmodule FastestMCP.ClientHTTPTest do
         {Bandit,
          plug:
            {FastestMCP.Transport.HTTPApp,
-            server_name: server_name, path: "/mcp", unsafe_allow_any_host: true},
+            server_name: server_name,
+            path: "/mcp",
+            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
          scheme: :http,
          port: 0}
       )
@@ -244,7 +249,7 @@ defmodule FastestMCP.ClientHTTPTest do
     end
   end
 
-  test "connected client uses pageSize for HTTP pagination helpers" do
+  test "connected client treats page size options as compatibility no-ops" do
     server_name =
       "client-http-pagination-" <> Integer.to_string(System.unique_integer([:positive]))
 
@@ -265,7 +270,9 @@ defmodule FastestMCP.ClientHTTPTest do
         {Bandit,
          plug:
            {FastestMCP.Transport.HTTPApp,
-            server_name: server_name, path: "/mcp", unsafe_allow_any_host: true},
+            server_name: server_name,
+            path: "/mcp",
+            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
          scheme: :http,
          port: 0}
       )
@@ -296,32 +303,22 @@ defmodule FastestMCP.ClientHTTPTest do
              }
            } = RemoteTask.result(task_b)
 
-    assert %{items: [_one_tool], next_cursor: tool_cursor} =
-             Client.list_tools(client, page_size: 1)
+    assert %{items: tools, next_cursor: nil} = Client.list_tools(client, page_size: 1)
+    assert Enum.map(tools, & &1["name"]) == ["echo_1", "echo_2"]
 
-    assert is_binary(tool_cursor)
+    assert %{items: prompts, next_cursor: nil} = Client.list_prompts(client, page_size: 1)
+    assert Enum.map(prompts, & &1["name"]) == ["prompt_1", "prompt_2"]
 
-    assert %{items: [_one_prompt], next_cursor: prompt_cursor} =
-             Client.list_prompts(client, page_size: 1)
-
-    assert is_binary(prompt_cursor)
-
-    assert %{items: [_one_resource], next_cursor: resource_cursor} =
+    assert %{items: resources, next_cursor: nil} =
              Client.list_resources(client, page_size: 1)
 
-    assert is_binary(resource_cursor)
+    assert Enum.map(resources, & &1["uri"]) == ["memo://1", "memo://2"]
 
-    assert %{items: [first_task], next_cursor: task_cursor} =
-             Client.list_tasks(client, page_size: 1)
+    assert %{items: tasks, next_cursor: nil} = Client.list_tasks(client, page_size: 1)
 
-    assert is_binary(task_cursor)
-    assert first_task["taskId"] in [task_a.task_id, task_b.task_id]
+    assert Enum.sort(Enum.map(tasks, & &1["taskId"])) ==
+             Enum.sort([task_a.task_id, task_b.task_id])
 
-    assert %{items: [second_task], next_cursor: nil} =
-             Client.list_tasks(client, page_size: 1, cursor: task_cursor)
-
-    assert second_task["taskId"] in [task_a.task_id, task_b.task_id]
-    refute second_task["taskId"] == first_task["taskId"]
     assert :ok = Client.disconnect(client)
   end
 
@@ -347,7 +344,9 @@ defmodule FastestMCP.ClientHTTPTest do
         {Bandit,
          plug:
            {FastestMCP.Transport.HTTPApp,
-            server_name: server_name, path: "/mcp", unsafe_allow_any_host: true},
+            server_name: server_name,
+            path: "/mcp",
+            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
          scheme: :http,
          port: 0}
       )
@@ -404,7 +403,9 @@ defmodule FastestMCP.ClientHTTPTest do
         {Bandit,
          plug:
            {FastestMCP.Transport.HTTPApp,
-            server_name: server_name, path: "/mcp", unsafe_allow_any_host: true},
+            server_name: server_name,
+            path: "/mcp",
+            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
          scheme: :http,
          port: 0}
       )
@@ -418,13 +419,19 @@ defmodule FastestMCP.ClientHTTPTest do
           send(test_pid, {:sampling_handler_called, messages, params})
           assert is_list(messages)
           assert params["maxTokens"] == 100
-          %{"content" => %{"text" => "sampled"}}
+          sampling_result("sampled")
         end,
         elicitation_handler: fn message, params ->
           send(test_pid, {:elicitation_handler_called, message, params})
           assert message == "What is your name?"
-          assert params["requestedSchema"] == %{"type" => "string"}
-          {:accept, "Alice"}
+
+          assert params["requestedSchema"] == %{
+                   "type" => "object",
+                   "properties" => %{"value" => %{"type" => "string"}},
+                   "required" => ["value"]
+                 }
+
+          {:accept, %{"value" => "Alice"}}
         end
       )
 
@@ -434,14 +441,94 @@ defmodule FastestMCP.ClientHTTPTest do
 
     sample_task = Task.async(fn -> Client.call_tool(client, "sample", %{}) end)
     assert_receive {:sampling_handler_called, _messages, _params}, 1_000
-    assert %{"text" => "sampled"} = Task.await(sample_task, 6_000)
+    assert "sampled" = Task.await(sample_task, 6_000)
 
     elicitation_task = Task.async(fn -> Client.call_tool(client, "ask_name", %{}) end)
     assert_receive {:elicitation_handler_called, _message, _params}, 1_000
     assert %{"name" => "Alice"} = Task.await(elicitation_task, 6_000)
   end
 
-  test "connected client reuses per-request auth for protected sampling and elicitation callbacks" do
+  test "session stream handles standalone elicitation and returns primitive defaults" do
+    parent = self()
+
+    server_name =
+      "client-http-standalone-elicitation-" <>
+        Integer.to_string(System.unique_integer([:positive]))
+
+    server = FastestMCP.server(server_name)
+
+    assert {:ok, _pid} = FastestMCP.start_server(server)
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+
+    bandit =
+      start_supervised!(
+        {Bandit,
+         plug:
+           {FastestMCP.Transport.HTTPApp,
+            server_name: server_name,
+            path: "/mcp",
+            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
+         scheme: :http,
+         port: 0}
+      )
+
+    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+
+    client =
+      Client.connect!("http://127.0.0.1:#{port}/mcp",
+        session_stream: true,
+        elicitation_handler: fn message, params ->
+          send(parent, {:standalone_elicitation, message, params})
+          {:accept, %{}}
+        end
+      )
+
+    on_exit(fn ->
+      if Client.connected?(client), do: Client.disconnect(client)
+    end)
+
+    assert wait_for_session_stream(client) == :ok
+
+    params = %{
+      "message" => "Accept the defaults",
+      "requestedSchema" => %{
+        "type" => "object",
+        "properties" => %{
+          "name" => %{"type" => "string", "default" => "John Doe"},
+          "score" => %{"type" => "number", "default" => 95.5},
+          "verified" => %{"type" => "boolean", "default" => true}
+        },
+        "required" => []
+      }
+    }
+
+    request =
+      Task.async(fn ->
+        Session.request_peer(
+          server_name,
+          Client.session_id(client),
+          "elicitation/create",
+          params,
+          timeout_ms: 2_000
+        )
+      end)
+
+    assert_receive {:standalone_elicitation, "Accept the defaults", ^params}, 1_000
+
+    assert {:ok,
+            %{
+              "action" => "accept",
+              "content" => %{
+                "name" => "John Doe",
+                "score" => 95.5,
+                "verified" => true
+              }
+            }} = Task.await(request, 3_000)
+
+    assert :ok = Client.disconnect(client)
+  end
+
+  test "connected client reuses authenticated credentials for protected callbacks" do
     test_pid = self()
 
     server_name =
@@ -476,7 +563,9 @@ defmodule FastestMCP.ClientHTTPTest do
         {Bandit,
          plug:
            {FastestMCP.Transport.HTTPApp,
-            server_name: server_name, path: "/mcp", unsafe_allow_any_host: true},
+            server_name: server_name,
+            path: "/mcp",
+            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
          scheme: :http,
          port: 0}
       )
@@ -486,9 +575,10 @@ defmodule FastestMCP.ClientHTTPTest do
     client =
       Client.connect!(
         "http://127.0.0.1:#{port}/mcp",
+        access_token: "dev-token",
         sampling_handler: fn messages, params ->
           send(test_pid, {:protected_sampling_handler_called, messages, params})
-          %{"content" => %{"text" => "sampled"}}
+          sampling_result("sampled")
         end,
         elicitation_handler: fn message, params ->
           send(test_pid, {:protected_elicitation_handler_called, message, params})
@@ -500,36 +590,35 @@ defmodule FastestMCP.ClientHTTPTest do
       if Client.connected?(client), do: Client.disconnect(client)
     end)
 
-    unauthorized_error =
-      assert_raise Error, fn ->
-        Client.call_tool(client, "sample", %{})
-      end
-
-    assert unauthorized_error.code == :unauthorized
-
     sample_task =
       Task.async(fn ->
-        Client.call_tool(client, "sample", %{}, access_token: "dev-token")
+        Client.call_tool(client, "sample", %{})
       end)
 
     assert_receive {:protected_sampling_handler_called, _messages, _params}, 1_000
-    assert %{"text" => "sampled"} = Task.await(sample_task, 6_000)
+    assert "sampled" = Task.await(sample_task, 6_000)
 
     elicitation_task =
       Task.async(fn ->
-        Client.call_tool(client, "ask_name", %{}, access_token: "dev-token")
+        Client.call_tool(client, "ask_name", %{})
       end)
 
     assert_receive {:protected_elicitation_handler_called, "What is your name?",
-                    %{"requestedSchema" => %{"type" => "string"}}},
+                    %{
+                      "requestedSchema" => %{
+                        "type" => "object",
+                        "properties" => %{"value" => %{"type" => "string"}},
+                        "required" => ["value"]
+                      }
+                    }},
                    1_000
 
     assert %{"name" => "Alice"} = Task.await(elicitation_task, 6_000)
   end
 
-  test "opening a session stream fails against stateless HTTP servers" do
+  test "request-scoped HTTP state still uses a server-issued session stream" do
     server_name =
-      "client-http-stateless-" <> Integer.to_string(System.unique_integer([:positive]))
+      "client-http-request-state-" <> Integer.to_string(System.unique_integer([:positive]))
 
     server =
       FastestMCP.server(server_name)
@@ -545,8 +634,8 @@ defmodule FastestMCP.ClientHTTPTest do
            {FastestMCP.Transport.HTTPApp,
             server_name: server_name,
             path: "/mcp",
-            unsafe_allow_any_host: true,
-            stateless_http: true},
+            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"],
+            state_scope: :request},
          scheme: :http,
          port: 0}
       )
@@ -558,13 +647,10 @@ defmodule FastestMCP.ClientHTTPTest do
       if Client.connected?(client), do: Client.disconnect(client)
     end)
 
-    error =
-      assert_raise Error, fn ->
-        Client.open_session_stream(client)
-      end
-
-    assert error.code == :bad_request
-    refute Client.session_stream_open?(client)
+    assert is_binary(Client.session_id(client))
+    assert :ok = Client.open_session_stream(client)
+    assert wait_for_session_stream(client) == :ok
+    assert Client.session_stream_open?(client)
   end
 
   test "connected client manages protected task lifecycle over HTTP" do
@@ -599,7 +685,9 @@ defmodule FastestMCP.ClientHTTPTest do
         {Bandit,
          plug:
            {FastestMCP.Transport.HTTPApp,
-            server_name: server_name, path: "/mcp", unsafe_allow_any_host: true},
+            server_name: server_name,
+            path: "/mcp",
+            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
          scheme: :http,
          port: 0}
       )
@@ -663,7 +751,9 @@ defmodule FastestMCP.ClientHTTPTest do
         {Bandit,
          plug:
            {FastestMCP.Transport.HTTPApp,
-            server_name: server_name, path: "/mcp", unsafe_allow_any_host: true},
+            server_name: server_name,
+            path: "/mcp",
+            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
          scheme: :http,
          port: 0}
       )
@@ -734,7 +824,9 @@ defmodule FastestMCP.ClientHTTPTest do
         {Bandit,
          plug:
            {FastestMCP.Transport.HTTPApp,
-            server_name: server_name, path: "/mcp", unsafe_allow_any_host: true},
+            server_name: server_name,
+            path: "/mcp",
+            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
          scheme: :http,
          port: 0}
       )
@@ -795,7 +887,9 @@ defmodule FastestMCP.ClientHTTPTest do
         {Bandit,
          plug:
            {FastestMCP.Transport.HTTPApp,
-            server_name: server_name, path: "/mcp", unsafe_allow_any_host: true},
+            server_name: server_name,
+            path: "/mcp",
+            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
          scheme: :http,
          port: 0}
       )
@@ -826,7 +920,7 @@ defmodule FastestMCP.ClientHTTPTest do
 
     Client.set_sampling_handler(client, fn messages, _params ->
       send(parent, {:runtime_sampling, messages})
-      %{"text" => "runtime sampled"}
+      sampling_result("runtime sampled")
     end)
 
     assert is_map(Client.initialize(client))
@@ -856,7 +950,7 @@ defmodule FastestMCP.ClientHTTPTest do
                     %{"method" => "notifications/progress", "params" => _}},
                    1_000
 
-    assert %{"text" => "runtime sampled"} = Client.call_tool(client, "sample", %{})
+    assert "runtime sampled" = Client.call_tool(client, "sample", %{})
 
     assert_receive {:runtime_sampling,
                     [%{"content" => %{"text" => "Reply with runtime sampled"}}]},
@@ -866,6 +960,14 @@ defmodule FastestMCP.ClientHTTPTest do
   defp wait_for_task_status(client, task_id, expected_status, timeout \\ 1_000) do
     deadline = System.monotonic_time(:millisecond) + timeout
     do_wait_for_task_status(client, task_id, expected_status, deadline)
+  end
+
+  defp sampling_result(text) do
+    %{
+      "role" => "assistant",
+      "model" => "test-model",
+      "content" => %{"type" => "text", "text" => text}
+    }
   end
 
   defp wait_for_session_stream(client, timeout \\ 1_000) do

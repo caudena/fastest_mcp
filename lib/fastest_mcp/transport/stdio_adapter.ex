@@ -34,6 +34,8 @@ defmodule FastestMCP.Transport.StdioAdapter do
                session_id: session_id,
                session_id_provided: true,
                connection_id: Keyword.get(opts, :connection_id),
+               jsonrpc_request_id: request_id,
+               jsonrpc_envelope: message,
                progress_token: get_in(params, ["_meta", "progressToken"])
              },
              auth_input: request_auth_input(params, opts)
@@ -52,7 +54,8 @@ defmodule FastestMCP.Transport.StdioAdapter do
            request_metadata: %{
              session_id: session_id,
              session_id_provided: true,
-             connection_id: Keyword.get(opts, :connection_id)
+             connection_id: Keyword.get(opts, :connection_id),
+             jsonrpc_envelope: message
            },
            auth_input: Map.new(Keyword.get(opts, :auth_input, %{}))
          }}
@@ -67,7 +70,9 @@ defmodule FastestMCP.Transport.StdioAdapter do
   def encode_success(%Request{} = request, payload), do: JSONRPC.success(request, payload)
 
   @impl true
-  def encode_error(%Error{} = error), do: JSONRPC.error(nil, error)
+  def encode_error(%Error{} = error) do
+    if JSONRPC.notification_error?(error), do: :no_response, else: JSONRPC.error(nil, error)
+  end
 
   @doc "Encodes an error for a decoded request."
   def encode_error(%Request{request_id: nil}, %Error{}), do: :no_response
