@@ -70,7 +70,9 @@ defmodule FastestMCP.PathSafety do
     do: {:error, :eloop}
 
   defp resolve_symlink(candidate, rest, seen, count) do
-    if MapSet.member?(seen, candidate) do
+    resolution_state = {candidate, rest}
+
+    if MapSet.member?(seen, resolution_state) do
       {:error, :eloop}
     else
       with {:ok, target} <- File.read_link(candidate) do
@@ -82,7 +84,7 @@ defmodule FastestMCP.PathSafety do
         resolve_segments(
           path_segments(target) ++ rest,
           "/",
-          MapSet.put(seen, candidate),
+          MapSet.put(seen, resolution_state),
           count + 1
         )
       end

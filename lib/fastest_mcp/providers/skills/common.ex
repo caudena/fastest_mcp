@@ -278,6 +278,7 @@ defmodule FastestMCP.Providers.Skills.Common do
 
       {:ok, Enum.reverse(files), visited}
     else
+      true -> {:ok, [], visited}
       false -> {:ok, [], visited}
       {:error, reason} -> {:error, reason}
     end

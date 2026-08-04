@@ -151,6 +151,7 @@ defmodule FastestMCP.Resources.Directory do
 
       {Enum.reverse(files), visited}
     else
+      true -> {[], visited}
       false -> {[], visited}
       {:error, _reason} -> {[], visited}
     end

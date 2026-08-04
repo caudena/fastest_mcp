@@ -1,6 +1,7 @@
 defmodule FastestMCP.ResourceHelpersTest do
   use ExUnit.Case, async: false
 
+  alias FastestMCP.PathSafety
   alias FastestMCP.Resources.Binary
   alias FastestMCP.Resources.Content
   alias FastestMCP.Resources.Directory, as: ResourceDirectory
@@ -245,11 +246,13 @@ defmodule FastestMCP.ResourceHelpersTest do
   end
 
   test "recursive directory resources stay contained and stop at symlink cycles" do
+    base = PathSafety.realpath!(System.tmp_dir!())
+
     root =
-      Path.join(System.tmp_dir!(), "fastest_mcp_safe_dir_#{System.unique_integer([:positive])}")
+      Path.join(base, "fastest_mcp_safe_dir_#{System.unique_integer([:positive])}")
 
     outside =
-      Path.join(System.tmp_dir!(), "fastest_mcp_outside_#{System.unique_integer([:positive])}")
+      Path.join(base, "fastest_mcp_outside_#{System.unique_integer([:positive])}")
 
     nested = Path.join(root, "nested")
     top_file = Path.join(root, "top.txt")
@@ -262,7 +265,7 @@ defmodule FastestMCP.ResourceHelpersTest do
     File.write!(nested_file, "nested")
     File.write!(outside_file, "secret")
     File.ln_s!(outside_file, Path.join(root, "leak.txt"))
-    File.ln_s!(root, Path.join(nested, "back"))
+    File.ln_s!(PathSafety.realpath!(root), Path.join(nested, "back"))
 
     on_exit(fn ->
       File.rm_rf(root)

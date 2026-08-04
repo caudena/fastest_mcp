@@ -1,6 +1,7 @@
 defmodule FastestMCP.SkillProviderTest do
   use ExUnit.Case, async: false
 
+  alias FastestMCP.PathSafety
   alias FastestMCP.Providers.Skill
   alias FastestMCP.Providers.Skills.Common
   alias FastestMCP.Transport.Engine
@@ -174,21 +175,23 @@ defmodule FastestMCP.SkillProviderTest do
     assert file["hash"] == "sha256:" <> expected_hash
   end
 
-  test "skill scanning ignores directory cycles and rejects an external main-file symlink" do
+  test "skill scanning ignores directory cycles" do
     skill_dir = create_skill_dir("cycle-skill")
     File.write!(Path.join(skill_dir, "SKILL.md"), "# Cycle Safe")
-    File.ln_s!(skill_dir, Path.join(skill_dir, "loop"))
+    File.ln_s!(PathSafety.realpath!(skill_dir), Path.join(skill_dir, "loop"))
 
     provider = Skill.new(skill_dir)
     assert Enum.map(provider.skill_info.files, & &1.path) == ["SKILL.md"]
+  end
 
-    outside = Path.join(Path.dirname(skill_dir), "outside.md")
-    unsafe_skill = Path.join(Path.dirname(skill_dir), "unsafe-skill")
+  test "skill loading rejects an external main-file symlink" do
+    unsafe_skill = create_skill_dir("unsafe-skill")
+    outside = Path.join(Path.dirname(unsafe_skill), "outside.md")
     File.write!(outside, "SECRET")
-    File.mkdir_p!(unsafe_skill)
     File.ln_s!(outside, Path.join(unsafe_skill, "SKILL.md"))
 
-    assert_raise File.Error, fn -> Skill.new(unsafe_skill) end
+    error = assert_raise File.Error, fn -> Skill.new(unsafe_skill) end
+    assert error.reason == :invalid_path
   end
 
   test "skill metadata survives mounted providers" do
@@ -222,10 +225,9 @@ defmodule FastestMCP.SkillProviderTest do
 
   defp create_skill_dir(name) do
     root =
-      Path.join(
-        System.tmp_dir!(),
-        "fastest_mcp_skill_provider_#{System.unique_integer([:positive])}"
-      )
+      System.tmp_dir!()
+      |> PathSafety.realpath!()
+      |> Path.join("fastest_mcp_skill_provider_#{System.unique_integer([:positive])}")
 
     skill_dir = Path.join(root, name)
     File.mkdir_p!(skill_dir)
