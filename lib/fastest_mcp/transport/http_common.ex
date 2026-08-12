@@ -13,6 +13,8 @@ defmodule FastestMCP.Transport.HTTPCommon do
 
   import Plug.Conn
 
+  require Logger
+
   alias FastestMCP.Auth
   alias FastestMCP.Auth.ProtectedResource
   alias FastestMCP.Context
@@ -172,9 +174,19 @@ defmodule FastestMCP.Transport.HTTPCommon do
   def validate_dns_rebinding(conn, opts) do
     allowed_hosts = allowed_hosts(opts)
 
-    with :ok <- validate_host_header(conn, allowed_hosts),
-         :ok <- validate_origin_header(conn, allowed_hosts) do
-      :ok
+    result =
+      with :ok <- validate_host_header(conn, allowed_hosts),
+           :ok <- validate_origin_header(conn, allowed_hosts) do
+        :ok
+      end
+
+    case result do
+      {:error, %Error{} = error} = rejection ->
+        log_dns_rebinding_rejection(conn, allowed_hosts, error)
+        rejection
+
+      other ->
+        other
     end
   end
 
@@ -529,6 +541,23 @@ defmodule FastestMCP.Transport.HTTPCommon do
        message: message,
        details: %{reason: :dns_rebinding_protection}
      }}
+  end
+
+  defp log_dns_rebinding_rejection(conn, allowed_hosts, error) do
+    received_host = inspect(conn.host, printable_limit: 256)
+    received_origins = inspect(get_req_header(conn, "origin"), limit: 4, printable_limit: 512)
+
+    configured_hosts =
+      allowed_hosts
+      |> MapSet.to_list()
+      |> Enum.sort()
+      |> inspect(limit: 20, printable_limit: 512)
+
+    Logger.warning(
+      "FastestMCP rejected HTTP request due to DNS-rebinding protection: " <>
+        "#{error.message}; received_host=#{received_host}; " <>
+        "received_origins=#{received_origins}; allowed_hosts=#{configured_hosts}"
+    )
   end
 
   defp host_allowed?(host, allowed_hosts) when is_binary(host) do

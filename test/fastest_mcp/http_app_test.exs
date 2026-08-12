@@ -1,6 +1,7 @@
 defmodule FastestMCP.HTTPAppTest do
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
   import Plug.Conn
   import Plug.Test
 
@@ -187,43 +188,84 @@ defmodule FastestMCP.HTTPAppTest do
 
     app = FastestMCP.http_app(server_name, allowed_hosts: :localhost)
 
-    blocked =
-      conn(
-        :post,
-        "/mcp",
-        JSON.encode!(%{
-          "jsonrpc" => "2.0",
-          "id" => 1,
-          "method" => "initialize",
-          "params" => ProtocolTest.initialize_params()
-        })
-      )
-      |> Map.put(:host, "evil.example.com")
-      |> put_req_header("content-type", "application/json")
-      |> put_req_header("accept", "application/json, text/event-stream")
-      |> put_req_header("origin", "http://evil.example.com")
-      |> app.()
+    blocked_host_log =
+      capture_log(fn ->
+        blocked =
+          conn(
+            :post,
+            "/mcp",
+            JSON.encode!(%{
+              "jsonrpc" => "2.0",
+              "id" => 1,
+              "method" => "initialize",
+              "params" => ProtocolTest.initialize_params()
+            })
+          )
+          |> Map.put(:host, "evil.example.com")
+          |> put_req_header("content-type", "application/json")
+          |> put_req_header("accept", "application/json, text/event-stream")
+          |> put_req_header("origin", "http://evil.example.com")
+          |> app.()
 
-    assert blocked.status == 403
+        assert blocked.status == 403
+      end)
 
-    allowed =
-      conn(
-        :post,
-        "/mcp",
-        JSON.encode!(%{
-          "jsonrpc" => "2.0",
-          "id" => 2,
-          "method" => "initialize",
-          "params" => ProtocolTest.initialize_params()
-        })
-      )
-      |> Map.put(:host, "127.0.0.1")
-      |> put_req_header("content-type", "application/json")
-      |> put_req_header("accept", "application/json, text/event-stream")
-      |> put_req_header("origin", "http://127.0.0.1:4000")
-      |> app.()
+    assert blocked_host_log =~ "request host is not allowed"
+    assert blocked_host_log =~ ~s(received_host="evil.example.com")
+    assert blocked_host_log =~ ~s(received_origins=["http://evil.example.com"])
 
-    assert allowed.status == 200
+    assert blocked_host_log =~
+             ~s(allowed_hosts=["127.0.0.1", "::1", "[::1]", "localhost"])
+
+    blocked_origin_log =
+      capture_log(fn ->
+        blocked =
+          conn(
+            :post,
+            "/mcp",
+            JSON.encode!(%{
+              "jsonrpc" => "2.0",
+              "id" => 2,
+              "method" => "initialize",
+              "params" => ProtocolTest.initialize_params()
+            })
+          )
+          |> Map.put(:host, "localhost")
+          |> put_req_header("content-type", "application/json")
+          |> put_req_header("accept", "application/json, text/event-stream")
+          |> put_req_header("origin", "https://app.example.com")
+          |> app.()
+
+        assert blocked.status == 403
+      end)
+
+    assert blocked_origin_log =~ "request origin is not allowed"
+    assert blocked_origin_log =~ ~s(received_host="localhost")
+    assert blocked_origin_log =~ ~s(received_origins=["https://app.example.com"])
+
+    allowed_log =
+      capture_log(fn ->
+        allowed =
+          conn(
+            :post,
+            "/mcp",
+            JSON.encode!(%{
+              "jsonrpc" => "2.0",
+              "id" => 3,
+              "method" => "initialize",
+              "params" => ProtocolTest.initialize_params()
+            })
+          )
+          |> Map.put(:host, "127.0.0.1")
+          |> put_req_header("content-type", "application/json")
+          |> put_req_header("accept", "application/json, text/event-stream")
+          |> put_req_header("origin", "http://127.0.0.1:4000")
+          |> app.()
+
+        assert allowed.status == 200
+      end)
+
+    refute allowed_log =~ "DNS-rebinding protection"
   end
 
   test "http app rejects malformed, opaque, and repeated Origin headers" do
@@ -232,28 +274,30 @@ defmodule FastestMCP.HTTPAppTest do
 
     app = FastestMCP.http_app(server_name, allowed_hosts: :localhost)
 
-    for origin <- [
-          "https://127.0.0.1/path",
-          "https://user@127.0.0.1",
-          "ftp://127.0.0.1",
-          "https://127.0.0.1?query=1",
-          "https://127.0.0.1#fragment",
-          "https://127.0.0.1:invalid",
-          "https://127.0.0.1:65536",
-          "null",
-          " https://127.0.0.1",
-          <<255>>
-        ] do
-      assert origin |> origin_initialize_conn() |> app.() |> Map.fetch!(:status) == 403
-    end
+    capture_log(fn ->
+      for origin <- [
+            "https://127.0.0.1/path",
+            "https://user@127.0.0.1",
+            "ftp://127.0.0.1",
+            "https://127.0.0.1?query=1",
+            "https://127.0.0.1#fragment",
+            "https://127.0.0.1:invalid",
+            "https://127.0.0.1:65536",
+            "null",
+            " https://127.0.0.1",
+            <<255>>
+          ] do
+        assert origin |> origin_initialize_conn() |> app.() |> Map.fetch!(:status) == 403
+      end
 
-    repeated =
-      "https://127.0.0.1"
-      |> origin_initialize_conn()
-      |> Map.update!(:req_headers, &[{"origin", "https://127.0.0.1"} | &1])
-      |> app.()
+      repeated =
+        "https://127.0.0.1"
+        |> origin_initialize_conn()
+        |> Map.update!(:req_headers, &[{"origin", "https://127.0.0.1"} | &1])
+        |> app.()
 
-    assert repeated.status == 403
+      assert repeated.status == 403
+    end)
 
     ipv6 =
       "HTTP://[::1]:4000"
