@@ -1,8 +1,6 @@
 # Changelog
 
-All notable changes to this project will be documented in this file.
-
-## 0.2.0 - Unreleased
+## 0.2.0 - 2026-08-12
 
 This is a breaking protocol and lifecycle release. Applications upgrading from
 0.1.x should review the migration notes below before deploying.
@@ -90,7 +88,7 @@ This is a breaking protocol and lifecycle release. Applications upgrading from
 
 ### Schema, sampling, providers, and middleware
 
-- add JSV `0.21.x` as the sole new runtime dependency and make
+- add JSV `0.22.x` as the sole new runtime dependency and make
   `FastestMCP.Schema` the compile-once validation boundary for Draft 2020-12
   and Draft 7; validation is non-coercing, bounded, and redacted
 - vendor the immutable MCP `2025-11-25` schema from source commit
@@ -194,8 +192,6 @@ This is a breaking protocol and lifecycle release. Applications upgrading from
 - configure concrete `allowed_hosts` for public mounts and, when RFC 9728
   discovery is needed, an exact `protected_resource:` plus an application-owned
   authenticator
-
-Publishing and tagging 0.2.0 remain separate release actions.
 
 ## 0.1.2 - 2026-05-27
 
