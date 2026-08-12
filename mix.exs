@@ -32,7 +32,7 @@ defmodule FastestMCP.MixProject do
     [
       {:bandit, "~> 1.5"},
       {:ex_doc, "~> 0.40", only: :dev, runtime: false},
-      {:jsv, "~> 0.21.2"},
+      {:jsv, "~> 0.22.0"},
       {:mint, "~> 1.9"},
       {:opentelemetry, "~> 1.6", only: :test},
       {:opentelemetry_api, "~> 1.5"},
