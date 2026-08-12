@@ -133,9 +133,13 @@ defmodule FastestMCP.InteractTest do
 
     assert %{
              "type" => "object",
-             "title" => "Name Form",
-             "description" => "Collects the display name",
-             "properties" => %{"value" => %{"type" => "string"}},
+             "properties" => %{
+               "value" => %{
+                 "type" => "string",
+                 "title" => "Name Form",
+                 "description" => "Collects the display name"
+               }
+             },
              "required" => ["value"]
            } = FastestMCP.fetch_task(ask_name).elicitation.requested_schema
 

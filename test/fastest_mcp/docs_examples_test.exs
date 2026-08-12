@@ -77,7 +77,12 @@ defmodule FastestMCP.DocsExamplesTest do
         client_info: %{"name" => "docs-client", "version" => "1.0.0"},
         sampling_handler: fn messages, params ->
           send(test_pid, {:sampling_handler_called, messages, params})
-          %{"text" => "short summary"}
+
+          %{
+            "role" => "assistant",
+            "model" => "docs-test-model",
+            "content" => %{"type" => "text", "text" => "short summary"}
+          }
         end
       )
 
@@ -171,7 +176,7 @@ defmodule FastestMCP.DocsExamplesTest do
         FastestMCP.call_tool(server_name, "dynamic.echo", %{"value" => "blocked"})
       end
 
-    assert error.code == :not_found
+    assert error.code == :disabled
     assert {:ok, _removed} = ComponentManager.remove_tool(manager, "dynamic.echo")
   end
 
@@ -197,7 +202,7 @@ defmodule FastestMCP.DocsExamplesTest do
     server_name = "docs-tools-" <> Integer.to_string(System.unique_integer([:positive]))
 
     server =
-      FastestMCP.server(server_name, dereference_schemas: false)
+      FastestMCP.server(server_name)
       |> FastestMCP.add_tool(
         "calculate_sum",
         fn %{"a" => a, "b" => b}, _ctx -> a + b end,
@@ -260,10 +265,13 @@ defmodule FastestMCP.DocsExamplesTest do
       )
       |> FastestMCP.add_tool(
         "list_values",
-        fn _args, _ctx -> ["alpha", "beta"] end,
+        fn _args, _ctx -> %{"values" => ["alpha", "beta"]} end,
         output_schema: %{
-          "type" => "array",
-          "items" => %{"type" => "string"}
+          "type" => "object",
+          "properties" => %{
+            "values" => %{"type" => "array", "items" => %{"type" => "string"}}
+          },
+          "required" => ["values"]
         }
       )
       |> FastestMCP.add_tool("private_tool", fn _args, _ctx -> "private" end, tags: ["private"])
@@ -286,7 +294,7 @@ defmodule FastestMCP.DocsExamplesTest do
       FastestMCP.stop_server(server_name)
     end)
 
-    assert 42 == FastestMCP.call_tool(server_name, "calculate_sum", %{"a" => "20", "b" => "22"})
+    assert 42 == FastestMCP.call_tool(server_name, "calculate_sum", %{"a" => 20, "b" => 22})
 
     assert %{
              "query" => "coffee",
@@ -310,11 +318,7 @@ defmodule FastestMCP.DocsExamplesTest do
     assert shipped_tool.input_schema["$defs"]["address"]["type"] == "object"
     assert shipped_tool.input_schema["properties"]["shipping"]["$ref"] == "#/$defs/address"
 
-    assert %{
-             "content" => [%{"type" => "text"}],
-             "structuredContent" => %{"result" => ["alpha", "beta"]},
-             "meta" => %{"fastestmcp" => %{"wrap_result" => true}}
-           } = Client.call_tool(client, "list_values", %{})
+    assert %{"values" => ["alpha", "beta"]} = Client.call_tool(client, "list_values", %{})
 
     :ok = FastestMCP.disable_components(server_name, tags: ["private"], components: [:tool])
 

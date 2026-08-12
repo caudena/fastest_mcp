@@ -117,6 +117,13 @@ OpenAPI-backed tools serialize common HTTP request shapes:
 - `multipart/form-data`
 - cookie parameters through the `Cookie` header
 
+Parameter locations are limited to the standard path/query/header/cookie
+strings without creating atoms. Operation parameters override path-level
+parameters by `{location, name}`; style/explode defaults are applied before
+encoding arrays and objects, and path spaces use `%20`. Scalar and array JSON
+request bodies are sent directly rather than wrapped. Responses are decoded
+only when their media type is JSON or ends in `+json`.
+
 Server URL variables are expanded from their declared defaults when a provider
 base URL is derived from the document. Component `$ref` resolution tracks
 visited references, so circular schemas are left as references instead of
@@ -141,6 +148,12 @@ server =
 This is useful when you want local skills to become discoverable through MCP
 resource reads without hand-registering each file.
 
+Skill roots are canonicalized before discovery. A main or supporting file is
+rejected if its resolved path leaves the owning root. With `reload: true`, the
+runtime activates a metadata-keyed cache and re-reads/re-hashes only files whose
+size or modification data changed; unchanged skills reuse their compiled
+component representation.
+
 ## Custom Providers
 
 When components come from somewhere else entirely, write a custom provider.
@@ -148,9 +161,19 @@ When components come from somewhere else entirely, write a custom provider.
 At minimum, a provider can implement one or more of:
 
 - `list_components/3`
+- `get_component_candidates/4`
 - `get_component/4`
+- `get_resource_target_candidates/3`
 - `get_resource_target/3`
 - `http_routes/1`
+
+Candidate callbacks are the preferred exact-lookup interface for versioned
+providers. Return every matching version; FastestMCP applies provider transforms
+once, then chooses the highest candidate that remains visible and authorized.
+Legacy single-result callbacks remain supported and are authoritative, so an
+exact lookup does not also enumerate the provider. A provider that implements
+only `list_components/3` uses the generic all-version fallback. Implement a
+candidate callback whenever an exact lookup must expose multiple versions.
 
 Example:
 
@@ -189,7 +212,7 @@ See [Transforms](transforms.md) for the detailed patterns.
 
 ## What FastestMCP Does Not Ship Yet
 
-FastestMCP v0.1 does not yet expose filesystem or proxy providers as public
+FastestMCP v0.2 does not yet expose filesystem or proxy providers as public
 built-ins. The current provider surface focuses on:
 
 - mounted FastestMCP servers
@@ -198,7 +221,7 @@ built-ins. The current provider surface focuses on:
 - skills providers
 - custom provider implementations
 
-That keeps the first release focused on the provider shapes already exercised by
+That keeps the public surface focused on provider shapes already exercised by
 the runtime and test suite.
 
 ## Why This Shape

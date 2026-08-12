@@ -61,14 +61,14 @@ defmodule FastestMCP.TaskDefaultsTest do
         FastestMCP.call_tool(server_name, "no_task", %{}, task: true)
       end
 
-    assert forbidden_error.code == :not_found
+    assert forbidden_error.code == :method_not_found
 
     required_error =
       assert_raise Error, fn ->
         FastestMCP.call_tool(server_name, "required_task", %{})
       end
 
-    assert required_error.code == :not_found
+    assert required_error.code == :method_not_found
   end
 
   test "tool metadata exposes execution task support for task-enabled tools" do

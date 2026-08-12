@@ -5,6 +5,14 @@ defmodule FastestMCP.TaskMetaTest do
   alias FastestMCP.Error
   alias FastestMCP.TaskMeta
 
+  test "fractional protocol durations are rounded up at the runtime timer boundary" do
+    assert %TaskMeta{ttl: 121} = TaskMeta.new(ttl: 120.1)
+    assert %TaskMeta{ttl: 1} = TaskMeta.new(ttl: 0.01)
+    assert %TaskMeta{ttl: 2} = TaskMeta.new(%TaskMeta{ttl: 1.1})
+
+    assert_raise ArgumentError, ~r/positive number/, fn -> TaskMeta.new(ttl: 0) end
+  end
+
   test "task-enabled direct calls stay synchronous unless task_meta is provided" do
     server_name = "task-meta-sync-" <> Integer.to_string(System.unique_integer([:positive]))
 
@@ -121,7 +129,7 @@ defmodule FastestMCP.TaskMetaTest do
              )
   end
 
-  test "task_meta raises a not_found error for forbidden direct task execution" do
+  test "task_meta raises method_not_found for forbidden direct task execution" do
     server_name = "task-meta-forbidden-" <> Integer.to_string(System.unique_integer([:positive]))
 
     server =
@@ -156,7 +164,7 @@ defmodule FastestMCP.TaskMetaTest do
       end
 
     for error <- [tool_error, prompt_error, resource_error, template_error] do
-      assert error.code == :not_found
+      assert error.code == :method_not_found
       assert error.message =~ "does not support background task execution"
     end
   end

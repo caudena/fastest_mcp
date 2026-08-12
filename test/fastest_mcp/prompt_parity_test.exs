@@ -59,7 +59,7 @@ defmodule FastestMCP.PromptParityTest do
     refute Map.has_key?(argument, "completion")
   end
 
-  test "render_prompt preserves description and meta when prompt returns a prompt result map" do
+  test "render_prompt preserves canonical _meta when a prompt returns a result map" do
     server_name = "prompt-result-" <> Integer.to_string(System.unique_integer([:positive]))
 
     server =
@@ -68,10 +68,10 @@ defmodule FastestMCP.PromptParityTest do
         %{
           messages: [
             %{role: "user", content: "Review #{subject}"},
-            %{role: "assistant", content: "Looks good", meta: %{confidence: "high"}}
+            %{role: "assistant", content: "Looks good", _meta: %{confidence: "high"}}
           ],
           description: "Review result",
-          meta: %{source: "prompt"}
+          _meta: %{source: "prompt"}
         }
       end)
 

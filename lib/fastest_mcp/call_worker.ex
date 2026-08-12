@@ -30,16 +30,48 @@ defmodule FastestMCP.CallWorker do
   @impl true
   @doc "Initializes the state used by this module before it starts processing work."
   def init(opts) do
+    caller_monitor = Process.monitor(Map.fetch!(opts, :reply_to))
     send(self(), :run)
-    {:ok, opts}
+    {:ok, Map.merge(opts, %{caller_monitor: caller_monitor, runner: nil})}
   end
 
   @impl true
   @doc "Processes asynchronous messages delivered to the process owned by this module."
-  def handle_info(:run, %{ref: ref, reply_to: reply_to, fun: fun} = state) do
-    send(reply_to, {ref, run_fun(fun)})
+  def handle_info(:run, %{ref: ref, fun: fun} = state) do
+    owner = self()
+    runner = spawn_link(fn -> send(owner, {ref, run_fun(fun)}) end)
+    {:noreply, %{state | runner: runner}}
+  end
+
+  def handle_info(
+        {ref, result},
+        %{ref: ref, reply_to: reply_to, caller_monitor: caller_monitor} = state
+      ) do
+    Process.demonitor(caller_monitor, [:flush])
+    send(reply_to, {ref, result})
     {:stop, :normal, state}
   end
+
+  def handle_info(
+        {:DOWN, caller_monitor, :process, reply_to, _reason},
+        %{caller_monitor: caller_monitor, reply_to: reply_to} = state
+      ) do
+    stop_runner(state.runner)
+    {:stop, :normal, %{state | runner: nil}}
+  end
+
+  @impl true
+  def terminate(_reason, state) do
+    stop_runner(Map.get(state, :runner))
+    :ok
+  end
+
+  defp stop_runner(runner) when is_pid(runner) do
+    if Process.alive?(runner), do: Process.exit(runner, :kill)
+    :ok
+  end
+
+  defp stop_runner(_runner), do: :ok
 
   defp run_fun(fun) do
     try do

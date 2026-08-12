@@ -14,6 +14,29 @@ defmodule FastestMCP.Protocol do
 
   @current_version "2025-11-25"
 
+  @server_method_capabilities %{
+    "tools/list" => ["tools"],
+    "tools/call" => ["tools"],
+    "resources/list" => ["resources"],
+    "resources/templates/list" => ["resources"],
+    "resources/read" => ["resources"],
+    "resources/subscribe" => ["resources", "subscribe"],
+    "resources/unsubscribe" => ["resources", "subscribe"],
+    "prompts/list" => ["prompts"],
+    "prompts/get" => ["prompts"],
+    "completion/complete" => ["completions"],
+    "logging/setLevel" => ["logging"],
+    "tasks/list" => ["tasks", "list"],
+    "tasks/cancel" => ["tasks", "cancel"]
+  }
+
+  @client_method_capabilities %{
+    "roots/list" => ["roots"],
+    "sampling/createMessage" => ["sampling"],
+    "tasks/list" => ["tasks", "list"],
+    "tasks/cancel" => ["tasks", "cancel"]
+  }
+
   @doc "Returns the active MCP protocol version supported by the library."
   def current_version, do: @current_version
 
@@ -69,9 +92,52 @@ defmodule FastestMCP.Protocol do
     end)
   end
 
-  @doc "Returns whether the given capability flag is enabled."
+  @doc "Returns whether the given capability path is advertised and enabled."
   def capability?(capabilities, path) do
-    not is_nil(capability(capabilities, path))
+    case capability(capabilities, path) do
+      nil -> false
+      false -> false
+      _advertised -> true
+    end
+  end
+
+  @doc "Returns whether the capability path contains an advertised capability object."
+  def capability_object?(capabilities, path),
+    do: is_map(capability(capabilities, path))
+
+  @doc "Returns whether the capability path is the boolean value true."
+  def capability_flag?(capabilities, path),
+    do: capability(capabilities, path) == true
+
+  @doc false
+  def required_server_capability(method) when is_binary(method),
+    do: Map.get(@server_method_capabilities, method)
+
+  @doc false
+  def server_supports_method?(capabilities, method) when is_binary(method) do
+    case required_server_capability(method) do
+      nil -> true
+      path -> capability?(capabilities, path)
+    end
+  end
+
+  @doc false
+  def required_client_capability("elicitation/create", params) when is_map(params) do
+    case Map.get(params, "mode", "form") do
+      "url" -> ["elicitation", "url"]
+      _form -> ["elicitation", "form"]
+    end
+  end
+
+  def required_client_capability(method, _params) when is_binary(method),
+    do: Map.get(@client_method_capabilities, method)
+
+  @doc false
+  def client_supports_method?(capabilities, method, params \\ %{}) do
+    case required_client_capability(method, params) do
+      nil -> true
+      path -> capability?(capabilities, path)
+    end
   end
 
   defp metadata_value(metadata, key) do

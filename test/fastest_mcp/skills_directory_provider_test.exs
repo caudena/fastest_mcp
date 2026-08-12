@@ -1,8 +1,10 @@
 defmodule FastestMCP.SkillsDirectoryProviderTest do
   use ExUnit.Case, async: false
 
+  alias FastestMCP.Provider
   alias FastestMCP.Providers.Skills
   alias FastestMCP.Providers.SkillsDirectory
+  alias FastestMCP.ServerRuntime
 
   test "directory provider discovers skills, descriptions, templates, and nested files" do
     skills_root = create_skills_root("skills")
@@ -108,6 +110,96 @@ defmodule FastestMCP.SkillsDirectoryProviderTest do
 
     reloaded_resources = FastestMCP.list_resources(server_name)
     assert Enum.any?(reloaded_resources, &(&1.uri == "skill://new-skill/SKILL.md"))
+  end
+
+  test "reload mode reuses metadata-matched providers and refreshes changed skills" do
+    root = create_skills_root("skills-cache")
+    skill_dir = Path.join(root, "cached-skill")
+    skill_file = Path.join(skill_dir, "SKILL.md")
+    File.mkdir_p!(skill_dir)
+    File.write!(skill_file, "---\ndescription: First\n---\n# Cached")
+
+    provider = SkillsDirectory.new(roots: root, reload: true)
+
+    _unactivated_components = SkillsDirectory.list_components(provider, :resource, nil)
+    assert provider.cache == nil
+    assert Process.whereis(SkillsDirectory.ReloadCache) == nil
+
+    assert {:ok, activated} = SkillsDirectory.activate_runtime(provider)
+    cache = activated.cache
+    assert is_pid(cache)
+    assert Process.alive?(cache)
+    assert Process.whereis(SkillsDirectory.ReloadCache) == nil
+    on_exit(fn -> SkillsDirectory.deactivate_runtime(activated) end)
+
+    first =
+      activated
+      |> SkillsDirectory.list_components(:resource, nil)
+      |> Enum.find(&(&1.uri == "skill://cached-skill/SKILL.md"))
+
+    second =
+      activated
+      |> SkillsDirectory.list_components(:resource, nil)
+      |> Enum.find(&(&1.uri == "skill://cached-skill/SKILL.md"))
+
+    assert first.compiled == second.compiled
+
+    File.write!(skill_file, "---\ndescription: Updated and longer\n---\n# Cached")
+
+    refreshed =
+      activated
+      |> SkillsDirectory.list_components(:resource, nil)
+      |> Enum.find(&(&1.uri == "skill://cached-skill/SKILL.md"))
+
+    assert refreshed.description == "Updated and longer"
+    refute refreshed.compiled == first.compiled
+
+    assert :ok = SkillsDirectory.deactivate_runtime(activated)
+    refute Process.alive?(cache)
+    assert Process.whereis(SkillsDirectory.ReloadCache) == nil
+  end
+
+  test "reload cache belongs to the activated server runtime and stops with it" do
+    root = create_skills_root("skills-runtime-cache")
+    skill_dir = Path.join(root, "runtime-skill")
+    File.mkdir_p!(skill_dir)
+    File.write!(Path.join(skill_dir, "SKILL.md"), "# Runtime Skill")
+
+    server_name = unique_server_name("skills-runtime-cache")
+
+    server =
+      FastestMCP.server(server_name)
+      |> FastestMCP.add_provider(SkillsDirectory.new(roots: root, reload: true))
+
+    assert {:ok, _pid} = FastestMCP.start_server(server)
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+
+    assert {:ok, runtime} = ServerRuntime.fetch(server_name)
+
+    cache =
+      Enum.find_value(runtime.server.providers, fn
+        %Provider{inner: %SkillsDirectory{cache: cache}} when is_pid(cache) -> cache
+        _provider -> nil
+      end)
+
+    assert is_pid(cache)
+    assert Process.alive?(cache)
+    assert Process.whereis(SkillsDirectory.ReloadCache) == nil
+
+    assert :ok = FastestMCP.stop_server(server_name)
+    refute Process.alive?(cache)
+  end
+
+  test "skill directory roots do not discover symlinked skills outside the root" do
+    root = create_skills_root("skills-contained")
+    outside_root = create_skills_root("skills-outside")
+    outside_skill = Path.join(outside_root, "outside-skill")
+    File.mkdir_p!(outside_skill)
+    File.write!(Path.join(outside_skill, "SKILL.md"), "# Outside")
+    File.ln_s!(outside_skill, Path.join(root, "linked-skill"))
+
+    provider = SkillsDirectory.new(roots: root)
+    assert provider.providers == []
   end
 
   test "supporting files can be listed as resources and Skills alias delegates to directory provider" do

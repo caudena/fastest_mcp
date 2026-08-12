@@ -19,6 +19,12 @@ defmodule FastestMCP.ProviderParityTest do
     end
 
     def get_component(%__MODULE__{}, _component_type, _identifier, _operation), do: nil
+
+    def get_component_candidates(provider, component_type, identifier, operation) do
+      provider
+      |> get_component(component_type, identifier, operation)
+      |> List.wrap()
+    end
   end
 
   test "dynamic providers compose with local components and use get_component for lookups" do
@@ -93,5 +99,6 @@ defmodule FastestMCP.ProviderParityTest do
              FastestMCP.call_tool(parent_name, "child_dynamic_echo", %{"value" => "hello"})
 
     assert_receive :get_tool_called, 1_000
+    refute_receive :list_tools_called, 50
   end
 end

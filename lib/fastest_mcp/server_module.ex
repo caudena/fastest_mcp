@@ -94,10 +94,9 @@ defmodule FastestMCP.ServerModule do
     ensure_server_module!(module)
     resolved = resolve_config(module, opts)
 
-    %{
-      id: Keyword.get(resolved, :id, module),
-      start: {FastestMCP.ServerInstance, :start_link, [{module, opts}]}
-    }
+    {module, opts}
+    |> FastestMCP.ServerInstance.child_spec()
+    |> Supervisor.child_spec(id: Keyword.get(resolved, :id, module))
   end
 
   @doc "Resolves server-module defaults and runtime overrides."

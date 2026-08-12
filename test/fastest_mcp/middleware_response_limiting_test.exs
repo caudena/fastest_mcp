@@ -1,12 +1,11 @@
 defmodule FastestMCP.MiddlewareResponseLimitingTest do
   use ExUnit.Case, async: false
 
-  import Plug.Conn
-  import Plug.Test
-
   alias FastestMCP.Middleware
   alias FastestMCP.Middleware.ResponseLimiting
   alias FastestMCP.Operation
+  alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
+  alias FastestMCP.Transport.Serializer
 
   test "responses under the limit pass through unchanged" do
     middleware = Middleware.response_limiting(max_size: 1_000_000)
@@ -16,6 +15,20 @@ defmodule FastestMCP.MiddlewareResponseLimitingTest do
              ResponseLimiting.call(middleware, operation, fn _operation ->
                %{"message" => "hello"}
              end)
+  end
+
+  test "the limit measures the canonical tool-result envelope rather than the raw value" do
+    middleware = Middleware.response_limiting(max_size: 70, truncation_suffix: "")
+    operation = %Operation{method: "tools/call", target: "scalar_tool"}
+
+    result =
+      ResponseLimiting.call(middleware, operation, fn _operation ->
+        String.duplicate("x", 50)
+      end)
+
+    assert %{"content" => [%{"type" => "text", "text" => text}]} = result
+    assert byte_size(text) < 50
+    assert result |> Serializer.tool_result() |> JSON.encode!() |> byte_size() <= 70
   end
 
   test "oversized tool responses are truncated to a text content block" do
@@ -176,6 +189,12 @@ defmodule FastestMCP.MiddlewareResponseLimitingTest do
     end
   end
 
+  test "a limit too small to encode any valid result is rejected" do
+    assert_raise ArgumentError, ~r/max_size must be at least .* valid tool result/, fn ->
+      Middleware.response_limiting(max_size: 1)
+    end
+  end
+
   test "http transport returns truncated tool results coherently" do
     middleware = Middleware.response_limiting(max_size: 250)
     server_name = "response-limit-http-" <> Integer.to_string(System.unique_integer([:positive]))
@@ -188,18 +207,120 @@ defmodule FastestMCP.MiddlewareResponseLimitingTest do
       end)
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
+    ProtocolTest.initialize_session(server_name, "response-limit-session")
 
     conn =
-      conn(
-        :post,
-        "/mcp/tools/call",
-        JSON.encode!(%{"name" => "large", "arguments" => %{}})
+      ProtocolTest.http_request(
+        server_name,
+        "response-limit-session",
+        1,
+        "tools/call",
+        %{"name" => "large", "arguments" => %{}}
       )
-      |> put_req_header("content-type", "application/json")
-      |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
 
     assert conn.status == 200
-    assert %{"content" => [%{"text" => text}]} = JSON.decode!(conn.resp_body)
+    assert %{"result" => %{"content" => [%{"text" => text}]}} = JSON.decode!(conn.resp_body)
     assert text =~ "[Response truncated"
+  end
+
+  test "structured output schemas are included in the response-size decision" do
+    middleware = Middleware.response_limiting(max_size: 200)
+    server_name = "response-limit-schema-#{System.unique_integer([:positive])}"
+
+    server =
+      FastestMCP.server(server_name)
+      |> FastestMCP.add_middleware(middleware)
+      |> FastestMCP.add_tool(
+        "values",
+        fn _arguments, _context -> %{"values" => Enum.to_list(1..30)} end,
+        output_schema: %{
+          "type" => "object",
+          "properties" => %{
+            "values" => %{"type" => "array", "items" => %{"type" => "integer"}}
+          },
+          "required" => ["values"]
+        }
+      )
+
+    assert {:ok, _pid} = FastestMCP.start_server(server)
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    ProtocolTest.initialize_session(server_name, "response-limit-schema-session")
+
+    conn =
+      ProtocolTest.http_request(
+        server_name,
+        "response-limit-schema-session",
+        1,
+        "tools/call",
+        %{"name" => "values", "arguments" => %{}}
+      )
+
+    assert conn.status == 200
+    %{"result" => result} = JSON.decode!(conn.resp_body)
+
+    assert %{
+             "content" => [%{"type" => "text", "text" => text}],
+             "structuredContent" => %{"values" => values}
+           } = result
+
+    assert values == Enum.to_list(1..30)
+    assert text =~ "[Response truncated"
+    assert byte_size(JSON.encode!(result)) <= 200
+  end
+
+  test "a structured result that cannot fit returns a bounded error instead of invalid output" do
+    middleware = Middleware.response_limiting(max_size: 200)
+    server_name = "response-limit-unrepresentable-#{System.unique_integer([:positive])}"
+
+    server =
+      FastestMCP.server(server_name)
+      |> FastestMCP.add_middleware(middleware)
+      |> FastestMCP.add_tool(
+        "values",
+        fn _arguments, _context -> %{"values" => Enum.to_list(1..200)} end,
+        output_schema: %{
+          "type" => "object",
+          "properties" => %{
+            "values" => %{"type" => "array", "items" => %{"type" => "integer"}}
+          },
+          "required" => ["values"]
+        }
+      )
+
+    assert {:ok, _pid} = FastestMCP.start_server(server)
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    ProtocolTest.initialize_session(server_name, "response-limit-unrepresentable-session")
+
+    conn =
+      ProtocolTest.http_request(
+        server_name,
+        "response-limit-unrepresentable-session",
+        1,
+        "tools/call",
+        %{"name" => "values", "arguments" => %{}}
+      )
+
+    assert conn.status == 200
+
+    assert %{
+             "error" => %{
+               "code" => -32_603,
+               "message" => "tool response exceeds the configured size limit",
+               "data" => %{
+                 "fastestmcp" => %{
+                   "code" => "internal_error",
+                   "details" => %{
+                     "actual_bytes" => actual_bytes,
+                     "maximum_bytes" => 200,
+                     "minimum_valid_result_bytes" => minimum_bytes
+                   }
+                 }
+               }
+             }
+           } = JSON.decode!(conn.resp_body)
+
+    assert actual_bytes > minimum_bytes
+    assert minimum_bytes > 200
+    assert byte_size(conn.resp_body) < 512
   end
 end

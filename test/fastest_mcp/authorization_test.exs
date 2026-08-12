@@ -67,6 +67,12 @@ defmodule FastestMCP.AuthorizationTest do
     end
 
     refute Authorization.run_checks(fn _ctx -> raise "boom" end, context)
+    refute Authorization.run_checks(fn _ctx -> throw(:boom) end, context)
+    refute Authorization.run_checks(fn _ctx -> exit(:boom) end, context)
+
+    for malformed <- [false, nil, :unexpected, {:error, :not_binary}, %{}] do
+      refute Authorization.run_checks(fn _ctx -> malformed end, context)
+    end
   end
 
   test "component authorization filters list results and rejects direct calls" do

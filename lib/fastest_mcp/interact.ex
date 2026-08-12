@@ -26,11 +26,26 @@ defmodule FastestMCP.Interact do
     Context.sample(context, prompt_or_messages, opts)
   end
 
+  @doc "Requests an identity-bound URL interaction from the connected client."
+  def url(context, message, url_or_builder, opts \\ []) do
+    case Context.elicit_url(context, message, url_or_builder, opts) do
+      %Accepted{data: data} -> {:ok, data}
+      %Declined{} -> :declined
+      %Cancelled{} -> :cancelled
+      %FastestMCP.PeerTask{} = task -> task
+    end
+  end
+
   @doc "Extracts or requests plain text for this interaction."
   def text(context, message, opts \\ []) do
     field = Keyword.get(opts, :field, :value)
 
-    case form(context, message, [{field, :string}], Keyword.drop(opts, [:field])) do
+    case form(
+           context,
+           message,
+           [{field, scalar_field_spec(:string, opts)}],
+           scalar_form_opts(opts)
+         ) do
       {:ok, data} -> {:ok, fetch_field!(data, field)}
       other -> other
     end
@@ -43,8 +58,8 @@ defmodule FastestMCP.Interact do
     case form(
            context,
            message,
-           [{field, [type: :boolean, required: true]}],
-           Keyword.drop(opts, [:field])
+           [{field, scalar_field_spec(:boolean, opts)}],
+           scalar_form_opts(opts)
          ) do
       {:ok, data} -> {:ok, fetch_boolean_field!(data, field)}
       other -> other
@@ -65,6 +80,7 @@ defmodule FastestMCP.Interact do
          [
            type: :string,
            required: true,
+           schema: scalar_response_metadata(opts),
            one_of:
              Enum.map(normalized, fn {id, label, _value} ->
                %{"const" => id, "title" => label}
@@ -72,7 +88,7 @@ defmodule FastestMCP.Interact do
          ]}
       ]
 
-    case form(context, message, schema, Keyword.drop(opts, [:field])) do
+    case form(context, message, schema, scalar_form_opts(opts)) do
       {:ok, data} ->
         choice_id = fetch_field!(data, field)
         {:ok, lookup_choice!(normalized, choice_id)}
@@ -96,6 +112,24 @@ defmodule FastestMCP.Interact do
   defp elicitation_opts(opts) do
     opts
     |> Keyword.take([:timeout_ms, :response_title, :response_description])
+  end
+
+  defp scalar_field_spec(type, opts) do
+    [
+      type: type,
+      required: true,
+      schema: scalar_response_metadata(opts)
+    ]
+  end
+
+  defp scalar_response_metadata(opts) do
+    %{}
+    |> maybe_put("title", Keyword.get(opts, :response_title))
+    |> maybe_put("description", Keyword.get(opts, :response_description))
+  end
+
+  defp scalar_form_opts(opts) do
+    Keyword.drop(opts, [:field, :response_title, :response_description])
   end
 
   defp normalize_schema(%{} = schema) do

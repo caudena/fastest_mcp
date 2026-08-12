@@ -14,11 +14,13 @@ defmodule FastestMCP.Transport.Adapter do
   alias FastestMCP.Error
   alias FastestMCP.Transport.Request
 
-  @type batch_item :: {:request, Request.t()} | {:error, term(), Error.t()}
+  @type immediate_response ::
+          {:response, pos_integer(), map()}
+          | {:response, pos_integer(), map(), [{binary(), binary()}]}
 
   @callback decode(any()) ::
-              {:ok, Request.t() | {:batch, [batch_item()]}}
-              | {:response, pos_integer(), map()}
+              {:ok, Request.t()}
+              | immediate_response()
               | {:error, Error.t()}
 
   @callback encode_success(Request.t(), map()) :: any()

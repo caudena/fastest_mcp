@@ -23,7 +23,8 @@ defmodule FastestMCP.Middleware.SlidingWindowRateLimiting do
     :middleware,
     :state,
     max_requests: nil,
-    window_seconds: 60
+    window_seconds: 60,
+    max_clients: 10_000
   ]
 
   @type t :: %__MODULE__{
@@ -33,18 +34,20 @@ defmodule FastestMCP.Middleware.SlidingWindowRateLimiting do
           middleware: (Operation.t(), (Operation.t() -> any()) -> any()),
           state: pid() | nil,
           max_requests: pos_integer(),
-          window_seconds: pos_integer()
+          window_seconds: pos_integer(),
+          max_clients: pos_integer()
         }
 
   @doc "Builds a new value for this module from the supplied options."
   def new(opts) do
     max_requests = Keyword.fetch!(opts, :max_requests)
     window_minutes = Keyword.get(opts, :window_minutes, 1)
+    max_clients = Keyword.get(opts, :max_clients, 10_000)
 
     if not (is_integer(max_requests) and max_requests > 0 and is_integer(window_minutes) and
-              window_minutes > 0) do
+              window_minutes > 0 and is_integer(max_clients) and max_clients > 0) do
       raise ArgumentError,
-            "max_requests and window_minutes must be positive integers, got: #{inspect(max_requests)} / #{inspect(window_minutes)}"
+            "max_requests, window_minutes, and max_clients must be positive integers, got: #{inspect(max_requests)} / #{inspect(window_minutes)} / #{inspect(max_clients)}"
     end
 
     window_seconds = window_minutes * 60
@@ -55,7 +58,8 @@ defmodule FastestMCP.Middleware.SlidingWindowRateLimiting do
       runtime_id: nil,
       state: nil,
       max_requests: max_requests,
-      window_seconds: window_seconds
+      window_seconds: window_seconds,
+      max_clients: max_clients
     }
 
     bind_middleware(middleware)
@@ -70,6 +74,12 @@ defmodule FastestMCP.Middleware.SlidingWindowRateLimiting do
     case __MODULE__.State.allow(middleware.state, client_id) do
       :ok ->
         next.(operation)
+
+      {:error, :overloaded} ->
+        raise Error,
+          code: :overloaded,
+          message: "sliding-window rate limiter client capacity exceeded",
+          details: %{max_clients: middleware.max_clients}
 
       {:error, retry_after_seconds} ->
         raise Error,
@@ -92,7 +102,8 @@ defmodule FastestMCP.Middleware.SlidingWindowRateLimiting do
     {:ok, state} =
       __MODULE__.State.start_link(
         max_requests: middleware.max_requests,
-        window_seconds: middleware.window_seconds
+        window_seconds: middleware.window_seconds,
+        max_clients: middleware.max_clients
       )
 
     runtime =
@@ -195,6 +206,7 @@ defmodule FastestMCP.Middleware.SlidingWindowRateLimiting do
        %{
          max_requests: Keyword.fetch!(opts, :max_requests),
          window_seconds: Keyword.fetch!(opts, :window_seconds),
+         max_clients: Keyword.get(opts, :max_clients, 10_000),
          windows: %{}
        }}
     end
@@ -202,21 +214,71 @@ defmodule FastestMCP.Middleware.SlidingWindowRateLimiting do
     @impl true
     @doc "Processes allowance checks for the sliding-window limiter process."
     def handle_call({:allow, client_id}, _from, state) do
-      now = System.monotonic_time(:second)
-      cutoff = now - state.window_seconds
+      now = System.monotonic_time(:microsecond)
+      cutoff = now - state.window_seconds * 1_000_000
+      {window, state} = fetch_window(state, client_id, cutoff)
 
-      requests =
-        state.windows
-        |> Map.get(client_id, [])
-        |> Enum.filter(&(&1 > cutoff))
+      case window do
+        :overloaded ->
+          {:reply, {:error, :overloaded}, state}
 
-      if length(requests) < state.max_requests do
-        {:reply, :ok, put_in(state.windows[client_id], requests ++ [now])}
-      else
-        oldest = hd(requests)
-        retry_after = max(oldest + state.window_seconds - now, 1)
-        {:reply, {:error, retry_after}, put_in(state.windows[client_id], requests)}
+        %{count: count} = window when count < state.max_requests ->
+          updated = %{window | requests: :queue.in(now, window.requests), count: count + 1}
+          {:reply, :ok, put_in(state.windows[client_id], updated)}
+
+        window ->
+          {{:value, oldest}, _requests} = :queue.out(window.requests)
+          retry_after = retry_after_seconds(oldest, state.window_seconds, now)
+          {:reply, {:error, retry_after}, put_in(state.windows[client_id], window)}
       end
+    end
+
+    defp fetch_window(state, client_id, cutoff) do
+      case Map.fetch(state.windows, client_id) do
+        {:ok, window} ->
+          {drop_expired(window, cutoff), state}
+
+        :error ->
+          windows = make_room(state, cutoff)
+          state = %{state | windows: windows}
+
+          if map_size(windows) < state.max_clients do
+            {new_window(), state}
+          else
+            {:overloaded, state}
+          end
+      end
+    end
+
+    defp make_room(%{windows: windows, max_clients: max_clients}, _cutoff)
+         when map_size(windows) < max_clients,
+         do: windows
+
+    defp make_room(state, cutoff) do
+      Enum.reduce(state.windows, %{}, fn {client_id, window}, active ->
+        case drop_expired(window, cutoff) do
+          %{count: 0} -> active
+          current -> Map.put(active, client_id, current)
+        end
+      end)
+    end
+
+    defp new_window, do: %{requests: :queue.new(), count: 0}
+
+    defp drop_expired(%{requests: requests, count: count} = window, cutoff) do
+      case :queue.peek(requests) do
+        {:value, timestamp} when timestamp <= cutoff ->
+          {{:value, _timestamp}, requests} = :queue.out(requests)
+          drop_expired(%{window | requests: requests, count: count - 1}, cutoff)
+
+        _other ->
+          window
+      end
+    end
+
+    defp retry_after_seconds(oldest, window_seconds, now) do
+      remaining_microseconds = oldest + window_seconds * 1_000_000 - now
+      max(div(remaining_microseconds + 999_999, 1_000_000), 1)
     end
   end
 end

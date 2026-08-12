@@ -1,14 +1,12 @@
 defmodule FastestMCP.MiddlewareRateLimitingTest do
   use ExUnit.Case, async: false
 
-  import Plug.Conn
-  import Plug.Test
-
   alias FastestMCP.Error
   alias FastestMCP.Middleware
   alias FastestMCP.Middleware.RateLimiting
   alias FastestMCP.Middleware.SlidingWindowRateLimiting
   alias FastestMCP.Operation
+  alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
 
   test "token bucket limiter allows bursts then rate limits" do
     middleware = Middleware.rate_limiting(max_requests_per_second: 1.0, burst_capacity: 1)
@@ -69,6 +67,34 @@ defmodule FastestMCP.MiddlewareRateLimitingTest do
     assert :ok == RateLimiting.call(middleware, operation_b, fn _operation -> :ok end)
   end
 
+  test "token bucket limiter bounds active clients and reuses semantically expired slots" do
+    middleware =
+      Middleware.rate_limiting(
+        max_requests_per_second: 1_000.0,
+        burst_capacity: 1,
+        max_clients: 1,
+        get_client_id: fn operation -> operation.context.session_id end
+      )
+
+    on_exit(fn -> RateLimiting.close(middleware) end)
+
+    operation_a = %Operation{method: "tools/call", context: %{session_id: "a"}}
+    operation_b = %Operation{method: "tools/call", context: %{session_id: "b"}}
+
+    assert :ok == RateLimiting.call(middleware, operation_a, fn _operation -> :ok end)
+
+    error =
+      assert_raise Error, fn ->
+        RateLimiting.call(middleware, operation_b, fn _operation -> :ok end)
+      end
+
+    assert error.code == :overloaded
+    assert error.details == %{max_clients: 1}
+
+    Process.sleep(5)
+    assert :ok == RateLimiting.call(middleware, operation_b, fn _operation -> :ok end)
+  end
+
   test "sliding window limiter rejects requests over the configured limit" do
     middleware =
       Middleware.sliding_window_rate_limiting(max_requests: 1, window_minutes: 1)
@@ -88,6 +114,34 @@ defmodule FastestMCP.MiddlewareRateLimitingTest do
     assert error.details.retry_after_seconds >= 1
   end
 
+  test "sliding window state uses queues and rejects new clients at capacity" do
+    {:ok, state} =
+      SlidingWindowRateLimiting.State.start_link(
+        max_requests: 2,
+        window_seconds: 60,
+        max_clients: 1
+      )
+
+    assert :ok == SlidingWindowRateLimiting.State.allow(state, "a")
+    assert {:error, :overloaded} == SlidingWindowRateLimiting.State.allow(state, "b")
+
+    assert %{windows: %{"a" => %{requests: requests, count: 1}}} = :sys.get_state(state)
+    assert :queue.is_queue(requests)
+  end
+
+  test "sliding window removes clients once their windows are semantically empty" do
+    {:ok, state} =
+      SlidingWindowRateLimiting.State.start_link(
+        max_requests: 1,
+        window_seconds: 0,
+        max_clients: 1
+      )
+
+    assert :ok == SlidingWindowRateLimiting.State.allow(state, "a")
+    assert :ok == SlidingWindowRateLimiting.State.allow(state, "b")
+    assert %{windows: %{"b" => %{count: 1}}} = :sys.get_state(state)
+  end
+
   test "token bucket close is safe after the state process already exits" do
     middleware =
       Middleware.rate_limiting(max_requests_per_second: 1.0, burst_capacity: 1)
@@ -101,11 +155,31 @@ defmodule FastestMCP.MiddlewareRateLimitingTest do
     assert :ok == RateLimiting.close(middleware)
   end
 
-  test "http transport renders rate-limited errors as 429 with retry-after" do
+  test "close unlinks a directly activated limiter from its calling process" do
+    parent = self()
+
+    {owner, monitor_ref} =
+      spawn_monitor(fn ->
+        middleware =
+          Middleware.rate_limiting()
+          |> RateLimiting.activate_runtime()
+
+        send(parent, {:limiter_runtime, RateLimiting.state_pid(middleware)})
+        send(parent, {:limiter_close, RateLimiting.close(middleware)})
+      end)
+
+    assert_receive {:limiter_runtime, runtime_pid}
+    assert_receive {:limiter_close, :ok}
+    assert_receive {:DOWN, ^monitor_ref, :process, ^owner, :normal}
+    refute Process.alive?(runtime_pid)
+  end
+
+  test "http transport renders rate-limited JSON-RPC errors on HTTP 200" do
     middleware = Middleware.rate_limiting(max_requests_per_second: 1.0, burst_capacity: 1)
     on_exit(fn -> RateLimiting.close(middleware) end)
 
     server_name = "rate-http-" <> Integer.to_string(System.unique_integer([:positive]))
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
     server =
       FastestMCP.server(server_name)
@@ -113,31 +187,45 @@ defmodule FastestMCP.MiddlewareRateLimitingTest do
       |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
+    ProtocolTest.initialize_session(server_name, "rate-http-session")
 
     first =
-      conn(
-        :post,
-        "/mcp/tools/call",
-        JSON.encode!(%{"name" => "echo", "arguments" => %{"message" => "first"}})
+      ProtocolTest.http_request(
+        server_name,
+        "rate-http-session",
+        1,
+        "tools/call",
+        %{"name" => "echo", "arguments" => %{"message" => "first"}}
       )
-      |> put_req_header("content-type", "application/json")
-      |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
 
     assert first.status == 200
 
     second =
-      conn(
-        :post,
-        "/mcp/tools/call",
-        JSON.encode!(%{"name" => "echo", "arguments" => %{"message" => "second"}})
+      ProtocolTest.http_request(
+        server_name,
+        "rate-http-session",
+        2,
+        "tools/call",
+        %{"name" => "echo", "arguments" => %{"message" => "second"}}
       )
-      |> put_req_header("content-type", "application/json")
-      |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
 
-    assert second.status == 429
-    assert get_resp_header(second, "retry-after") != []
+    assert second.status == 200
+    assert Plug.Conn.get_resp_header(second, "retry-after") == []
 
-    assert %{"error" => %{"code" => "rate_limited"}} = JSON.decode!(second.resp_body)
+    assert %{
+             "jsonrpc" => "2.0",
+             "id" => 2,
+             "error" => %{
+               "data" => %{
+                 "fastestmcp" => %{
+                   "code" => "rate_limited",
+                   "details" => %{"retry_after_seconds" => retry_after_seconds}
+                 }
+               }
+             }
+           } = JSON.decode!(second.resp_body)
+
+    assert retry_after_seconds >= 1
   end
 
   test "reusing one limiter config across servers keeps runtime state isolated" do

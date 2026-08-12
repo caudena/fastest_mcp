@@ -4,7 +4,10 @@ defmodule FastestMCP.TestSupport.DocsFixture do
   def bandit_child_spec(server_name) do
     {Bandit,
      plug:
-       {FastestMCP.Transport.HTTPApp, server_name: server_name, path: "/mcp", allowed_hosts: :any},
+       {FastestMCP.Transport.HTTPApp,
+        server_name: server_name,
+        path: "/mcp",
+        allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
      scheme: :http,
      port: 0}
   end

@@ -1,8 +1,7 @@
 defmodule FastestMCP.VerticalSliceTest do
   use ExUnit.Case, async: false
 
-  import Plug.Conn
-  import Plug.Test
+  alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
 
   test "tool, resource, template, prompt, middleware, stdio, and HTTP flow through one runtime" do
     server_name = "vertical-" <> Integer.to_string(System.unique_integer([:positive]))
@@ -27,6 +26,7 @@ defmodule FastestMCP.VerticalSliceTest do
       |> FastestMCP.add_prompt("greet", fn %{"name" => name}, _ctx -> "Hello, #{name}!" end)
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
     assert [%{name: "echo"}] = FastestMCP.list_tools(server_name)
     assert [%{uri: "config://app"}] = FastestMCP.list_resources(server_name)
@@ -42,28 +42,43 @@ defmodule FastestMCP.VerticalSliceTest do
     assert %{messages: [%{role: "user", content: "Hello, Nate!"}]} ==
              FastestMCP.render_prompt(server_name, "greet", %{"name" => "Nate"})
 
-    stdio_response =
-      FastestMCP.stdio_dispatch(server_name, %{
-        "method" => "tools/call",
-        "params" => %{"name" => "echo", "arguments" => %{"message" => "stdio"}}
-      })
+    {connection_id, _initialize_response} = ProtocolTest.initialize_stdio(server_name)
 
-    assert stdio_response["ok"] == true
+    stdio_response =
+      ProtocolTest.stdio_request(
+        server_name,
+        connection_id,
+        2,
+        "tools/call",
+        %{"name" => "echo", "arguments" => %{"message" => "stdio"}}
+      )
+
+    assert stdio_response["jsonrpc"] == "2.0"
     assert stdio_response["result"]["structuredContent"]["middleware"] == true
 
+    {session_id, _initialize_response, initialized_response} =
+      ProtocolTest.initialize_http(server_name)
+
+    assert initialized_response.status == 202
+
     conn =
-      conn(
-        :post,
-        "/mcp/tools/call",
-        JSON.encode!(%{"name" => "echo", "arguments" => %{"message" => "http"}})
+      ProtocolTest.http_request(
+        server_name,
+        session_id,
+        3,
+        "tools/call",
+        %{"name" => "echo", "arguments" => %{"message" => "http"}}
       )
-      |> put_req_header("content-type", "application/json")
-      |> put_req_header("x-fastestmcp-session", "http-session")
-      |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
 
     assert conn.status == 200
 
-    assert %{"structuredContent" => %{"middleware" => true, "message" => "http"}} =
+    assert %{
+             "jsonrpc" => "2.0",
+             "id" => 3,
+             "result" => %{
+               "structuredContent" => %{"middleware" => true, "message" => "http"}
+             }
+           } =
              JSON.decode!(conn.resp_body)
   end
 end

@@ -5,6 +5,7 @@ defmodule FastestMCP.AuthContractTest do
   import Plug.Test
 
   alias FastestMCP.Error
+  alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
 
   defmodule StaticProvider do
     @behaviour FastestMCP.Auth
@@ -153,27 +154,43 @@ defmodule FastestMCP.AuthContractTest do
                auth_input: %{"authorization" => "Bearer valid-token"}
              )
 
-    stdio_response =
-      FastestMCP.stdio_dispatch(server_name, %{
-        "method" => "tools/call",
-        "params" => %{
-          "name" => "whoami",
-          "auth_input" => %{"token" => "valid-token"}
-        }
-      })
+    auth_input = %{"authorization" => "Bearer valid-token"}
 
-    assert stdio_response["ok"] == true
+    {connection_id, _initialize_response} =
+      ProtocolTest.initialize_stdio(server_name, auth_input: auth_input)
+
+    stdio_response =
+      ProtocolTest.stdio_request(
+        server_name,
+        connection_id,
+        2,
+        "tools/call",
+        %{"name" => "whoami"},
+        auth_input: auth_input
+      )
+
+    assert stdio_response["jsonrpc"] == "2.0"
     assert stdio_response["result"]["structuredContent"]["principal"] == %{"sub" => "service-a"}
 
+    ProtocolTest.initialize_session(server_name, "static-token-http-session")
+
     conn =
-      conn(:post, "/mcp/tools/call", JSON.encode!(%{"name" => "whoami"}))
-      |> put_req_header("content-type", "application/json")
-      |> put_req_header("authorization", "Bearer valid-token")
-      |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
+      ProtocolTest.http_request(
+        server_name,
+        "static-token-http-session",
+        3,
+        "tools/call",
+        %{"name" => "whoami"},
+        headers: [{"authorization", "Bearer valid-token"}]
+      )
 
     assert conn.status == 200
 
-    assert %{"structuredContent" => %{"principal" => %{"sub" => "service-a"}}} =
+    assert %{
+             "jsonrpc" => "2.0",
+             "id" => 3,
+             "result" => %{"structuredContent" => %{"principal" => %{"sub" => "service-a"}}}
+           } =
              JSON.decode!(conn.resp_body)
   end
 
@@ -189,29 +206,46 @@ defmodule FastestMCP.AuthContractTest do
       |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
+    ProtocolTest.initialize_session(server_name, "auth-error-session")
 
     unauthorized_conn =
-      conn(:post, "/mcp/tools/call", JSON.encode!(%{"name" => "echo"}))
-      |> put_req_header("content-type", "application/json")
-      |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
+      ProtocolTest.http_request(
+        server_name,
+        "auth-error-session",
+        1,
+        "tools/call",
+        %{"name" => "echo"}
+      )
 
     assert unauthorized_conn.status == 401
     assert [challenge] = get_resp_header(unauthorized_conn, "www-authenticate")
     assert String.starts_with?(challenge, "Bearer ")
 
-    assert %{"error" => %{"code" => "unauthorized"}} =
+    assert %{
+             "jsonrpc" => "2.0",
+             "id" => 1,
+             "error" => %{"data" => %{"fastestmcp" => %{"code" => "unauthorized"}}}
+           } =
              JSON.decode!(unauthorized_conn.resp_body)
 
     forbidden_conn =
-      conn(:post, "/mcp/tools/call", JSON.encode!(%{"name" => "echo"}))
-      |> put_req_header("content-type", "application/json")
-      |> put_req_header("authorization", "Bearer valid-token")
-      |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
+      ProtocolTest.http_request(
+        server_name,
+        "auth-error-session",
+        2,
+        "tools/call",
+        %{"name" => "echo"},
+        headers: [{"authorization", "Bearer valid-token"}]
+      )
 
     assert forbidden_conn.status == 403
     assert get_resp_header(forbidden_conn, "www-authenticate") == []
 
-    assert %{"error" => %{"code" => "forbidden"}} =
+    assert %{
+             "jsonrpc" => "2.0",
+             "id" => 2,
+             "error" => %{"data" => %{"fastestmcp" => %{"code" => "forbidden"}}}
+           } =
              JSON.decode!(forbidden_conn.resp_body)
   end
 
@@ -280,34 +314,57 @@ defmodule FastestMCP.AuthContractTest do
       end)
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
+    ProtocolTest.initialize_session(server_name, "auth-assign-session")
 
     conn =
-      conn(:post, "/mcp/tools/call", JSON.encode!(%{"name" => "whoami"}))
+      conn(
+        :post,
+        "/mcp",
+        JSON.encode!(ProtocolTest.jsonrpc_request(1, "tools/call", %{"name" => "whoami"}))
+      )
       |> put_req_header("content-type", "application/json")
+      |> put_req_header("accept", "application/json, text/event-stream")
+      |> put_req_header("mcp-session-id", "auth-assign-session")
+      |> put_req_header("mcp-protocol-version", ProtocolTest.protocol_version())
       |> assign(:current_user, %{id: 456, scopes: ["tools:call"]})
       |> assign(:admin_secret, "not copied")
       |> FastestMCP.Transport.StreamableHTTP.call(
         server_name: server_name,
-        auth_assigns: [:current_user]
+        auth_assigns: [:current_user],
+        allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"],
+        json_response: true
       )
 
     assert conn.status == 200
 
     assert %{
-             "structuredContent" => %{
-               "principal" => %{"sub" => "456"},
-               "auth" => %{"seen_assigns" => ["current_user"]},
-               "capabilities" => ["tools:call"],
-               "metadata_has_assigns" => false
+             "jsonrpc" => "2.0",
+             "id" => 1,
+             "result" => %{
+               "structuredContent" => %{
+                 "principal" => %{"sub" => "456"},
+                 "auth" => %{"seen_assigns" => ["current_user"]},
+                 "capabilities" => ["tools:call"],
+                 "metadata_has_assigns" => false
+               }
              }
            } = JSON.decode!(conn.resp_body)
 
     missing_conn =
-      conn(:post, "/mcp/tools/call", JSON.encode!(%{"name" => "whoami"}))
+      conn(
+        :post,
+        "/mcp",
+        JSON.encode!(ProtocolTest.jsonrpc_request(2, "tools/call", %{"name" => "whoami"}))
+      )
       |> put_req_header("content-type", "application/json")
+      |> put_req_header("accept", "application/json, text/event-stream")
+      |> put_req_header("mcp-session-id", "auth-assign-session")
+      |> put_req_header("mcp-protocol-version", ProtocolTest.protocol_version())
       |> FastestMCP.Transport.StreamableHTTP.call(
         server_name: server_name,
-        auth_assigns: [:current_user]
+        auth_assigns: [:current_user],
+        allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"],
+        json_response: true
       )
 
     assert missing_conn.status == 401
@@ -323,28 +380,43 @@ defmodule FastestMCP.AuthContractTest do
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
 
-    stdio_response =
-      FastestMCP.stdio_dispatch(server_name, %{
-        "method" => "tools/call",
-        "params" => %{
-          "name" => "whoami",
-          "auth_input" => %{"token" => "secret-token"}
-        }
-      })
+    auth_input = %{"token" => "secret-token"}
 
-    assert stdio_response["ok"] == true
+    {connection_id, _initialize_response} =
+      ProtocolTest.initialize_stdio(server_name, auth_input: auth_input)
+
+    stdio_response =
+      ProtocolTest.stdio_request(
+        server_name,
+        connection_id,
+        2,
+        "tools/call",
+        %{"name" => "whoami"},
+        auth_input: auth_input
+      )
+
+    assert stdio_response["jsonrpc"] == "2.0"
     assert stdio_response["result"]["structuredContent"] == %{"sub" => "user-123"}
 
+    ProtocolTest.initialize_session(server_name, "auth-http-session")
+
     conn =
-      conn(:post, "/mcp/tools/call", JSON.encode!(%{"name" => "whoami"}))
-      |> put_req_header("content-type", "application/json")
-      |> put_req_header("authorization", "Bearer secret-token")
-      |> put_req_header("x-fastestmcp-session", "auth-http-session")
-      |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
+      ProtocolTest.http_request(
+        server_name,
+        "auth-http-session",
+        3,
+        "tools/call",
+        %{"name" => "whoami"},
+        headers: [{"authorization", "Bearer secret-token"}]
+      )
 
     assert conn.status == 200
 
-    assert %{"structuredContent" => %{"sub" => "user-123"}} =
+    assert %{
+             "jsonrpc" => "2.0",
+             "id" => 3,
+             "result" => %{"structuredContent" => %{"sub" => "user-123"}}
+           } =
              JSON.decode!(conn.resp_body)
   end
 end

@@ -38,6 +38,7 @@ defmodule FastestMCP.TaskNotificationSubscriber do
     session_id = Keyword.fetch!(opts, :session_id) |> to_string()
     event_bus = Keyword.fetch!(opts, :event_bus)
     task_store = Keyword.fetch!(opts, :task_store)
+    task_supervisor = Keyword.fetch!(opts, :task_supervisor)
     owner = Keyword.get(opts, :owner, self())
 
     case EventBus.subscribe(event_bus, server_name) do
@@ -47,6 +48,7 @@ defmodule FastestMCP.TaskNotificationSubscriber do
            server_name: server_name,
            session_id: session_id,
            task_store: task_store,
+           task_supervisor: task_supervisor,
            owner: owner,
            owner_ref: Process.monitor(owner),
            target: Keyword.get(opts, :target, owner),
@@ -113,30 +115,34 @@ defmodule FastestMCP.TaskNotificationSubscriber do
     with task_id when is_binary(task_id) <- map_value(metadata, :task_id),
          request_id when is_binary(request_id) <- elicitation_request_id(metadata),
          false <- MapSet.member?(state.handled_elicitations, request_id) do
-      Task.start(fn ->
-        case resolve_elicitation_result(state.elicitation_handler, metadata) do
-          {:ok, action, content} ->
-            _ =
-              BackgroundTaskStore.send_input(
-                state.task_store,
-                task_id,
-                action,
-                content,
-                session_id: state.session_id,
-                request_id: request_id
-              )
+      case Task.Supervisor.start_child(state.task_supervisor, fn ->
+             case resolve_elicitation_result(state.elicitation_handler, metadata) do
+               {:ok, action, content} ->
+                 _ =
+                   BackgroundTaskStore.send_input(
+                     state.task_store,
+                     task_id,
+                     action,
+                     content,
+                     session_id: state.session_id,
+                     request_id: request_id
+                   )
 
-            :ok
+                 :ok
 
-          :ignore ->
-            :ok
-        end
-      end)
+               :ignore ->
+                 :ok
+             end
+           end) do
+        {:ok, _pid} ->
+          %{
+            state
+            | handled_elicitations: MapSet.put(state.handled_elicitations, request_id)
+          }
 
-      %{
-        state
-        | handled_elicitations: MapSet.put(state.handled_elicitations, request_id)
-      }
+        {:error, _reason} ->
+          state
+      end
     else
       _other -> state
     end

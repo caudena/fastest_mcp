@@ -4,6 +4,7 @@ defmodule FastestMCP.TransportEngineTest do
   import Plug.Conn
   import Plug.Test
 
+  alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
   alias FastestMCP.Transport.Engine
   alias FastestMCP.Transport.Request
   alias FastestMCP.Transport.StdioAdapter
@@ -95,30 +96,24 @@ defmodule FastestMCP.TransportEngineTest do
                }
              })
 
-    assert_raise FastestMCP.Error,
-                 "resource subscriptions are only supported for streamable HTTP clients",
-                 fn ->
-                   Engine.dispatch!(server_name, %Request{
-                     method: "resources/subscribe",
-                     transport: :stdio,
-                     session_id: "transport-session",
-                     payload: %{"uri" => "config://app"}
-                   })
-                 end
+    assert %{} =
+             Engine.dispatch!(server_name, %Request{
+               method: "resources/subscribe",
+               transport: :stdio,
+               session_id: "transport-session",
+               payload: %{"uri" => "config://app"}
+             })
 
-    assert_raise FastestMCP.Error,
-                 "resource subscriptions are only supported for streamable HTTP clients",
-                 fn ->
-                   Engine.dispatch!(server_name, %Request{
-                     method: "resources/unsubscribe",
-                     transport: :stdio,
-                     session_id: "transport-session",
-                     payload: %{"uri" => "config://app"}
-                   })
-                 end
+    assert %{} =
+             Engine.dispatch!(server_name, %Request{
+               method: "resources/unsubscribe",
+               transport: :stdio,
+               session_id: "transport-session",
+               payload: %{"uri" => "config://app"}
+             })
   end
 
-  test "stdio initialize omits async session capabilities" do
+  test "stdio initialize advertises its deliverable session capabilities" do
     server_name =
       "transport-engine-capabilities-" <> Integer.to_string(System.unique_integer([:positive]))
 
@@ -131,18 +126,13 @@ defmodule FastestMCP.TransportEngineTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    result =
-      Engine.dispatch!(server_name, %Request{
-        method: "initialize",
-        transport: :stdio,
-        payload: %{"clientInfo" => %{"name" => "stdio-client"}}
-      })
+    {_connection_id, %{"result" => result}} = ProtocolTest.initialize_stdio(server_name)
 
     assert %{
-             "tools" => %{},
-             "resources" => %{},
-             "prompts" => %{},
-             "logging" => %{}
+             "logging" => %{},
+             "tools" => %{"listChanged" => true},
+             "resources" => %{"listChanged" => true, "subscribe" => true},
+             "prompts" => %{"listChanged" => true}
            } = result["capabilities"]
   end
 
@@ -172,22 +162,28 @@ defmodule FastestMCP.TransportEngineTest do
   end
 
   test "stdio and HTTP adapters normalize transport-native inputs into shared requests" do
+    connection_id = {:stdio_connection, System.unique_integer([:positive])}
+
     assert {:ok,
             %Request{
               method: "tools/call",
               transport: :stdio,
-              session_id: "stdio-session",
+              session_id: "stdio-" <> _session_digest,
+              request_id: 7,
+              protocol: :jsonrpc,
               payload: %{"name" => "echo"},
               auth_input: %{"token" => "secret-token"}
             }} =
-             StdioAdapter.decode(%{
-               "method" => "tools/call",
-               "params" => %{
-                 "name" => "echo",
-                 "session_id" => "stdio-session",
-                 "auth_token" => "secret-token"
-               }
-             })
+             StdioAdapter.decode(
+               %{
+                 "jsonrpc" => "2.0",
+                 "id" => 7,
+                 "method" => "tools/call",
+                 "params" => %{"name" => "echo"}
+               },
+               connection_id: connection_id,
+               auth_input: %{"token" => "secret-token"}
+             )
 
     conn =
       conn(
@@ -201,8 +197,10 @@ defmodule FastestMCP.TransportEngineTest do
         })
       )
       |> put_req_header("content-type", "application/json")
+      |> put_req_header("accept", "application/json, text/event-stream")
       |> put_req_header("authorization", "Bearer secret-token")
       |> put_req_header("mcp-session-id", "http-session")
+      |> put_req_header("mcp-protocol-version", ProtocolTest.protocol_version())
 
     assert {:ok,
             %Request{
@@ -222,23 +220,6 @@ defmodule FastestMCP.TransportEngineTest do
             }} = StreamableHTTPAdapter.decode(conn)
   end
 
-  test "HTTP adapter carries stateless mode into request metadata" do
-    conn =
-      conn(
-        :post,
-        "/mcp",
-        JSON.encode!(%{
-          "jsonrpc" => "2.0",
-          "id" => 2,
-          "method" => "ping"
-        })
-      )
-      |> put_req_header("content-type", "application/json")
-
-    assert {:ok, %Request{request_metadata: %{stateless_http: true}}} =
-             StreamableHTTPAdapter.decode(conn, stateless_http: true)
-  end
-
   test "HTTP adapter ignores query-string session ids for streamable HTTP requests" do
     conn =
       conn(
@@ -252,6 +233,8 @@ defmodule FastestMCP.TransportEngineTest do
         })
       )
       |> put_req_header("content-type", "application/json")
+      |> put_req_header("accept", "application/json, text/event-stream")
+      |> put_req_header("mcp-protocol-version", ProtocolTest.protocol_version())
 
     assert {:ok,
             %Request{
@@ -286,9 +269,11 @@ defmodule FastestMCP.TransportEngineTest do
              })
   end
 
-  test "descriptor lookups do not allocate extra sessions" do
+  test "descriptor lookups reuse the request session" do
     server_name =
       "transport-engine-session-count-" <> Integer.to_string(System.unique_integer([:positive]))
+
+    session_id = "transport-engine-session-count"
 
     server =
       FastestMCP.server(server_name)
@@ -304,6 +289,7 @@ defmodule FastestMCP.TransportEngineTest do
              Engine.dispatch!(server_name, %Request{
                method: "tools/call",
                transport: :stdio,
+               session_id: session_id,
                payload: %{"name" => "echo", "arguments" => %{"message" => "hi"}}
              })
 
@@ -311,11 +297,12 @@ defmodule FastestMCP.TransportEngineTest do
              Engine.dispatch!(server_name, %Request{
                method: "resources/read",
                transport: :stdio,
+               session_id: session_id,
                payload: %{"uri" => "config://app"}
              })
 
     sessions_after = :ets.info(:fastest_mcp_sessions, :size)
 
-    assert sessions_after == sessions_before + 2
+    assert sessions_after == sessions_before + 1
   end
 end

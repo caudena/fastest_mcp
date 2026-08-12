@@ -1,0 +1,8 @@
+{
+  "name": "fastest-mcp-conformance",
+  "private": true,
+  "version": "0.0.0",
+  "dependencies": {
+    "@modelcontextprotocol/conformance": "0.1.16"
+  }
+}

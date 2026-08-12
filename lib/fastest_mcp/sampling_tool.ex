@@ -12,6 +12,8 @@ defmodule FastestMCP.SamplingTool do
 
   alias FastestMCP.Components.Tool
   alias FastestMCP.Context
+  alias FastestMCP.JSONValue
+  alias FastestMCP.Schema
 
   defstruct [:name, :description, :parameters, :runner]
 
@@ -107,9 +109,9 @@ defmodule FastestMCP.SamplingTool do
   def definition(%__MODULE__{} = tool) do
     %{
       "name" => tool.name,
-      "description" => tool.description,
       "inputSchema" => tool.parameters
     }
+    |> maybe_put("description", tool.description)
   end
 
   defp normalize_runner(fun) when is_function(fun) do
@@ -173,11 +175,18 @@ defmodule FastestMCP.SamplingTool do
   defp normalize_schema(nil), do: empty_schema()
 
   defp normalize_schema(%{} = schema) do
+    schema = JSONValue.stringify_keys(schema)
+
+    if not Schema.object_root?(schema) do
+      raise ArgumentError, "sampling tool inputSchema must have an object root"
+    end
+
+    _compiled = Schema.compile!(schema)
     schema
-    |> Map.new()
-    |> Map.put_new("type", "object")
-    |> Map.put_new("properties", %{})
   end
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
   defp normalize_arguments(nil), do: %{}
   defp normalize_arguments(arguments) when is_map(arguments), do: arguments

@@ -136,7 +136,8 @@ defmodule FastestMCP.MountedProviderTaskTest do
         request_metadata: %{session_id_provided: true}
       })
 
-    assert result["structuredContent"] == :done
+    assert result["content"] == [%{"type" => "text", "text" => "\"done\""}]
+    refute Map.has_key?(result, "structuredContent")
     assert result._meta["io.modelcontextprotocol/related-task"].taskId == task_id
   end
 end

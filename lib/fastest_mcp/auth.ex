@@ -22,6 +22,8 @@ defmodule FastestMCP.Auth do
     * `principal`
     * `auth`
     * `capabilities`
+    * `audiences` (verified resource audiences)
+    * `scopes` (verified granted scopes)
 
   That keeps the rest of the execution path independent from whether the source
   was a Phoenix assign, Plug middleware, static token, or application-owned
@@ -30,6 +32,7 @@ defmodule FastestMCP.Auth do
 
   alias FastestMCP.Context
   alias FastestMCP.Error
+  alias FastestMCP.Auth.ProtectedResource
 
   defstruct [:provider, options: %{}]
 
@@ -42,14 +45,32 @@ defmodule FastestMCP.Auth do
   defmodule Result do
     @moduledoc """
     Normalized authentication result attached to the runtime context.
+
+    `audiences` and `scopes` are claims the authenticator has actually
+    validated. Protected HTTP resources reject successful-looking results that
+    do not prove the configured resource and required scopes.
+
+    The older `verified_audiences` and `verified_scopes` names remain accepted
+    as compatibility aliases. New authenticators should use the canonical
+    fields; contradictory canonical and compatibility values are rejected.
     """
 
-    defstruct principal: nil, auth: %{}, capabilities: []
+    defstruct principal: nil,
+              auth: %{},
+              capabilities: [],
+              audiences: [],
+              scopes: [],
+              verified_audiences: nil,
+              verified_scopes: nil
 
     @type t :: %__MODULE__{
             principal: any(),
             auth: map(),
-            capabilities: [any()]
+            capabilities: [any()],
+            audiences: [String.t()],
+            scopes: [String.t()],
+            verified_audiences: [String.t()] | nil,
+            verified_scopes: [String.t()] | nil
           }
   end
 
@@ -135,7 +156,11 @@ defmodule FastestMCP.Auth do
     try do
       case auth.provider.authenticate(auth_input, context, auth.options) do
         {:ok, result} ->
-          {:ok, Context.put_auth_result(context, normalize_result(result))}
+          result = normalize_result(result)
+
+          with :ok <- validate_protected_resource_evidence(result, auth_input) do
+            {:ok, Context.put_auth_result(context, result)}
+          end
 
         {:error, reason} ->
           {:error, normalize_error(reason, auth.provider)}
@@ -157,20 +182,36 @@ defmodule FastestMCP.Auth do
 
   @doc "Extracts the auth result stored on the context."
   def result_from_context(%Context{} = context) do
+    audiences = normalize_verified_values!(context.verified_audiences, :audiences)
+    scopes = normalize_verified_values!(context.verified_scopes, :scopes)
+
     %Result{
       principal: context.principal,
       auth: normalize_map(context.auth),
-      capabilities: normalize_capabilities(context.capabilities)
+      capabilities: normalize_capabilities(context.capabilities),
+      audiences: audiences,
+      scopes: scopes,
+      verified_audiences: audiences,
+      verified_scopes: scopes
     }
   end
 
-  @doc "Builds the WWW-Authenticate header value for an auth error."
-  def www_authenticate(nil, %Error{} = error, _http_context) do
-    default_www_authenticate(error)
+  @doc false
+  def identity_fingerprint(principal, auth) do
+    {principal, normalize_map(auth)}
+    |> :erlang.term_to_binary([:deterministic])
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.url_encode64(padding: false)
+    |> then(&("auth-sha256:" <> &1))
   end
 
-  def www_authenticate(%__MODULE__{}, %Error{} = error, _http_context) do
-    default_www_authenticate(error)
+  @doc "Builds the WWW-Authenticate header value for an auth error."
+  def www_authenticate(nil, %Error{} = error, http_context) do
+    protected_or_default_www_authenticate(error, http_context)
+  end
+
+  def www_authenticate(%__MODULE__{}, %Error{} = error, http_context) do
+    protected_or_default_www_authenticate(error, http_context)
   end
 
   defp validate!(%__MODULE__{provider: provider} = auth) do
@@ -183,18 +224,53 @@ defmodule FastestMCP.Auth do
   end
 
   defp normalize_result(%Result{} = result) do
+    audiences =
+      normalize_evidence_pair(
+        result.audiences,
+        result.verified_audiences,
+        :audiences,
+        :verified_audiences
+      )
+
+    scopes =
+      normalize_evidence_pair(result.scopes, result.verified_scopes, :scopes, :verified_scopes)
+
     %Result{
       principal: result.principal,
       auth: normalize_map(result.auth),
-      capabilities: normalize_capabilities(result.capabilities)
+      capabilities: normalize_capabilities(result.capabilities),
+      audiences: audiences,
+      scopes: scopes,
+      verified_audiences: audiences,
+      verified_scopes: scopes
     }
   end
 
   defp normalize_result(result) when is_map(result) do
+    audiences =
+      normalize_evidence_pair(
+        fetch_field(result, :audiences, []),
+        fetch_field(result, :verified_audiences),
+        :audiences,
+        :verified_audiences
+      )
+
+    scopes =
+      normalize_evidence_pair(
+        fetch_field(result, :scopes, []),
+        fetch_field(result, :verified_scopes),
+        :scopes,
+        :verified_scopes
+      )
+
     %Result{
       principal: fetch_field(result, :principal),
       auth: normalize_map(fetch_field(result, :auth, %{})),
-      capabilities: normalize_capabilities(fetch_field(result, :capabilities, []))
+      capabilities: normalize_capabilities(fetch_field(result, :capabilities, [])),
+      audiences: audiences,
+      scopes: scopes,
+      verified_audiences: audiences,
+      verified_scopes: scopes
     }
   end
 
@@ -233,11 +309,109 @@ defmodule FastestMCP.Auth do
   defp normalize_capabilities(nil), do: []
   defp normalize_capabilities(capability), do: List.wrap(capability)
 
+  defp normalize_verified_values!(nil, _field), do: []
+
+  defp normalize_verified_values!(values, field) when is_list(values) do
+    if Enum.all?(values, &(is_binary(&1) and &1 != "")) do
+      Enum.uniq(values)
+    else
+      raise ArgumentError, "#{field} must be a list of non-empty strings"
+    end
+  end
+
+  defp normalize_verified_values!(value, _field) when is_binary(value) and value != "",
+    do: [value]
+
+  defp normalize_verified_values!(_value, field) do
+    raise ArgumentError, "#{field} must be a list of non-empty strings"
+  end
+
+  defp normalize_evidence_pair(canonical, compatibility, canonical_field, compatibility_field) do
+    canonical = normalize_verified_values!(canonical, canonical_field)
+
+    case compatibility do
+      value when value in [nil, []] ->
+        canonical
+
+      value ->
+        compatibility = normalize_verified_values!(value, compatibility_field)
+
+        cond do
+          canonical == [] -> compatibility
+          canonical == compatibility -> canonical
+          true -> raise ArgumentError, "#{canonical_field} conflicts with #{compatibility_field}"
+        end
+    end
+  end
+
+  defp validate_protected_resource_evidence(%Result{} = result, auth_input) do
+    expected_resource = fetch_field(auth_input, :expected_resource)
+    expected_scopes = fetch_field(auth_input, :expected_scopes, [])
+
+    cond do
+      not is_binary(expected_resource) or expected_resource == "" ->
+        :ok
+
+      expected_resource not in result.audiences ->
+        {:error,
+         %Error{
+           code: :unauthorized,
+           message: "access token audience is not valid for this protected resource"
+         }}
+
+      not valid_expected_scopes?(expected_scopes) ->
+        {:error,
+         %Error{
+           code: :internal_error,
+           message: "protected resource expected scopes are invalid"
+         }}
+
+      true ->
+        missing_scopes = Enum.uniq(expected_scopes) -- result.scopes
+
+        if missing_scopes == [] do
+          :ok
+        else
+          {:error,
+           %Error{
+             code: :forbidden,
+             message: "access token does not grant the required scopes",
+             details: %{missing_scopes: missing_scopes}
+           }}
+        end
+    end
+  end
+
+  defp valid_expected_scopes?(scopes) when is_list(scopes) do
+    Enum.all?(scopes, &(is_binary(&1) and &1 != ""))
+  end
+
+  defp valid_expected_scopes?(_scopes), do: false
+
   defp normalize_map(nil), do: %{}
   defp normalize_map(map) when is_map(map), do: map
 
   defp default_www_authenticate(%Error{} = error) do
     ~s(Bearer error="#{bearer_error_code(error)}", error_description="#{escape_header_value(error.message)}")
+  end
+
+  defp protected_or_default_www_authenticate(%Error{} = error, http_context) do
+    case fetch_field(normalize_map(http_context), :protected_resource) do
+      %ProtectedResource{} = protected_resource ->
+        ProtectedResource.www_authenticate(protected_resource,
+          scopes:
+            fetch_field(
+              http_context,
+              :expected_scopes,
+              protected_resource.required_scopes
+            ),
+          error: error,
+          error_description: error.message
+        )
+
+      _other ->
+        default_www_authenticate(error)
+    end
   end
 
   defp bearer_error_code(%Error{code: :forbidden}), do: "insufficient_scope"

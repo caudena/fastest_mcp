@@ -3,35 +3,36 @@ defmodule FastestMCP.StreamableHTTPSingleEndpointTest do
 
   import Plug.Test
 
-  alias FastestMCP.Protocol
+  alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
+  alias FastestMCP.Transport.StreamableHTTP
 
-  test "streamable HTTP accepts JSON-RPC requests on the MCP base path" do
-    server_name = "http-jsonrpc-" <> Integer.to_string(System.unique_integer([:positive]))
+  setup do
+    server_name = "http-endpoint-#{System.unique_integer([:positive])}"
 
     server =
       FastestMCP.server(server_name)
       |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    %{server_name: server_name}
+  end
 
-    on_exit(fn ->
-      FastestMCP.stop_server(server_name)
-    end)
+  test "POST /mcp accepts one JSON-RPC request after initialization", %{server_name: server_name} do
+    {session_id, initialize_response, initialized_response} =
+      ProtocolTest.initialize_http(server_name)
+
+    assert initialize_response.status == 200
+    assert initialized_response.status == 202
 
     response =
-      conn(
-        :post,
-        "/mcp",
-        JSON.encode!(%{
-          "jsonrpc" => "2.0",
-          "id" => 7,
-          "method" => "tools/call",
-          "params" => %{"name" => "echo", "arguments" => %{"message" => "hi"}}
-        })
+      ProtocolTest.http_request(
+        server_name,
+        session_id,
+        7,
+        "tools/call",
+        %{"name" => "echo", "arguments" => %{"message" => "hi"}}
       )
-      |> Plug.Conn.put_req_header("content-type", "application/json")
-      |> Plug.Conn.put_req_header("mcp-session-id", "jsonrpc-session")
-      |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
 
     assert response.status == 200
 
@@ -45,253 +46,147 @@ defmodule FastestMCP.StreamableHTTPSingleEndpointTest do
            } = JSON.decode!(response.resp_body)
   end
 
-  test "streamable HTTP redirects trailing slash requests to the canonical MCP path" do
-    server_name = "http-redirect-" <> Integer.to_string(System.unique_integer([:positive]))
-    assert {:ok, _pid} = FastestMCP.start_server(FastestMCP.server(server_name))
-
-    on_exit(fn ->
-      FastestMCP.stop_server(server_name)
-    end)
-
+  test "only the exact configured MCP path is routed", %{server_name: server_name} do
     response =
       conn(:get, "/mcp/")
-      |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
+      |> Map.put(:host, "localhost")
+      |> StreamableHTTP.call(server_name: server_name)
 
-    assert response.status == 307
-    assert Plug.Conn.get_resp_header(response, "location") == ["http://www.example.com/mcp"]
-    assert response.resp_body == ""
+    assert response.status == 404
+
+    assert %{"error" => %{"code" => "not_found", "message" => "unknown route"}} =
+             JSON.decode!(response.resp_body)
   end
 
-  test "initialize returns an MCP session header on the single endpoint" do
-    server_name = "http-initialize-" <> Integer.to_string(System.unique_integer([:positive]))
-    protocol_version = Protocol.current_version()
-    assert {:ok, _pid} = FastestMCP.start_server(FastestMCP.server(server_name))
-
-    on_exit(fn ->
-      FastestMCP.stop_server(server_name)
-    end)
-
-    response =
-      conn(
-        :post,
-        "/mcp",
-        JSON.encode!(%{
-          "jsonrpc" => "2.0",
-          "id" => 1,
-          "method" => "initialize",
-          "params" => %{
-            "protocolVersion" => protocol_version,
-            "clientInfo" => %{"name" => "test-client", "version" => "1.0.0"}
-          }
-        })
-      )
-      |> Plug.Conn.put_req_header("content-type", "application/json")
-      |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
+  test "initialize returns a server-issued URL-safe MCP session id", %{server_name: server_name} do
+    {session_id, response} = ProtocolTest.http_initialize(server_name)
 
     assert response.status == 200
-    [session_id] = Plug.Conn.get_resp_header(response, "mcp-session-id")
-    assert session_id != ""
-    assert session_id =~ ~r/\A[0-9a-f]{32}\z/
+    assert session_id =~ ~r/\A[A-Za-z0-9_-]{43}\z/
 
     assert %{
              "jsonrpc" => "2.0",
              "id" => 1,
-             "result" => %{"protocolVersion" => ^protocol_version}
+             "result" => %{"protocolVersion" => protocol_version}
            } = JSON.decode!(response.resp_body)
+
+    assert protocol_version == ProtocolTest.protocol_version()
   end
 
-  test "initialize ignores query-string session ids and only uses the session header" do
-    server_name =
-      "http-query-session-" <> Integer.to_string(System.unique_integer([:positive]))
-
-    protocol_version = Protocol.current_version()
-
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-
-    on_exit(fn ->
-      FastestMCP.stop_server(server_name)
-    end)
-
+  test "initialize ignores query-string session ids and only uses the session header", %{
+    server_name: server_name
+  } do
     initialize_response =
       conn(
         :post,
         "/mcp?session_id=spoofed-session",
-        JSON.encode!(%{
-          "jsonrpc" => "2.0",
-          "id" => 1,
-          "method" => "initialize",
-          "params" => %{
-            "protocolVersion" => protocol_version,
-            "clientInfo" => %{"name" => "test-client", "version" => "1.0.0"}
-          }
-        })
+        JSON.encode!(
+          ProtocolTest.jsonrpc_request(1, "initialize", ProtocolTest.initialize_params())
+        )
       )
       |> Plug.Conn.put_req_header("content-type", "application/json")
-      |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
+      |> Plug.Conn.put_req_header("accept", "application/json, text/event-stream")
+      |> Map.put(:host, "localhost")
+      |> StreamableHTTP.call(server_name: server_name)
 
     assert initialize_response.status == 200
     [session_id] = Plug.Conn.get_resp_header(initialize_response, "mcp-session-id")
     refute session_id == "spoofed-session"
-    assert session_id =~ ~r/\A[0-9a-f]{32}\z/
+    assert session_id =~ ~r/\A[A-Za-z0-9_-]{43}\z/
 
     delete_response =
       conn(:delete, "/mcp?session_id=#{session_id}")
-      |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
+      |> Map.put(:host, "localhost")
+      |> Plug.Conn.put_req_header("mcp-protocol-version", ProtocolTest.protocol_version())
+      |> StreamableHTTP.call(server_name: server_name)
 
     assert delete_response.status == 400
 
     assert %{
              "error" => %{
-               "message" => "streamable HTTP session deletion requires mcp-session-id"
+               "message" => "MCP-Session-Id is required"
              }
            } = JSON.decode!(delete_response.resp_body)
 
+    assert ProtocolTest.http_mark_initialized(server_name, session_id).status == 202
+
     reuse_response =
-      conn(
-        :post,
-        "/mcp",
-        JSON.encode!(%{
-          "jsonrpc" => "2.0",
-          "id" => 2,
-          "method" => "tools/call",
-          "params" => %{"name" => "echo", "arguments" => %{"message" => "hi"}}
-        })
+      ProtocolTest.http_request(
+        server_name,
+        session_id,
+        2,
+        "tools/call",
+        %{"name" => "echo", "arguments" => %{"message" => "hi"}}
       )
-      |> Plug.Conn.put_req_header("content-type", "application/json")
-      |> Plug.Conn.put_req_header("mcp-session-id", session_id)
-      |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
 
     assert reuse_response.status == 200
   end
 
-  test "streamable HTTP accepts JSON-RPC batch requests on the MCP base path" do
-    server_name = "http-jsonrpc-batch-" <> Integer.to_string(System.unique_integer([:positive]))
-    protocol_version = Protocol.current_version()
-    assert {:ok, _pid} = FastestMCP.start_server(FastestMCP.server(server_name))
-
-    on_exit(fn ->
-      FastestMCP.stop_server(server_name)
-    end)
-
+  test "POST /mcp rejects JSON-RPC batches", %{server_name: server_name} do
     response =
       conn(
         :post,
         "/mcp",
         JSON.encode!([
-          %{
-            "jsonrpc" => "2.0",
-            "id" => 1,
-            "method" => "initialize",
-            "params" => %{
-              "protocolVersion" => protocol_version,
-              "clientInfo" => %{"name" => "test-client", "version" => "1.0.0"}
-            }
-          },
-          %{
-            "jsonrpc" => "2.0",
-            "method" => "notifications/initialized",
-            "params" => %{}
-          }
+          ProtocolTest.jsonrpc_request(1, "initialize", ProtocolTest.initialize_params()),
+          ProtocolTest.jsonrpc_notification("notifications/initialized")
         ])
       )
       |> Plug.Conn.put_req_header("content-type", "application/json")
-      |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
+      |> Plug.Conn.put_req_header("accept", "application/json, text/event-stream")
+      |> Map.put(:host, "localhost")
+      |> StreamableHTTP.call(server_name: server_name)
 
-    assert response.status == 200
-    [session_id] = Plug.Conn.get_resp_header(response, "mcp-session-id")
-    assert session_id != ""
+    assert response.status == 400
+    assert Plug.Conn.get_resp_header(response, "mcp-session-id") == []
 
-    assert [
-             %{
-               "jsonrpc" => "2.0",
-               "id" => 1,
-               "result" => %{"protocolVersion" => ^protocol_version}
-             }
-           ] = JSON.decode!(response.resp_body)
-  end
-
-  test "stateless streamable HTTP rejects GET requests on the MCP base path" do
-    server_name = "http-stateless-get-" <> Integer.to_string(System.unique_integer([:positive]))
-    assert {:ok, _pid} = FastestMCP.start_server(FastestMCP.server(server_name))
-
-    on_exit(fn ->
-      FastestMCP.stop_server(server_name)
-    end)
-
-    response =
-      conn(:get, "/mcp")
-      |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name, stateless_http: true)
-
-    assert response.status == 405
-    assert Plug.Conn.get_resp_header(response, "allow") == ["POST, DELETE"]
+    body = JSON.decode!(response.resp_body)
 
     assert %{
+             "jsonrpc" => "2.0",
              "error" => %{
-               "code" => "method_not_allowed",
-               "message" => "stateless streamable HTTP does not support GET"
+               "code" => -32_600,
+               "message" => "JSON-RPC batch requests are not supported"
              }
-           } = JSON.decode!(response.resp_body)
+           } = body
+
+    refute Map.has_key?(body, "id")
   end
 
-  test "DELETE /mcp terminates a session and rejects later reuse" do
-    server_name = "http-delete-session-" <> Integer.to_string(System.unique_integer([:positive]))
-    protocol_version = Protocol.current_version()
+  test "legacy stateless streamable HTTP options fail fast", %{server_name: server_name} do
+    assert_raise ArgumentError,
+                 "stateless HTTP is no longer supported; use state_scope: :request for request-local handler state",
+                 fn ->
+                   conn(:get, "/mcp")
+                   |> Map.put(:host, "localhost")
+                   |> StreamableHTTP.call(server_name: server_name, stateless_http: true)
+                 end
+  end
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+  test "DELETE /mcp terminates a session and rejects later reuse", %{server_name: server_name} do
+    {session_id, _initialize_response, initialized_response} =
+      ProtocolTest.initialize_http(server_name)
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-
-    on_exit(fn ->
-      FastestMCP.stop_server(server_name)
-    end)
-
-    initialize_response =
-      conn(
-        :post,
-        "/mcp",
-        JSON.encode!(%{
-          "jsonrpc" => "2.0",
-          "id" => 1,
-          "method" => "initialize",
-          "params" => %{
-            "protocolVersion" => protocol_version,
-            "clientInfo" => %{"name" => "test-client", "version" => "1.0.0"}
-          }
-        })
-      )
-      |> Plug.Conn.put_req_header("content-type", "application/json")
-      |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
-
-    [session_id] = Plug.Conn.get_resp_header(initialize_response, "mcp-session-id")
+    assert initialized_response.status == 202
 
     delete_response =
       conn(:delete, "/mcp")
+      |> Map.put(:host, "localhost")
       |> Plug.Conn.put_req_header("mcp-session-id", session_id)
-      |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
+      |> Plug.Conn.put_req_header("mcp-protocol-version", ProtocolTest.protocol_version())
+      |> StreamableHTTP.call(server_name: server_name)
 
     assert delete_response.status == 204
     assert delete_response.resp_body == ""
 
     reuse_response =
-      conn(
-        :post,
-        "/mcp",
-        JSON.encode!(%{
-          "jsonrpc" => "2.0",
-          "id" => 2,
-          "method" => "tools/call",
-          "params" => %{"name" => "echo", "arguments" => %{"message" => "hi"}}
-        })
+      ProtocolTest.http_request(
+        server_name,
+        session_id,
+        2,
+        "tools/call",
+        %{"name" => "echo", "arguments" => %{"message" => "hi"}}
       )
-      |> Plug.Conn.put_req_header("content-type", "application/json")
-      |> Plug.Conn.put_req_header("mcp-session-id", session_id)
-      |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
 
     assert reuse_response.status == 404
 

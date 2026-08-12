@@ -14,6 +14,8 @@ defmodule FastestMCP.Lifespan do
 
   defstruct [:enter, :exit]
 
+  require Logger
+
   @type cleanup :: (-> any()) | (map() -> any())
   @type enter ::
           (FastestMCP.Server.t() ->
@@ -56,12 +58,22 @@ defmodule FastestMCP.Lifespan do
 
   @doc "Runs the collected cleanup callbacks."
   def cleanup_all(cleanups) when is_list(cleanups) do
-    Enum.each(cleanups, fn cleanup ->
-      _ = cleanup.()
-      :ok
-    end)
+    Enum.each(cleanups, &run_cleanup/1)
 
     :ok
+  end
+
+  defp run_cleanup(cleanup) do
+    _ = cleanup.()
+    :ok
+  rescue
+    error ->
+      Logger.error("lifespan cleanup failed: #{Exception.message(error)}")
+      :ok
+  catch
+    kind, reason ->
+      Logger.error("lifespan cleanup failed: #{kind}: #{inspect(reason)}")
+      :ok
   end
 
   defp enter(server, lifespan) do
@@ -92,6 +104,9 @@ defmodule FastestMCP.Lifespan do
   rescue
     error ->
       {:error, error}
+  catch
+    kind, reason ->
+      {:error, {kind, reason}}
   end
 
   defp wrap_exit(_server, nil, _state), do: nil

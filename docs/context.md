@@ -108,7 +108,7 @@ FastestMCP.add_tool(server, "server_info", fn _arguments, ctx ->
 
   %{
     server_name: server.name,
-    strict_input_validation: server.strict_input_validation
+    schema_options: server.schema_options
   }
 end)
 ```
@@ -154,9 +154,9 @@ The request snapshot also exposes the active transport:
 ```elixir
 FastestMCP.add_tool(server, "connection_info", fn _arguments, ctx ->
   case FastestMCP.Context.request_context(ctx).transport do
-    "stdio" -> "Connected via STDIO"
-    "sse" -> "Connected via SSE"
-    "streamable-http" -> "Connected via Streamable HTTP"
+    :stdio -> "Connected via stdio"
+    :streamable_http -> "Connected via streamable HTTP"
+    :in_process -> "Called in process"
     other -> "Connected via #{other || "unknown"}"
   end
 end)
@@ -213,7 +213,15 @@ server =
 ```
 
 Use session state when the value belongs to the client conversation, not to one
-request and not to the whole server.
+request and not to the whole server. HTTP, stdio, and normal in-process calls
+use `ctx.state_scope == :session` by default.
+
+Pass `state_scope: :request` when application values must reset for every
+operation. In that mode, `set_state/4`, `get_state/3`, and `delete_state/2`
+operate only on request-local storage; they never write a session backend
+entry. HTTP still completes the normal initialize lifecycle and keeps a stable,
+non-null `ctx.session_id`, negotiated version, client information,
+capabilities, subscriptions, and task ownership.
 
 FastestMCP exposes three related APIs:
 
@@ -398,15 +406,61 @@ Several higher-level features are just context operations:
 - `Context.send_notification/3`
 - `Context.sample/3`
 - `Context.elicit/4`
+- `Context.elicit_url/4`
+- `Context.require_url_elicitation!/4`
+- `Context.list_roots/2`
+- `Context.cached_roots/1`
+- `Context.list_peer_tasks/2`
+- `Context.ping_peer/2`
 
 Sampling lets the server ask the connected client model to generate content.
-Elicitation lets the server ask the user for structured input. Both keep the
-round trip explicit and transport-aware.
+Form elicitation asks for schema-validated structured input, while URL
+elicitation coordinates an identity-bound out-of-band interaction. Roots let a
+server request the client's canonical `file://` boundaries. All of these use
+the same session coordinator over streamable HTTP and stdio.
+
+`Context.sample/3`, `Context.elicit/4`, and `Context.elicit_url/4` return an
+immediate result by default. With `task: true`, sampling and elicitation return
+a `%FastestMCP.PeerTask{}` only when the client negotiated the exact requester
+task capability.
+
+Protocol delivery helpers report failures explicitly. In particular,
+`Context.log/4`, `Context.report_progress/4`, and
+`Context.send_notification/3` can return delivery, lifecycle, rate, or state
+errors. Custom notifications cannot use reserved standard MCP method names.
 
 See:
 
 - [Sampling and Interaction](sampling-and-interaction.md)
 - [Background Tasks](background-tasks.md)
+
+## Client Roots and Peer Ping
+
+`Context.list_roots/2` requests the connected client's current filesystem
+roots after verifying the negotiated `roots` capability. Successful results
+are parsed into `%FastestMCP.Root{}` values and cached on the exact session:
+
+```elixir
+roots = Context.list_roots(ctx)
+
+if Enum.any?(roots, &FastestMCP.Root.contains?(&1, "file:///workspace/app/mix.exs")) do
+  %{inside_declared_root: true}
+end
+```
+
+Pass `refresh: true` to bypass the cache. A negotiated
+`notifications/roots/list_changed` refreshes the cache under runtime
+supervision. Only canonical `file://` roots are accepted;
+`FastestMCP.Root.safe_realpath/2` adds symlink-aware containment for paths on
+the server's local filesystem.
+
+`Context.ping_peer/2` sends an outbound MCP ping through the same session path
+and returns `:ok` only for the standard empty-object result.
+
+When the client negotiated `tasks.list`, `Context.list_peer_tasks/2` returns
+`%{items: tasks, next_cursor: cursor}` for tasks owned by that peer. Continue
+with the opaque `cursor:` only; a `page_size:` option is ignored and never sent
+on the wire.
 
 ## Nested Resource and Prompt Access
 
@@ -453,8 +507,8 @@ server =
   end)
 ```
 
-That produces `notifications/resources/updated` for subscribed streamable HTTP
-sessions.
+That produces `notifications/resources/updated` for subscribed initialized
+HTTP or stdio sessions with a deliverable output sink.
 
 ## Session Visibility
 
@@ -495,13 +549,21 @@ alias FastestMCP.Context
 server =
   FastestMCP.server("context-notifications")
   |> FastestMCP.add_tool("announce", fn _arguments, ctx ->
-    :ok = Context.send_notification(ctx, "notifications/tools/list_changed")
+    {:ok, _delivery} =
+      Context.send_notification(
+        ctx,
+        "com.example/notifications/build_completed",
+        %{"buildId" => "build-42"}
+      )
+
     %{ok: true}
   end)
 ```
 
 That is mainly useful for advanced runtime integrations and custom
-session-stream behavior.
+session-stream behavior. Standard MCP notification names are reserved; use the
+typed resource, visibility, progress, logging, cancellation, task, roots, and
+elicitation helpers for those methods.
 
 ## Current Compatibility Boundary
 

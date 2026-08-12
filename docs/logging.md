@@ -58,6 +58,17 @@ These messages are session-aware. They are useful when the client is actively
 watching the operation and wants structured log notifications alongside
 progress, sampling, or elicitation callbacks.
 
+Each initialized session starts at the MCP `info` threshold. A client can
+change it with `logging/setLevel`; FastestMCP applies the complete MCP/RFC 5424
+ordering from `debug` through `emergency` before enqueueing. The threshold is
+isolated to that session and disappears when the session terminates.
+
+Protocol logs are recursively filtered for configurable sensitive keys and are
+bounded to 100 messages per second per session by default. `Context.log/4`
+returns explicit lifecycle, delivery, or rate errors instead of claiming that
+an undeliverable log was sent. Set the runtime `max_logs_per_second:` option to
+change that bound and `redaction_opts:` to configure recursive key filtering.
+
 ## Client-side Consumption
 
 Connected clients can provide a `log_handler`:

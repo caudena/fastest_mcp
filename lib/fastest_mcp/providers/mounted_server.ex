@@ -12,7 +12,6 @@ defmodule FastestMCP.Providers.MountedServer do
   """
 
   alias FastestMCP.Component
-  alias FastestMCP.ComponentPolicy
   alias FastestMCP.Components.Prompt
   alias FastestMCP.Components.Resource
   alias FastestMCP.Components.ResourceTemplate
@@ -57,7 +56,7 @@ defmodule FastestMCP.Providers.MountedServer do
     provider
     |> child_components_for(component_type, operation)
     |> Enum.reduce([], fn component, acc ->
-      case apply_child_policy(
+      case transform_child_component(
              provider.server,
              component,
              child_operation(provider, operation, component)
@@ -82,67 +81,74 @@ defmodule FastestMCP.Providers.MountedServer do
         identifier,
         %Operation{} = operation
       ) do
-    child_operation = child_lookup_operation(provider, operation, component_type, identifier)
+    provider
+    |> get_component_candidates(component_type, identifier, operation)
+    |> Component.highest_version()
+  end
 
-    with {:ok, child_identifier} <- child_identifier(provider, component_type, identifier),
-         component when not is_nil(component) <-
-           child_component_for(provider, component_type, child_identifier, child_operation),
-         component when not is_nil(component) <-
-           transform_child_component(
-             provider.server,
-             component,
-             child_operation(provider, operation, component)
-           ),
-         component when not is_nil(component) <- filter_component(provider, component) do
-      wrap_component(provider, component, operation)
+  @doc false
+  def get_component_candidates(
+        %__MODULE__{} = provider,
+        component_type,
+        identifier,
+        %Operation{} = operation
+      ) do
+    with {:ok, child_identifier} <- child_identifier(provider, component_type, identifier) do
+      child_lookup_operation =
+        child_lookup_operation(provider, operation, component_type, child_identifier)
+
+      provider
+      |> child_component_candidates_for(
+        component_type,
+        child_identifier,
+        child_lookup_operation
+      )
+      |> Enum.reduce([], fn component, candidates ->
+        case transform_child_component(
+               provider.server,
+               component,
+               child_operation(provider, operation, component)
+             ) do
+          nil ->
+            candidates
+
+          component ->
+            case filter_component(provider, component) do
+              nil -> candidates
+              filtered -> [wrap_component(provider, filtered, operation) | candidates]
+            end
+        end
+      end)
+      |> Enum.reverse()
+      |> Component.sort_by_version_desc()
     else
-      _ -> nil
+      _ -> []
     end
   end
 
   @doc "Resolves the backing resource target for a concrete URI."
   def get_resource_target(%__MODULE__{} = provider, uri, %Operation{} = operation) do
+    provider
+    |> get_resource_target_candidates(uri, operation)
+    |> pick_resource_target()
+  end
+
+  @doc false
+  def get_resource_target_candidates(%__MODULE__{} = provider, uri, %Operation{} = operation) do
     with {:ok, child_uri} <- child_resource_uri(provider, uri) do
-      child_operation = child_lookup_operation(provider, operation, :resource, child_uri)
+      child_lookup_operation = child_lookup_operation(provider, operation, :resource, child_uri)
 
-      case child_resource_target_for(provider, child_uri, child_operation) do
-        {:exact, component, _captures} ->
-          case transform_child_component(
-                 provider.server,
-                 component,
-                 child_operation(provider, operation, component)
-               ) do
-            nil ->
-              nil
-
-            component ->
-              case filter_component(provider, component) do
-                nil -> nil
-                filtered -> {:exact, wrap_component(provider, filtered, operation), %{}}
-              end
-          end
-
-        {:template, component, captures} ->
-          case transform_child_component(
-                 provider.server,
-                 component,
-                 child_operation(provider, operation, component)
-               ) do
-            nil ->
-              nil
-
-            component ->
-              case filter_component(provider, component) do
-                nil -> nil
-                filtered -> {:template, wrap_component(provider, filtered, operation), captures}
-              end
-          end
-
-        nil ->
-          nil
-      end
+      provider
+      |> child_resource_target_candidates_for(child_uri, child_lookup_operation)
+      |> Enum.reduce([], fn target, candidates ->
+        case transform_child_resource_target(provider, target, uri, operation) do
+          nil -> candidates
+          transformed -> [transformed | candidates]
+        end
+      end)
+      |> Enum.reverse()
     else
-      _ -> nil
+      _ -> []
     end
   end
 
@@ -162,7 +168,7 @@ defmodule FastestMCP.Providers.MountedServer do
       )
   end
 
-  defp child_component_for(
+  defp child_component_candidates_for(
          %__MODULE__{} = provider,
          component_type,
          child_identifier,
@@ -171,53 +177,109 @@ defmodule FastestMCP.Providers.MountedServer do
     static =
       provider.server
       |> components_for(component_type)
-      |> Enum.filter(&(Component.identifier(&1) == child_identifier))
-      |> Component.highest_version()
+      |> Enum.filter(fn component ->
+        Component.identifier(component) == child_identifier and
+          version_matches?(component, child_operation.version)
+      end)
 
-    case static do
-      nil ->
-        Enum.find_value(
-          provider.server.providers,
-          &Provider.get_component(&1, component_type, child_identifier, child_operation)
+    dynamic =
+      Enum.flat_map(
+        provider.server.providers,
+        &Provider.get_component_candidates(
+          &1,
+          component_type,
+          child_identifier,
+          child_operation
         )
+      )
 
-      component ->
-        component
+    (static ++ dynamic)
+    |> Enum.uniq_by(&Component.key/1)
+    |> Component.sort_by_version_desc()
+  end
+
+  defp child_resource_target_candidates_for(
+         %__MODULE__{} = provider,
+         child_uri,
+         child_operation
+       ) do
+    static_exact =
+      provider.server.resources
+      |> Enum.filter(fn component ->
+        Component.identifier(component) == child_uri and
+          version_matches?(component, child_operation.version)
+      end)
+      |> Enum.map(&{:exact, &1, %{}})
+
+    provider_targets =
+      Enum.flat_map(
+        provider.server.providers,
+        &Provider.get_resource_target_candidates(&1, child_uri, child_operation)
+      )
+
+    exact_targets =
+      static_exact ++ Enum.filter(provider_targets, &(elem(&1, 0) == :exact))
+
+    if exact_targets == [] do
+      static_templates =
+        provider.server.resource_templates
+        |> Enum.reduce([], fn template, matches ->
+          if version_matches?(template, child_operation.version) do
+            case ResourceTemplate.match(template, child_uri) do
+              nil -> matches
+              captures -> [{:template, template, captures} | matches]
+            end
+          else
+            matches
+          end
+        end)
+        |> Enum.reverse()
+
+      static_templates ++ Enum.filter(provider_targets, &(elem(&1, 0) == :template))
+    else
+      exact_targets
     end
   end
 
-  defp child_resource_target_for(%__MODULE__{} = provider, child_uri, child_operation) do
-    exact =
-      provider.server.resources
-      |> Enum.filter(&(Component.identifier(&1) == child_uri))
-      |> Component.highest_version()
+  defp transform_child_resource_target(provider, {kind, component, _captures}, uri, operation)
+       when kind in [:exact, :template] do
+    component =
+      transform_child_component(
+        provider.server,
+        component,
+        child_operation(provider, operation, component)
+      )
 
-    case exact do
-      nil ->
-        static_template =
-          provider.server.resource_templates
-          |> Enum.reduce([], fn template, matches ->
-            case ResourceTemplate.match(template, child_uri) do
-              nil -> matches
-              captures -> [{template, captures} | matches]
-            end
-          end)
-          |> pick_template(provider, child_operation)
+    with component when not is_nil(component) <- component,
+         component when not is_nil(component) <- filter_component(provider, component) do
+      wrapped = wrap_component(provider, component, operation)
 
-        case static_template do
-          nil ->
-            Enum.find_value(
-              provider.server.providers,
-              &Provider.get_resource_target(&1, child_uri, child_operation)
-            )
+      case kind do
+        :exact ->
+          if Component.identifier(wrapped) == to_string(uri), do: {:exact, wrapped, %{}}
 
-          target ->
-            target
-        end
-
-      component ->
-        {:exact, component, %{}}
+        :template ->
+          case ResourceTemplate.match(wrapped, uri) do
+            nil -> nil
+            captures -> {:template, wrapped, captures}
+          end
+      end
+    else
+      _other -> nil
     end
+  end
+
+  defp transform_child_resource_target(_provider, _target, _uri, _operation), do: nil
+
+  defp pick_resource_target([]), do: nil
+
+  defp pick_resource_target(targets) do
+    exact = Enum.filter(targets, &(elem(&1, 0) == :exact))
+    targets = if exact == [], do: targets, else: exact
+
+    targets
+    |> Component.sort_by_version_desc(fn {_, component, _} -> Component.version(component) end)
+    |> List.first()
   end
 
   defp wrap_component(%__MODULE__{} = provider, %Tool{} = component, %Operation{} = operation) do
@@ -361,10 +423,6 @@ defmodule FastestMCP.Providers.MountedServer do
     }
   end
 
-  defp apply_child_policy(server, component, operation) do
-    ComponentPolicy.apply(server, component, operation, raise_on_filtered: false)
-  end
-
   defp transform_child_component(server, component, operation) do
     Enum.reduce(server.transforms, component, fn transform, current ->
       if current, do: transform.(current, operation), else: nil
@@ -478,27 +536,8 @@ defmodule FastestMCP.Providers.MountedServer do
     end
   end
 
-  defp pick_template([], _provider, _operation), do: nil
+  defp version_matches?(_component, nil), do: true
 
-  defp pick_template(matches, provider, operation) do
-    {component, captures} =
-      Enum.reduce(matches, nil, fn
-        current, nil ->
-          current
-
-        {candidate, _} = current, {best, _} = previous ->
-          if Component.compare_versions(candidate.version, best.version) == :gt,
-            do: current,
-            else: previous
-      end)
-
-    case apply_child_policy(
-           provider.server,
-           component,
-           child_operation(provider, operation, component)
-         ) do
-      nil -> nil
-      component -> {:template, component, captures}
-    end
-  end
+  defp version_matches?(component, version),
+    do: Component.version(component) == to_string(version)
 end

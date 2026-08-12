@@ -35,7 +35,6 @@ defmodule FastestMCP.Middleware do
   alias FastestMCP.Middleware.ErrorHandling
   alias FastestMCP.Middleware.Logging
   alias FastestMCP.Middleware.DetailedTiming
-  alias FastestMCP.Middleware.DereferenceRefs
   alias FastestMCP.Middleware.Ping
   alias FastestMCP.Middleware.RateLimiting
   alias FastestMCP.Middleware.ResponseCaching
@@ -79,6 +78,7 @@ defmodule FastestMCP.Middleware do
 
   @doc false
   def shutdown_runtime_pid(pid) when is_pid(pid) do
+    Process.unlink(pid)
     ref = Process.monitor(pid)
     Process.exit(pid, :shutdown)
 
@@ -94,8 +94,6 @@ defmodule FastestMCP.Middleware do
 
   @doc "Builds detailed-timing middleware with per-operation labels."
   def detailed_timing(opts \\ []), do: DetailedTiming.new(opts)
-  @doc "Builds middleware that expands local `$ref` pointers in JSON Schemas."
-  def dereference_refs(opts \\ []), do: DereferenceRefs.new(opts)
   @doc "Builds error-handling middleware with logging and counters."
   def error_handling(opts \\ []), do: ErrorHandling.new(opts)
   @doc "Builds request-logging middleware."

@@ -5,6 +5,7 @@ defmodule FastestMCP.HTTPContextTest do
   import Plug.Test
 
   alias FastestMCP.Context
+  alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
 
   test "context exposes a normalized HTTP request snapshot across tools prompts and resources" do
     server_name =
@@ -24,7 +25,7 @@ defmodule FastestMCP.HTTPContextTest do
 
     request_metadata = %{
       method: "POST",
-      path: "/mcp/tools/call",
+      path: "/mcp",
       query_params: %{"demo" => "1"},
       headers: %{
         "X-Demo-Header" => "ABC",
@@ -34,7 +35,7 @@ defmodule FastestMCP.HTTPContextTest do
 
     assert %{
              method: "POST",
-             path: "/mcp/tools/call",
+             path: "/mcp",
              query_params: %{"demo" => "1"},
              headers: %{
                "authorization" => "Bearer request-token",
@@ -54,7 +55,7 @@ defmodule FastestMCP.HTTPContextTest do
 
     assert %{
              method: "POST",
-             path: "/mcp/tools/call",
+             path: "/mcp",
              query_params: %{"demo" => "1"},
              headers: %{
                "authorization" => "Bearer request-token",
@@ -92,7 +93,7 @@ defmodule FastestMCP.HTTPContextTest do
         session_id: "http-task-session",
         request_metadata: %{
           method: "POST",
-          path: "/mcp/tools/call",
+          path: "/mcp",
           headers: %{
             "Content-Type" => "application/json",
             "Accept" => "application/json",
@@ -137,34 +138,52 @@ defmodule FastestMCP.HTTPContextTest do
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
 
+    {session_id, _initialize_response, initialized_response} =
+      ProtocolTest.initialize_http(server_name)
+
+    assert initialized_response.status == 202
+
     conn =
       conn(
         :post,
-        "/mcp/tools/call?demo=1",
-        JSON.encode!(%{"name" => "inspect_headers", "arguments" => %{}})
+        "/mcp?demo=1",
+        JSON.encode!(
+          ProtocolTest.jsonrpc_request(2, "tools/call", %{
+            "name" => "inspect_headers",
+            "arguments" => %{}
+          })
+        )
       )
       |> put_req_header("content-type", "application/json")
+      |> put_req_header("accept", "application/json, text/event-stream")
+      |> Map.put(:host, "localhost")
       |> put_req_header("x-demo-header", "ABC")
       |> put_req_header("authorization", "Bearer fresh-token")
-      |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name)
+      |> put_req_header("mcp-session-id", session_id)
+      |> put_req_header("mcp-protocol-version", ProtocolTest.protocol_version())
+      |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name, json_response: true)
 
     assert conn.status == 200
 
     assert %{
-             "structuredContent" => %{
-               "request" => %{
-                 "method" => "POST",
-                 "path" => "/mcp/tools/call",
-                 "query_params" => %{"demo" => "1"},
-                 "headers" => %{
+             "jsonrpc" => "2.0",
+             "id" => 2,
+             "result" => %{
+               "structuredContent" => %{
+                 "request" => %{
+                   "method" => "POST",
+                   "path" => "/mcp",
+                   "query_params" => %{"demo" => "1"},
+                   "headers" => %{
+                     "authorization" => "Bearer fresh-token",
+                     "content-type" => "application/json",
+                     "x-demo-header" => "ABC"
+                   }
+                 },
+                 "filtered_headers" => %{
                    "authorization" => "Bearer fresh-token",
-                   "content-type" => "application/json",
                    "x-demo-header" => "ABC"
                  }
-               },
-               "filtered_headers" => %{
-                 "authorization" => "Bearer fresh-token",
-                 "x-demo-header" => "ABC"
                }
              }
            } = JSON.decode!(conn.resp_body)

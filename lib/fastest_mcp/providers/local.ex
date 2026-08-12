@@ -1,6 +1,4 @@
 defmodule FastestMCP.Providers.Local do
-  require Logger
-
   @moduledoc """
   Standalone in-memory provider for dynamic local components.
 
@@ -37,7 +35,8 @@ defmodule FastestMCP.Providers.Local do
   def new(opts \\ []) do
     %__MODULE__{
       name: to_string(Keyword.get(opts, :name, "local-provider")),
-      on_duplicate: normalize_on_duplicate(Keyword.get(opts, :on_duplicate, :error))
+      on_duplicate:
+        Component.normalize_duplicate_policy!(Keyword.get(opts, :on_duplicate, :error))
     }
   end
 
@@ -105,121 +104,83 @@ defmodule FastestMCP.Providers.Local do
   def list_components(%__MODULE__{}, _component_type, _operation), do: []
 
   @doc "Resolves one component by type and identifier."
-  def get_component(%__MODULE__{} = provider, component_type, identifier, _operation) do
+  def get_component(%__MODULE__{} = provider, component_type, identifier, operation) do
     provider
-    |> list_components(component_type, nil)
-    |> Enum.filter(&(Component.identifier(&1) == to_string(identifier)))
+    |> get_component_candidates(component_type, identifier, operation)
     |> Component.highest_version()
   end
 
+  @doc false
+  def get_component_candidates(%__MODULE__{} = provider, component_type, identifier, operation) do
+    provider
+    |> list_components(component_type, nil)
+    |> Enum.filter(fn component ->
+      Component.identifier(component) == to_string(identifier) and
+        version_matches?(component, operation_version(operation))
+    end)
+    |> Component.sort_by_version_desc()
+  end
+
   @doc "Resolves the backing resource target for a concrete URI."
-  def get_resource_target(%__MODULE__{} = provider, uri, _operation) do
-    exact = get_component(provider, :resource, uri, nil)
+  def get_resource_target(%__MODULE__{} = provider, uri, operation) do
+    provider
+    |> get_resource_target_candidates(uri, operation)
+    |> pick_resource_target()
+  end
+
+  @doc false
+  def get_resource_target_candidates(%__MODULE__{} = provider, uri, operation) do
+    exact = get_component_candidates(provider, :resource, uri, operation)
 
     case exact do
-      nil ->
+      [] ->
         provider.resource_templates
         |> Enum.reduce([], fn template, matches ->
-          case ResourceTemplate.match(template, uri) do
-            nil -> matches
-            captures -> [{template, captures} | matches]
+          if version_matches?(template, operation_version(operation)) do
+            case ResourceTemplate.match(template, uri) do
+              nil -> matches
+              captures -> [{:template, template, captures} | matches]
+            end
+          else
+            matches
           end
         end)
-        |> pick_template()
+        |> Enum.reverse()
 
-      component ->
-        {:exact, component, %{}}
+      components ->
+        Enum.map(components, &{:exact, &1, %{}})
     end
   end
 
   defp put_component(%__MODULE__{} = provider, key, component) do
     components = Map.fetch!(provider, key)
-    validate_version_mixing!(components, component)
 
-    case duplicate_match(components, component) do
-      nil ->
-        Map.update!(provider, key, &(&1 ++ [component]))
+    case Component.registration_action(components, component, provider.on_duplicate) do
+      :insert ->
+        Map.replace!(provider, key, components ++ [component])
 
-      _match ->
-        apply_duplicate_policy(provider, key, component)
-    end
-  end
-
-  defp drop_component(%__MODULE__{} = provider, key, identifier) do
-    Map.update!(provider, key, fn components ->
-      Enum.reject(components, &(Component.identifier(&1) == identifier))
-    end)
-  end
-
-  defp pick_template([]), do: nil
-
-  defp pick_template(matches) do
-    {component, captures} =
-      Enum.reduce(matches, nil, fn
-        current, nil ->
-          current
-
-        {candidate, _} = current, {best, _} = previous ->
-          if Component.compare_versions(candidate.version, best.version) == :gt,
-            do: current,
-            else: previous
-      end)
-
-    {:template, component, captures}
-  end
-
-  defp validate_version_mixing!(existing_components, component) do
-    siblings =
-      Enum.filter(existing_components, fn existing ->
-        Component.identifier(existing) == Component.identifier(component)
-      end)
-
-    has_versioned = Enum.any?(siblings, &(not is_nil(Component.version(&1))))
-    has_unversioned = Enum.any?(siblings, &is_nil(Component.version(&1)))
-    incoming_unversioned = is_nil(Component.version(component))
-    incoming_versioned = not incoming_unversioned
-
-    cond do
-      incoming_unversioned and has_versioned ->
-        raise ArgumentError,
-              "#{Component.type(component)} #{inspect(Component.identifier(component))} cannot mix unversioned and versioned definitions"
-
-      incoming_versioned and has_unversioned ->
-        raise ArgumentError,
-              "#{Component.type(component)} #{inspect(Component.identifier(component))} cannot mix versioned and unversioned definitions"
-
-      true ->
-        :ok
-    end
-  end
-
-  defp duplicate_match(existing_components, component) do
-    Enum.find(existing_components, fn existing ->
-      Component.identifier(existing) == Component.identifier(component) and
-        Component.version(existing) == Component.version(component)
-    end)
-  end
-
-  defp apply_duplicate_policy(%__MODULE__{} = provider, key, component) do
-    case provider.on_duplicate do
-      :error ->
-        raise_duplicate_error(component)
-
-      :warn ->
-        Logger.warning(duplicate_warning(component))
+      {:replace, _existing} ->
         replace_duplicate(provider, key, component)
 
-      :replace ->
-        replace_duplicate(provider, key, component)
-
-      :ignore ->
+      {:ignore, _existing} ->
         provider
     end
   end
 
+  defp drop_component(%__MODULE__{} = provider, key, identifier) do
+    components =
+      provider
+      |> Map.fetch!(key)
+      |> Enum.reject(&(Component.identifier(&1) == identifier))
+
+    Map.replace!(provider, key, components)
+  end
+
   defp replace_duplicate(%__MODULE__{} = provider, key, component) do
-    Map.update!(provider, key, fn components ->
-      Enum.map(components, fn existing ->
+    updated =
+      provider
+      |> Map.fetch!(key)
+      |> Enum.map(fn existing ->
         if Component.identifier(existing) == Component.identifier(component) and
              Component.version(existing) == Component.version(component) do
           component
@@ -227,34 +188,22 @@ defmodule FastestMCP.Providers.Local do
           existing
         end
       end)
-    end)
+
+    Map.replace!(provider, key, updated)
   end
 
-  defp raise_duplicate_error(component) do
-    if is_nil(Component.version(component)) do
-      raise ArgumentError,
-            "#{Component.type(component)} #{inspect(Component.identifier(component))} is already defined without a version"
-    else
-      raise ArgumentError,
-            "#{Component.type(component)} #{inspect(Component.identifier(component))} version #{inspect(Component.version(component))} is already defined"
-    end
+  defp pick_resource_target([]), do: nil
+
+  defp pick_resource_target(targets) do
+    targets
+    |> Component.sort_by_version_desc(fn {_, component, _} -> Component.version(component) end)
+    |> List.first()
   end
 
-  defp duplicate_warning(component) do
-    if is_nil(Component.version(component)) do
-      "#{Component.type(component)} #{inspect(Component.identifier(component))} is already defined without a version; replacing existing definition"
-    else
-      "#{Component.type(component)} #{inspect(Component.identifier(component))} version #{inspect(Component.version(component))} is already defined; replacing existing definition"
-    end
-  end
+  defp operation_version(%{version: nil}), do: nil
+  defp operation_version(%{version: version}), do: to_string(version)
+  defp operation_version(_operation), do: nil
 
-  defp normalize_on_duplicate(policy) when policy in [:error, :warn, :ignore, :replace],
-    do: policy
-
-  defp normalize_on_duplicate(other) do
-    raise ArgumentError,
-          "on_duplicate must be one of :error, :warn, :ignore, or :replace, got #{inspect(other)}"
-  end
+  defp version_matches?(_component, nil), do: true
+  defp version_matches?(component, version), do: Component.version(component) == version
 end
-
-require Logger

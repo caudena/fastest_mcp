@@ -139,11 +139,12 @@ server =
 
 Blank query values are preserved. Path captures take precedence over query
 captures, and templates that would create a hyphen/underscore collision are
-rejected.
+rejected. Literal and expanded fragments are matched consistently for exact
+and templated lookup.
 
 ## Template Parameter Validation and Completion
 
-Resource templates can validate and coerce captures and query parameters with
+Resource templates can validate captures and query parameters with
 `parameters`:
 
 ```elixir
@@ -152,7 +153,7 @@ schema = %{
   "properties" => %{
     "owner" => %{"type" => "string"},
     "repo" => %{"type" => "string"},
-    "page" => %{"type" => "integer"}
+    "page" => %{"type" => "string", "pattern" => "^[0-9]+$"}
   },
   "required" => ["owner", "repo"]
 }
@@ -170,8 +171,11 @@ server =
 
 ```elixir
 FastestMCP.read_resource("resource-parameters", "repos://phoenixframework/phoenix/issues?page=2")
-# => %{owner: "phoenixframework", repo: "phoenix", page: 2}
+# => %{owner: "phoenixframework", repo: "phoenix", page: "2"}
 ```
+
+URI captures remain strings. Parameter validation never parses or coerces
+them.
 
 Templates can also expose completion sources for URI variables:
 
@@ -197,14 +201,17 @@ server =
 ```elixir
 FastestMCP.complete(
   "resource-completion",
-  %{"type" => "ref/resourceTemplate", "uriTemplate" => "repos://{owner}/{repo}"},
+  %{"type" => "ref/resource", "uri" => "repos://{owner}/{repo}"},
   %{"name" => "owner", "value" => "pre"}
 )
 # => %{values: ["prefecthq"], total: 1}
 ```
 
 Completion providers stay server-side. They are not leaked into public list
-metadata or exposed parameter schemas.
+metadata or exposed parameter schemas. MCP `2025-11-25` uses only the standard
+`ref/resource` shape for resource-template completion; the older
+`ref/resourceTemplate` spelling remains an Elixir-native compatibility input
+and is rejected on the wire.
 
 ## Explicit Resource Result Helpers
 
@@ -242,8 +249,14 @@ server =
   |> FastestMCP.add_resource("reports://daily", fn _arguments, _ctx ->
     Result.new(
       [
-        Text.new("Daily report is ready", meta: %{slot: "summary"}),
-        Binary.new(<<0, 1, 2>>, meta: %{slot: "attachment"})
+        Text.new("Daily report is ready",
+          uri: "reports://daily/summary",
+          meta: %{slot: "summary"}
+        ),
+        Binary.new(<<0, 1, 2>>,
+          uri: "reports://daily/attachment",
+          meta: %{slot: "attachment"}
+        )
       ],
       meta: %{source: "reporting"}
     )
@@ -254,8 +267,18 @@ server =
 FastestMCP.read_resource("resource-results", "reports://daily")
 # => %{
 #      contents: [
-#        %{content: "Daily report is ready", mime_type: "text/plain", meta: %{slot: "summary"}},
-#        %{content: <<0, 1, 2>>, mime_type: "application/octet-stream", meta: %{slot: "attachment"}}
+#        %{
+#          uri: "reports://daily/summary",
+#          content: "Daily report is ready",
+#          mime_type: "text/plain",
+#          meta: %{slot: "summary"}
+#        },
+#        %{
+#          uri: "reports://daily/attachment",
+#          content: <<0, 1, 2>>,
+#          mime_type: "application/octet-stream",
+#          meta: %{slot: "attachment"}
+#        }
 #      ],
 #      meta: %{source: "reporting"}
 #    }
@@ -264,6 +287,7 @@ FastestMCP.read_resource("resource-results", "reports://daily")
 These helpers are useful when you need:
 
 - multiple content items
+- distinct subresource URIs, which are preserved on each transport content item
 - per-item MIME types
 - per-item metadata
 - result-level metadata
@@ -330,6 +354,7 @@ server =
 
 - absolute-path validation
 - file listing for one directory or a recursive tree
+- exclusion of external and cyclic symlink traversal during recursive reads
 - optional hidden-file inclusion
 - normalized read errors
 - JSON resource payload generation
@@ -372,10 +397,11 @@ server =
 Transport metadata uses the same source options, but exposes them in the MCP
 shape clients expect:
 
-- direct Elixir list APIs keep `meta`, `tags`, `version`, and `task` on the
-  resource or template struct
+- direct Elixir list APIs keep `meta`, `tags`, `version`, and local `task`
+  configuration on the resource or template struct
 - transport list APIs merge `tags` and `version` into `_meta.fastestmcp`
-- `task: true` or explicit task config becomes `execution.taskSupport`
+- resource and resource-template task configuration is not advertised as a
+  remote request capability; MCP `2025-11-25` task augmentation is tool-only
 - underscore-prefixed keys inside `meta[:fastestmcp]` are stripped from the public
   transport payload, while your own keys are preserved
 
@@ -441,13 +467,12 @@ client =
       "version" => "2.0.0"
     }
   },
-  "execution" => %{"taskSupport" => "optional"},
   "uri" => "memo://report"
 }]} = FastestMCP.Client.list_resources(client)
 ```
 
-That same `_meta.fastestmcp` and `execution` contract is used for resource
-templates in `FastestMCP.Client.list_resource_templates/2`.
+The same `_meta.fastestmcp` metadata contract is used for resource templates in
+`FastestMCP.Client.list_resource_templates/2`.
 
 ## Context-Aware Resources
 
@@ -472,7 +497,7 @@ server =
 
 ## Background Tasks
 
-Resources can opt into task execution:
+Resources can opt into local, in-process task execution:
 
 ```elixir
 server =
@@ -489,27 +514,21 @@ server =
 This is useful when generating the resource itself is slow, even if the final
 shape is still a read result.
 
-The same resource can then be read synchronously or as a task:
+The same resource can then be read synchronously or as a local task:
 
 ```elixir
-alias FastestMCP.Client.Task, as: RemoteTask
-
-client =
-  FastestMCP.Client.connect!("http://127.0.0.1:4100/mcp",
-    client_info: %{"name" => "docs-client", "version" => "1.0.0"}
-  )
-
 task =
-  FastestMCP.Client.read_resource(client, "file://report.txt",
+  FastestMCP.read_resource("resource-tasks", "file://report.txt",
     task: true
   )
 
-RemoteTask.result(task)
+FastestMCP.await_task(task, 5_000)
 ```
 
-Use this when the read itself may block or when a remote caller wants normal
-task polling and cancellation. The task handle shape is the same one described
-in [Client](client.md) and [Background Tasks](background-tasks.md).
+Use this when the read itself may block inside an Elixir-owned workflow. Remote
+MCP `resources/read` requests are synchronous; task metadata on that wire method
+is rejected. See [Background Tasks](background-tasks.md) for the local/remote
+boundary.
 
 ## Runtime Changes
 
@@ -580,15 +599,17 @@ Read failures still surface as normal `FastestMCP.Error` values:
 ## Subscriptions and Update Notifications
 
 FastestMCP supports session-scoped resource subscriptions through the MCP
-transport surface. A subscription can target either one concrete URI or a URI
-template pattern:
+transport surface. A subscription targets one concrete resource URI:
 
 ```elixir
 client = FastestMCP.Client.connect!("http://127.0.0.1:4100/mcp", session_stream: true)
 
 %{} = FastestMCP.Client.subscribe_resource(client, "config://release")
-%{} = FastestMCP.Client.subscribe_resource(client, "users://{id}{?format}")
 ```
+
+Resource templates remain available for discovery and reads, but their
+template strings are not subscription targets. Subscribe separately to each
+expanded concrete URI whose updates the client needs.
 
 When the server knows that resource changed, emit an update:
 
@@ -607,13 +628,13 @@ end)
 
 Current behavior:
 
-- subscriptions may be exact concrete URIs or template-style URI patterns
-- `notifications/resources/updated` is delivered only to subscribed streamable
-  HTTP sessions
+- subscriptions are exact concrete resource URIs
+- `notifications/resources/updated` is delivered only to subscribed,
+  initialized sessions with an attached HTTP or stdio output sink
 - `notifications/resources/list_changed` is emitted when the visible set of
   resources or resource templates changes for a session
-- stdio remains request/response only and does not receive unsolicited session
-  notifications
+- bidirectional stdio receives the same negotiated resource notifications as
+  Streamable HTTP
 
 ## Helper Types in Practice
 
@@ -659,15 +680,21 @@ explicit Elixir APIs and OTP-owned runtime state internally.
 That is why examples in this guide stay explicit about handler arguments,
 context access, and runtime APIs.
 
-## Current Compatibility Boundary
+## RFC 6570 URI Templates
 
-A few things are still narrower than a general-purpose URI-template engine:
+Resource templates are parsed and expanded through the direct `Texture`
+dependency and cover RFC 6570 levels 1 through 4: every operator, fragments,
+prefix modifiers, explode, scalar/list/map values, percent encoding, and empty
+or undefined variables. Malformed templates are rejected during registration.
+Reverse routing keeps the existing handler map interface and decodes captures
+deterministically as strings, ordered lists, or maps.
 
-- URI templates support named placeholders, wildcard path placeholders,
-  reserved expansions, path-segment expansions, label expansions, path-style
-  parameter expansions, and form-style query variables or continuations, but
-  not the full RFC 6570 operator set
-- resource update notifications require an active session event stream
+The repository runs the official `uri-templates/uritemplate-test` positive and
+negative fixtures, pinned at commit
+`4171dac22aa67fc710b3f6df308a50bd08552986`, together with reverse-routing
+fixtures for fragment, prefix, exploded, and ambiguous templates.
+
+Resource update notifications require an active session event stream.
 
 ## Why This Shape
 

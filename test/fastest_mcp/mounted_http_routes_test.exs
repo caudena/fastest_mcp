@@ -27,7 +27,10 @@ defmodule FastestMCP.MountedHTTPRoutesTest do
     assert {:ok, _pid} = FastestMCP.start_server(parent)
     on_exit(fn -> FastestMCP.stop_server(parent_name) end)
 
-    app = FastestMCP.http_app(parent_name)
+    app =
+      FastestMCP.http_app(parent_name,
+        allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]
+      )
 
     ready = conn(:get, "/readyz") |> app.()
     leaf_ready = conn(:get, "/leaf-health") |> app.()

@@ -25,6 +25,7 @@ defmodule FastestMCP.Resources.Directory do
   """
 
   alias FastestMCP.Error
+  alias FastestMCP.PathSafety
   alias FastestMCP.Resources.Content
   alias FastestMCP.Resources.Result
 
@@ -57,7 +58,11 @@ defmodule FastestMCP.Resources.Directory do
   def list_files(%__MODULE__{} = directory) do
     try do
       validate_directory!(directory.path)
-      walk(directory.path, directory.recursive, directory.include_hidden)
+      real_root = PathSafety.realpath!(directory.path)
+
+      directory.path
+      |> walk(real_root, directory.recursive, directory.include_hidden, MapSet.new())
+      |> elem(0)
     rescue
       error ->
         raise Error,
@@ -112,24 +117,54 @@ defmodule FastestMCP.Resources.Directory do
     end
   end
 
-  defp walk(path, recursive?, include_hidden?) do
-    path
-    |> File.ls!()
-    |> Enum.reject(&(hidden?(&1) and not include_hidden?))
-    |> Enum.map(&Path.join(path, &1))
-    |> Enum.sort()
-    |> Enum.flat_map(fn child ->
-      cond do
-        File.dir?(child) and recursive? ->
-          walk(child, recursive?, include_hidden?)
+  defp walk(path, real_root, recursive?, include_hidden?, visited) do
+    with {:ok, real_path} <- PathSafety.realpath(path),
+         true <- PathSafety.within?(real_root, real_path),
+         false <- MapSet.member?(visited, real_path) do
+      visited = MapSet.put(visited, real_path)
 
-        File.dir?(child) ->
-          []
+      {files, visited} =
+        path
+        |> File.ls!()
+        |> Enum.reject(&(hidden?(&1) and not include_hidden?))
+        |> Enum.sort()
+        |> Enum.reduce({[], visited}, fn entry, {files, visited} ->
+          child = Path.join(path, entry)
 
-        true ->
-          [child]
-      end
-    end)
+          case safe_child(child, real_root) do
+            {:ok, :directory} when recursive? ->
+              {nested, visited} =
+                walk(child, real_root, recursive?, include_hidden?, visited)
+
+              {Enum.reverse(nested, files), visited}
+
+            {:ok, :directory} ->
+              {files, visited}
+
+            {:ok, _type} ->
+              {[child | files], visited}
+
+            :error ->
+              {files, visited}
+          end
+        end)
+
+      {Enum.reverse(files), visited}
+    else
+      true -> {[], visited}
+      false -> {[], visited}
+      {:error, _reason} -> {[], visited}
+    end
+  end
+
+  defp safe_child(path, real_root) do
+    with {:ok, real_path} <- PathSafety.realpath(path),
+         true <- PathSafety.within?(real_root, real_path),
+         {:ok, %File.Stat{type: type}} <- File.stat(real_path) do
+      {:ok, type}
+    else
+      _other -> :error
+    end
   end
 
   defp file_size(path) do

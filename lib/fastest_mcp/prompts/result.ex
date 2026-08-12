@@ -51,7 +51,12 @@ defmodule FastestMCP.Prompts.Result do
     new(
       Map.get(value, :messages, Map.get(value, "messages")),
       description: Map.get(value, :description, Map.get(value, "description")),
-      meta: Map.get(value, :meta, Map.get(value, "meta"))
+      meta:
+        Map.get(
+          value,
+          :_meta,
+          Map.get(value, "_meta", Map.get(value, :meta, Map.get(value, "meta")))
+        )
     )
   end
 

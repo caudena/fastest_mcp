@@ -13,7 +13,10 @@ defmodule FastestMCP.Middleware.ResponseLimiting do
 
   require Logger
 
+  alias FastestMCP.Error
   alias FastestMCP.Operation
+  alias FastestMCP.OperationPipeline
+  alias FastestMCP.Transport.Serializer
 
   @default_suffix "\n\n[Response truncated due to size limit]"
 
@@ -39,6 +42,13 @@ defmodule FastestMCP.Middleware.ResponseLimiting do
 
     if not (is_integer(max_size) and max_size > 0) do
       raise ArgumentError, "max_size must be positive, got #{inspect(max_size)}"
+    end
+
+    minimum_size = minimum_result_size()
+
+    if max_size < minimum_size do
+      raise ArgumentError,
+            "max_size must be at least #{minimum_size} bytes to encode a valid tool result, got #{max_size}"
     end
 
     middleware = %__MODULE__{
@@ -79,7 +89,9 @@ defmodule FastestMCP.Middleware.ResponseLimiting do
   end
 
   defp maybe_limit_result(%__MODULE__{} = middleware, %Operation{} = operation, result) do
-    serialized = JSON.encode!(result)
+    component = operation.component || resolved_component(operation.context)
+    payload = Serializer.tool_result(result, component)
+    serialized = JSON.encode!(payload)
 
     if byte_size(serialized) <= middleware.max_size do
       result
@@ -88,14 +100,78 @@ defmodule FastestMCP.Middleware.ResponseLimiting do
         "Tool #{inspect(operation.target)} response exceeds size limit: #{byte_size(serialized)} bytes > #{middleware.max_size} bytes, truncating"
       )
 
-      result
-      |> extract_text()
-      |> truncate_to_tool_result(
-        middleware.max_size,
-        middleware.truncation_suffix,
-        extract_metadata(result)
-      )
+      if structured_output_required?(component) do
+        truncate_structured_tool_result(
+          payload,
+          byte_size(serialized),
+          middleware.max_size,
+          middleware.truncation_suffix
+        )
+      else
+        result
+        |> extract_text()
+        |> truncate_to_tool_result(
+          middleware.max_size,
+          middleware.truncation_suffix,
+          extract_metadata(result)
+        )
+      end
     end
+  end
+
+  defp truncate_structured_tool_result(payload, actual_size, max_size, suffix) do
+    case Map.fetch(payload, "structuredContent") do
+      {:ok, structured_content} when is_map(structured_content) ->
+        required_metadata =
+          %{"structuredContent" => structured_content}
+          |> maybe_put_metadata("isError", Map.get(payload, "isError"))
+
+        optional_metadata =
+          %{}
+          |> maybe_put_metadata("_meta", Map.get(payload, "_meta"))
+
+        text = extract_text(payload)
+
+        limited =
+          truncate_preserving_metadata(
+            text,
+            max_size,
+            suffix,
+            Map.merge(required_metadata, optional_metadata)
+          ) ||
+            truncate_preserving_metadata(text, max_size, suffix, required_metadata)
+
+        limited ||
+          raise_unrepresentable_result!(
+            actual_size,
+            max_size,
+            encoded_result_size("", required_metadata)
+          )
+
+      _other ->
+        raise_unrepresentable_result!(actual_size, max_size, minimum_result_size())
+    end
+  end
+
+  defp truncate_preserving_metadata(text, max_size, suffix, metadata) do
+    suffix = to_string(suffix)
+
+    case build_truncated_text(text, suffix, max_size, metadata) ||
+           build_truncated_suffix(suffix, max_size, metadata) do
+      candidate when is_binary(candidate) -> limited_result(candidate, metadata)
+      nil -> nil
+    end
+  end
+
+  defp raise_unrepresentable_result!(actual_size, max_size, minimum_size) do
+    raise Error,
+      code: :internal_error,
+      message: "tool response exceeds the configured size limit",
+      details: %{
+        actual_bytes: actual_size,
+        maximum_bytes: max_size,
+        minimum_valid_result_bytes: minimum_size
+      }
   end
 
   defp truncate_to_tool_result(text, max_size, suffix, metadata) do
@@ -163,9 +239,21 @@ defmodule FastestMCP.Middleware.ResponseLimiting do
   defp encoded_result_size(text, metadata) do
     text
     |> limited_result(metadata)
+    |> Serializer.tool_result()
     |> JSON.encode!()
     |> byte_size()
   end
+
+  defp minimum_result_size, do: encoded_result_size("", %{})
+
+  defp resolved_component(%FastestMCP.Context{} = context) do
+    OperationPipeline.resolved_component(context)
+  end
+
+  defp resolved_component(_context), do: nil
+
+  defp structured_output_required?(%{output_schema: schema}) when not is_nil(schema), do: true
+  defp structured_output_required?(_component), do: false
 
   defp limited_result(text, metadata) do
     Map.merge(%{"content" => [%{"type" => "text", "text" => text}]}, metadata)

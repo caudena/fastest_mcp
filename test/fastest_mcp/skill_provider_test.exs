@@ -1,6 +1,7 @@
 defmodule FastestMCP.SkillProviderTest do
   use ExUnit.Case, async: false
 
+  alias FastestMCP.PathSafety
   alias FastestMCP.Providers.Skill
   alias FastestMCP.Providers.Skills.Common
   alias FastestMCP.Transport.Engine
@@ -154,6 +155,45 @@ defmodule FastestMCP.SkillProviderTest do
     end
   end
 
+  test "manifest hashes the complete contents of files larger than one stream chunk" do
+    skill_dir = create_skill_dir("large-file-skill")
+    File.write!(Path.join(skill_dir, "SKILL.md"), "# Large File")
+
+    content = :binary.copy(<<0, 1, 2, 3, 4, 5, 6, 7>>, 2_000)
+    File.write!(Path.join(skill_dir, "large.bin"), content)
+
+    provider = Skill.new(skill_dir)
+    manifest = provider.skill_info |> Common.manifest_json() |> JSON.decode!()
+    file = Enum.find(manifest["files"], &(&1["path"] == "large.bin"))
+
+    expected_hash =
+      content
+      |> then(&:crypto.hash(:sha256, &1))
+      |> Base.encode16(case: :lower)
+
+    assert file["size"] == byte_size(content)
+    assert file["hash"] == "sha256:" <> expected_hash
+  end
+
+  test "skill scanning ignores directory cycles" do
+    skill_dir = create_skill_dir("cycle-skill")
+    File.write!(Path.join(skill_dir, "SKILL.md"), "# Cycle Safe")
+    File.ln_s!(PathSafety.realpath!(skill_dir), Path.join(skill_dir, "loop"))
+
+    provider = Skill.new(skill_dir)
+    assert Enum.map(provider.skill_info.files, & &1.path) == ["SKILL.md"]
+  end
+
+  test "skill loading rejects an external main-file symlink" do
+    unsafe_skill = create_skill_dir("unsafe-skill")
+    outside = Path.join(Path.dirname(unsafe_skill), "outside.md")
+    File.write!(outside, "SECRET")
+    File.ln_s!(outside, Path.join(unsafe_skill, "SKILL.md"))
+
+    error = assert_raise File.Error, fn -> Skill.new(unsafe_skill) end
+    assert error.reason == :invalid_path
+  end
+
   test "skill metadata survives mounted providers" do
     skill_dir = create_skill_dir("mounted-skill")
     File.write!(Path.join(skill_dir, "SKILL.md"), "# Mounted Skill")
@@ -185,10 +225,9 @@ defmodule FastestMCP.SkillProviderTest do
 
   defp create_skill_dir(name) do
     root =
-      Path.join(
-        System.tmp_dir!(),
-        "fastest_mcp_skill_provider_#{System.unique_integer([:positive])}"
-      )
+      System.tmp_dir!()
+      |> PathSafety.realpath!()
+      |> Path.join("fastest_mcp_skill_provider_#{System.unique_integer([:positive])}")
 
     skill_dir = Path.join(root, name)
     File.mkdir_p!(skill_dir)

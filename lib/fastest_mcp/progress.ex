@@ -66,7 +66,11 @@ defmodule FastestMCP.Progress do
     next_state = Map.merge(state(progress), changes)
     :ok = Context.put_request_state(context, @state_key, next_state)
 
-    :ok =
+    # The helper's state update is useful for local and background-task calls
+    # even when the originating MCP request did not negotiate a progress token.
+    # Callers that need delivery feedback use Context.report_progress/4
+    # directly; the convenience helper deliberately remains state-oriented.
+    _delivery =
       Context.report_progress(
         context,
         next_state.current,

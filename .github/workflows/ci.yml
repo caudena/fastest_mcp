@@ -17,13 +17,22 @@ jobs:
           elixir-version: "1.19.5"
           otp-version: "28.4"
 
-      - name: Install dependencies
-        run: mix deps.get
+      - name: Install locked dependencies
+        run: mix deps.get --check-locked
+
+      - name: Check whitespace
+        run: git diff --check
 
       - name: Check formatting
         run: mix format --check-formatted
 
-      - name: Run hermetic test suite
+      - name: Compile development code without warnings
+        run: mix compile --warnings-as-errors
+
+      - name: Compile test code without warnings
+        run: MIX_ENV=test mix compile --warnings-as-errors
+
+      - name: Run hermetic native test suite
         run: mix test --exclude external_auth --exclude conformance --exclude docs_examples
 
   docs-build:
@@ -37,38 +46,11 @@ jobs:
           elixir-version: "1.19.5"
           otp-version: "28.4"
 
-      - name: Install dependencies
-        run: mix deps.get
+      - name: Install locked dependencies
+        run: mix deps.get --check-locked
 
-      - name: Build HexDocs
-        run: mix docs
-
-  package:
-    runs-on: ubuntu-latest
-    env:
-      HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: erlef/setup-beam@v1
-        with:
-          elixir-version: "1.19.5"
-          otp-version: "28.4"
-
-      - name: Install dependencies
-        run: mix deps.get
-
-      - name: Build Hex package
-        run: mix hex.build
-
-      - name: Verify Hex publish dry-run
-        if: ${{ env.HEX_API_KEY != '' }}
-        run: mix hex.publish --yes --dry-run
-
-      - name: Skip Hex publish dry-run
-        if: ${{ env.HEX_API_KEY == '' }}
-        run: echo "Skipping Hex publish --dry-run because HEX_API_KEY is not configured."
+      - name: Build HexDocs without warnings
+        run: mix docs --warnings-as-errors
 
   docs-examples:
     runs-on: ubuntu-latest
@@ -81,27 +63,13 @@ jobs:
           elixir-version: "1.19.5"
           otp-version: "28.4"
 
-      - name: Install dependencies
-        run: mix deps.get
+      - name: Install locked dependencies
+        run: mix deps.get --check-locked
 
       - name: Run docs example harness
         run: mix test --only docs_examples --exclude external_auth --exclude conformance
 
-  clean-project-smoke:
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: erlef/setup-beam@v1
-        with:
-          elixir-version: "1.19.5"
-          otp-version: "28.4"
-
-      - name: Run clean project smoke test
-        run: ./scripts/clean_project_smoke.sh
-
-  conformance:
+  conformance-server:
     needs: hermetic-test
     runs-on: ubuntu-latest
 
@@ -116,16 +84,40 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
+          cache: npm
+          cache-dependency-path: test/conformance/package-lock.json
 
-      - name: Install dependencies
-        run: mix deps.get
+      - name: Install locked Elixir dependencies
+        run: mix deps.get --check-locked
 
-      - name: Run MCP conformance lane
-        run: mix test --only conformance --exclude external_auth
+      - name: Install pinned conformance runner
+        working-directory: test/conformance
+        run: npm ci
 
-  external-auth:
-    if: ${{ vars.FASTEST_MCP_EXTERNAL_AUTH == 'true' || github.event_name == 'workflow_dispatch' }}
-    needs: [hermetic-test, conformance]
+      - name: Verify pinned conformance runner
+        working-directory: test/conformance
+        run: test "$(npx --no-install conformance --version)" = "0.1.16"
+
+      - name: Prove runner adapter boundary and run all server conformance scenarios
+        env:
+          MCP_CONFORMANCE_OUTPUT_DIR: ${{ runner.temp }}/conformance-server
+        run: >-
+          mix test
+          test/fastest_mcp/conformance_protocol_shim_test.exs
+          test/fastest_mcp/conformance_test.exs
+          --include conformance --exclude external_auth
+
+      - name: Upload server conformance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-server-${{ github.sha }}
+          path: ${{ runner.temp }}/conformance-server
+          if-no-files-found: warn
+          retention-days: 14
+
+  conformance-client:
+    needs: hermetic-test
     runs-on: ubuntu-latest
 
     steps:
@@ -136,8 +128,68 @@ jobs:
           elixir-version: "1.19.5"
           otp-version: "28.4"
 
-      - name: Install dependencies
-        run: mix deps.get
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: test/conformance/package-lock.json
 
-      - name: Run credentials-backed auth provider suite
-        run: mix test --include external_auth
+      - name: Install locked Elixir dependencies
+        run: mix deps.get --check-locked
+
+      - name: Install pinned conformance runner
+        working-directory: test/conformance
+        run: npm ci
+
+      - name: Verify pinned conformance runner
+        working-directory: test/conformance
+        run: test "$(npx --no-install conformance --version)" = "0.1.16"
+
+      - name: Prove runner adapter boundary and run all client conformance scenarios
+        env:
+          MCP_CONFORMANCE_OUTPUT_DIR: ${{ runner.temp }}/conformance-client
+        run: >-
+          mix test
+          test/fastest_mcp/conformance_client_protocol_proxy_test.exs
+          test/fastest_mcp/conformance_client_test.exs
+          --include conformance --exclude external_auth
+
+      - name: Upload client conformance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-client-${{ github.sha }}
+          path: ${{ runner.temp }}/conformance-client
+          if-no-files-found: warn
+          retention-days: 14
+
+  package:
+    needs:
+      - hermetic-test
+      - docs-build
+      - docs-examples
+      - conformance-server
+      - conformance-client
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.19.5"
+          otp-version: "28.4"
+
+      - name: Install locked dependencies
+        run: mix deps.get --check-locked
+
+      - name: Build and verify one fresh package candidate
+        run: ./scripts/package_smoke.sh "$RUNNER_TEMP/fastest-mcp-package-artifacts"
+
+      - name: Upload the verified package candidate and evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: fastest-mcp-package-${{ github.sha }}
+          path: ${{ runner.temp }}/fastest-mcp-package-artifacts
+          if-no-files-found: error
+          retention-days: 14

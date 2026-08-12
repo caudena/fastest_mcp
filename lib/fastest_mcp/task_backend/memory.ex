@@ -124,10 +124,10 @@ defmodule FastestMCP.TaskBackend.Memory do
       [{^task_id, task}] ->
         if session_matches?(task, opts[:session_id]) and owner_matches?(task, owner_fingerprint),
           do: {:ok, task},
-          else: :error
+          else: {:error, :not_found}
 
       [] ->
-        :error
+        {:error, :not_found}
     end
   end
 
@@ -153,7 +153,7 @@ defmodule FastestMCP.TaskBackend.Memory do
   end
 
   defp expire_tasks_reply(state, now_ms) do
-    expire_tasks(state, now_ms, [])
+    {:ok, expire_tasks(state, now_ms, [])}
   end
 
   defp expire_tasks(state, now_ms, expired_ids) do
@@ -337,8 +337,6 @@ defmodule FastestMCP.TaskBackend.Memory do
   defp created_index_key(task), do: {-task.submitted_at, task.id}
   defp session_created_index_key(task), do: {task.session_id, -task.submitted_at, task.id}
   defp expiry_index_key(task), do: {task.expires_at, task.id}
-
-  defp next_key_for_page([], _session_id), do: nil
 
   defp next_key_for_page(tasks, session_id) do
     last = List.last(tasks)

@@ -27,6 +27,8 @@ FastestMCP.ComponentManager.remove_tool(manager, "dynamic.echo")
 ```
 
 The same pattern exists for resources, resource templates, and prompts.
+Resolving a disabled dynamic component raises `FastestMCP.Error` with code
+`:disabled`; it is not reported as an unknown component.
 
 ## Why This Shape
 

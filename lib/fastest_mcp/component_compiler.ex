@@ -16,13 +16,22 @@ defmodule FastestMCP.ComponentCompiler do
   alias FastestMCP.Components.Resource
   alias FastestMCP.Components.ResourceTemplate
   alias FastestMCP.Components.Tool
+  alias FastestMCP.Protocol.URI, as: ProtocolURI
+  alias FastestMCP.Schema
   alias FastestMCP.TaskConfig
   alias FastestMCP.Authorization
 
   @doc "Compiles the given handler into a runtime component."
   def compile(:tool, server_name, name, handler, opts) do
     inject = normalize_inject(opts[:inject])
-    input_schema = opts[:input_schema]
+    schema_opts = Keyword.get(opts, :schema_options, [])
+
+    {input_schema, compiled_input_schema} =
+      compile_tool_schema!(:input, opts[:input_schema], schema_opts)
+
+    {output_schema, compiled_output_schema} =
+      compile_tool_schema!(:output, opts[:output_schema], schema_opts)
+
     completions = normalize_completions(opts[:completions])
     validate_injected_keys!(:tool, schema_property_keys(input_schema), inject)
 
@@ -35,6 +44,7 @@ defmodule FastestMCP.ComponentCompiler do
       icons: normalize_icons(opts[:icons]),
       annotations: normalize_annotations(opts[:annotations]),
       input_schema: input_schema,
+      compiled_input_schema: compiled_input_schema,
       completions: completions,
       inject: inject,
       task: normalize_task(opts[:task]),
@@ -44,15 +54,18 @@ defmodule FastestMCP.ComponentCompiler do
       visibility: normalize_visibility(opts[:visibility]),
       meta: Map.new(Keyword.get(opts, :meta, %{})),
       timeout: opts[:timeout],
-      output_schema: opts[:output_schema],
+      output_schema: output_schema,
+      compiled_output_schema: compiled_output_schema,
       compiled: normalize_callable!(:tool, handler)
     }
   end
 
   def compile(:resource, server_name, uri, handler, opts) do
+    uri = uri |> to_string() |> ProtocolURI.validate!("resource URI")
+
     %Resource{
       server_name: server_name,
-      uri: to_string(uri),
+      uri: uri,
       version: normalize_version(opts[:version]),
       title: opts[:title],
       description: opts[:description],
@@ -67,6 +80,7 @@ defmodule FastestMCP.ComponentCompiler do
       meta: Map.new(Keyword.get(opts, :meta, %{})),
       timeout: opts[:timeout],
       mime_type: Keyword.get(opts, :mime_type, "application/json"),
+      size: normalize_resource_size(opts[:size]),
       compiled: normalize_callable!(:resource, handler)
     }
   end
@@ -76,7 +90,7 @@ defmodule FastestMCP.ComponentCompiler do
       ResourceTemplate.compile_matcher!(to_string(uri_template))
 
     inject = normalize_inject(opts[:inject])
-    parameters = opts[:parameters]
+    {parameters, compiled_parameters} = compile_optional_schema!(opts[:parameters], opts)
     completions = normalize_completions(opts[:completions])
 
     validate_injected_keys!(
@@ -96,6 +110,7 @@ defmodule FastestMCP.ComponentCompiler do
       inject: inject,
       completions: completions,
       parameters: parameters,
+      compiled_parameters: compiled_parameters,
       task: normalize_task(opts[:task]),
       authorization: normalize_authorization(opts),
       tags: normalize_tags(opts[:tags]),
@@ -135,6 +150,41 @@ defmodule FastestMCP.ComponentCompiler do
       timeout: opts[:timeout],
       compiled: normalize_callable!(:prompt, handler)
     }
+  end
+
+  defp compile_tool_schema!(_kind, nil, _schema_opts), do: {nil, nil}
+
+  defp compile_tool_schema!(kind, schema, schema_opts) do
+    normalized = normalize_tool_schema!(kind, schema)
+    {normalized, Schema.compile!(normalized, schema_opts)}
+  end
+
+  @doc false
+  def normalize_tool_schema!(_kind, nil), do: nil
+
+  def normalize_tool_schema!(kind, schema) when kind in [:input, :output] do
+    with {:ok, normalized} <- Schema.normalize(schema),
+         true <- Schema.object_root?(normalized) do
+      normalized
+    else
+      false ->
+        raise ArgumentError,
+              "tool #{kind}_schema must be a JSON Schema object with type: \"object\" at the root"
+
+      {:error, error} ->
+        raise error
+    end
+  end
+
+  defp compile_optional_schema!(nil, _opts), do: {nil, nil}
+
+  defp compile_optional_schema!(schema, opts) do
+    schema_opts = Keyword.get(opts, :schema_options, [])
+
+    case Schema.normalize(schema) do
+      {:ok, normalized} -> {normalized, Schema.compile!(normalized, schema_opts)}
+      {:error, error} -> raise error
+    end
   end
 
   defp normalize_callable!(_type, handler) when is_function(handler) do
@@ -228,6 +278,14 @@ defmodule FastestMCP.ComponentCompiler do
 
   defp normalize_annotations(annotations) do
     raise ArgumentError, "component annotations must be a map, got #{inspect(annotations)}"
+  end
+
+  defp normalize_resource_size(nil), do: nil
+  defp normalize_resource_size(size) when is_integer(size) and size >= 0, do: size
+
+  defp normalize_resource_size(size) do
+    raise ArgumentError,
+          "resource size must be a non-negative integer, got #{inspect(size)}"
   end
 
   defp normalize_tags(nil), do: MapSet.new()

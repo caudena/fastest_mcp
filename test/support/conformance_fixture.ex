@@ -58,7 +58,7 @@ defmodule FastestMCP.TestSupport.ConformanceFixture do
   alias FastestMCP.Context
 
   def build_server(server_name) do
-    FastestMCP.server(server_name, dereference_schemas: false)
+    FastestMCP.server(server_name)
     |> add_tools()
     |> add_resources()
     |> add_prompts()
@@ -66,6 +66,14 @@ defmodule FastestMCP.TestSupport.ConformanceFixture do
 
   defp add_tools(server) do
     server
+    |> FastestMCP.add_tool(
+      "test_reconnection",
+      fn _arguments, ctx ->
+        close_originating_post_stream!(ctx)
+        %{"reconnected" => true}
+      end,
+      description: "Closes its originating POST stream before returning for SSE replay testing."
+    )
     |> FastestMCP.add_tool(
       "test_simple_text",
       fn _arguments, _ctx ->
@@ -369,7 +377,12 @@ defmodule FastestMCP.TestSupport.ConformanceFixture do
       end,
       description: "A prompt that accepts arguments.",
       arguments: [
-        %{name: "arg1", required: true, description: "First argument"},
+        %{
+          name: "arg1",
+          required: true,
+          description: "First argument",
+          completion: ["test", "testing"]
+        },
         %{name: "arg2", required: true, description: "Second argument"}
       ]
     )
@@ -407,6 +420,31 @@ defmodule FastestMCP.TestSupport.ConformanceFixture do
       end,
       description: "A prompt that returns an image."
     )
+  end
+
+  defp close_originating_post_stream!(ctx) do
+    sink_ref = Map.fetch!(ctx.request_metadata, :session_sink_ref)
+    {:ok, session_pid} = FastestMCP.Registry.lookup_session(ctx.server_name, ctx.session_id)
+
+    %{kind: :post, pid: sink_pid} =
+      session_pid |> :sys.get_state() |> Map.fetch!(:sinks) |> Map.fetch!(sink_ref)
+
+    send(sink_pid, {:fastest_mcp_session_replaced, sink_ref})
+    await_sink_kind(session_pid, :get, System.monotonic_time(:millisecond) + 2_000)
+  end
+
+  defp await_sink_kind(session_pid, kind, deadline) do
+    cond do
+      Enum.any?(:sys.get_state(session_pid).sinks, fn {_ref, sink} -> sink.kind == kind end) ->
+        :ok
+
+      System.monotonic_time(:millisecond) < deadline ->
+        Process.sleep(10)
+        await_sink_kind(session_pid, kind, deadline)
+
+      true ->
+        raise "conformance peer did not attach a #{kind} sink after the POST stream closed"
+    end
   end
 
   defp sampling_text(%{"content" => %{"text" => text}}) when is_binary(text), do: text

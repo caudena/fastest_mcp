@@ -1,4 +1,6 @@
 defmodule FastestMCP.Component do
+  require Logger
+
   @moduledoc """
   Shared helpers for component metadata, lookup identifiers, version ordering, and
   result normalization.
@@ -13,6 +15,7 @@ defmodule FastestMCP.Component do
 
   alias FastestMCP.BackgroundTaskStore
   alias FastestMCP.CallSupervisor
+  alias FastestMCP.ComponentCompiler
   alias FastestMCP.Context
   alias FastestMCP.Components.Prompt
   alias FastestMCP.Components.Resource
@@ -20,15 +23,20 @@ defmodule FastestMCP.Component do
   alias FastestMCP.Components.Tool
   alias FastestMCP.Error
   alias FastestMCP.InputValidator
+  alias FastestMCP.JSONValue
   alias FastestMCP.Prompts.Message, as: PromptMessage
   alias FastestMCP.Prompts.Result, as: PromptResult
   alias FastestMCP.ResultNormalizer
   alias FastestMCP.Resources.Content, as: ResourceContent
   alias FastestMCP.Resources.Result, as: ResourceResult
   alias FastestMCP.TaskConfig
+  alias FastestMCP.Schema
+  alias FastestMCP.Schema.Compiled
   alias FastestMCP.Telemetry
   alias FastestMCP.Tools.Result, as: ToolResult
   alias FastestMCP.Tools.OutputSchema
+
+  @duplicate_policies [:error, :warn, :ignore, :replace]
 
   @doc "Returns the component or provider type."
   def type(%Tool{}), do: :tool
@@ -100,6 +108,49 @@ defmodule FastestMCP.Component do
     end
   end
 
+  @doc false
+  def sort_by_version_desc(components) when is_list(components) do
+    sort_by_version_desc(components, &version/1)
+  end
+
+  @doc false
+  def sort_by_version_desc(items, version_fun)
+      when is_list(items) and is_function(version_fun, 1) do
+    items
+    |> Enum.with_index()
+    |> Enum.sort(fn {left, left_index}, {right, right_index} ->
+      case compare_versions(version_fun.(left), version_fun.(right)) do
+        :gt -> true
+        :lt -> false
+        :eq -> left_index < right_index
+      end
+    end)
+    |> Enum.map(&elem(&1, 0))
+  end
+
+  @doc false
+  def normalize_duplicate_policy!(policy) when policy in @duplicate_policies, do: policy
+
+  def normalize_duplicate_policy!(other) do
+    raise ArgumentError,
+          "on_duplicate must be one of #{inspect(@duplicate_policies)}, got #{inspect(other)}"
+  end
+
+  @doc false
+  def registration_action(existing_components, component, policy)
+      when is_list(existing_components) do
+    policy = normalize_duplicate_policy!(policy)
+    validate_version_mixing!(existing_components, component)
+
+    case Enum.find(existing_components, &same_registration?(&1, component)) do
+      nil ->
+        :insert
+
+      existing ->
+        duplicate_registration_action(existing, component, policy)
+    end
+  end
+
   @doc "Invokes the compiled handler."
   def invoke(%{compiled: compiled}, arguments, context) do
     compiled.(arguments, context)
@@ -112,13 +163,13 @@ defmodule FastestMCP.Component do
     cond do
       operation.task_request and not TaskConfig.supports_tasks?(task_config) ->
         raise Error,
-          code: :not_found,
+          code: :method_not_found,
           message:
             "#{type(component)} #{inspect(identifier(component))} does not support background task execution"
 
       not operation.task_request and task_config.mode == :required ->
         raise Error,
-          code: :not_found,
+          code: :method_not_found,
           message:
             "#{type(component)} #{inspect(identifier(component))} requires background task execution"
 
@@ -134,20 +185,13 @@ defmodule FastestMCP.Component do
     timeout = Map.get(component, :timeout)
     trace_context = Telemetry.current_context()
 
-    strict_input_validation =
-      case operation.context.server do
-        %{strict_input_validation: value} -> value
-        _other -> false
-      end
-
     case CallSupervisor.invoke(
            operation.call_supervisor,
            fn ->
              validated_arguments =
                component
                |> InputValidator.validate(
-                 strip_injected_arguments(component, operation.arguments),
-                 strict_input_validation
+                 strip_injected_arguments(component, operation.arguments)
                )
                |> merge_injected_arguments(component, operation.context)
 
@@ -199,16 +243,153 @@ defmodule FastestMCP.Component do
   end
 
   @doc "Normalizes a raw handler result for the component type."
-  def normalize_result(%Tool{}, %ToolResult{} = value) do
-    value
-    |> ToolResult.to_map()
-    |> ResultNormalizer.normalize_tool()
+  def normalize_result(%Tool{} = tool, %ToolResult{} = value) do
+    normalized = value |> ToolResult.to_map() |> ResultNormalizer.normalize_tool()
+    validate_tool_output!(tool, value, normalized)
   end
 
-  def normalize_result(%Tool{}, value), do: ResultNormalizer.normalize_tool(value)
+  def normalize_result(%Tool{} = tool, value) do
+    normalized = ResultNormalizer.normalize_tool(value)
+    validate_tool_output!(tool, value, normalized)
+  end
+
   def normalize_result(%Resource{}, value), do: normalize_resource_result(value)
   def normalize_result(%ResourceTemplate{}, value), do: normalize_resource_result(value)
   def normalize_result(%Prompt{}, value), do: normalize_prompt_result(value)
+
+  @doc false
+  def validate_normalized_output(%Tool{} = tool, normalized) do
+    validate_tool_output!(tool, normalized, normalized)
+  end
+
+  def validate_normalized_output(_component, normalized), do: normalized
+
+  @doc false
+  def refresh_compiled_schemas(component, cache, schema_options \\ [])
+
+  def refresh_compiled_schemas(%Tool{} = tool, cache, schema_options) do
+    input_schema = ComponentCompiler.normalize_tool_schema!(:input, tool.input_schema)
+    output_schema = ComponentCompiler.normalize_tool_schema!(:output, tool.output_schema)
+
+    %{
+      tool
+      | input_schema: input_schema,
+        output_schema: output_schema,
+        compiled_input_schema:
+          cached_schema(input_schema, cache, schema_options, tool.compiled_input_schema),
+        compiled_output_schema:
+          cached_schema(output_schema, cache, schema_options, tool.compiled_output_schema)
+    }
+  end
+
+  def refresh_compiled_schemas(%ResourceTemplate{} = template, cache, schema_options) do
+    %{
+      template
+      | compiled_parameters:
+          cached_schema(
+            template.parameters,
+            cache,
+            schema_options,
+            template.compiled_parameters
+          )
+    }
+  end
+
+  def refresh_compiled_schemas(component, _cache, _schema_options), do: component
+
+  defp validate_tool_output!(%Tool{output_schema: nil}, _raw, normalized), do: normalized
+
+  defp validate_tool_output!(%Tool{} = tool, raw, normalized) do
+    compiled = tool.compiled_output_schema || Schema.compile!(tool.output_schema)
+
+    with {:ok, structured} <- structured_tool_output(raw, normalized),
+         structured <- JSONValue.stringify_keys(structured),
+         {:ok, ^structured} <- Schema.validate(compiled, structured) do
+      normalized
+    else
+      {:error, :missing_structured_content} ->
+        raise Error,
+          code: :internal_error,
+          message:
+            "tool #{inspect(tool.name)} declares output_schema but returned no structuredContent"
+
+      {:error, schema_error} ->
+        raise Error,
+          code: :internal_error,
+          message:
+            "tool #{inspect(tool.name)} returned structuredContent that does not match output_schema: #{schema_error.message}",
+          details: %{schema: %{violations: schema_error.violations}}
+    end
+  end
+
+  defp structured_tool_output(%ToolResult{structured_content: nil}, _normalized),
+    do: {:error, :missing_structured_content}
+
+  defp structured_tool_output(%ToolResult{structured_content: structured}, _normalized),
+    do: {:ok, structured}
+
+  defp structured_tool_output(raw, normalized) when is_map(raw) do
+    keys = [:structuredContent, "structuredContent", :structured_content, "structured_content"]
+
+    case Enum.find(keys, &Map.has_key?(raw, &1)) do
+      nil ->
+        if Map.has_key?(raw, :content) or Map.has_key?(raw, "content") do
+          {:error, :missing_structured_content}
+        else
+          {:ok, normalized}
+        end
+
+      key ->
+        case Map.get(raw, key) do
+          nil -> {:error, :missing_structured_content}
+          structured -> {:ok, structured}
+        end
+    end
+  end
+
+  defp structured_tool_output(_raw, normalized) when is_map(normalized), do: {:ok, normalized}
+  defp structured_tool_output(_raw, _normalized), do: {:error, :missing_structured_content}
+
+  defp cached_schema(nil, _cache, _schema_options, _existing), do: nil
+
+  defp cached_schema(schema, cache, schema_options, existing)
+       when is_reference(cache) or is_integer(cache) do
+    {:ok, digest} = Schema.digest(schema)
+
+    case :ets.lookup(cache, digest) do
+      [{^digest, compiled}] ->
+        compiled
+
+      [] ->
+        compiled =
+          matching_compiled(existing, digest, schema) || Schema.compile!(schema, schema_options)
+
+        if :ets.insert_new(cache, {digest, compiled}) do
+          compiled
+        else
+          [{^digest, winner}] = :ets.lookup(cache, digest)
+          winner
+        end
+    end
+  rescue
+    ArgumentError -> cached_schema(schema, nil, schema_options, existing)
+  end
+
+  defp cached_schema(schema, _cache, schema_options, existing) do
+    {:ok, digest} = Schema.digest(schema)
+
+    matching_compiled(existing, digest, schema) || Schema.compile!(schema, schema_options)
+  end
+
+  defp matching_compiled(
+         %Compiled{digest: digest, source: source} = compiled,
+         digest,
+         schema
+       )
+       when source === schema,
+       do: compiled
+
+  defp matching_compiled(_existing, _digest, _schema), do: nil
 
   @doc "Returns the transport-facing metadata for the component."
   def metadata(component) do
@@ -247,7 +428,8 @@ defmodule FastestMCP.Component do
           annotations: component.annotations,
           task: TaskConfig.metadata(task_config),
           execution: task_execution_metadata(task_config),
-          mime_type: component.mime_type
+          mime_type: component.mime_type,
+          size: component.size
         })
 
       %ResourceTemplate{} ->
@@ -315,7 +497,14 @@ defmodule FastestMCP.Component do
         normalize_prompt_messages(Map.get(value, :messages, Map.get(value, "messages")))
       )
       |> maybe_put(:description, Map.get(value, :description, Map.get(value, "description")))
-      |> maybe_put(:meta, Map.get(value, :meta, Map.get(value, "meta")))
+      |> maybe_put(
+        :meta,
+        Map.get(
+          value,
+          :_meta,
+          Map.get(value, "_meta", Map.get(value, :meta, Map.get(value, "meta")))
+        )
+      )
     else
       %{messages: [%{role: "user", content: inspect(value)}]}
     end
@@ -369,6 +558,7 @@ defmodule FastestMCP.Component do
 
   defp normalize_resource_content(%ResourceContent{} = content) do
     %{}
+    |> maybe_put(:uri, content.uri)
     |> Map.put(:content, content.content)
     |> Map.put(:mime_type, content.mime_type)
     |> maybe_put(:meta, content.meta)
@@ -453,5 +643,57 @@ defmodule FastestMCP.Component do
     if TaskConfig.supports_tasks?(config) do
       %{taskSupport: Atom.to_string(config.mode)}
     end
+  end
+
+  defp validate_version_mixing!(existing_components, component) do
+    siblings =
+      Enum.filter(existing_components, fn existing ->
+        type(existing) == type(component) and identifier(existing) == identifier(component)
+      end)
+
+    has_versioned? = Enum.any?(siblings, &(not is_nil(version(&1))))
+    has_unversioned? = Enum.any?(siblings, &is_nil(version(&1)))
+
+    cond do
+      is_nil(version(component)) and has_versioned? ->
+        raise ArgumentError,
+              "#{type(component)} #{inspect(identifier(component))} cannot mix unversioned and versioned definitions"
+
+      not is_nil(version(component)) and has_unversioned? ->
+        raise ArgumentError,
+              "#{type(component)} #{inspect(identifier(component))} cannot mix versioned and unversioned definitions"
+
+      true ->
+        :ok
+    end
+  end
+
+  defp same_registration?(left, right) do
+    type(left) == type(right) and identifier(left) == identifier(right) and
+      version(left) == version(right)
+  end
+
+  defp duplicate_registration_action(_existing, component, :error) do
+    raise ArgumentError, duplicate_error(component)
+  end
+
+  defp duplicate_registration_action(existing, component, :warn) do
+    Logger.warning(duplicate_warning(component))
+    {:replace, existing}
+  end
+
+  defp duplicate_registration_action(existing, _component, :ignore), do: {:ignore, existing}
+  defp duplicate_registration_action(existing, _component, :replace), do: {:replace, existing}
+
+  defp duplicate_error(component) do
+    if is_nil(version(component)) do
+      "#{type(component)} #{inspect(identifier(component))} is already defined without a version"
+    else
+      "#{type(component)} #{inspect(identifier(component))} version #{inspect(version(component))} is already defined"
+    end
+  end
+
+  defp duplicate_warning(component) do
+    duplicate_error(component) <> "; replacing existing definition"
   end
 end

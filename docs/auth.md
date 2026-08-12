@@ -152,18 +152,101 @@ Authorization rules can also filter list results with tags:
 FastestMCP.Authorization.restrict_tag("internal")
 ```
 
+Authorization is fail closed. A component check authorizes only when it returns
+`true` or `:ok`. `false`, `nil`, malformed return values, exceptions, throws,
+and exits all deny access; a binary `{:error, message}` also denies with that
+message. When multiple versions share an identity, an unauthorized higher
+version is skipped so an authorized lower version can remain visible, while an
+explicit request for the unauthorized version is rejected.
+
 ## HTTP Behavior
 
-HTTP auth failures use plain bearer challenges:
+When a server configures auth, FastestMCP authenticates every inbound HTTP
+initialize, request, notification, client response, POST stream, GET stream,
+and DELETE before dispatch. The successful initialize identity is bound to the
+session; a different principal cannot reuse the session id. Component
+authorization still runs in the operation pipeline after transport
+authentication.
+
+Without protected-resource configuration, HTTP auth failures use a plain
+bearer challenge:
 
 ```text
 WWW-Authenticate: Bearer error="invalid_token", error_description="missing credentials"
 ```
 
-FastestMCP does not serve OAuth discovery, authorization, token, callback, or
-protected-resource metadata routes. Applications that need those endpoints
-should expose them from their Plug or Phoenix application and pass normalized
-auth results into FastestMCP.
+### RFC 9728 Protected Resource Metadata
+
+Configure `protected_resource:` when standards-aware clients must discover the
+authorization server and authoritative scopes for the MCP endpoint:
+
+```elixir
+server =
+  FastestMCP.server("documents",
+    auth: MyApp.MCPAuth,
+    protected_resource: [
+      resource: "https://mcp.example.com/mcp",
+      authorization_servers: ["https://auth.example.com"],
+      scopes_supported: ["documents:read", "documents:write"],
+      required_scopes: ["documents:read"]
+    ]
+  )
+```
+
+The public HTTP app serves the path-derived metadata document on the same
+resource origin. For the example above it is:
+
+```text
+https://mcp.example.com/.well-known/oauth-protected-resource/mcp
+```
+
+Authentication failures include both discovery and authoritative scope:
+
+```text
+WWW-Authenticate: Bearer resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource/mcp", scope="documents:read", error="invalid_token"
+```
+
+The configured `resource` must be the exact absolute MCP resource URI.
+Non-loopback resources and every authorization-server URI must use HTTPS, and
+the authorization-server list cannot be empty. Access tokens in query strings
+are rejected before the authenticator runs. The authenticator receives
+`"expected_resource"` and `"expected_scopes"` in its input and the same values
+in request metadata.
+
+For a protected resource, successful authentication must return verified
+evidence, not merely untrusted token claims:
+
+```elixir
+{:ok,
+ %FastestMCP.Auth.Result{
+   principal: %{"sub" => subject},
+   audiences: ["https://mcp.example.com/mcp"],
+   scopes: ["documents:read"]
+ }}
+```
+
+`audiences` identifies the resource audiences the host authenticator actually
+verified, and `scopes` identifies the granted scopes it actually verified.
+When protected-resource auth is enabled, FastestMCP fails closed unless the
+configured resource is present in `audiences` and every required scope is
+present in `scopes`. Those values survive the request-context handoff for
+component authorization; a session id is never accepted as authentication.
+
+The older `verified_audiences` and `verified_scopes` struct/map keys remain
+accepted as compatibility aliases. New authenticators should use `audiences`
+and `scopes`; conflicting values are rejected.
+
+FastestMCP remains the protected resource server. Authorization-server token
+issuance, signing, introspection, consent UI, and authorization-server
+operation stay application-owned or external. Signature/opaque-token
+verification is the authenticator's responsibility; FastestMCP enforces the
+verified audience and scope evidence returned by that boundary. Configure
+`FastestMCP.Auth.ProtectedResource` only together with an authenticator;
+protected-resource HTTP fails closed when no authenticator exists.
+
+The connected-client OAuth flow and its host-owned browser/token-store
+boundaries are documented in [Client](client.md). They do not turn FastestMCP
+into an authorization server.
 
 ## Why This Shape
 

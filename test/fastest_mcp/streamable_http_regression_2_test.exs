@@ -25,9 +25,10 @@ defmodule FastestMCP.StreamableHTTPRegression2Test do
 
     request =
       [
-        "POST /mcp/tools/call HTTP/1.1\r\n",
+        "POST /mcp HTTP/1.1\r\n",
         "Host: 127.0.0.1\r\n",
         "Content-Type: application/json\r\n",
+        "Accept: application/json, text/event-stream\r\n",
         "Content-Length: 8\r\n",
         "Connection: close\r\n\r\n",
         "not-json"
@@ -35,7 +36,18 @@ defmodule FastestMCP.StreamableHTTPRegression2Test do
       |> IO.iodata_to_binary()
 
     assert {400, body} = request(port, request)
-    assert %{"error" => %{"code" => "bad_request"}} = JSON.decode!(body)
+
+    payload = JSON.decode!(body)
+
+    assert %{
+             "jsonrpc" => "2.0",
+             "error" => %{
+               "code" => -32_700,
+               "data" => %{"fastestmcp" => %{"code" => "parse_error"}}
+             }
+           } = payload
+
+    refute Map.has_key?(payload, "id")
   end
 
   defp request(port, payload) do

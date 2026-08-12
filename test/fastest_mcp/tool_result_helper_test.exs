@@ -46,6 +46,10 @@ defmodule FastestMCP.ToolResultHelperTest do
       ToolResult.new("bad", meta: [:invalid])
     end
 
+    assert_raise ArgumentError, ~r/structured_content must be a map/, fn ->
+      ToolResult.new("bad", structured_content: ["invalid"])
+    end
+
     assert_raise ArgumentError, ~r/is_error must be a boolean/, fn ->
       ToolResult.new("bad", is_error: :invalid)
     end
@@ -90,7 +94,7 @@ defmodule FastestMCP.ToolResultHelperTest do
                "status" => "ok",
                "generated_at" => "2025-11-05T12:30:45Z"
              },
-             "meta" => %{"source" => "helper"},
+             "_meta" => %{"source" => "helper"},
              "isError" => false
            } =
              Engine.dispatch!(server_name, %Request{
@@ -130,7 +134,9 @@ defmodule FastestMCP.ToolResultHelperTest do
         {Bandit,
          plug:
            {FastestMCP.Transport.HTTPApp,
-            server_name: server_name, path: "/mcp", allowed_hosts: :any},
+            server_name: server_name,
+            path: "/mcp",
+            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
          scheme: :http,
          port: 0}
       )
@@ -145,7 +151,7 @@ defmodule FastestMCP.ToolResultHelperTest do
     assert %{
              "content" => [%{"type" => "text", "text" => "Release checklist generated"}],
              "structuredContent" => %{"status" => "ok"},
-             "meta" => %{"source" => "helper"}
+             "_meta" => %{"source" => "helper"}
            } = Client.call_tool(client, "report", %{})
 
     assert %{"message" => "hi"} = Client.call_tool(client, "mirror", %{})

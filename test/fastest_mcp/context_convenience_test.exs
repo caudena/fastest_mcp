@@ -39,14 +39,14 @@ defmodule FastestMCP.ContextConvenienceTest do
              explicit_request_id: request_id,
              nested_request_id: request_id,
              nested_session_id: "ctx-session",
-             request_path: "/mcp/tools/call",
+             request_path: "/mcp",
              request_meta: %{"custom" => "value", "method" => "POST"}
            } =
              FastestMCP.call_tool(server_name, "nested", %{},
                session_id: "ctx-session",
                request_metadata: %{
                  method: "POST",
-                 path: "/mcp/tools/call",
+                 path: "/mcp",
                  custom: "value"
                }
              )
@@ -59,7 +59,7 @@ defmodule FastestMCP.ContextConvenienceTest do
       request_id: "req-1",
       transport: :streamable_http,
       request_metadata: %{
-        path: "/mcp/prompts/get",
+        path: "/mcp",
         query_params: %{"page" => "1"},
         headers: %{"authorization" => "Bearer token", "x-demo" => "1"},
         custom: "meta"
@@ -69,7 +69,7 @@ defmodule FastestMCP.ContextConvenienceTest do
     assert %RequestContext{
              request_id: "req-1",
              transport: :streamable_http,
-             path: "/mcp/prompts/get",
+             path: "/mcp",
              query_params: %{"page" => "1"},
              headers: %{"authorization" => "Bearer token", "x-demo" => "1"},
              meta: %{"custom" => "meta"}
