@@ -16,8 +16,8 @@ defmodule FastestMCP.BackgroundTaskStore do
   use GenServer
 
   alias FastestMCP.BackgroundTask
-  alias FastestMCP.Component
   alias FastestMCP.BackgroundTaskSupervisor
+  alias FastestMCP.Component
   alias FastestMCP.Context
   alias FastestMCP.Elicitation
   alias FastestMCP.Error
@@ -102,31 +102,33 @@ defmodule FastestMCP.BackgroundTaskStore do
 
   @impl true
   def init(opts) do
-    with {:ok, backend} <- task_backend_from_opts(opts) do
-      state = %{
-        server_name: Keyword.fetch!(opts, :server_name),
-        event_bus: Keyword.get(opts, :event_bus, EventBus),
-        relay_task_supervisor: Keyword.get(opts, :relay_task_supervisor),
-        backend: backend,
-        mask_error_details: Keyword.get(opts, :mask_error_details, false),
-        task_monitors: %{},
-        waiter_monitors: %{},
-        waiters: %{},
-        result_waiters: %{},
-        interaction_waiters: %{},
-        relay_requests: %{},
-        session_task_activity: %{}
-      }
+    case task_backend_from_opts(opts) do
+      {:ok, backend} ->
+        state = %{
+          server_name: Keyword.fetch!(opts, :server_name),
+          event_bus: Keyword.get(opts, :event_bus, EventBus),
+          relay_task_supervisor: Keyword.get(opts, :relay_task_supervisor),
+          backend: backend,
+          mask_error_details: Keyword.get(opts, :mask_error_details, false),
+          task_monitors: %{},
+          waiter_monitors: %{},
+          waiters: %{},
+          result_waiters: %{},
+          interaction_waiters: %{},
+          relay_requests: %{},
+          session_task_activity: %{}
+        }
 
-      with {:ok, _expired_ids} <-
-             backend(state).expire_tasks(store(state), System.system_time(:millisecond)),
-           :ok <- reconcile_runtime_tasks(state) do
-        {:ok, state}
-      else
-        {:error, reason} -> {:stop, {:task_backend_startup_failed, reason}}
-      end
-    else
-      {:error, reason} -> {:stop, {:task_backend_startup_failed, reason}}
+        with {:ok, _expired_ids} <-
+               backend(state).expire_tasks(store(state), System.system_time(:millisecond)),
+             :ok <- reconcile_runtime_tasks(state) do
+          {:ok, state}
+        else
+          {:error, reason} -> {:stop, {:task_backend_startup_failed, reason}}
+        end
+
+      {:error, reason} ->
+        {:stop, {:task_backend_startup_failed, reason}}
     end
   end
 
@@ -1400,27 +1402,33 @@ defmodule FastestMCP.BackgroundTaskStore do
   end
 
   defp apply_interaction_waiter_responses(state, task, task_id, matching) do
-    with {:ok, waiter} <- fetch_interaction_waiter(state, task_id) do
-      case Map.fetch(matching, waiter.request_id) do
-        :error ->
-          {:reply, {:ok, public_task(task)}, state}
+    case fetch_interaction_waiter(state, task_id) do
+      {:ok, waiter} ->
+        case Map.fetch(matching, waiter.request_id) do
+          :error ->
+            {:reply, {:ok, public_task(task)}, state}
 
-        {:ok, response} ->
-          with {:ok, resolved} <- resolve_task_input_response(waiter, response) do
-            task = mark_answered_input_requests(task, [waiter.request_id])
+          {:ok, response} ->
+            case resolve_task_input_response(waiter, response) do
+              {:ok, resolved} ->
+                task = mark_answered_input_requests(task, [waiter.request_id])
 
-            case resolve_interaction(state, task, task_id, {:ok, resolved}) do
-              {:ok, next_state, resumed_task} ->
-                emit_status_notification(next_state, resumed_task, "working", nil)
-                {:reply, {:ok, public_task(resumed_task)}, next_state}
+                case resolve_interaction(state, task, task_id, {:ok, resolved}) do
+                  {:ok, next_state, resumed_task} ->
+                    emit_status_notification(next_state, resumed_task, "working", nil)
+                    {:reply, {:ok, public_task(resumed_task)}, next_state}
 
-              {:error, reason, next_state} ->
-                {:reply, {:error, reason}, next_state}
+                  {:error, reason, next_state} ->
+                    {:reply, {:error, reason}, next_state}
+                end
+
+              {:error, %Error{} = error} ->
+                {:reply, {:error, error}, state}
             end
-          else
-            {:error, %Error{} = error} -> {:reply, {:error, error}, state}
-          end
-      end
+        end
+
+      {:error, _reason} = error ->
+        error
     end
   end
 

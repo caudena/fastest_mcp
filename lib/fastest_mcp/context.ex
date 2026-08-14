@@ -79,8 +79,9 @@ defmodule FastestMCP.Context do
   alias FastestMCP.BackgroundTaskStore
   alias FastestMCP.ComponentVisibility
   alias FastestMCP.Elicitation
-  alias FastestMCP.EventBus
+  alias FastestMCP.Elicitation.URL, as: URLElicitation
   alias FastestMCP.Error
+  alias FastestMCP.EventBus
   alias FastestMCP.HTTPRequest
   alias FastestMCP.JSONValue
   alias FastestMCP.OperationPipeline
@@ -458,8 +459,10 @@ defmodule FastestMCP.Context do
     end
   rescue
     _error in KeyError ->
-      raise ArgumentError,
-            "unknown dependency #{inspect(name)} for server #{inspect(context.server_name)}"
+      reraise ArgumentError.exception(
+                "unknown dependency #{inspect(name)} for server #{inspect(context.server_name)}"
+              ),
+              __STACKTRACE__
   end
 
   @doc "Stores session-scoped state for the current session."
@@ -696,44 +699,42 @@ defmodule FastestMCP.Context do
       |> maybe_put_sampling_tool_choice(tools, Keyword.get(opts, :tool_choice, :auto))
       |> maybe_put_task_request(opts)
 
-    cond do
-      is_background_task(context) ->
-        case task_store(context) do
-          nil ->
-            raise RuntimeError, "background task context is missing its task store"
+    if background_task?(context) do
+      case task_store(context) do
+        nil ->
+          raise RuntimeError, "background task context is missing its task store"
 
-          store ->
-            case BackgroundTaskStore.sample(
-                   store,
-                   task_id(context),
-                   params,
-                   Keyword.get(opts, :timeout_ms, 60_000)
-                 ) do
-              {:ok, result} ->
-                validate_sampling_result!(result, tools, opts)
+        store ->
+          case BackgroundTaskStore.sample(
+                 store,
+                 task_id(context),
+                 params,
+                 Keyword.get(opts, :timeout_ms, 60_000)
+               ) do
+            {:ok, result} ->
+              validate_sampling_result!(result, tools, opts)
 
-              {:error, %Error{} = error} ->
-                raise error
+            {:error, %Error{} = error} ->
+              raise error
 
-              {:error, :not_found} ->
-                raise Error,
-                  code: :not_found,
-                  message: "unknown background task #{inspect(task_id(context))}"
-            end
-        end
+            {:error, :not_found} ->
+              raise Error,
+                code: :not_found,
+                message: "unknown background task #{inspect(task_id(context))}"
+          end
+      end
+    else
+      result =
+        send_client_request(
+          context,
+          "sampling/createMessage",
+          params,
+          Keyword.get(opts, :timeout_ms, 60_000),
+          opts
+        )
 
-      true ->
-        result =
-          send_client_request(
-            context,
-            "sampling/createMessage",
-            params,
-            Keyword.get(opts, :timeout_ms, 60_000),
-            opts
-          )
-
-        result = validate_sampling_result!(result, tools, opts)
-        normalize_peer_task_or_result(context, result, :sampling, "sampling/createMessage")
+      result = validate_sampling_result!(result, tools, opts)
+      normalize_peer_task_or_result(context, result, :sampling, "sampling/createMessage")
     end
   end
 
@@ -745,13 +746,13 @@ defmodule FastestMCP.Context do
       "connected client did not declare roots support"
     )
 
-    if not Keyword.get(opts, :refresh, false) do
+    if Keyword.get(opts, :refresh, false) do
+      request_and_cache_roots(context, opts)
+    else
       case Session.cached_roots(context.server_name, context.session_id) do
         roots when is_list(roots) -> roots
         _other -> request_and_cache_roots(context, opts)
       end
-    else
-      request_and_cache_roots(context, opts)
     end
   end
 
@@ -821,7 +822,7 @@ defmodule FastestMCP.Context do
         context,
         "elicitation/create",
         elicitation
-        |> FastestMCP.Elicitation.URL.to_params()
+        |> URLElicitation.to_params()
         |> maybe_put_task_request(opts),
         Keyword.get(opts, :timeout_ms, 60_000),
         opts
@@ -863,7 +864,7 @@ defmodule FastestMCP.Context do
     )
 
     elicitation = build_and_register_url_elicitation!(context, message, url_or_builder, opts)
-    raise FastestMCP.Elicitation.URL.required_error([elicitation])
+    raise URLElicitation.required_error([elicitation])
   end
 
   @doc "Returns the current access token available on the context."
@@ -979,9 +980,11 @@ defmodule FastestMCP.Context do
   end
 
   @doc "Returns whether the context belongs to background-task execution."
+  @deprecated "Use background_task?/1"
+  # credo:disable-for-next-line Credo.Check.Readability.PredicateFunctionNames
   def is_background_task(%__MODULE__{} = context), do: not is_nil(task_id(context))
   @doc "Returns whether the context belongs to background-task execution."
-  def background_task?(%__MODULE__{} = context), do: is_background_task(context)
+  def background_task?(%__MODULE__{} = context), do: not is_nil(task_id(context))
 
   @doc "Returns the current background-task id, if any."
   def task_id(%__MODULE__{} = context) do
@@ -1092,7 +1095,7 @@ defmodule FastestMCP.Context do
     request = Elicitation.request(message, response_type, opts)
 
     cond do
-      is_background_task(context) ->
+      background_task?(context) ->
         case task_store(context) do
           nil ->
             raise RuntimeError, "background task context is missing its task store"
@@ -1526,7 +1529,7 @@ defmodule FastestMCP.Context do
 
     principal_fingerprint = Auth.identity_fingerprint(context.principal, context.auth)
 
-    FastestMCP.Elicitation.URL.new!(message, url_or_builder,
+    URLElicitation.new!(message, url_or_builder,
       session_id: context.session_id,
       principal_fingerprint: principal_fingerprint,
       allowed_hosts: allowed_hosts,

@@ -68,8 +68,8 @@ defmodule FastestMCP.Server do
   alias FastestMCP.Elicitation.URL, as: URLElicitation
   alias FastestMCP.Middleware.ToolInjection
   alias FastestMCP.Middleware.ToolSearch
-  alias FastestMCP.Provider
   alias FastestMCP.Protocol.Extensions
+  alias FastestMCP.Provider
   alias FastestMCP.Providers.MountedServer, as: MountedServerProvider
   alias FastestMCP.Providers.Proxy, as: ProxyProvider
   alias FastestMCP.ResourceSecurity

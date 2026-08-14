@@ -15,10 +15,13 @@ defmodule FastestMCP.SSEDecoderTest do
             ], decoder} =
              SSEDecoder.feed(
                decoder,
-               "data: {\"line\":\"lf\"}\n\n" <>
-                 "data: {\"line\":\"crlf\"}\r\n\r\n" <>
-                 "data: {\"line\":\"cr\"}\r\r" <>
-                 "data: {\"line\":\"mixed\"}\r\n\n"
+               ~S(data: {"line":"lf"}) <>
+                 "\n\n" <>
+                 ~S(data: {"line":"crlf"}) <>
+                 "\r\n\r\n" <>
+                 ~S(data: {"line":"cr"}) <>
+                 "\r\r" <>
+                 ~S(data: {"line":"mixed"}) <> "\r\n\n"
              )
 
     assert :ok = SSEDecoder.finish(decoder)
@@ -30,7 +33,11 @@ defmodule FastestMCP.SSEDecoderTest do
     assert {:ok, [%{"nested" => %{"ok" => true}}], decoder} =
              SSEDecoder.feed(
                decoder,
-               "data: {\ndata: \"nested\": {\"ok\": true}\ndata: }\n\n"
+               ~S(data: {) <>
+                 "\n" <>
+                 ~S(data: "nested": {"ok": true}) <>
+                 "\n" <>
+                 ~S(data: }) <> "\n\n"
              )
 
     assert :ok = SSEDecoder.finish(decoder)

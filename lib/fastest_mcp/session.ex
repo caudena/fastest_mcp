@@ -348,18 +348,16 @@ defmodule FastestMCP.Session do
 
   @doc "Returns whether the session is subscribed to the given concrete URI."
   def subscribed_to_resource?(server_name, session_id, uri) do
-    with {:ok, pid} <- Registry.lookup_session(server_name, session_id) do
-      GenServer.call(pid, {:subscribed_to_resource?, to_string(uri)})
-    else
+    case Registry.lookup_session(server_name, session_id) do
+      {:ok, pid} -> GenServer.call(pid, {:subscribed_to_resource?, to_string(uri)})
       _ -> false
     end
   end
 
   @doc "Lists resource subscriptions for the given session."
   def subscribed_resources(server_name, session_id) do
-    with {:ok, pid} <- Registry.lookup_session(server_name, session_id) do
-      GenServer.call(pid, :subscribed_resources)
-    else
+    case Registry.lookup_session(server_name, session_id) do
+      {:ok, pid} -> GenServer.call(pid, :subscribed_resources)
       _ -> []
     end
   end
@@ -373,9 +371,8 @@ defmodule FastestMCP.Session do
 
   @doc "Returns negotiated client info for the given session."
   def client_info(server_name, session_id) do
-    with {:ok, pid} <- Registry.lookup_session(server_name, session_id) do
-      GenServer.call(pid, :client_info)
-    else
+    case Registry.lookup_session(server_name, session_id) do
+      {:ok, pid} -> GenServer.call(pid, :client_info)
       _ -> nil
     end
   end
@@ -1305,25 +1302,23 @@ defmodule FastestMCP.Session do
         _from,
         state
       ) do
-    cond do
-      state.lifecycle_state != :new ->
-        {:reply, {:error, {:invalid_transition, state.lifecycle_state}}, touch(state)}
+    if state.lifecycle_state != :new do
+      {:reply, {:error, {:invalid_transition, state.lifecycle_state}}, touch(state)}
+    else
+      client_capabilities = normalize_client_capabilities(client_capabilities)
+      server_capabilities = Protocol.normalize_capabilities(server_capabilities)
 
-      true ->
-        client_capabilities = normalize_client_capabilities(client_capabilities)
-        server_capabilities = Protocol.normalize_capabilities(server_capabilities)
+      next_state = %{
+        touch(state)
+        | lifecycle_state: :initializing,
+          protocol_version: @supported_protocol_version,
+          client_capabilities: client_capabilities,
+          server_capabilities: server_capabilities,
+          client_info: client_info,
+          auth_identity: auth_identity
+      }
 
-        next_state = %{
-          touch(state)
-          | lifecycle_state: :initializing,
-            protocol_version: @supported_protocol_version,
-            client_capabilities: client_capabilities,
-            server_capabilities: server_capabilities,
-            client_info: client_info,
-            auth_identity: auth_identity
-        }
-
-        {:reply, :ok, next_state}
+      {:reply, :ok, next_state}
     end
   end
 

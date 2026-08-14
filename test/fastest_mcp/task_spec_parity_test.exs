@@ -284,7 +284,7 @@ defmodule FastestMCP.TaskSpecParityTest do
              "jsonrpc" => "2.0",
              "id" => 2,
              "error" => %{
-               "code" => -32602,
+               "code" => -32_602,
                "message" => "Invalid taskId: task-missing not found"
              }
            } = JSON.decode!(response.resp_body)

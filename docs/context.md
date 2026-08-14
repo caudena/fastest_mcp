@@ -385,7 +385,7 @@ transport credential is not copied into background or detached task context.
 
 When an operation runs as a background task, the context reflects that:
 
-- `Context.is_background_task/1`
+- `Context.background_task?/1`
 - `Context.task_id/1`
 - `Context.origin_request_id/1`
 - `Context.task_store/1`

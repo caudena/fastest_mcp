@@ -155,7 +155,10 @@ end
 defmodule FastestMCP.ClientResponseCacheTest do
   use ExUnit.Case, async: false
 
+  require OpenTelemetry.Tracer, as: Tracer
+
   alias FastestMCP.Client
+  alias FastestMCP.TraceTestHelper
 
   setup do
     counters = start_supervised!({Agent, fn -> %{} end})
@@ -212,6 +215,35 @@ defmodule FastestMCP.ClientResponseCacheTest do
     :ok = Client.set_roots(client, [FastestMCP.Root.new("file:///workspace")])
     assert %{items: [_tool]} = Client.list_tools(client)
     assert count(counters, "tools/list") == 7
+  end
+
+  test "trace propagation never changes cache identity", %{client: client, counters: counters} do
+    TraceTestHelper.set_exporter(self())
+    _ = TraceTestHelper.drain_spans()
+
+    Tracer.with_span "first-caller" do
+      assert %{items: [_tool]} = Client.list_tools(client)
+    end
+
+    Tracer.with_span "second-caller" do
+      assert %{items: [_tool]} = Client.list_tools(client)
+    end
+
+    assert count(counters, "tools/list") == 1
+
+    spans = TraceTestHelper.drain_spans()
+
+    client_spans =
+      Enum.filter(spans, fn span ->
+        TraceTestHelper.span_name(span) == "tools/list" and
+          TraceTestHelper.span_kind(span) == :client
+      end)
+
+    assert length(client_spans) == 2
+
+    assert Enum.any?(client_spans, fn span ->
+             TraceTestHelper.span_attributes(span)["fastestmcp.cache.hit"] == true
+           end)
   end
 
   test "bypasses request-scoped credentials and stores no raw params or tokens", %{

@@ -13,11 +13,11 @@ defmodule FastestMCP.Middleware.ResponseCaching do
   require Logger
 
   alias FastestMCP.Auth
+  alias FastestMCP.BackgroundTask
+  alias FastestMCP.InputRequiredResult
   alias FastestMCP.Middleware
   alias FastestMCP.Operation
   alias FastestMCP.Registry
-  alias FastestMCP.BackgroundTask
-  alias FastestMCP.InputRequiredResult
 
   @default_list_ttl_ms 5 * 60_000
   @default_read_ttl_ms 60 * 60_000

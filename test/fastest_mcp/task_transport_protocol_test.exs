@@ -410,7 +410,7 @@ defmodule FastestMCP.TaskTransportProtocolTest do
              "jsonrpc" => "2.0",
              "id" => 1,
              "error" => %{
-               "code" => -32602,
+               "code" => -32_602,
                "message" => "boom",
                "data" => %{
                  "_meta" => %{
@@ -466,7 +466,7 @@ defmodule FastestMCP.TaskTransportProtocolTest do
              "jsonrpc" => "2.0",
              "id" => 3,
              "error" => %{
-               "code" => -32602,
+               "code" => -32_602,
                "message" => "boom",
                "data" => %{
                  "_meta" => %{

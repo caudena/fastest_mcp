@@ -311,39 +311,35 @@ defmodule FastestMCP.Authorization do
   end
 
   defp run_public_check(%Check{kind: :opaque, value: check}, context) do
-    try do
-      case check.(context) do
-        true -> true
-        :ok -> true
-        false -> false
-        nil -> false
-        {:error, message} when is_binary(message) -> raise Error, message: message
-        _other -> false
-      end
-    rescue
-      error in Error ->
-        reraise error, __STACKTRACE__
-
-      _error ->
-        false
-    catch
-      _kind, _reason ->
-        false
+    case check.(context) do
+      true -> true
+      :ok -> true
+      false -> false
+      nil -> false
+      {:error, message} when is_binary(message) -> raise Error, message: message
+      _other -> false
     end
+  rescue
+    error in Error ->
+      reraise error, __STACKTRACE__
+
+    _error ->
+      false
+  catch
+    _kind, _reason ->
+      false
   end
 
   defp safe_check(check, %Context{} = context) do
-    try do
-      case check.(context) do
-        true -> true
-        :ok -> true
-        _other -> false
-      end
-    rescue
-      _error -> false
-    catch
-      _kind, _reason -> false
+    case check.(context) do
+      true -> true
+      :ok -> true
+      _other -> false
     end
+  rescue
+    _error -> false
+  catch
+    _kind, _reason -> false
   end
 
   defp normalize_oauth_tokens!(tokens, label) when is_list(tokens) do

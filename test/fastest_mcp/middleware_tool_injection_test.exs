@@ -1,8 +1,8 @@
 defmodule FastestMCP.MiddlewareToolInjectionTest do
   use ExUnit.Case, async: false
 
-  alias FastestMCP.Error
   alias FastestMCP.Authorization
+  alias FastestMCP.Error
   alias FastestMCP.Middleware
 
   test "generic tool injection adds tools to list_tools and handles tool calls" do

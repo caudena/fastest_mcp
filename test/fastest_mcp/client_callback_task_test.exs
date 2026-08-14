@@ -4,6 +4,8 @@ defmodule FastestMCP.ClientCallbackTaskTest do
   import Plug.Conn
 
   alias FastestMCP.Client
+  alias FastestMCP.Client.CallbackContext
+  alias FastestMCP.Client.URLElicitation
   alias FastestMCP.Error
   alias FastestMCP.SamplingTool
 
@@ -308,7 +310,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
     assert_receive {:fake_callback_server_post,
                     %{
                       "id" => "server-reused-id",
-                      "error" => %{"code" => -32600}
+                      "error" => %{"code" => -32_600}
                     }},
                    2_000
 
@@ -366,7 +368,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
                     %{
                       "id" => "callback-capacity-2",
                       "error" => %{
-                        "code" => -32002,
+                        "code" => -32_002,
                         "data" => %{
                           "fastestmcp" => %{"code" => "overloaded"},
                           "resource" => "request_ids"
@@ -542,7 +544,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
     FakeCallbackServer.push(state, request)
 
     assert_receive {:url_elicitation,
-                    %FastestMCP.Client.URLElicitation{
+                    %URLElicitation{
                       elicitation_id: "url-1",
                       origin: "https://accounts.example.test"
                     }},
@@ -565,7 +567,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
     refute_receive {:url_elicitation_complete, "url-1"}, 100
 
     assert {:error, %Error{code: :bad_request}} =
-             FastestMCP.Client.URLElicitation.parse(%{
+             URLElicitation.parse(%{
                "mode" => "url",
                "elicitationId" => "bad-scheme",
                "url" => "file:///tmp/secret",
@@ -585,7 +587,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
     )
 
     assert_receive {:fake_callback_server_post,
-                    %{"id" => "url-content", "error" => %{"code" => -32603}}},
+                    %{"id" => "url-content", "error" => %{"code" => -32_603}}},
                    2_000
   end
 
@@ -600,12 +602,12 @@ defmodule FastestMCP.ClientCallbackTaskTest do
         sampling_tools: [{fn arguments -> arguments end, [name: "lookup"]}],
         sampling_context: %{source: "test"},
         sampling_handler: fn _messages, _params, context ->
-          :ok = FastestMCP.Client.CallbackContext.report_progress(context, 1, total: 2)
-          :ok = FastestMCP.Client.CallbackContext.report_progress(context, 1.5, total: 3)
-          :ok = FastestMCP.Client.CallbackContext.report_progress(context, 3)
+          :ok = CallbackContext.report_progress(context, 1, total: 2)
+          :ok = CallbackContext.report_progress(context, 1.5, total: 3)
+          :ok = CallbackContext.report_progress(context, 3)
 
           try do
-            FastestMCP.Client.CallbackContext.report_progress(context, 2)
+            CallbackContext.report_progress(context, 2)
           rescue
             error in Error -> send(parent, {:callback_progress_error, error})
           end
@@ -674,7 +676,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
                    2_000
 
     assert_receive {:callback_waiting,
-                    %FastestMCP.Client.CallbackContext{
+                    %CallbackContext{
                       request_id: "cancel-sampling",
                       method: "sampling/createMessage",
                       progress_token: "callback-progress",
@@ -691,7 +693,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
     })
 
     assert_eventually(fn ->
-      FastestMCP.Client.CallbackContext.cancelled?(context) and
+      CallbackContext.cancelled?(context) and
         not Process.alive?(callback_pid)
     end)
 
@@ -761,7 +763,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
                     %{
                       "id" => "sync-sampling-error",
                       "error" => %{
-                        "code" => -32603,
+                        "code" => -32_603,
                         "message" => "callback task \"sampling/createMessage\" failed",
                         "data" => %{}
                       }
@@ -808,7 +810,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
                     %{
                       "id" => "sync-elicitation-error",
                       "error" => %{
-                        "code" => -32602,
+                        "code" => -32_602,
                         "message" => "safe callback failure",
                         "data" => %{"field" => "name"}
                       }
@@ -1387,7 +1389,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
     assert cancelled["taskId"] == task_id
     assert cancelled["status"] == "cancelled"
 
-    assert FastestMCP.Client.CallbackContext.cancelled?(context)
+    assert CallbackContext.cancelled?(context)
     refute Process.alive?(callback_pid)
 
     assert_receive {:fake_callback_server_post,

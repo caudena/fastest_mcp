@@ -6,6 +6,7 @@ defmodule FastestMCP.AuthContractTest do
 
   alias FastestMCP.Error
   alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
+  alias FastestMCP.Transport.StreamableHTTP
 
   defmodule StaticProvider do
     @behaviour FastestMCP.Auth
@@ -437,7 +438,7 @@ defmodule FastestMCP.AuthContractTest do
       |> put_req_header("mcp-protocol-version", ProtocolTest.protocol_version())
       |> assign(:current_user, %{id: 456, scopes: ["tools:call"]})
       |> assign(:admin_secret, "not copied")
-      |> FastestMCP.Transport.StreamableHTTP.call(
+      |> StreamableHTTP.call(
         server_name: server_name,
         auth_assigns: [:current_user],
         allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"],
@@ -469,7 +470,7 @@ defmodule FastestMCP.AuthContractTest do
       |> put_req_header("accept", "application/json, text/event-stream")
       |> put_req_header("mcp-session-id", "auth-assign-session")
       |> put_req_header("mcp-protocol-version", ProtocolTest.protocol_version())
-      |> FastestMCP.Transport.StreamableHTTP.call(
+      |> StreamableHTTP.call(
         server_name: server_name,
         auth_assigns: [:current_user],
         allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"],

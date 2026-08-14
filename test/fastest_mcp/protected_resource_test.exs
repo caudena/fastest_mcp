@@ -5,8 +5,8 @@ defmodule FastestMCP.ProtectedResourceTest do
   import Plug.Test
 
   alias FastestMCP.Auth
-  alias FastestMCP.Auth.Result, as: AuthResult
   alias FastestMCP.Auth.ProtectedResource
+  alias FastestMCP.Auth.Result, as: AuthResult
   alias FastestMCP.Authorization
   alias FastestMCP.Context
   alias FastestMCP.Error

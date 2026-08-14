@@ -1,9 +1,11 @@
 defmodule FastestMCP.Protocol.URI do
   @moduledoc false
 
+  alias JSV.FormatValidator.Default, as: DefaultFormatValidator
+
   @doc false
   def valid?(value) when is_binary(value) and value != "" do
-    match?({:ok, %Elixir.URI{}}, JSV.FormatValidator.Default.validate_cast("uri", value))
+    match?({:ok, %Elixir.URI{}}, DefaultFormatValidator.validate_cast("uri", value))
   end
 
   def valid?(_value), do: false

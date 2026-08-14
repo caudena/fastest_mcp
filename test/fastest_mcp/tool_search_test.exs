@@ -8,10 +8,10 @@ defmodule FastestMCP.ToolSearchTest do
   alias FastestMCP.Middleware
   alias FastestMCP.Middleware.ToolSearch
   alias FastestMCP.Pagination
-  alias FastestMCP.Provider
-  alias FastestMCP.ProviderTransforms.Namespace
-  alias FastestMCP.Providers.Local
   alias FastestMCP.Protocol.Extensions
+  alias FastestMCP.Provider
+  alias FastestMCP.Providers.Local
+  alias FastestMCP.ProviderTransforms.Namespace
   alias FastestMCP.Server
 
   defmodule PagedProvider do
@@ -122,6 +122,82 @@ defmodule FastestMCP.ToolSearchTest do
       end
 
     assert error.code == :bad_request
+  end
+
+  test "search indexes public top-level parameter names and descriptions last" do
+    server_name = unique_name("tool-search-parameters")
+
+    parameter_schema = %{
+      "type" => "object",
+      "properties" => %{
+        "record_id" => %{
+          "type" => "string",
+          "description" => "Recipient account identifier",
+          "properties" => %{"secret_code" => %{"type" => "string"}}
+        }
+      },
+      "additionalProperties" => false
+    }
+
+    server =
+      FastestMCP.server(server_name)
+      |> FastestMCP.add_tool("recipient", &echo_name/2, description: "Name match")
+      |> FastestMCP.add_tool("account_lookup", &echo_name/2,
+        description: "Lookup by input",
+        input_schema: parameter_schema
+      )
+      |> FastestMCP.enable_tool_search()
+
+    start_server!(server)
+
+    assert %{"tools" => tools} =
+             FastestMCP.call_tool(server_name, "search_tools", %{"query" => "recipient"})
+
+    assert Enum.map(tools, & &1["name"]) == ["recipient", "account_lookup"]
+
+    assert %{"tools" => [%{"name" => "account_lookup"}]} =
+             FastestMCP.call_tool(server_name, "search_tools", %{"query" => "record id"})
+
+    assert %{"tools" => [%{"name" => "account_lookup"}]} =
+             FastestMCP.call_tool(server_name, "search_tools", %{
+               "query" => "lookup recipient"
+             })
+
+    assert %{"tools" => []} =
+             FastestMCP.call_tool(server_name, "search_tools", %{"query" => "secret code"})
+  end
+
+  test "search does not index injected parameters" do
+    server_name = unique_name("tool-search-injected-parameters")
+
+    schema = %{
+      "type" => "object",
+      "properties" => %{
+        "visible_query" => %{"type" => "string"},
+        "private_tenant" => %{"type" => "string", "description" => "Internal tenant"}
+      },
+      "additionalProperties" => false
+    }
+
+    transformed_tool =
+      "lookup"
+      |> tool(inject: [private_tenant: fn _context -> "tenant-1" end])
+      |> Map.put(:input_schema, schema)
+
+    provider = %PagedProvider{tools: [transformed_tool], test_pid: self()}
+
+    server =
+      FastestMCP.server(server_name)
+      |> FastestMCP.add_provider(provider)
+      |> FastestMCP.enable_tool_search()
+
+    start_server!(server)
+
+    assert %{"tools" => [%{"name" => "lookup"}]} =
+             FastestMCP.call_tool(server_name, "search_tools", %{"query" => "visible query"})
+
+    assert %{"tools" => []} =
+             FastestMCP.call_tool(server_name, "search_tools", %{"query" => "private tenant"})
   end
 
   test "bounded search uses provider pages and never calls the list fallback" do

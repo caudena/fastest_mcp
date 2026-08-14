@@ -98,36 +98,38 @@ defmodule FastestMCP.Providers.MountedServer do
         identifier,
         %Operation{} = operation
       ) do
-    with {:ok, child_identifier} <- child_identifier(provider, component_type, identifier) do
-      child_lookup_operation =
-        child_lookup_operation(provider, operation, component_type, child_identifier)
+    case child_identifier(provider, component_type, identifier) do
+      {:ok, child_identifier} ->
+        child_lookup_operation =
+          child_lookup_operation(provider, operation, component_type, child_identifier)
 
-      provider
-      |> child_component_candidates_for(
-        component_type,
-        child_identifier,
-        child_lookup_operation
-      )
-      |> Enum.reduce([], fn component, candidates ->
-        case transform_child_component(
-               provider.server,
-               component,
-               child_operation(provider, operation, component)
-             ) do
-          nil ->
-            candidates
+        provider
+        |> child_component_candidates_for(
+          component_type,
+          child_identifier,
+          child_lookup_operation
+        )
+        |> Enum.reduce([], fn component, candidates ->
+          case transform_child_component(
+                 provider.server,
+                 component,
+                 child_operation(provider, operation, component)
+               ) do
+            nil ->
+              candidates
 
-          component ->
-            case filter_component(provider, component) do
-              nil -> candidates
-              filtered -> [wrap_component(provider, filtered, operation) | candidates]
-            end
-        end
-      end)
-      |> Enum.reverse()
-      |> Component.sort_by_version_desc()
-    else
-      _ -> []
+            component ->
+              case filter_component(provider, component) do
+                nil -> candidates
+                filtered -> [wrap_component(provider, filtered, operation) | candidates]
+              end
+          end
+        end)
+        |> Enum.reverse()
+        |> Component.sort_by_version_desc()
+
+      _ ->
+        []
     end
   end
 
@@ -140,20 +142,22 @@ defmodule FastestMCP.Providers.MountedServer do
 
   @doc false
   def get_resource_target_candidates(%__MODULE__{} = provider, uri, %Operation{} = operation) do
-    with {:ok, child_uri} <- child_resource_uri(provider, uri) do
-      child_lookup_operation = child_lookup_operation(provider, operation, :resource, child_uri)
+    case child_resource_uri(provider, uri) do
+      {:ok, child_uri} ->
+        child_lookup_operation = child_lookup_operation(provider, operation, :resource, child_uri)
 
-      provider
-      |> child_resource_target_candidates_for(child_uri, child_lookup_operation)
-      |> Enum.reduce([], fn target, candidates ->
-        case transform_child_resource_target(provider, target, uri, operation) do
-          nil -> candidates
-          transformed -> [transformed | candidates]
-        end
-      end)
-      |> Enum.reverse()
-    else
-      _ -> []
+        provider
+        |> child_resource_target_candidates_for(child_uri, child_lookup_operation)
+        |> Enum.reduce([], fn target, candidates ->
+          case transform_child_resource_target(provider, target, uri, operation) do
+            nil -> candidates
+            transformed -> [transformed | candidates]
+          end
+        end)
+        |> Enum.reverse()
+
+      _ ->
+        []
     end
   end
 

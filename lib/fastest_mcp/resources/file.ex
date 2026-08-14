@@ -55,28 +55,28 @@ defmodule FastestMCP.Resources.File do
 
   @doc "Reads the file and returns a normalized resource result."
   def read(%__MODULE__{} = file) do
-    try do
-      content =
-        if file.binary do
-          Binary.new(File.read!(file.path),
-            mime_type: file.mime_type || "application/octet-stream"
-          )
-        else
-          text =
-            file.path
-            |> File.read!()
-            |> :unicode.characters_to_binary(file.encoding, :utf8)
+    content =
+      if file.binary do
+        Binary.new(File.read!(file.path),
+          mime_type: file.mime_type || "application/octet-stream"
+        )
+      else
+        text =
+          file.path
+          |> File.read!()
+          |> :unicode.characters_to_binary(file.encoding, :utf8)
 
-          Text.new(text, mime_type: file.mime_type || mime_from_extension(file.path))
-        end
+        Text.new(text, mime_type: file.mime_type || mime_from_extension(file.path))
+      end
 
-      Result.new([content])
-    rescue
-      error ->
-        raise Error,
-          code: :internal_error,
-          message: "Error reading file #{inspect(file.path)}: #{Exception.message(error)}"
-    end
+    Result.new([content])
+  rescue
+    error ->
+      reraise Error.exception(
+                code: :internal_error,
+                message: "Error reading file #{inspect(file.path)}: #{Exception.message(error)}"
+              ),
+              __STACKTRACE__
   end
 
   defp mime_from_extension(path) do

@@ -7,12 +7,12 @@ defmodule FastestMCP.Schema do
   references fail closed unless an application resolver is provided.
   """
 
+  alias FastestMCP.Protocol
+  alias FastestMCP.Protocol.Formats
   alias FastestMCP.Schema.Compiled
   alias FastestMCP.Schema.Error
   alias FastestMCP.Schema.HTTPResolver
   alias FastestMCP.Schema.Resolver
-  alias FastestMCP.Protocol
-  alias FastestMCP.Protocol.Formats
 
   @draft_2020_12 "https://json-schema.org/draft/2020-12/schema"
   @draft_7 "http://json-schema.org/draft-07/schema"
@@ -818,9 +818,8 @@ defmodule FastestMCP.Schema do
   end
 
   defp apply_protocol_semantic_overlay(@modern_version, source) do
-    with {:ok, task_definitions} <- load_tasks_extension_definitions() do
-      merge_tasks_extension(source, task_definitions)
-    else
+    case load_tasks_extension_definitions() do
+      {:ok, task_definitions} -> merge_tasks_extension(source, task_definitions)
       {:error, %Error{} = error} -> raise error
     end
   end

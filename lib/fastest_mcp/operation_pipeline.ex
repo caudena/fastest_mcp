@@ -29,15 +29,16 @@ defmodule FastestMCP.OperationPipeline do
   alias FastestMCP.CallSupervisor
   alias FastestMCP.Component
   alias FastestMCP.ComponentPolicy
+  alias FastestMCP.Components.ResourceTemplate
   alias FastestMCP.Context
   alias FastestMCP.Error
   alias FastestMCP.Middleware
   alias FastestMCP.Operation
+  alias FastestMCP.Pagination
+  alias FastestMCP.Protocol
   alias FastestMCP.Protocol.Duration
   alias FastestMCP.Protocol.Extensions
-  alias FastestMCP.Pagination
   alias FastestMCP.Provider
-  alias FastestMCP.Protocol
   alias FastestMCP.Registry
   alias FastestMCP.ResourceSecurity
   alias FastestMCP.Schema
@@ -574,7 +575,7 @@ defmodule FastestMCP.OperationPipeline do
                 })
               )
 
-              raise wrapped
+              reraise wrapped, __STACKTRACE__
           end
         end)
 
@@ -1707,7 +1708,7 @@ defmodule FastestMCP.OperationPipeline do
     |> Registry.list_components(:resource_template)
     |> Enum.reduce([], fn template, matches ->
       if version_matches?(template, operation.version) do
-        case FastestMCP.Components.ResourceTemplate.match(template, uri) do
+        case ResourceTemplate.match(template, uri) do
           nil -> matches
           captures -> [{template, captures} | matches]
         end
@@ -1808,7 +1809,7 @@ defmodule FastestMCP.OperationPipeline do
   defp prepare_template_candidate(server, template, _initial_captures, operation) do
     with {:ok, visible_template} <- ComponentPolicy.prepare_result(server, template, operation),
          final_captures when is_map(final_captures) <-
-           FastestMCP.Components.ResourceTemplate.match(visible_template, operation.target),
+           ResourceTemplate.match(visible_template, operation.target),
          :ok <- screen_resource_captures(server, visible_template, final_captures, operation),
          authorization_operation = %{
            operation

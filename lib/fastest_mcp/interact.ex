@@ -213,24 +213,22 @@ defmodule FastestMCP.Interact do
   end
 
   defp normalize_choices(choices) when is_list(choices) do
-    cond do
-      Keyword.keyword?(choices) ->
-        Enum.map(choices, fn {label, value} ->
+    if Keyword.keyword?(choices) do
+      Enum.map(choices, fn {label, value} ->
+        {choice_id(label), choice_label(label), value}
+      end)
+    else
+      Enum.map(choices, fn
+        {label, value} when is_atom(label) or is_binary(label) ->
           {choice_id(label), choice_label(label), value}
-        end)
 
-      true ->
-        Enum.map(choices, fn
-          {label, value} when is_atom(label) or is_binary(label) ->
-            {choice_id(label), choice_label(label), value}
+        value when is_atom(value) or is_binary(value) or is_integer(value) ->
+          {choice_id(value), choice_label(value), value}
 
-          value when is_atom(value) or is_binary(value) or is_integer(value) ->
-            {choice_id(value), choice_label(value), value}
-
-          other ->
-            raise ArgumentError,
-                  "Interact.choose/4 expects choices as atoms, strings, integers, or {label, value} tuples, got: #{inspect(other)}"
-        end)
+        other ->
+          raise ArgumentError,
+                "Interact.choose/4 expects choices as atoms, strings, integers, or {label, value} tuples, got: #{inspect(other)}"
+      end)
     end
   end
 

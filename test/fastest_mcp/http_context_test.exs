@@ -6,6 +6,7 @@ defmodule FastestMCP.HTTPContextTest do
 
   alias FastestMCP.Context
   alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
+  alias FastestMCP.Transport.StreamableHTTP
 
   test "context exposes a normalized HTTP request snapshot across tools prompts and resources" do
     server_name =
@@ -151,7 +152,7 @@ defmodule FastestMCP.HTTPContextTest do
       |> put_req_header("authorization", "Bearer fresh-token")
       |> put_req_header("mcp-session-id", session_id)
       |> put_req_header("mcp-protocol-version", ProtocolTest.protocol_version())
-      |> FastestMCP.Transport.StreamableHTTP.call(server_name: server_name, json_response: true)
+      |> StreamableHTTP.call(server_name: server_name, json_response: true)
 
     assert conn.status == 200
 

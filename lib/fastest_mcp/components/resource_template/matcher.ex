@@ -66,8 +66,10 @@ defmodule FastestMCP.Components.ResourceTemplate.Matcher do
     end
   rescue
     error in [ArgumentError, Protocol.UndefinedError] ->
-      raise ArgumentError,
-            "invalid RFC 6570 resource template #{inspect(template)}: #{Exception.message(error)}"
+      reraise ArgumentError.exception(
+                "invalid RFC 6570 resource template #{inspect(template)}: #{Exception.message(error)}"
+              ),
+              __STACKTRACE__
   end
 
   # Texture is the parser and renderer used by FastestMCP. Its current parser

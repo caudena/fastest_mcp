@@ -4,6 +4,7 @@ defmodule FastestMCP.SchemaTest do
   alias FastestMCP.Error
   alias FastestMCP.Schema
   alias FastestMCP.Schema.HTTPResolver
+  alias FastestMCP.Tools.Result, as: ToolResult
 
   @legacy_version "2025-11-25"
 
@@ -196,7 +197,7 @@ defmodule FastestMCP.SchemaTest do
     error_response = %{
       "jsonrpc" => "2.0",
       "id" => "call-1",
-      "error" => %{"code" => -32602, "message" => "Invalid params"}
+      "error" => %{"code" => -32_602, "message" => "Invalid params"}
     }
 
     assert {:ok, ^error_response} =
@@ -645,7 +646,7 @@ defmodule FastestMCP.SchemaTest do
       |> FastestMCP.add_tool(
         "scalar",
         fn _args ->
-          FastestMCP.Tools.Result.new("ok", structured_content: "ok")
+          ToolResult.new("ok", structured_content: "ok")
         end,
         output_schema: %{"type" => "string"}
       )

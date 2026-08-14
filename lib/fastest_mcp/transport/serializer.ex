@@ -13,19 +13,19 @@ defmodule FastestMCP.Transport.Serializer do
 
   @content_block_types MapSet.new(["text", "image", "audio", "resource", "resource_link"])
 
-  alias FastestMCP.Base64
   alias FastestMCP.Apps
+  alias FastestMCP.Base64
   alias FastestMCP.Error
   alias FastestMCP.JSONValue
   alias FastestMCP.MIME
-  alias FastestMCP.Protocol.Content
-  alias FastestMCP.Protocol.Meta
   alias FastestMCP.Prompts.Message, as: PromptMessage
   alias FastestMCP.Prompts.Result, as: PromptResult
+  alias FastestMCP.Protocol.Content
+  alias FastestMCP.Protocol.Meta
   alias FastestMCP.Resources.Content, as: ResourceContent
   alias FastestMCP.Resources.Result, as: ResourceResult
-  alias FastestMCP.Tools.Result, as: ToolResult
   alias FastestMCP.Tools.OutputSchema
+  alias FastestMCP.Tools.Result, as: ToolResult
 
   @doc "Serializes tool metadata for transport exposure."
   def tool_metadata(tool, opts \\ []) do
@@ -610,9 +610,10 @@ defmodule FastestMCP.Transport.Serializer do
         &Map.has_key?(result, &1)
       )
 
-    cond do
-      modern?(opts) and present? -> Map.put(payload, "structuredContent", value)
-      true -> maybe_put(payload, "structuredContent", value)
+    if modern?(opts) and present? do
+      Map.put(payload, "structuredContent", value)
+    else
+      maybe_put(payload, "structuredContent", value)
     end
   end
 

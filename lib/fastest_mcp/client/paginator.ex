@@ -31,7 +31,8 @@ defmodule FastestMCP.Client.Paginator do
            %{
              items: list(),
              ttl_ms: non_neg_integer() | nil,
-             cache_scope: String.t()
+             cache_scope: String.t(),
+             page_count: pos_integer()
            }}
           | {:error, term()}
   def fetch_all_with_meta(fetch_page, opts \\ []) when is_function(fetch_page, 1) do
@@ -96,7 +97,8 @@ defmodule FastestMCP.Client.Paginator do
              %{
                items: flatten_pages([items | pages]),
                ttl_ms: ttl_ms |> page_ttl(page) |> final_ttl(),
-               cache_scope: page_cache_scope(cache_scope, page)
+               cache_scope: page_cache_scope(cache_scope, page),
+               page_count: page_count + 1
              }}
 
           MapSet.member?(seen, next_cursor) ->

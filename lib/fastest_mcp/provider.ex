@@ -161,19 +161,20 @@ defmodule FastestMCP.Provider do
 
   @doc false
   def get_resource_target_candidates(%__MODULE__{} = provider, uri, operation) do
-    with {:ok, raw_uri} <-
-           reverse_identifier(provider.transforms, :resource, to_string(uri), operation) do
-      provider.inner
-      |> do_get_resource_target_candidates(raw_uri, operation)
-      |> Enum.reduce([], fn target, transformed ->
-        case transform_resource_target(target, provider.transforms, uri, operation) do
-          nil -> transformed
-          target -> [target | transformed]
-        end
-      end)
-      |> Enum.reverse()
-    else
-      _ -> []
+    case reverse_identifier(provider.transforms, :resource, to_string(uri), operation) do
+      {:ok, raw_uri} ->
+        provider.inner
+        |> do_get_resource_target_candidates(raw_uri, operation)
+        |> Enum.reduce([], fn target, transformed ->
+          case transform_resource_target(target, provider.transforms, uri, operation) do
+            nil -> transformed
+            target -> [target | transformed]
+          end
+        end)
+        |> Enum.reverse()
+
+      _ ->
+        []
     end
   end
 

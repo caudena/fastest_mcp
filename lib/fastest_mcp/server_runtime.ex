@@ -38,10 +38,10 @@ defmodule FastestMCP.ServerRuntime do
   alias FastestMCP.Server
   alias FastestMCP.SessionNotificationSupervisor
   alias FastestMCP.SessionStateStore.Memory, as: SessionStateStoreMemory
+  alias FastestMCP.SessionSupervisor
   alias FastestMCP.TaskBackend.Memory, as: MemoryTaskBackend
   alias FastestMCP.TaskNotificationSupervisor
   alias FastestMCP.TTLStore
-  alias FastestMCP.SessionSupervisor
 
   @doc "Starts the runtime or application process owned by this module."
   def start(%Server{} = server, opts \\ []) do

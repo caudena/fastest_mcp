@@ -82,25 +82,29 @@ defmodule FastestMCP do
   over result envelopes.
   """
 
-  alias FastestMCP.BackgroundTask
-  alias FastestMCP.BackgroundTaskStore
   alias FastestMCP.Auth
   alias FastestMCP.Auth.Result, as: AuthResult
+  alias FastestMCP.BackgroundTask
+  alias FastestMCP.BackgroundTaskStore
   alias FastestMCP.ComponentManager
   alias FastestMCP.ComponentVisibility
   alias FastestMCP.Context
   alias FastestMCP.Error
   alias FastestMCP.OperationPipeline
+  alias FastestMCP.Protocol
   alias FastestMCP.Provider
   alias FastestMCP.Providers.OpenAPI
-  alias FastestMCP.Protocol
   alias FastestMCP.Registry
   alias FastestMCP.Sampling
   alias FastestMCP.Server
-  alias FastestMCP.TaskNotificationSupervisor
-  alias FastestMCP.TaskOwner
   alias FastestMCP.ServerRuntime
   alias FastestMCP.Session
+  alias FastestMCP.TaskNotificationSupervisor
+  alias FastestMCP.TaskOwner
+  alias FastestMCP.Transport.HTTPApp
+  alias FastestMCP.Transport.Stdio
+  alias FastestMCP.Transport.StreamableHTTP
+  alias FastestMCP.Transport.WellKnownHTTP
 
   @doc "Builds a new server definition."
   defdelegate server(name, opts \\ []), to: Server, as: :new
@@ -314,23 +318,23 @@ defmodule FastestMCP do
 
   @doc "Builds the main HTTP app for a running server."
   def http_app(server_name, opts \\ []) do
-    init_opts = FastestMCP.Transport.HTTPApp.init(Keyword.put(opts, :server_name, server_name))
-    fn conn -> FastestMCP.Transport.HTTPApp.call(conn, init_opts) end
+    init_opts = HTTPApp.init(Keyword.put(opts, :server_name, server_name))
+    fn conn -> HTTPApp.call(conn, init_opts) end
   end
 
   @doc "Returns a child spec for the streamable HTTP transport."
   def streamable_http_child_spec(server_name, opts \\ []) do
-    FastestMCP.Transport.StreamableHTTP.child_spec(Keyword.put(opts, :server_name, server_name))
+    StreamableHTTP.child_spec(Keyword.put(opts, :server_name, server_name))
   end
 
   @doc "Returns a child spec for the well-known HTTP transport."
   def well_known_http_child_spec(server_name, opts \\ []) do
-    FastestMCP.Transport.WellKnownHTTP.child_spec(Keyword.put(opts, :server_name, server_name))
+    WellKnownHTTP.child_spec(Keyword.put(opts, :server_name, server_name))
   end
 
   @doc "Dispatches one stdio request against a running server."
   def stdio_dispatch(server_name, request, opts \\ []) do
-    FastestMCP.Transport.Stdio.dispatch(server_name, request, opts)
+    Stdio.dispatch(server_name, request, opts)
   end
 
   @doc "Fetches background-task state."

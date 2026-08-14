@@ -28,14 +28,12 @@ defmodule FastestMCP.Protocol.Subscriptions do
     reject_unknown? = Keyword.get(opts, :reject_unknown, false)
     filter = Map.new(filter, fn {key, value} -> {to_string(key), value} end)
 
-    cond do
-      reject_unknown? and Enum.any?(Map.keys(filter), &(&1 not in @known_filter_keys)) ->
-        {:error, "subscription acknowledgement contains an unknown filter"}
-
-      true ->
-        filter
-        |> Map.take(@known_filter_keys)
-        |> Enum.reduce_while({:ok, %{}}, &normalize_filter_entry/2)
+    if reject_unknown? and Enum.any?(Map.keys(filter), &(&1 not in @known_filter_keys)) do
+      {:error, "subscription acknowledgement contains an unknown filter"}
+    else
+      filter
+      |> Map.take(@known_filter_keys)
+      |> Enum.reduce_while({:ok, %{}}, &normalize_filter_entry/2)
     end
   end
 

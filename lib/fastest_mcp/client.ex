@@ -61,8 +61,8 @@ defmodule FastestMCP.Client do
 
   require Logger
 
-  alias FastestMCP.BackgroundTask
   alias FastestMCP.Apps
+  alias FastestMCP.BackgroundTask
   alias FastestMCP.Client.CallbackContext
   alias FastestMCP.Client.OAuth
   alias FastestMCP.Client.OAuth.Error, as: OAuthError
@@ -70,30 +70,33 @@ defmodule FastestMCP.Client do
   alias FastestMCP.Client.ProtocolError
   alias FastestMCP.Client.Request, as: ClientRequest
   alias FastestMCP.Client.ResponseCache
+  alias FastestMCP.Client.Task, as: RemoteTask
+  alias FastestMCP.Client.ToolCatalog
+  alias FastestMCP.Client.ToolResult, as: ClientToolResult
   alias FastestMCP.Client.Transport, as: ClientTransport
   alias FastestMCP.Client.Transport.InProcess, as: InProcessClientTransport
   alias FastestMCP.Client.Transport.Stdio, as: StdioClientTransport
   alias FastestMCP.Client.Transport.StreamableHTTP, as: HTTPClientTransport
-  alias FastestMCP.Client.ToolCatalog
   alias FastestMCP.Client.URLElicitation
+  alias FastestMCP.Elicitation
   alias FastestMCP.Error
   alias FastestMCP.ErrorExposure
-  alias FastestMCP.Elicitation
   alias FastestMCP.JSONValue
   alias FastestMCP.MIME
-  alias FastestMCP.Client.Task, as: RemoteTask
   alias FastestMCP.Protocol
-  alias FastestMCP.Protocol.Extensions
   alias FastestMCP.Protocol.Duration
+  alias FastestMCP.Protocol.Extensions
   alias FastestMCP.Protocol.HTTPHeaders
   alias FastestMCP.Protocol.Progress, as: ProtocolProgress
   alias FastestMCP.Protocol.Sampling, as: SamplingProtocol
+  alias FastestMCP.Protocol.Subscriptions
   alias FastestMCP.Root
   alias FastestMCP.Sampling
   alias FastestMCP.SamplingTool
   alias FastestMCP.Schema
   alias FastestMCP.TaskId
   alias FastestMCP.TaskWire
+  alias FastestMCP.Telemetry
   alias FastestMCP.Transport.JSONRPC
   alias FastestMCP.Transport.SSEDecoder
 
@@ -118,33 +121,99 @@ defmodule FastestMCP.Client do
   defstruct [:pid]
 
   @type t :: %__MODULE__{pid: pid()}
+  @type ref :: t() | GenServer.server()
+
+  @doc "Starts a supervised MCP client from a keyword configuration."
+  def start_link(opts) when is_list(opts) do
+    if Keyword.keyword?(opts) do
+      case Keyword.fetch(opts, :target) do
+        {:ok, target} ->
+          name = Keyword.get(opts, :name)
+          client_opts = Keyword.drop(opts, [:target, :name, :id])
+          start_and_negotiate(target, client_opts, name)
+
+        :error ->
+          raise ArgumentError, "client start_link/1 requires a :target option"
+      end
+    else
+      raise ArgumentError, "client start options must be a keyword list"
+    end
+  end
+
+  def start_link(other) do
+    raise ArgumentError, "client start options must be a keyword list, got: #{inspect(other)}"
+  end
+
+  @doc "Returns a permanent worker specification for a supervised MCP client."
+  def child_spec(opts) when is_list(opts) do
+    unless Keyword.keyword?(opts) do
+      raise ArgumentError, "client child options must be a keyword list"
+    end
+
+    %{
+      id: Keyword.get(opts, :id, Keyword.get(opts, :name, __MODULE__)),
+      start: {__MODULE__, :start_link, [Keyword.delete(opts, :id)]},
+      restart: :permanent,
+      shutdown: 20_000,
+      type: :worker
+    }
+  end
+
+  def child_spec(other) do
+    raise ArgumentError, "client child options must be a keyword list, got: #{inspect(other)}"
+  end
 
   @doc "Connects a client to the given transport target."
   def connect(target, opts \\ []) do
+    case start_and_negotiate(target, opts, Keyword.get(opts, :name)) do
+      {:ok, pid} -> {:ok, %__MODULE__{pid: pid}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp start_and_negotiate(target, opts, name) do
     with :ok <- validate_protocol_options(opts),
          {:ok, transport} <- normalize_transport(target, opts),
-         {:ok, pid} <- GenServer.start_link(__MODULE__, {transport, opts}) do
+         {:ok, pid} <- start_client_process(transport, opts, name) do
       client = %__MODULE__{pid: pid}
 
-      if Keyword.get(opts, :auto_initialize, true) do
-        try do
+      try do
+        if Keyword.get(opts, :auto_initialize, true) do
           _ = negotiate_ready(client, opts)
 
           if Keyword.get(opts, :session_stream, false) and
                protocol_version(client) == "2025-11-25",
              do: open_session_stream(client)
-
-          {:ok, client}
-        rescue
-          error in [Error, ProtocolError] ->
-            Process.unlink(pid)
-            GenServer.stop(pid, :shutdown)
-            {:error, error}
         end
-      else
-        {:ok, client}
+
+        {:ok, pid}
+      rescue
+        error in [Error, ProtocolError] ->
+          stop_failed_client(pid)
+          {:error, error}
+      catch
+        kind, reason ->
+          stop_failed_client(pid)
+          {:error, {kind, reason}}
       end
     end
+  end
+
+  defp start_client_process(transport, opts, nil),
+    do: GenServer.start_link(__MODULE__, {transport, opts})
+
+  defp start_client_process(transport, opts, name),
+    do: GenServer.start_link(__MODULE__, {transport, opts}, name: name)
+
+  defp stop_failed_client(pid) do
+    if Process.alive?(pid) do
+      Process.unlink(pid)
+      GenServer.stop(pid, :shutdown)
+    end
+
+    :ok
+  catch
+    :exit, _reason -> :ok
   end
 
   @doc "Connects a client to the given transport target and raises on failure."
@@ -158,88 +227,133 @@ defmodule FastestMCP.Client do
   end
 
   @doc "Disconnects a client and releases its transport resources."
-  def disconnect(%__MODULE__{pid: pid}) do
+  def disconnect(client_ref) do
+    %__MODULE__{pid: pid} = pin_client!(client_ref)
     GenServer.stop(pid, :normal)
   end
 
   @doc "Returns whether the client process is still alive."
-  def connected?(%__MODULE__{pid: pid}), do: Process.alive?(pid)
+  def connected?(client_ref) do
+    case resolve_client(client_ref) do
+      {:ok, %__MODULE__{pid: pid}} -> Process.alive?(pid)
+      :error -> false
+    end
+  end
+
+  @doc "Returns whether the client has completed negotiation and its transport is usable."
+  def ready?(client_ref) do
+    case resolve_client(client_ref) do
+      {:ok, %__MODULE__{pid: pid}} ->
+        GenServer.call(pid, :ready?)
+
+      :error ->
+        false
+    end
+  catch
+    :exit, _reason -> false
+  end
+
+  @doc "Waits until a client is ready or raises a normalized timeout or connection error."
+  def await_ready(client_ref, timeout \\ @default_init_timeout_ms)
+
+  def await_ready(client_ref, timeout)
+      when timeout == :infinity or (is_integer(timeout) and timeout >= 0) do
+    deadline = if timeout == :infinity, do: :infinity, else: monotonic_ms() + timeout
+    follow_name? = not match?(%__MODULE__{}, client_ref) and not is_pid(client_ref)
+    do_await_ready(client_ref, deadline, follow_name?)
+  end
+
+  def await_ready(_client_ref, timeout) do
+    raise ArgumentError,
+          "ready timeout must be :infinity or a non-negative integer, got: #{inspect(timeout)}"
+  end
 
   @doc "Returns the negotiated session id."
-  def session_id(%__MODULE__{pid: pid}), do: GenServer.call(pid, :session_id)
+  def session_id(client_ref), do: GenServer.call(pin_client!(client_ref).pid, :session_id)
   @doc "Returns the last initialize result cached by the client."
-  def initialize_result(%__MODULE__{pid: pid}), do: GenServer.call(pid, :initialize_result)
+  def initialize_result(client_ref),
+    do: GenServer.call(pin_client!(client_ref).pid, :initialize_result)
 
   @doc "Returns the last modern server discovery result cached by the client."
-  def discovery_result(%__MODULE__{pid: pid}), do: GenServer.call(pid, :discovery_result)
+  def discovery_result(client_ref),
+    do: GenServer.call(pin_client!(client_ref).pid, :discovery_result)
 
   @doc false
-  def lifecycle_state(%__MODULE__{pid: pid}), do: GenServer.call(pid, :lifecycle_state)
+  def lifecycle_state(client_ref),
+    do: GenServer.call(pin_client!(client_ref).pid, :lifecycle_state)
 
   @doc "Returns the negotiated protocol version."
-  def protocol_version(%__MODULE__{pid: pid}), do: GenServer.call(pid, :protocol_version)
+  def protocol_version(client_ref),
+    do: GenServer.call(pin_client!(client_ref).pid, :protocol_version)
 
   @doc "Returns the negotiated server capabilities."
-  def capabilities(%__MODULE__{pid: pid}), do: GenServer.call(pid, :capabilities)
+  def capabilities(client_ref), do: GenServer.call(pin_client!(client_ref).pid, :capabilities)
 
   @doc "Returns whether the client session stream is currently open."
-  def session_stream_open?(%__MODULE__{pid: pid}), do: GenServer.call(pid, :session_stream_open?)
+  def session_stream_open?(client_ref),
+    do: GenServer.call(pin_client!(client_ref).pid, :session_stream_open?)
 
   @doc "Registers the sampling callback used for server-initiated sampling requests."
-  def set_sampling_handler(%__MODULE__{pid: pid}, handler)
-      when is_function(handler) or is_nil(handler) do
+  def set_sampling_handler(client_ref, handler) when is_function(handler) or is_nil(handler) do
+    %__MODULE__{pid: pid} = pin_client!(client_ref)
     GenServer.call(pid, {:set_handler, :sampling_handler, handler})
   end
 
   @doc "Registers the elicitation callback used for server-initiated interaction requests."
-  def set_elicitation_handler(%__MODULE__{pid: pid}, handler)
-      when is_function(handler) or is_nil(handler) do
+  def set_elicitation_handler(client_ref, handler) when is_function(handler) or is_nil(handler) do
+    %__MODULE__{pid: pid} = pin_client!(client_ref)
     GenServer.call(pid, {:set_handler, :elicitation_handler, handler})
   end
 
   @doc "Registers the callback used for URL-mode elicitation requests."
-  def set_url_elicitation_handler(%__MODULE__{pid: pid}, handler)
+  def set_url_elicitation_handler(client_ref, handler)
       when is_function(handler) or is_nil(handler) do
+    %__MODULE__{pid: pid} = pin_client!(client_ref)
     GenServer.call(pid, {:set_handler, :url_elicitation_handler, handler})
   end
 
   @doc "Registers the callback for completion of an accepted URL elicitation."
-  def set_elicitation_complete_handler(%__MODULE__{pid: pid}, handler)
+  def set_elicitation_complete_handler(client_ref, handler)
       when is_function(handler) or is_nil(handler) do
+    %__MODULE__{pid: pid} = pin_client!(client_ref)
     GenServer.call(pid, {:set_handler, :elicitation_complete_handler, handler})
   end
 
   @doc "Registers the callback used for server log messages."
-  def set_log_handler(%__MODULE__{pid: pid}, handler)
-      when is_function(handler) or is_nil(handler) do
+  def set_log_handler(client_ref, handler) when is_function(handler) or is_nil(handler) do
+    %__MODULE__{pid: pid} = pin_client!(client_ref)
     GenServer.call(pid, {:set_handler, :log_handler, handler})
   end
 
   @doc "Registers the callback used for progress notifications."
-  def set_progress_handler(%__MODULE__{pid: pid}, handler)
-      when is_function(handler) or is_nil(handler) do
+  def set_progress_handler(client_ref, handler) when is_function(handler) or is_nil(handler) do
+    %__MODULE__{pid: pid} = pin_client!(client_ref)
     GenServer.call(pid, {:set_handler, :progress_handler, handler})
   end
 
   @doc "Registers the callback used for generic notifications."
-  def set_notification_handler(%__MODULE__{pid: pid}, handler)
+  def set_notification_handler(client_ref, handler)
       when is_function(handler) or is_nil(handler) do
+    %__MODULE__{pid: pid} = pin_client!(client_ref)
     GenServer.call(pid, {:set_handler, :notification_handler, handler})
   end
 
   @doc "Replaces the access token used for future requests."
-  def set_access_token(%__MODULE__{pid: pid}, token) when is_binary(token) or is_nil(token) do
+  def set_access_token(client_ref, token) when is_binary(token) or is_nil(token) do
+    %__MODULE__{pid: pid} = pin_client!(client_ref)
     GenServer.call(pid, {:set_access_token, token})
   end
 
   @doc "Merges or replaces auth input used for future requests."
-  def set_auth_input(%__MODULE__{pid: pid}, auth_input)
-      when is_map(auth_input) or is_list(auth_input) do
+  def set_auth_input(client_ref, auth_input) when is_map(auth_input) or is_list(auth_input) do
+    %__MODULE__{pid: pid} = pin_client!(client_ref)
     GenServer.call(pid, {:replace_auth_input, auth_input})
   end
 
   @doc "Replaces the advertised filesystem roots and notifies the server on material changes."
-  def set_roots(%__MODULE__{pid: pid}, roots) when is_list(roots) do
+  def set_roots(client_ref, roots) when is_list(roots) do
+    %__MODULE__{pid: pid} = pin_client!(client_ref)
+
     case GenServer.call(pid, {:set_roots, roots}) do
       :ok -> :ok
       {:error, %Error{} = error} -> raise error
@@ -247,7 +361,9 @@ defmodule FastestMCP.Client do
   end
 
   @doc "Opens the session event stream when the transport supports it."
-  def open_session_stream(%__MODULE__{pid: pid}, opts \\ []) do
+  def open_session_stream(client_ref, opts \\ []) do
+    %__MODULE__{pid: pid} = pin_client!(client_ref)
+
     case GenServer.call(pid, {:open_session_stream, opts}) do
       :ok -> :ok
       {:error, %Error{} = error} -> raise error
@@ -255,12 +371,15 @@ defmodule FastestMCP.Client do
   end
 
   @doc "Closes the session event stream."
-  def close_session_stream(%__MODULE__{pid: pid}) do
+  def close_session_stream(client_ref) do
+    %__MODULE__{pid: pid} = pin_client!(client_ref)
     GenServer.call(pid, :close_session_stream)
   end
 
   @doc "Runs the MCP initialize handshake."
-  def initialize(%__MODULE__{} = client, params \\ %{}, opts \\ []) do
+  def initialize(client_ref, params \\ %{}, opts \\ []) do
+    client = pin_client!(client_ref)
+
     case GenServer.call(client.pid, :begin_initialize) do
       :ok ->
         try do
@@ -284,17 +403,30 @@ defmodule FastestMCP.Client do
   end
 
   @doc "Runs modern stateless server discovery and selects MCP 2026 for this connection."
-  def discover(%__MODULE__{} = client, opts \\ []) do
+  def discover(client_ref, opts \\ []) do
+    client = pin_client!(client_ref)
+
     case GenServer.call(client.pid, :begin_discover) do
-      :ok -> :ok
-      {:error, %Error{} = error} -> raise error
-    end
+      {:ok, token} ->
+        try do
+          result = discover_with_version_retry(client, opts, 1)
 
-    result = discover_with_version_retry(client, opts, 1)
+          case GenServer.call(client.pid, {:finish_discover, token, result}) do
+            :ok -> result
+            {:error, %Error{} = error} -> raise error
+          end
+        rescue
+          error ->
+            _ = fail_discover(client, token, error)
+            reraise error, __STACKTRACE__
+        catch
+          kind, reason ->
+            _ = fail_discover(client, token, {kind, reason})
+            :erlang.raise(kind, reason, __STACKTRACE__)
+        end
 
-    case GenServer.call(client.pid, {:finish_discover, result}) do
-      :ok -> result
-      {:error, %Error{} = error} -> raise error
+      {:error, %Error{} = error} ->
+        raise error
     end
   end
 
@@ -321,7 +453,8 @@ defmodule FastestMCP.Client do
   defp retryable_unsupported_version?(_error), do: false
 
   @doc "Starts a modern subscription/listen request and returns its request handle."
-  def listen(%__MODULE__{} = client, filter \\ %{}, opts \\ []) do
+  def listen(client_ref, filter \\ %{}, opts \\ []) do
+    client = pin_client!(client_ref)
     params = %{"notifications" => Map.new(filter)}
 
     request_async(
@@ -333,12 +466,14 @@ defmodule FastestMCP.Client do
   end
 
   @doc "Runs a ping request."
-  def ping(%__MODULE__{} = client, opts \\ []) do
+  def ping(client_ref, opts \\ []) do
+    client = pin_client!(client_ref)
     request(client, "ping", %{}, :identity, opts)
   end
 
   @doc "Requests that the server emit logs at `level` or higher."
-  def set_log_level(%__MODULE__{} = client, level, opts \\ []) do
+  def set_log_level(client_ref, level, opts \\ []) do
+    client = pin_client!(client_ref)
     level = normalize_log_level!(level)
 
     _result =
@@ -354,33 +489,52 @@ defmodule FastestMCP.Client do
   end
 
   @doc "Starts a low-level MCP request and returns an opaque cancellable handle."
-  def request_async(%__MODULE__{pid: pid} = client, method, params \\ %{}, opts \\ [])
+  def request_async(client_ref, method, params \\ %{}, opts \\ [])
       when is_binary(method) and is_map(params) and is_list(opts) do
+    %__MODULE__{pid: pid} = client = pin_client!(client_ref)
     timeout_ms = Keyword.get(opts, :timeout_ms, @default_timeout_ms)
+    target = client_trace_target(method, params)
+    trace = Telemetry.start_client_span(Telemetry.current_context(), method, target)
 
-    case GenServer.call(
-           pid,
-           {:request_async, method, params, :identity, opts, self()},
-           call_timeout(timeout_ms)
-         ) do
-      {:ok, ref, request_id, task_augmented} ->
-        %ClientRequest{
-          client: client,
-          ref: ref,
-          request_id: request_id,
-          method: method,
-          owner: self(),
-          task_augmented: task_augmented
-        }
+    opts =
+      opts
+      |> Keyword.put(:__fastestmcp_trace_context, trace.context)
+      |> Keyword.put(:__fastestmcp_async_trace, trace)
 
-      {:error, exception} when is_exception(exception) ->
-        raise exception
+    try do
+      case GenServer.call(
+             pid,
+             {:request_async, method, params, :identity, opts, self()},
+             call_timeout(timeout_ms)
+           ) do
+        {:ok, ref, request_id, task_augmented} ->
+          %ClientRequest{
+            client: client,
+            ref: ref,
+            request_id: request_id,
+            method: method,
+            owner: self(),
+            task_augmented: task_augmented
+          }
+
+        {:error, exception} when is_exception(exception) ->
+          raise exception
+      end
+    rescue
+      error ->
+        Telemetry.finish_client_span(trace, {:error, error})
+        reraise error, __STACKTRACE__
+    catch
+      kind, reason ->
+        Telemetry.finish_client_span(trace, {:error, {kind, reason}})
+        :erlang.raise(kind, reason, __STACKTRACE__)
     end
   end
 
   @doc "Sends a low-level MCP request and returns its raw result."
-  def request(%__MODULE__{} = client, method, params \\ %{}, opts \\ [])
+  def request(client_ref, method, params \\ %{}, opts \\ [])
       when is_binary(method) and is_map(params) and is_list(opts) do
+    client = pin_client!(client_ref)
     request(client, method, params, :identity, opts)
   end
 
@@ -445,7 +599,9 @@ defmodule FastestMCP.Client do
   end
 
   @doc "Requests completion values for a prompt argument or resource-template parameter."
-  def complete(%__MODULE__{} = client, ref, argument, opts \\ []) do
+  def complete(client_ref, ref, argument, opts \\ []) do
+    client = pin_client!(client_ref)
+
     params =
       %{
         "ref" => Map.new(ref),
@@ -461,26 +617,73 @@ defmodule FastestMCP.Client do
   end
 
   @doc "Lists visible tools."
-  def list_tools(%__MODULE__{} = client, opts \\ []) do
+  def list_tools(client_ref, opts \\ []) do
+    client = pin_client!(client_ref)
     request(client, "tools/list", pagination_params(opts), :tools, opts)
   end
 
   @doc "Lists every visible tool across the server's bounded pagination sequence."
-  def list_all_tools(%__MODULE__{} = client, opts \\ []) do
-    list_all(client, &list_tools/2, "tools/list", opts)
+  def list_all_tools(client_ref, opts \\ []) do
+    client = pin_client!(client_ref)
+
+    Telemetry.with_client_span("tools/list", nil, %{}, fn trace ->
+      list_all(client, &list_tools/2, "tools/list", trace_propagation_opts(opts, trace))
+    end)
   end
 
   @doc "Calls a tool with the given arguments."
-  def call_tool(%__MODULE__{} = client, name, arguments \\ %{}, opts \\ []) do
+  def call_tool(client_ref, name, arguments \\ %{}, opts \\ []) do
+    client = pin_client!(client_ref)
+    name = to_string(name)
+
+    Telemetry.with_client_span("tools/call", name, %{}, fn trace ->
+      traced_opts = trace_propagation_opts(opts, trace)
+      modern_protocol? = protocol_version(client) == "2026-07-28"
+
+      case execute_tool_call(client, name, arguments, traced_opts, modern_protocol?) do
+        {:task, %RemoteTask{} = task} ->
+          maybe_drive_tool_task(client, task, traced_opts, modern_protocol?)
+
+        {:complete, %{} = raw_result} ->
+          maybe_mark_tool_error(raw_result, trace, "tools/call")
+          normalize_response(:tool_call, raw_result)
+      end
+    end)
+  end
+
+  @doc "Calls a tool and returns one stable, protocol-faithful terminal result."
+  def call_tool_result(client_ref, name, arguments \\ %{}, opts \\ []) do
+    client = pin_client!(client_ref)
+    reject_tool_result_handle_option!(opts)
+    name = to_string(name)
+
+    Telemetry.with_client_span("tools/call", name, %{}, fn trace ->
+      traced_opts = trace_propagation_opts(opts, trace)
+      modern_protocol? = protocol_version(client) == "2026-07-28"
+
+      raw_result =
+        case execute_tool_call(client, name, arguments, traced_opts, modern_protocol?) do
+          {:complete, %{} = result} ->
+            result
+
+          {:task, %RemoteTask{} = task} ->
+            task_opts = transparent_task_opts(traced_opts)
+            remote_task_raw_result(client, task, task_opts)
+        end
+
+      maybe_mark_tool_error(raw_result, trace, "tools/call")
+      ClientToolResult.from_raw(raw_result)
+    end)
+  end
+
+  defp execute_tool_call(client, name, arguments, opts, modern_protocol?) do
     name = to_string(name)
     arguments = Map.new(arguments)
     timeout_ms = Keyword.get(opts, :timeout_ms, @default_timeout_ms)
     deadline = System.monotonic_time(:millisecond) + timeout_ms
-    descriptor = tool_descriptor!(client, name, opts[:version], deadline)
+    descriptor = tool_descriptor!(client, name, opts[:version], deadline, opts)
 
     validate_tool_arguments!(descriptor, arguments)
-
-    modern_protocol? = protocol_version(client) == "2026-07-28"
 
     validate_tool_task_mode!(
       client,
@@ -518,7 +721,7 @@ defmodule FastestMCP.Client do
             output_validator: descriptor.output_validator
           )
 
-        maybe_drive_tool_task(client, task, opts, modern_protocol?)
+        {:task, task}
 
       %{"resultType" => "task", "taskId" => _task_id} = task ->
         task =
@@ -528,7 +731,7 @@ defmodule FastestMCP.Client do
             output_validator: descriptor.output_validator
           )
 
-        maybe_drive_tool_task(client, task, opts, modern_protocol?)
+        {:task, task}
 
       %{} = direct_result ->
         if modern_protocol? and task_handle_requested?(opts) do
@@ -538,21 +741,29 @@ defmodule FastestMCP.Client do
         end
 
         validate_tool_output!(descriptor, direct_result)
-        normalize_response(:tool_call, direct_result)
+        {:complete, direct_result}
     end
   end
 
   @doc "Calls a tool and returns its remote task handle."
-  def call_tool_task(%__MODULE__{} = client, name, arguments \\ %{}, opts \\ []) do
-    case call_tool(client, name, arguments, Keyword.put(opts, :task, :handle)) do
-      %RemoteTask{} = task ->
-        task
+  def call_tool_task(client_ref, name, arguments \\ %{}, opts \\ []) do
+    client = pin_client!(client_ref)
+    name = to_string(name)
 
-      _result ->
-        raise Error,
-          code: :bad_request,
-          message: "tool #{inspect(to_string(name))} did not create a task"
-    end
+    Telemetry.with_client_span("tools/call", name, %{}, fn trace ->
+      traced_opts = opts |> trace_propagation_opts(trace) |> Keyword.put(:task, :handle)
+      modern_protocol? = protocol_version(client) == "2026-07-28"
+
+      case execute_tool_call(client, name, arguments, traced_opts, modern_protocol?) do
+        {:task, %RemoteTask{} = task} ->
+          task
+
+        {:complete, _result} ->
+          raise Error,
+            code: :bad_request,
+            message: "tool #{inspect(name)} did not create a task"
+      end
+    end)
   end
 
   defp maybe_drive_tool_task(_client, %RemoteTask{} = task, _opts, false), do: task
@@ -561,27 +772,53 @@ defmodule FastestMCP.Client do
     if task_handle_requested?(opts) do
       task
     else
-      task_opts =
-        opts
-        |> Keyword.delete(:timeout_ms)
-        |> Keyword.put_new(:task_timeout_ms, @default_task_timeout_ms)
+      raw_result = remote_task_raw_result(client, task, transparent_task_opts(opts))
 
-      remote_task_result(client, task, task_opts)
+      case Keyword.get(opts, :__fastestmcp_client_trace) do
+        nil -> :ok
+        trace -> maybe_mark_tool_error(raw_result, trace, "tools/call")
+      end
+
+      normalize_remote_task_result(task.kind, raw_result)
+    end
+  end
+
+  defp transparent_task_opts(opts) do
+    opts
+    |> Keyword.delete(:timeout_ms)
+    |> Keyword.put_new(:task_timeout_ms, @default_task_timeout_ms)
+  end
+
+  defp reject_tool_result_handle_option!(opts) do
+    case Keyword.get(opts, :task) do
+      value when value in [nil, false] ->
+        :ok
+
+      _other ->
+        raise ArgumentError,
+              "call_tool_result/4 returns a terminal result; use call_tool_task/4 for an explicit task handle"
     end
   end
 
   @doc "Lists visible resources."
-  def list_resources(%__MODULE__{} = client, opts \\ []) do
+  def list_resources(client_ref, opts \\ []) do
+    client = pin_client!(client_ref)
     request(client, "resources/list", pagination_params(opts), :resources, opts)
   end
 
   @doc "Lists every visible resource across the server's bounded pagination sequence."
-  def list_all_resources(%__MODULE__{} = client, opts \\ []) do
-    list_all(client, &list_resources/2, "resources/list", opts)
+  def list_all_resources(client_ref, opts \\ []) do
+    client = pin_client!(client_ref)
+
+    Telemetry.with_client_span("resources/list", nil, %{}, fn trace ->
+      list_all(client, &list_resources/2, "resources/list", trace_propagation_opts(opts, trace))
+    end)
   end
 
   @doc "Lists visible resource templates."
-  def list_resource_templates(%__MODULE__{} = client, opts \\ []) do
+  def list_resource_templates(client_ref, opts \\ []) do
+    client = pin_client!(client_ref)
+
     request(
       client,
       "resources/templates/list",
@@ -592,22 +829,40 @@ defmodule FastestMCP.Client do
   end
 
   @doc "Lists every visible resource template across the bounded pagination sequence."
-  def list_all_resource_templates(%__MODULE__{} = client, opts \\ []) do
-    list_all(client, &list_resource_templates/2, "resources/templates/list", opts)
+  def list_all_resource_templates(client_ref, opts \\ []) do
+    client = pin_client!(client_ref)
+
+    Telemetry.with_client_span("resources/templates/list", nil, %{}, fn trace ->
+      list_all(
+        client,
+        &list_resource_templates/2,
+        "resources/templates/list",
+        trace_propagation_opts(opts, trace)
+      )
+    end)
   end
 
   @doc "Reads a resource by URI."
-  def read_resource(%__MODULE__{} = client, uri, opts \\ []) do
-    params =
-      %{"uri" => to_string(uri)}
-      |> maybe_put_transport_version(opts[:version])
-      |> maybe_put_request_meta(opts)
+  def read_resource(client_ref, uri, opts \\ []) do
+    client = pin_client!(client_ref)
+    uri = to_string(uri)
 
-    request_with_mrtr(client, "resources/read", params, opts, :resource_read)
+    Telemetry.with_client_span("resources/read", uri, %{}, fn trace ->
+      traced_opts = trace_propagation_opts(opts, trace)
+
+      params =
+        %{"uri" => uri}
+        |> maybe_put_transport_version(traced_opts[:version])
+        |> maybe_put_request_meta(traced_opts)
+
+      request_with_mrtr(client, "resources/read", params, traced_opts, :resource_read)
+    end)
   end
 
   @doc "Subscribes the current session to updates for one concrete resource URI."
-  def subscribe_resource(%__MODULE__{} = client, uri, opts \\ []) do
+  def subscribe_resource(client_ref, uri, opts \\ []) do
+    client = pin_client!(client_ref)
+
     request(
       client,
       "resources/subscribe",
@@ -618,7 +873,9 @@ defmodule FastestMCP.Client do
   end
 
   @doc "Removes one resource subscription from the current session."
-  def unsubscribe_resource(%__MODULE__{} = client, uri, opts \\ []) do
+  def unsubscribe_resource(client_ref, uri, opts \\ []) do
+    client = pin_client!(client_ref)
+
     request(
       client,
       "resources/unsubscribe",
@@ -629,29 +886,43 @@ defmodule FastestMCP.Client do
   end
 
   @doc "Lists visible prompts."
-  def list_prompts(%__MODULE__{} = client, opts \\ []) do
+  def list_prompts(client_ref, opts \\ []) do
+    client = pin_client!(client_ref)
     request(client, "prompts/list", pagination_params(opts), :prompts, opts)
   end
 
   @doc "Lists every visible prompt across the server's bounded pagination sequence."
-  def list_all_prompts(%__MODULE__{} = client, opts \\ []) do
-    list_all(client, &list_prompts/2, "prompts/list", opts)
+  def list_all_prompts(client_ref, opts \\ []) do
+    client = pin_client!(client_ref)
+
+    Telemetry.with_client_span("prompts/list", nil, %{}, fn trace ->
+      list_all(client, &list_prompts/2, "prompts/list", trace_propagation_opts(opts, trace))
+    end)
   end
 
   @doc "Renders a prompt with the given arguments."
-  def render_prompt(%__MODULE__{} = client, name, arguments \\ %{}, opts \\ []) do
-    params =
-      %{
-        "name" => to_string(name),
-        "arguments" => Map.new(arguments)
-      }
-      |> maybe_put_request_meta(opts)
+  def render_prompt(client_ref, name, arguments \\ %{}, opts \\ []) do
+    client = pin_client!(client_ref)
+    name = to_string(name)
 
-    request_with_mrtr(client, "prompts/get", params, opts, :prompt)
+    Telemetry.with_client_span("prompts/get", name, %{}, fn trace ->
+      traced_opts = trace_propagation_opts(opts, trace)
+
+      params =
+        %{
+          "name" => name,
+          "arguments" => Map.new(arguments)
+        }
+        |> maybe_put_request_meta(traced_opts)
+
+      request_with_mrtr(client, "prompts/get", params, traced_opts, :prompt)
+    end)
   end
 
   @doc "Fetches background-task state."
-  def fetch_task(%__MODULE__{} = client, task_id, opts \\ []) do
+  def fetch_task(client_ref, task_id, opts \\ []) do
+    client = pin_client!(client_ref)
+
     task =
       request(
         client,
@@ -666,12 +937,17 @@ defmodule FastestMCP.Client do
   end
 
   @doc "Returns the normalized result for a background task."
-  def task_result(%__MODULE__{} = client, task_id, opts \\ []) do
-    if protocol_version(client) == "2026-07-28" do
-      modern_task_result(client, task_id, opts)
-    else
-      legacy_task_result(client, task_id, opts)
-    end
+  def task_result(client_ref, task_id, opts \\ []) do
+    client = pin_client!(client_ref)
+    task_id = to_string(task_id)
+
+    with_client_operation_span("tasks/result", task_id, opts, fn traced_opts, _trace ->
+      if protocol_version(client) == "2026-07-28" do
+        modern_task_result(client, task_id, traced_opts)
+      else
+        legacy_task_result(client, task_id, traced_opts)
+      end
+    end)
   end
 
   defp legacy_task_result(client, task_id, opts) do
@@ -697,9 +973,17 @@ defmodule FastestMCP.Client do
     snapshot = GenServer.call(client.pid, :mrtr_snapshot)
     task_id = to_string(task_id)
 
-    status =
-      cached_task_status(client, task_id) ||
-        refresh_task(client, task_id, task_request_opts(opts, deadline, "tasks/get"))
+    {status, poll_count} =
+      case cached_task_status(client, task_id) do
+        nil ->
+          {
+            refresh_task(client, task_id, task_request_opts(opts, deadline, "tasks/get")),
+            1
+          }
+
+        cached ->
+          {cached, 0}
+      end
 
     drive_modern_task(
       client,
@@ -708,12 +992,27 @@ defmodule FastestMCP.Client do
       snapshot,
       deadline,
       @initial_task_poll_interval_ms,
-      opts
+      opts,
+      poll_count,
+      nil
     )
   end
 
-  defp drive_modern_task(client, task_id, status, snapshot, deadline, poll_delay_ms, opts) do
-    case status["status"] || status[:status] do
+  defp drive_modern_task(
+         client,
+         task_id,
+         status,
+         snapshot,
+         deadline,
+         poll_delay_ms,
+         opts,
+         poll_count,
+         previous_status
+       ) do
+    status_name = status["status"] || status[:status]
+    record_task_trace(opts, task_id, status_name, previous_status, poll_count)
+
+    case status_name do
       "completed" ->
         result = Map.get(status, "result", Map.get(status, :result))
 
@@ -755,11 +1054,19 @@ defmodule FastestMCP.Client do
           fulfill_input_requests(client, input_requests, snapshot, deadline, task_id)
 
         _acknowledgement =
-          update_task(
-            client,
+          with_internal_client_span(
+            "tasks/update",
             task_id,
-            responses,
-            task_request_opts(opts, deadline, "tasks/update")
+            opts,
+            %{"mcp.task.status" => "input_required"},
+            fn update_opts ->
+              update_task(
+                client,
+                task_id,
+                responses,
+                task_request_opts(update_opts, deadline, "tasks/update")
+              )
+            end
           )
 
         refreshed =
@@ -772,7 +1079,9 @@ defmodule FastestMCP.Client do
           snapshot,
           deadline,
           @initial_task_poll_interval_ms,
-          opts
+          opts,
+          poll_count + 1,
+          status_name
         )
 
       status_name when status_name in ["working", "submitted"] ->
@@ -784,17 +1093,20 @@ defmodule FastestMCP.Client do
 
         target_statuses = MapSet.new(["input_required", "completed", "failed", "cancelled"])
 
-        next_status =
+        {next_status, next_poll_count} =
           case GenServer.call(
                  client.pid,
                  {:wait_task_notification, task_id, target_statuses, wait_window},
                  wait_window + 1_000
                ) do
             {:ok, notified_status} ->
-              notified_status
+              {notified_status, poll_count}
 
             :timeout ->
-              refresh_task(client, task_id, task_request_opts(opts, deadline, "tasks/get"))
+              {
+                refresh_task(client, task_id, task_request_opts(opts, deadline, "tasks/get")),
+                poll_count + 1
+              }
           end
 
         next_poll_delay_ms =
@@ -810,7 +1122,9 @@ defmodule FastestMCP.Client do
           snapshot,
           deadline,
           next_poll_delay_ms,
-          opts
+          opts,
+          next_poll_count,
+          status_name
         )
 
       other ->
@@ -826,13 +1140,20 @@ defmodule FastestMCP.Client do
 
   defp task_request_opts(opts, deadline, operation) do
     opts
-    |> Keyword.take([:request_meta])
+    |> Keyword.take([
+      :request_meta,
+      :__fastestmcp_trace_context,
+      :__fastestmcp_client_trace,
+      :__fastestmcp_trace_mode
+    ])
     |> Keyword.put(:timeout_ms, remaining_timeout!(deadline, operation))
   end
 
   @doc "Supplies responses to a remote task's outstanding input requests."
-  def update_task(%__MODULE__{} = client, task_id, input_responses, opts \\ [])
+  def update_task(client_ref, task_id, input_responses, opts \\ [])
       when is_map(input_responses) do
+    client = pin_client!(client_ref)
+
     request(
       client,
       "tasks/update",
@@ -847,7 +1168,9 @@ defmodule FastestMCP.Client do
   end
 
   @doc "Lists background tasks."
-  def list_tasks(%__MODULE__{} = client, opts \\ []) do
+  def list_tasks(client_ref, opts \\ []) do
+    client = pin_client!(client_ref)
+
     page =
       request(
         client,
@@ -865,7 +1188,8 @@ defmodule FastestMCP.Client do
   end
 
   @doc "Cancels a background task."
-  def cancel_task(%__MODULE__{} = client, task_id, opts \\ []) do
+  def cancel_task(client_ref, task_id, opts \\ []) do
+    client = pin_client!(client_ref)
     modern? = protocol_version(client) == "2026-07-28"
 
     result =
@@ -888,50 +1212,65 @@ defmodule FastestMCP.Client do
   @doc "Builds or refreshes a remote task handle tracked by this client."
   def track_task(client, task_or_id, opts \\ [])
 
-  def track_task(%__MODULE__{} = client, %{} = task, opts) do
+  def track_task(client_ref, %{} = task, opts) do
+    client = pin_client!(client_ref)
     task_id = task["taskId"] || task[:taskId] || task["id"] || task[:id]
     :ok = cache_task_status(client, task_id, task)
     register_tracked_task(client, task_id, opts)
   end
 
-  def track_task(%__MODULE__{} = client, task_id, opts) when is_binary(task_id) do
+  def track_task(client_ref, task_id, opts) when is_binary(task_id) do
+    client = pin_client!(client_ref)
     register_tracked_task(client, task_id, opts)
   end
 
   @doc "Returns the last cached task status, if any."
-  def cached_task_status(%__MODULE__{pid: pid}, task_id) do
+  def cached_task_status(client_ref, task_id) do
+    %__MODULE__{pid: pid} = pin_client!(client_ref)
     GenServer.call(pid, {:cached_task_status, to_string(task_id)})
   end
 
   @doc "Caches fresh task status after a `tasks/get` round trip."
-  def refresh_task(%__MODULE__{} = client, task_id, opts \\ []) do
+  def refresh_task(client_ref, task_id, opts \\ []) do
+    client = pin_client!(client_ref)
     task = fetch_task(client, task_id, opts)
     :ok = cache_task_status(client, task_id, task)
     task
   end
 
   @doc "Waits for a tracked task to reach a target status or any terminal status."
-  def wait_for_task(%__MODULE__{} = client, task_id, opts \\ []) do
-    register_tracked_task(client, task_id, opts)
-    target_statuses = normalize_target_statuses(opts)
+  def wait_for_task(client_ref, task_id, opts \\ []) do
+    client = pin_client!(client_ref)
+    task_id = to_string(task_id)
 
-    timeout_ms =
-      opts
-      |> Keyword.get(:timeout_ms, @default_task_timeout_ms)
-      |> normalize_positive_integer!(:timeout_ms)
+    with_client_operation_span("tasks/get", task_id, opts, fn traced_opts, _trace ->
+      register_tracked_task(client, task_id, traced_opts)
+      target_statuses = normalize_target_statuses(traced_opts)
 
-    deadline = System.monotonic_time(:millisecond) + timeout_ms
+      timeout_ms =
+        traced_opts
+        |> Keyword.get(:timeout_ms, @default_task_timeout_ms)
+        |> normalize_positive_integer!(:timeout_ms)
 
-    do_wait_for_task(client, to_string(task_id), target_statuses, deadline, opts)
+      deadline = System.monotonic_time(:millisecond) + timeout_ms
+
+      do_wait_for_task(client, task_id, target_statuses, deadline, traced_opts)
+    end)
   end
 
   @doc "Fetches and caches the final result for a remote task handle."
-  def remote_task_result(%__MODULE__{} = client, %RemoteTask{} = task, opts \\ []) do
+  def remote_task_result(client_ref, %RemoteTask{} = task, opts \\ []) do
+    client = pin_client!(client_ref)
+    result = remote_task_raw_result(client, task, opts)
+    normalize_remote_task_result(task.kind, result)
+  end
+
+  defp remote_task_raw_result(client, %RemoteTask{} = task, opts) do
     task_id = task.task_id
 
     case cached_task_result(client, task_id) do
       {:ok, {:ok, result}} ->
-        normalize_remote_task_result(task.kind, result)
+        result
 
       _other ->
         ensure_legacy_task_session_stream(client)
@@ -939,7 +1278,7 @@ defmodule FastestMCP.Client do
         try do
           result = task_result(client, task_id, opts)
           :ok = cache_task_result(client, task_id, {:ok, result})
-          normalize_remote_task_result(task.kind, result)
+          result
         rescue
           error in Error ->
             reraise error, __STACKTRACE__
@@ -948,7 +1287,8 @@ defmodule FastestMCP.Client do
   end
 
   @doc "Cancels a remote task and updates the local cache."
-  def cancel_remote_task(%__MODULE__{} = client, task_id, opts \\ []) do
+  def cancel_remote_task(client_ref, task_id, opts \\ []) do
+    client = pin_client!(client_ref)
     result = cancel_task(client, task_id, opts)
 
     if result["resultType"] == "complete" do
@@ -960,8 +1300,9 @@ defmodule FastestMCP.Client do
   end
 
   @doc "Registers a callback for remote task status changes."
-  def on_task_status_change(%__MODULE__{pid: pid}, task_id, callback)
+  def on_task_status_change(client_ref, task_id, callback)
       when is_function(callback) do
+    %__MODULE__{pid: pid} = pin_client!(client_ref)
     GenServer.call(pid, {:register_task_callback, to_string(task_id), callback})
   end
 
@@ -994,6 +1335,9 @@ defmodule FastestMCP.Client do
           advertised_client_capabilities: nil,
           lifecycle_state: :new,
           initialization_owner_ref: nil,
+          discovery_attempt: nil,
+          readiness_waiters: %{},
+          readiness_owner_refs: %{},
           schema_options: normalize_schema_options!(Keyword.get(opts, :schema_options, [])),
           tool_catalog: ToolCatalog.new(),
           tool_catalog_ready?: false,
@@ -1031,7 +1375,7 @@ defmodule FastestMCP.Client do
           legacy_stdio_auth_metadata?: Keyword.get(opts, :legacy_stdio_auth_metadata, false),
           task_registry: %{},
           callback_tasks: %{},
-          callback_supervisor: nil,
+          worker_supervisor: nil,
           callback_requests: %{},
           callback_worker_refs: %{},
           callback_request_ids: MapSet.new(),
@@ -1061,8 +1405,8 @@ defmodule FastestMCP.Client do
       case validate_transport_options(state) do
         :ok ->
           case Task.Supervisor.start_link() do
-            {:ok, callback_supervisor} ->
-              state = Map.put(state, :callback_supervisor, callback_supervisor)
+            {:ok, worker_supervisor} ->
+              state = Map.put(state, :worker_supervisor, worker_supervisor)
 
               case maybe_start_oauth(state, Keyword.get(opts, :oauth)) do
                 {:ok, state} -> open_client_transport(state)
@@ -1120,6 +1464,29 @@ defmodule FastestMCP.Client do
 
   def handle_call(:lifecycle_state, _from, state), do: {:reply, state.lifecycle_state, state}
 
+  def handle_call(:ready?, _from, state), do: {:reply, client_ready?(state), state}
+
+  def handle_call({:await_ready, owner, token}, _from, state) do
+    cond do
+      client_ready?(state) ->
+        {:reply, :ready, state}
+
+      state.lifecycle_state == :failed ->
+        {:reply, {:error, readiness_error(state)}, state}
+
+      true ->
+        owner_ref = Process.monitor(owner)
+        waiter = %{owner: owner, owner_ref: owner_ref}
+
+        {:reply, :waiting,
+         %{
+           state
+           | readiness_waiters: Map.put(state.readiness_waiters, token, waiter),
+             readiness_owner_refs: Map.put(state.readiness_owner_refs, owner_ref, token)
+         }}
+    end
+  end
+
   def handle_call(:begin_initialize, {owner, _tag}, %{lifecycle_state: :new} = state) do
     if state.protocol_preference == "2026-07-28" do
       {:reply,
@@ -1147,17 +1514,53 @@ defmodule FastestMCP.Client do
       }}, state}
   end
 
-  def handle_call(:begin_discover, _from, state) do
-    if state.protocol_preference == "2025-11-25" do
-      {:reply,
-       {:error,
-        %Error{
-          code: :invalid_request,
-          message:
-            "server/discover is a modern-only API and cannot be used with protocol_version: \"2025-11-25\""
-        }}, state}
-    else
-      {:reply, :ok, state}
+  def handle_call(:begin_discover, {owner, _tag}, state) do
+    cond do
+      state.protocol_preference == "2025-11-25" ->
+        {:reply,
+         {:error,
+          %Error{
+            code: :invalid_request,
+            message:
+              "server/discover is a modern-only API and cannot be used with protocol_version: \"2025-11-25\""
+          }}, state}
+
+      not is_nil(state.discovery_attempt) ->
+        {:reply,
+         {:error,
+          %Error{
+            code: :invalid_request,
+            message: "server discovery is already in progress"
+          }}, state}
+
+      state.lifecycle_state not in [:new, :initialized] ->
+        {:reply,
+         {:error,
+          %Error{
+            code: :invalid_request,
+            message: "server discovery is invalid while client is #{state.lifecycle_state}",
+            details: %{lifecycle_state: state.lifecycle_state}
+          }}, state}
+
+      true ->
+        token = make_ref()
+        owner_ref = Process.monitor(owner)
+
+        attempt = %{
+          token: token,
+          owner_ref: owner_ref,
+          previous_lifecycle: state.lifecycle_state,
+          previous_discovery_result: state.discovery_result,
+          previous_protocol_version: state.selected_protocol_version,
+          previous_session_id: state.session_id,
+          previous_server_identity: state.server_identity
+        }
+
+        lifecycle_state =
+          if state.lifecycle_state == :new, do: :discovering, else: state.lifecycle_state
+
+        {:reply, {:ok, token},
+         %{state | lifecycle_state: lifecycle_state, discovery_attempt: attempt}}
     end
   end
 
@@ -1174,14 +1577,18 @@ defmodule FastestMCP.Client do
 
     next_state = maybe_invalidate_connection_cache(state, next_state)
 
-    {:reply, :ok, next_state}
+    {:reply, :ok, release_ready_waiters(next_state)}
   end
 
-  def handle_call({:finish_discover, %{} = result}, _from, state) do
+  def handle_call(
+        {:finish_discover, token, %{} = result},
+        _from,
+        %{discovery_attempt: %{token: token} = attempt} = state
+      ) do
     supported = Map.get(result, "supportedVersions", [])
 
     if "2026-07-28" in supported do
-      demonitor_initialization_owner(state.initialization_owner_ref)
+      demonitor_initialization_owner(attempt.owner_ref)
 
       next_state = %{
         state
@@ -1189,13 +1596,13 @@ defmodule FastestMCP.Client do
           discovery_result: result,
           selected_protocol_version: "2026-07-28",
           session_id: nil,
-          initialization_owner_ref: nil,
+          discovery_attempt: nil,
           server_identity: server_identity(result)
       }
 
       next_state = maybe_invalidate_connection_cache(state, next_state)
 
-      {:reply, :ok, next_state}
+      {:reply, :ok, release_ready_waiters(next_state)}
     else
       {:reply,
        {:error,
@@ -1205,6 +1612,15 @@ defmodule FastestMCP.Client do
           details: %{supported: supported, requested: "2026-07-28", jsonrpc_code: -32_022}
         }}, state}
     end
+  end
+
+  def handle_call({:finish_discover, _token, _result}, _from, state) do
+    {:reply,
+     {:error,
+      %Error{
+        code: :invalid_request,
+        message: "server discovery attempt is no longer active"
+      }}, state}
   end
 
   def handle_call(:finish_initialize, _from, state) do
@@ -1220,15 +1636,38 @@ defmodule FastestMCP.Client do
   def handle_call({:fail_initialize, _reason}, _from, state) do
     demonitor_initialization_owner(state.initialization_owner_ref)
 
+    next_state =
+      %{
+        state
+        | lifecycle_state: :failed,
+          initialization_owner_ref: nil,
+          initialize_result: nil,
+          advertised_client_capabilities: nil
+      }
+
+    {:reply, :ok, fail_ready_waiters(next_state, readiness_error(next_state))}
+  end
+
+  def handle_call(
+        {:fail_discover, token, _reason},
+        _from,
+        %{discovery_attempt: %{token: token} = attempt} = state
+      ) do
+    demonitor_initialization_owner(attempt.owner_ref)
+
     {:reply, :ok,
      %{
        state
-       | lifecycle_state: :failed,
-         initialization_owner_ref: nil,
-         initialize_result: nil,
-         advertised_client_capabilities: nil
+       | lifecycle_state: attempt.previous_lifecycle,
+         discovery_result: attempt.previous_discovery_result,
+         selected_protocol_version: attempt.previous_protocol_version,
+         session_id: attempt.previous_session_id,
+         server_identity: attempt.previous_server_identity,
+         discovery_attempt: nil
      }}
   end
+
+  def handle_call({:fail_discover, _token, _reason}, _from, state), do: {:reply, :ok, state}
 
   def handle_call(:session_stream_open?, _from, state),
     do: {:reply, session_stream_started?(state), state}
@@ -1564,7 +2003,7 @@ defmodule FastestMCP.Client do
         stream_ref = make_ref()
 
         {pid, monitor_ref} =
-          spawn_monitor(fn ->
+          start_monitored_client_worker!(state, fn ->
             run_session_stream(parent, stream_ref, state)
           end)
 
@@ -1676,6 +2115,11 @@ defmodule FastestMCP.Client do
       {:ok, next_state} -> {:reply, :ok, next_state}
       {:error, %Error{} = error} -> {:reply, {:error, error}, state}
     end
+  end
+
+  @impl true
+  def handle_cast({:cancel_ready_waiter, token}, state) do
+    {:noreply, drop_ready_waiter(state, token)}
   end
 
   @impl true
@@ -1816,15 +2260,35 @@ defmodule FastestMCP.Client do
 
   def handle_info({:DOWN, worker_ref, :process, _pid, reason}, state) do
     cond do
-      state.initialization_owner_ref == worker_ref ->
+      Map.has_key?(state.readiness_owner_refs, worker_ref) ->
+        token = Map.fetch!(state.readiness_owner_refs, worker_ref)
+        {:noreply, drop_ready_waiter(state, token, false)}
+
+      match?(%{owner_ref: ^worker_ref}, state.discovery_attempt) ->
+        attempt = state.discovery_attempt
+
         {:noreply,
          %{
            state
-           | lifecycle_state: :failed,
-             initialization_owner_ref: nil,
-             initialize_result: nil,
-             advertised_client_capabilities: nil
+           | lifecycle_state: attempt.previous_lifecycle,
+             discovery_result: attempt.previous_discovery_result,
+             selected_protocol_version: attempt.previous_protocol_version,
+             session_id: attempt.previous_session_id,
+             server_identity: attempt.previous_server_identity,
+             discovery_attempt: nil
          }}
+
+      state.initialization_owner_ref == worker_ref ->
+        next_state =
+          %{
+            state
+            | lifecycle_state: :failed,
+              initialization_owner_ref: nil,
+              initialize_result: nil,
+              advertised_client_capabilities: nil
+          }
+
+        {:noreply, fail_ready_waiters(next_state, readiness_error(next_state))}
 
       match?(%{monitor_ref: ^worker_ref}, state.recovery) ->
         error = %Error{
@@ -2079,6 +2543,7 @@ defmodule FastestMCP.Client do
           |> Map.put(:stdio_restart_timer_ref, nil)
           |> Map.put(:stdio_restart_token, nil)
           |> reopen_modern_stdio_subscriptions()
+          |> release_ready_waiters()
 
         {:noreply, state}
 
@@ -2147,10 +2612,11 @@ defmodule FastestMCP.Client do
       if entry[:worker_ref], do: Process.demonitor(entry.worker_ref, [:flush])
       cancel_timer(entry[:timer_ref])
       cancel_timer(entry[:reconnect_timer_ref])
+      finish_async_request_trace(entry, {:error, client_not_running_error()})
     end)
 
-    if is_pid(state.callback_supervisor) and Process.alive?(state.callback_supervisor) do
-      Supervisor.stop(state.callback_supervisor, :normal)
+    if is_pid(state.worker_supervisor) and Process.alive?(state.worker_supervisor) do
+      Supervisor.stop(state.worker_supervisor, :normal)
     end
 
     if match?(%{pid: pid} when is_pid(pid), state.oauth) and Process.alive?(state.oauth.pid) do
@@ -2188,6 +2654,25 @@ defmodule FastestMCP.Client do
   defp terminate_remote_http_session(_state), do: :ok
 
   defp request(%__MODULE__{pid: pid}, method, params, normalizer, opts) do
+    case Keyword.get(opts, :__fastestmcp_trace_mode, :span) do
+      :propagate_only ->
+        context = Keyword.get(opts, :__fastestmcp_trace_context, Telemetry.current_context())
+        do_client_request(pid, method, params, normalizer, put_trace_context(opts, context))
+
+      :span ->
+        target = client_trace_target(method, params)
+
+        Telemetry.with_client_span(method, target, %{}, fn trace ->
+          result =
+            do_client_request(pid, method, params, normalizer, put_client_trace(opts, trace))
+
+          maybe_mark_tool_error(result, trace, method)
+          result
+        end)
+    end
+  end
+
+  defp do_client_request(pid, method, params, normalizer, opts) do
     timeout_ms = Keyword.get(opts, :timeout_ms, @default_timeout_ms)
 
     case GenServer.call(pid, {:request, method, params, normalizer, opts}, timeout_ms + 1_000) do
@@ -2207,6 +2692,127 @@ defmodule FastestMCP.Client do
           details: %{reason: inspect(reason)}
     end
   end
+
+  defp put_client_trace(opts, trace) do
+    opts
+    |> Keyword.put(:__fastestmcp_trace_context, trace.context)
+    |> Keyword.put(:__fastestmcp_client_trace, trace)
+  end
+
+  defp put_trace_context(opts, context),
+    do: Keyword.put(opts, :__fastestmcp_trace_context, context)
+
+  defp trace_propagation_opts(opts, trace) do
+    opts
+    |> put_client_trace(trace)
+    |> Keyword.put(:__fastestmcp_trace_mode, :propagate_only)
+  end
+
+  defp with_client_operation_span(method, target, opts, fun) when is_function(fun, 2) do
+    if Keyword.get(opts, :__fastestmcp_trace_mode) == :propagate_only do
+      fun.(opts, Keyword.get(opts, :__fastestmcp_client_trace))
+    else
+      Telemetry.with_client_span(method, target, %{}, fn trace ->
+        fun.(trace_propagation_opts(opts, trace), trace)
+      end)
+    end
+  end
+
+  defp with_internal_client_span(method, target, opts, attrs, fun) when is_function(fun, 1) do
+    case Keyword.get(opts, :__fastestmcp_trace_context) do
+      nil ->
+        fun.(opts)
+
+      parent_context ->
+        Telemetry.with_client_span(parent_context, method, target, attrs, fn trace ->
+          fun.(trace_propagation_opts(opts, trace))
+        end)
+    end
+  end
+
+  defp annotate_pagination_trace(opts, page_count, item_count) do
+    case Keyword.get(opts, :__fastestmcp_client_trace) do
+      nil ->
+        :ok
+
+      trace ->
+        Telemetry.annotate_client_span(trace, %{
+          "mcp.pagination.page.count" => page_count,
+          "mcp.pagination.item.count" => item_count
+        })
+    end
+  end
+
+  defp record_task_trace(opts, _task_id, status, previous_status, poll_count) do
+    case Keyword.get(opts, :__fastestmcp_client_trace) do
+      nil ->
+        :ok
+
+      trace ->
+        Telemetry.annotate_client_span(trace, %{"mcp.task.poll.count" => poll_count})
+
+        if is_binary(status) and status != previous_status do
+          Telemetry.add_client_span_event(trace, "mcp.task.status", %{
+            "mcp.task.status" => status
+          })
+        end
+    end
+  end
+
+  defp maybe_mark_tool_error(%{"isError" => true}, trace, "tools/call"),
+    do: Telemetry.mark_client_tool_error(trace)
+
+  defp maybe_mark_tool_error(_result, _trace, _method), do: :ok
+
+  defp annotate_client_request_trace(opts, state, method, protocol_version, extra \\ %{}) do
+    trace =
+      Keyword.get(opts, :__fastestmcp_async_trace) ||
+        Keyword.get(opts, :__fastestmcp_client_trace)
+
+    if trace do
+      server_name =
+        case state.server_identity do
+          %{"name" => name} -> name
+          %{name: name} -> name
+          _other -> nil
+        end
+
+      attrs =
+        %{
+          "mcp.method.name" => method,
+          "mcp.protocol.version" => protocol_version,
+          "mcp.server.name" => server_name,
+          "mcp.session.id" => state.session_id,
+          "fastestmcp.transport" => to_string(state.transport.type)
+        }
+        |> Map.merge(extra)
+
+      Telemetry.annotate_client_span(trace, attrs)
+    end
+
+    :ok
+  end
+
+  defp client_trace_target("tools/call", params), do: map_param(params, "name")
+  defp client_trace_target("prompts/get", params), do: map_param(params, "name")
+  defp client_trace_target("resources/read", params), do: map_param(params, "uri")
+
+  defp client_trace_target(method, params)
+       when method in ["tasks/get", "tasks/update", "tasks/cancel"],
+       do: map_param(params, "taskId")
+
+  defp client_trace_target(_method, _params), do: nil
+
+  defp map_param(params, "name") when is_map(params),
+    do: Map.get(params, "name", Map.get(params, :name))
+
+  defp map_param(params, "uri") when is_map(params),
+    do: Map.get(params, "uri", Map.get(params, :uri))
+
+  defp map_param(params, "taskId") when is_map(params),
+    do: Map.get(params, "taskId", Map.get(params, :taskId))
+
+  defp map_param(_params, _key), do: nil
 
   defp request_with_mrtr(client, method, params, opts, normalizer \\ :identity) do
     snapshot = GenServer.call(client.pid, :mrtr_snapshot)
@@ -2263,16 +2869,24 @@ defmodule FastestMCP.Client do
 
         retry_params = latest_mrtr_retry_params(params, result, responses)
 
-        do_request_with_mrtr(
-          client,
+        with_internal_client_span(
+          "mcp.mrtr.continue",
           method,
-          retry_params,
           opts,
-          snapshot,
-          deadline,
-          round + 1,
-          max_rounds,
-          normalizer
+          %{"mcp.mrtr.round" => round + 1},
+          fn continuation_opts ->
+            do_request_with_mrtr(
+              client,
+              method,
+              retry_params,
+              continuation_opts,
+              snapshot,
+              deadline,
+              round + 1,
+              max_rounds,
+              normalizer
+            )
+          end
         )
 
       %{"resultType" => "input_required"} ->
@@ -2303,8 +2917,9 @@ defmodule FastestMCP.Client do
         capture_page(fn -> list_page.(client, page_opts) end)
     end
 
-    case Paginator.fetch_all(fetch_page, paginator_opts) do
-      {:ok, items} ->
+    case Paginator.fetch_all_with_meta(fetch_page, paginator_opts) do
+      {:ok, %{items: items, page_count: page_count}} ->
+        annotate_pagination_trace(opts, page_count, length(items))
         items
 
       {:error, exception} when is_exception(exception) ->
@@ -2460,16 +3075,19 @@ defmodule FastestMCP.Client do
 
   defp run_with_deadline!(deadline, operation, fun) when is_function(fun, 0) do
     timeout_ms = remaining_timeout!(deadline, operation)
+    trace_context = Telemetry.current_context()
 
     task =
       Task.async(fn ->
-        try do
-          {:ok, fun.()}
-        rescue
-          error -> {:raise, error, __STACKTRACE__}
-        catch
-          kind, reason -> {:raise, kind, reason, __STACKTRACE__}
-        end
+        Telemetry.with_context(trace_context, fn ->
+          try do
+            {:ok, fun.()}
+          rescue
+            error -> {:raise, error, __STACKTRACE__}
+          catch
+            kind, reason -> {:raise, kind, reason, __STACKTRACE__}
+          end
+        end)
       end)
 
     case Task.yield(task, timeout_ms) do
@@ -2496,6 +3114,183 @@ defmodule FastestMCP.Client do
     end
   catch
     :exit, _reason -> :ok
+  end
+
+  defp fail_discover(%__MODULE__{pid: pid}, token, reason) do
+    if Process.alive?(pid) do
+      GenServer.call(pid, {:fail_discover, token, reason})
+    else
+      :ok
+    end
+  catch
+    :exit, _reason -> :ok
+  end
+
+  defp resolve_client(%__MODULE__{pid: pid} = client) when is_pid(pid) do
+    if Process.alive?(pid), do: {:ok, client}, else: :error
+  end
+
+  defp resolve_client(client_ref) do
+    case GenServer.whereis(client_ref) do
+      pid when is_pid(pid) -> {:ok, %__MODULE__{pid: pid}}
+      nil -> :error
+    end
+  rescue
+    ArgumentError -> :error
+  end
+
+  defp pin_client!(client_ref) do
+    case resolve_client(client_ref) do
+      {:ok, client} ->
+        client
+
+      :error ->
+        raise Error,
+          code: :internal_error,
+          message: "MCP client is not running"
+    end
+  end
+
+  defp do_await_ready(client_ref, deadline, follow_name?) do
+    case resolve_client(client_ref) do
+      {:ok, client} -> await_resolved_client(client_ref, client, deadline, follow_name?)
+      :error when follow_name? -> retry_named_ready(client_ref, deadline)
+      :error -> raise client_not_running_error()
+    end
+  end
+
+  defp await_resolved_client(original_ref, %__MODULE__{pid: pid}, deadline, follow_name?) do
+    token = make_ref()
+    monitor_ref = Process.monitor(pid)
+
+    reply =
+      try do
+        GenServer.call(pid, {:await_ready, self(), token}, readiness_call_timeout(deadline))
+      catch
+        :exit, _reason -> :client_down
+      end
+
+    case reply do
+      :ready ->
+        Process.demonitor(monitor_ref, [:flush])
+        :ok
+
+      {:error, %Error{} = error} ->
+        Process.demonitor(monitor_ref, [:flush])
+        raise error
+
+      :waiting ->
+        receive do
+          {__MODULE__, :ready, ^pid, ^token} ->
+            Process.demonitor(monitor_ref, [:flush])
+            :ok
+
+          {__MODULE__, :ready_error, ^pid, ^token, %Error{} = error} ->
+            Process.demonitor(monitor_ref, [:flush])
+            raise error
+
+          {:DOWN, ^monitor_ref, :process, ^pid, _reason} when follow_name? ->
+            do_await_ready(original_ref, deadline, true)
+
+          {:DOWN, ^monitor_ref, :process, ^pid, _reason} ->
+            raise client_not_running_error()
+        after
+          readiness_remaining(deadline) ->
+            GenServer.cast(pid, {:cancel_ready_waiter, token})
+            Process.demonitor(monitor_ref, [:flush])
+            raise readiness_timeout_error(deadline)
+        end
+
+      :client_down when follow_name? ->
+        Process.demonitor(monitor_ref, [:flush])
+        do_await_ready(original_ref, deadline, true)
+
+      :client_down ->
+        Process.demonitor(monitor_ref, [:flush])
+        raise client_not_running_error()
+    end
+  end
+
+  defp retry_named_ready(client_ref, deadline) do
+    remaining = readiness_remaining(deadline)
+
+    if remaining == 0 do
+      raise readiness_timeout_error(deadline)
+    else
+      Process.sleep(if(remaining == :infinity, do: 25, else: min(remaining, 25)))
+      do_await_ready(client_ref, deadline, true)
+    end
+  end
+
+  defp readiness_call_timeout(:infinity), do: :infinity
+  defp readiness_call_timeout(deadline), do: max(readiness_remaining(deadline), 1) + 1_000
+
+  defp readiness_remaining(:infinity), do: :infinity
+  defp readiness_remaining(deadline), do: max(deadline - monotonic_ms(), 0)
+
+  defp readiness_timeout_error(:infinity),
+    do: %Error{code: :timeout, message: "MCP client did not become ready"}
+
+  defp readiness_timeout_error(_deadline),
+    do: %Error{code: :timeout, message: "MCP client did not become ready before the deadline"}
+
+  defp client_not_running_error do
+    %Error{code: :internal_error, message: "MCP client is not running"}
+  end
+
+  defp monotonic_ms, do: System.monotonic_time(:millisecond)
+
+  defp client_ready?(state) do
+    state.lifecycle_state == :initialized and is_nil(state.recovery) and
+      is_nil(state.stdio_restart_token) and ClientTransport.connected?(state.transport)
+  rescue
+    _error -> false
+  end
+
+  defp readiness_error(state) do
+    %Error{
+      code: :internal_error,
+      message: "MCP client failed to become ready",
+      details: %{lifecycle_state: state.lifecycle_state}
+    }
+  end
+
+  defp release_ready_waiters(state) do
+    if client_ready?(state) do
+      Enum.each(state.readiness_waiters, fn {token, waiter} ->
+        send(waiter.owner, {__MODULE__, :ready, self(), token})
+        Process.demonitor(waiter.owner_ref, [:flush])
+      end)
+
+      %{state | readiness_waiters: %{}, readiness_owner_refs: %{}}
+    else
+      state
+    end
+  end
+
+  defp fail_ready_waiters(state, %Error{} = error) do
+    Enum.each(state.readiness_waiters, fn {token, waiter} ->
+      send(waiter.owner, {__MODULE__, :ready_error, self(), token, error})
+      Process.demonitor(waiter.owner_ref, [:flush])
+    end)
+
+    %{state | readiness_waiters: %{}, readiness_owner_refs: %{}}
+  end
+
+  defp drop_ready_waiter(state, token, demonitor? \\ true) do
+    case Map.pop(state.readiness_waiters, token) do
+      {nil, _waiters} ->
+        state
+
+      {waiter, waiters} ->
+        if demonitor?, do: Process.demonitor(waiter.owner_ref, [:flush])
+
+        %{
+          state
+          | readiness_waiters: waiters,
+            readiness_owner_refs: Map.delete(state.readiness_owner_refs, waiter.owner_ref)
+        }
+    end
   end
 
   defp negotiate_ready(%__MODULE__{} = client, opts) do
@@ -2577,7 +3372,7 @@ defmodule FastestMCP.Client do
          "server/discover",
          _normalizer
        )
-       when state in [:new, :initialized],
+       when state in [:new, :discovering, :initialized],
        do: :ok
 
   defp validate_outbound_request_lifecycle(
@@ -3295,6 +4090,8 @@ defmodule FastestMCP.Client do
     protocol_version = selected_request_protocol_version(state, method)
     opts = Keyword.put(opts, :protocol_version, protocol_version)
 
+    annotate_client_request_trace(opts, state, method, protocol_version)
+
     lifecycle_validation =
       validate_outbound_request_lifecycle(state, method, normalizer)
 
@@ -3358,6 +4155,10 @@ defmodule FastestMCP.Client do
                    reply_to
                  ) do
               {:hit, result, next_state} ->
+                annotate_client_request_trace(opts, next_state, method, protocol_version, %{
+                  "fastestmcp.cache.hit" => true
+                })
+
                 {:cached, result, next_state}
 
               {:miss, cache_key, cache_mode, next_state} ->
@@ -3432,6 +4233,8 @@ defmodule FastestMCP.Client do
       request_opts: opts,
       response_cache_key: cache_key,
       response_cache_mode: cache_mode,
+      async_trace: Keyword.get(opts, :__fastestmcp_async_trace),
+      trace_context: Keyword.get(opts, :__fastestmcp_trace_context),
       subscription_acknowledged?: false,
       subscription_reconnect_attempt: 0,
       reconnect_timer_ref: nil,
@@ -3649,7 +4452,7 @@ defmodule FastestMCP.Client do
     parent = self()
 
     {pid, worker_ref} =
-      spawn_monitor(fn ->
+      start_monitored_client_worker!(state, fn ->
         request_started = fn request_ref ->
           send(parent, {:http_request_started, ref, self(), request_ref})
         end
@@ -3917,7 +4720,7 @@ defmodule FastestMCP.Client do
         :ok
 
       :streamable_http ->
-        spawn(fn ->
+        start_client_worker(state, fn ->
           _ = send_client_notification(state, "notifications/cancelled", params, opts)
         end)
 
@@ -3971,8 +4774,8 @@ defmodule FastestMCP.Client do
     )
   end
 
-  defp tool_descriptor!(client, name, version, deadline) do
-    catalog = ensure_tool_catalog!(client, deadline)
+  defp tool_descriptor!(client, name, version, deadline, trace_opts) do
+    catalog = ensure_tool_catalog!(client, deadline, trace_opts)
 
     case ToolCatalog.lookup(catalog, name, version) do
       {:ok, descriptor} ->
@@ -4001,7 +4804,7 @@ defmodule FastestMCP.Client do
     end
   end
 
-  defp ensure_tool_catalog!(client, deadline) do
+  defp ensure_tool_catalog!(client, deadline, trace_opts) do
     timeout = remaining_timeout!(deadline, "tools/list")
 
     response =
@@ -4017,12 +4820,12 @@ defmodule FastestMCP.Client do
         catalog
 
       {:load, generation, schema_options} ->
-        result = load_tool_catalog(client, generation, schema_options, deadline)
+        result = load_tool_catalog(client, generation, schema_options, deadline, trace_opts)
 
         case GenServer.call(client.pid, {:install_tool_catalog, generation, result}) do
           {:ready, %ToolCatalog{} = catalog} -> catalog
           {:error, exception} when is_exception(exception) -> raise exception
-          :stale -> ensure_tool_catalog!(client, deadline)
+          :stale -> ensure_tool_catalog!(client, deadline, trace_opts)
         end
 
       {:error, exception} when is_exception(exception) ->
@@ -4030,9 +4833,13 @@ defmodule FastestMCP.Client do
     end
   end
 
-  defp load_tool_catalog(client, generation, schema_options, deadline) do
+  defp load_tool_catalog(client, generation, schema_options, deadline, trace_opts) do
     fetch_page = fn cursor ->
-      opts = [timeout_ms: remaining_timeout!(deadline, "tools/list")]
+      opts =
+        trace_opts
+        |> Keyword.take([:__fastestmcp_trace_context, :__fastestmcp_client_trace])
+        |> Keyword.put(:__fastestmcp_trace_mode, :propagate_only)
+        |> Keyword.put(:timeout_ms, remaining_timeout!(deadline, "tools/list"))
 
       opts =
         if is_nil(cursor) do
@@ -4047,7 +4854,8 @@ defmodule FastestMCP.Client do
     end
 
     case Paginator.fetch_all_with_meta(fetch_page) do
-      {:ok, %{items: tools, ttl_ms: ttl_ms}} ->
+      {:ok, %{items: tools, ttl_ms: ttl_ms, page_count: page_count}} ->
+        annotate_pagination_trace(trace_opts, page_count, length(tools))
         {:ok, ToolCatalog.build(tools, generation, schema_options, ttl_ms)}
 
       {:error, %Error{} = error} ->
@@ -4352,7 +5160,7 @@ defmodule FastestMCP.Client do
         stream_ref = make_ref()
 
         {pid, monitor_ref} =
-          spawn_monitor(fn ->
+          start_monitored_client_worker!(state, fn ->
             run_session_stream(parent, stream_ref, state)
           end)
 
@@ -4591,6 +5399,8 @@ defmodule FastestMCP.Client do
           end
       end
 
+    params = put_request_trace_context(params, opts)
+
     case state.transport.type do
       :stdio ->
         %{
@@ -4625,6 +5435,17 @@ defmodule FastestMCP.Client do
           "method" => method,
           "params" => params
         }
+    end
+  end
+
+  defp put_request_trace_context(params, opts) do
+    case Keyword.get(opts, :__fastestmcp_trace_context) do
+      nil ->
+        params
+
+      context ->
+        meta = params |> Map.get("_meta", %{}) |> Map.new()
+        Map.put(params, "_meta", Telemetry.inject_mcp_trace_context(meta, context))
     end
   end
 
@@ -4956,7 +5777,7 @@ defmodule FastestMCP.Client do
     recovery_state = %{state | session_id: nil, initialize_result: nil}
 
     {pid, monitor_ref} =
-      spawn_monitor(fn ->
+      start_monitored_client_worker!(state, fn ->
         result =
           perform_http_session_recovery(
             recovery_request_id,
@@ -5001,7 +5822,7 @@ defmodule FastestMCP.Client do
     recovery_state = %{state | session_id: nil, initialize_result: nil}
 
     {pid, monitor_ref} =
-      spawn_monitor(fn ->
+      start_monitored_client_worker!(state, fn ->
         result =
           perform_http_session_recovery(
             recovery_request_id,
@@ -5066,6 +5887,7 @@ defmodule FastestMCP.Client do
     state
     |> maybe_reopen_recovered_session_stream(recovery.reopen_session_stream?)
     |> flush_recovery_queue(Enum.reverse(recovery.queue))
+    |> release_ready_waiters()
   end
 
   defp finish_session_recovery(
@@ -5088,15 +5910,18 @@ defmodule FastestMCP.Client do
 
     Enum.each(recovery.stream_waiters, &GenServer.reply(&1, {:error, recovery_error}))
 
-    state
-    |> Map.merge(%{
-      session_id: nil,
-      initialize_result: nil,
-      advertised_client_capabilities: nil,
-      lifecycle_state: :failed,
-      recovery: nil
-    })
-    |> invalidate_client_caches(:session_recovery_failed)
+    next_state =
+      state
+      |> Map.merge(%{
+        session_id: nil,
+        initialize_result: nil,
+        advertised_client_capabilities: nil,
+        lifecycle_state: :failed,
+        recovery: nil
+      })
+      |> invalidate_client_caches(:session_recovery_failed)
+
+    fail_ready_waiters(next_state, recovery_error)
   end
 
   defp finish_session_recovery(state, _generation, _result), do: state
@@ -5190,7 +6015,11 @@ defmodule FastestMCP.Client do
   defp maybe_reopen_recovered_session_stream(state, true) do
     parent = self()
     stream_ref = make_ref()
-    {pid, monitor_ref} = spawn_monitor(fn -> run_session_stream(parent, stream_ref, state) end)
+
+    {pid, monitor_ref} =
+      start_monitored_client_worker!(state, fn ->
+        run_session_stream(parent, stream_ref, state)
+      end)
 
     %{
       state
@@ -6013,7 +6842,7 @@ defmodule FastestMCP.Client do
   end
 
   defp post_client_response_async(state, id, response, opts) do
-    spawn(fn ->
+    start_client_worker(state, fn ->
       _ = post_client_response(state, id, response, opts)
     end)
 
@@ -6033,7 +6862,7 @@ defmodule FastestMCP.Client do
     caller = self()
     ref = make_ref()
 
-    spawn(fn ->
+    start_client_worker(state, fn ->
       send(
         caller,
         {:client_callback_post_complete, ref, do_post_client_response(state, payload, opts)}
@@ -6098,10 +6927,29 @@ defmodule FastestMCP.Client do
   end
 
   defp maybe_start_callback_task(state, id, method, params, handler, executor, opts) do
-    with {:ok, {task_request, ttl_ms}} <- safe_parse_task_request(params) do
-      cond do
-        not task_request ->
-          if is_nil(handler) do
+    case safe_parse_task_request(params) do
+      {:ok, {task_request, ttl_ms}} ->
+        cond do
+          not task_request ->
+            if is_nil(handler) do
+              with :ok <-
+                     post_client_response(
+                       state,
+                       id,
+                       {:error,
+                        %Error{
+                          code: :bad_request,
+                          message: missing_callback_handler_message(method)
+                        }},
+                       opts
+                     ) do
+                {:ok, state}
+              end
+            else
+              {:ok, start_callback_request(state, id, method, params, handler, executor, opts)}
+            end
+
+          is_nil(handler) ->
             with :ok <-
                    post_client_response(
                      state,
@@ -6115,57 +6963,39 @@ defmodule FastestMCP.Client do
                    ) do
               {:ok, state}
             end
-          else
-            {:ok, start_callback_request(state, id, method, params, handler, executor, opts)}
-          end
 
-        is_nil(handler) ->
-          with :ok <-
-                 post_client_response(
-                   state,
-                   id,
-                   {:error,
-                    %Error{
-                      code: :bad_request,
-                      message: missing_callback_handler_message(method)
-                    }},
-                   opts
-                 ) do
-            {:ok, state}
-          end
+          true ->
+            task_id = TaskId.generate()
+            submitted_at = System.system_time(:millisecond)
+            task = new_callback_task(task_id, method, submitted_at, ttl_ms)
+            create_result = callback_task_create_result(task)
 
-        true ->
-          task_id = TaskId.generate()
-          submitted_at = System.system_time(:millisecond)
-          task = new_callback_task(task_id, method, submitted_at, ttl_ms)
-          create_result = callback_task_create_result(task)
+            task_response_opts = Keyword.put(opts, :task_response, true)
 
-          task_response_opts = Keyword.put(opts, :task_response, true)
+            with :ok <- post_client_response(state, id, {:ok, create_result}, task_response_opts) do
+              context = callback_context(state, id, method, params, task_id)
 
-          with :ok <- post_client_response(state, id, {:ok, create_result}, task_response_opts) do
-            context = callback_context(state, id, method, params, task_id)
+              task =
+                task
+                |> Map.put(:context, context)
+                |> Map.put(:params, params)
+                |> Map.put(:last_progress, nil)
+                |> Map.put(:progress_total, nil)
 
-            task =
-              task
-              |> Map.put(:context, context)
-              |> Map.put(:params, params)
-              |> Map.put(:last_progress, nil)
-              |> Map.put(:progress_total, nil)
+              {:ok,
+               start_callback_task(state, task, fn ->
+                 case executor.(handler, context) do
+                   {:ok, result} ->
+                     validate_callback_result!(method, result)
+                     {:ok, result}
 
-            {:ok,
-             start_callback_task(state, task, fn ->
-               case executor.(handler, context) do
-                 {:ok, result} ->
-                   validate_callback_result!(method, result)
-                   {:ok, result}
+                   {:error, %Error{} = error} ->
+                     {:error, error}
+                 end
+               end)}
+            end
+        end
 
-                 {:error, %Error{} = error} ->
-                   {:error, error}
-               end
-             end)}
-          end
-      end
-    else
       {:error, %Error{} = error} ->
         with :ok <- post_client_response(state, id, {:error, error}, opts) do
           {:ok, state}
@@ -6176,10 +7006,11 @@ defmodule FastestMCP.Client do
   defp start_callback_request(state, id, method, params, handler, executor, opts) do
     parent = self()
     context = callback_context(state, id, method, params, nil)
+    trace_context = callback_trace_context(params)
 
     {:ok, pid} =
-      Task.Supervisor.start_child(state.callback_supervisor, fn ->
-        result = executor.(handler, context)
+      Task.Supervisor.start_child(state.worker_supervisor, fn ->
+        result = Telemetry.with_context(trace_context, fn -> executor.(handler, context) end)
         send(parent, {:callback_request_complete, id, result})
       end)
 
@@ -6221,43 +7052,46 @@ defmodule FastestMCP.Client do
 
   defp start_callback_task(state, task, executor) do
     parent = self()
+    trace_context = callback_trace_context(task.params)
 
     {:ok, pid} =
-      Task.Supervisor.start_child(state.callback_supervisor, fn ->
+      Task.Supervisor.start_child(state.worker_supervisor, fn ->
         result =
-          try do
-            executor.()
-          rescue
-            error in Error ->
-              {:error, error}
+          Telemetry.with_context(trace_context, fn ->
+            try do
+              executor.()
+            rescue
+              error in Error ->
+                {:error, error}
 
-            error ->
-              {:error,
-               callback_failure(
-                 task.method,
-                 :internal_error,
-                 Exception.message(error),
-                 %{kind: inspect(error.__struct__)}
-               )}
-          catch
-            :exit, reason ->
-              {:error,
-               callback_failure(
-                 task.method,
-                 :internal_error,
-                 "client callback task exited",
-                 %{reason: inspect(reason)}
-               )}
+              error ->
+                {:error,
+                 callback_failure(
+                   task.method,
+                   :internal_error,
+                   Exception.message(error),
+                   %{kind: inspect(error.__struct__)}
+                 )}
+            catch
+              :exit, reason ->
+                {:error,
+                 callback_failure(
+                   task.method,
+                   :internal_error,
+                   "client callback task exited",
+                   %{reason: inspect(reason)}
+                 )}
 
-            kind, reason ->
-              {:error,
-               callback_failure(
-                 task.method,
-                 :internal_error,
-                 "client callback task failed",
-                 %{kind: inspect(kind), reason: inspect(reason)}
-               )}
-          end
+              kind, reason ->
+                {:error,
+                 callback_failure(
+                   task.method,
+                   :internal_error,
+                   "client callback task failed",
+                   %{kind: inspect(kind), reason: inspect(reason)}
+                 )}
+            end
+          end)
 
         send(parent, {:callback_task_complete, task.id, result})
       end)
@@ -6272,6 +7106,12 @@ defmodule FastestMCP.Client do
     state
     |> put_in([:callback_tasks, task.id], task)
     |> put_in([:callback_task_refs, monitor_ref], task.id)
+  end
+
+  defp callback_trace_context(params) when is_map(params) do
+    params
+    |> Map.get("_meta", %{})
+    |> Telemetry.extract_trace_context()
   end
 
   defp complete_callback_task(state, task_id, status, result, error) do
@@ -6396,7 +7236,7 @@ defmodule FastestMCP.Client do
 
       {request, requests} ->
         mark_callback_cancelled(request.context)
-        _ = Task.Supervisor.terminate_child(state.callback_supervisor, request.pid)
+        _ = Task.Supervisor.terminate_child(state.worker_supervisor, request.pid)
         Process.demonitor(request.monitor_ref, [:flush])
 
         %{
@@ -6568,7 +7408,7 @@ defmodule FastestMCP.Client do
       "params" => TaskWire.task(task, mask_error_details: true)
     }
 
-    spawn(fn ->
+    start_client_worker(state, fn ->
       _ = do_post_client_response(state, payload, [])
     end)
 
@@ -6830,12 +7670,14 @@ defmodule FastestMCP.Client do
 
   defp url_elicitation_response(handler, params, context) do
     callback_response("elicitation/create", fn ->
-      with {:ok, request} <- URLElicitation.parse(params) do
-        handler
-        |> invoke_url_handler(request, context)
-        |> normalize_elicitation_result(params)
-      else
-        {:error, %Error{} = error} -> raise error
+      case URLElicitation.parse(params) do
+        {:ok, request} ->
+          handler
+          |> invoke_url_handler(request, context)
+          |> normalize_elicitation_result(params)
+
+        {:error, %Error{} = error} ->
+          raise error
       end
     end)
   end
@@ -7036,9 +7878,9 @@ defmodule FastestMCP.Client do
        ) do
     requested = get_in(entry, [:request_params, "notifications"]) || %{}
 
-    case FastestMCP.Protocol.Subscriptions.acknowledged_subset(requested, accepted) do
+    case Subscriptions.acknowledged_subset(requested, accepted) do
       {:ok, accepted} ->
-        compiled_filter = FastestMCP.Protocol.Subscriptions.compile_filter(accepted)
+        compiled_filter = Subscriptions.compile_filter(accepted)
         maybe_invoke_notification_handler(entry.notification_handler, message)
 
         state
@@ -7081,7 +7923,7 @@ defmodule FastestMCP.Client do
   end
 
   defp route_modern_subscription_notification(state, ref, entry, message) do
-    if FastestMCP.Protocol.Subscriptions.notification_allowed?(
+    if Subscriptions.notification_allowed?(
          Map.fetch!(entry, :acknowledged_subscription_filter),
          message
        ) do
@@ -7310,19 +8152,17 @@ defmodule FastestMCP.Client do
   defp maybe_invoke_notification_handler(nil, _payload), do: :ok
 
   defp maybe_invoke_notification_handler(handler, payload) do
-    try do
-      cond do
-        is_function(handler, 1) -> handler.(payload)
-        is_function(handler, 0) -> handler.()
-        true -> :ok
-      end
-    rescue
-      _error ->
-        :ok
-    catch
-      _kind, _reason ->
-        :ok
+    cond do
+      is_function(handler, 1) -> handler.(payload)
+      is_function(handler, 0) -> handler.()
+      true -> :ok
     end
+  rescue
+    _error ->
+      :ok
+  catch
+    _kind, _reason ->
+      :ok
   end
 
   defp ensure_http_apps do
@@ -8746,6 +9586,22 @@ defmodule FastestMCP.Client do
     :ok
   end
 
+  defp start_monitored_client_worker!(%{worker_supervisor: supervisor}, fun)
+       when is_pid(supervisor) and is_function(fun, 0) do
+    case Task.Supervisor.start_child(supervisor, fun) do
+      {:ok, pid} -> {pid, Process.monitor(pid)}
+      {:error, reason} -> raise "failed to start MCP client worker: #{inspect(reason)}"
+    end
+  end
+
+  defp start_client_worker(%{worker_supervisor: supervisor}, fun)
+       when is_pid(supervisor) and is_function(fun, 0) do
+    case Task.Supervisor.start_child(supervisor, fun) do
+      {:ok, _pid} -> :ok
+      {:error, _reason} -> :ok
+    end
+  end
+
   defp normalize_request_auth_opts(opts) do
     auth_input =
       opts
@@ -8979,9 +9835,28 @@ defmodule FastestMCP.Client do
   defp reply_request_entry(%{reply_to: {:sync, from}}, reply), do: GenServer.reply(from, reply)
 
   defp reply_request_entry(%{reply_to: {:async, owner}} = entry, reply) do
+    finish_async_request_trace(entry, reply)
     send(owner, {:fastest_mcp_client_response, request_entry_ref(entry), reply})
     :ok
   end
+
+  defp finish_async_request_trace(%{async_trace: nil}, _reply), do: :ok
+
+  defp finish_async_request_trace(%{async_trace: trace, method: method}, reply) do
+    case reply do
+      {:ok, %{"isError" => true}} when method == "tools/call" ->
+        Telemetry.mark_client_tool_error(trace)
+        Telemetry.finish_client_span(trace, :ok)
+
+      {:ok, _result} ->
+        Telemetry.finish_client_span(trace, :ok)
+
+      {:error, error} ->
+        Telemetry.finish_client_span(trace, {:error, error})
+    end
+  end
+
+  defp finish_async_request_trace(_entry, _reply), do: :ok
 
   defp request_entry_ref(%{public_ref: ref}), do: ref
   defp request_entry_ref(%{ref: ref}), do: ref

@@ -1,10 +1,10 @@
 defmodule FastestMCP.SamplingToolsTest do
   use ExUnit.Case, async: false
 
-  alias FastestMCP.Sampling
-  alias FastestMCP.SamplingTool
   alias FastestMCP.Authorization
   alias FastestMCP.Context
+  alias FastestMCP.Sampling
+  alias FastestMCP.SamplingTool
 
   def double(value), do: value * 2
 

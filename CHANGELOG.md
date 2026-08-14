@@ -35,8 +35,9 @@
   authenticated per-principal buckets, opaque explicit handles, termination,
   and an opt-in anonymous bearer mode
 - add bounded request-scoped tool search with pinned list entries, deterministic
-  ranking, provider pagination, model-visible policy enforcement, and a
-  synthetic call path that revalidates the selected tool at execution time
+  ranking across tool and top-level public parameter metadata, provider
+  pagination, model-visible policy enforcement, and a synthetic call path that
+  revalidates the selected tool at execution time
 
 ### Authorization and resource safety
 
@@ -53,6 +54,15 @@
 
 ### Connected client
 
+- add OTP-supervised clients with `start_link/1`, explicit child specs, standard
+  process naming, readiness checks, restart-safe pid pinning, and supervised
+  ownership of request, callback, stream, and recovery workers
+- add `call_tool_result/4` and `%FastestMCP.Client.ToolResult{}` as a stable,
+  protocol-faithful terminal result while preserving the existing
+  `call_tool/4` compatibility projection
+- add connected-client OpenTelemetry spans and W3C propagation across HTTP,
+  stdio, in-process calls, MRTR, Tasks, asynchronous lifecycles, pagination,
+  cache hits, recovery, and cancellation without recording payloads or secrets
 - make modern tool calls transparently drive server-created tasks while adding
   `call_tool_task/4` for explicit handles, a separate 60-second task deadline,
   adaptive polling, notification wakeups, and bounded MRTR interaction rounds

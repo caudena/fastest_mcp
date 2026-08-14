@@ -142,9 +142,7 @@ defmodule FastestMCP.ComponentVisibility do
   end
 
   defp visibility_rule_matches?(rule, component) do
-    if not has_visibility_criteria?(rule) do
-      false
-    else
+    if has_visibility_criteria?(rule) do
       identifier = Component.identifier(component)
       key = Component.key(component)
       version = Component.version(component) && to_string(Component.version(component))
@@ -156,6 +154,8 @@ defmodule FastestMCP.ComponentVisibility do
         matches_version_selector?(rule.version, version) and
         matches_component_selector?(rule.components, component_type) and
         matches_tag_selector?(rule.tags, tags)
+    else
+      false
     end
   end
 

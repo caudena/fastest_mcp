@@ -1,8 +1,8 @@
 defmodule FastestMCP.PinnedConformanceSSEProxyTest do
   use ExUnit.Case, async: true
 
-  alias FastestMCP.TestSupport.PinnedConformanceSSEProxy, as: Proxy
   alias FastestMCP.TestSupport.ConformanceRunner
+  alias FastestMCP.TestSupport.PinnedConformanceSSEProxy, as: Proxy
 
   test "repairs only the pinned runner's legacy initialize response" do
     assert {:awaiting_request, request_prefix} =

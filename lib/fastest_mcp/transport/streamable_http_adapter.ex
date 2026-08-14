@@ -298,13 +298,10 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
   defp validate_session_header(method, conn, _opts) do
     session_header? = get_req_header(conn, "mcp-session-id") != []
 
-    cond do
-      method == "initialize" and session_header? ->
-        {:error,
-         %Error{code: :bad_request, message: "initialize must not include MCP-Session-Id"}}
-
-      true ->
-        :ok
+    if method == "initialize" and session_header? do
+      {:error, %Error{code: :bad_request, message: "initialize must not include MCP-Session-Id"}}
+    else
+      :ok
     end
   end
 

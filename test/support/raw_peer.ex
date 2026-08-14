@@ -1,10 +1,12 @@
 defmodule FastestMCP.TestSupport.RawPeer do
   @moduledoc false
 
+  alias FastestMCP.Session
   alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
   alias FastestMCP.TestSupport.RawPeer.Input
-  alias FastestMCP.Session
+  alias FastestMCP.Transport.HTTPApp
   alias FastestMCP.Transport.Stdio
+  alias FastestMCP.Transport.StdioAdapter
 
   defstruct [
     :transport,
@@ -50,7 +52,7 @@ defmodule FastestMCP.TestSupport.RawPeer do
     peer = %__MODULE__{
       transport: :stdio,
       server_name: to_string(server_name),
-      session_id: FastestMCP.Transport.StdioAdapter.connection_session_id(connection_id),
+      session_id: StdioAdapter.connection_session_id(connection_id),
       input: input,
       output: output,
       serve_task: serve_task
@@ -86,7 +88,7 @@ defmodule FastestMCP.TestSupport.RawPeer do
     {:ok, bandit} =
       Bandit.start_link(
         plug:
-          {FastestMCP.Transport.HTTPApp,
+          {HTTPApp,
            server_name: server_name,
            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"],
            json_response: json_response?},

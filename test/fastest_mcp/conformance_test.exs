@@ -4,7 +4,9 @@ defmodule FastestMCP.ConformanceServerTest do
   @moduletag :conformance
   @moduletag timeout: 600_000
 
+  alias FastestMCP.TestSupport.ConformanceFixture
   alias FastestMCP.TestSupport.ConformanceRunner
+  alias FastestMCP.Transport.HTTPApp
 
   test "pinned official runner passes the frozen core requirements on both protocol eras" do
     ConformanceRunner.assert_version!()
@@ -48,7 +50,7 @@ defmodule FastestMCP.ConformanceServerTest do
 
   defp start_conformance_server! do
     server_name = "conformance-" <> Integer.to_string(System.unique_integer([:positive]))
-    server = FastestMCP.TestSupport.ConformanceFixture.build_server(server_name)
+    server = ConformanceFixture.build_server(server_name)
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
@@ -56,9 +58,7 @@ defmodule FastestMCP.ConformanceServerTest do
     bandit =
       start_supervised!(
         {Bandit,
-         plug:
-           {FastestMCP.Transport.HTTPApp,
-            server_name: server_name, path: "/mcp", allowed_hosts: :localhost},
+         plug: {HTTPApp, server_name: server_name, path: "/mcp", allowed_hosts: :localhost},
          scheme: :http,
          port: 0}
       )

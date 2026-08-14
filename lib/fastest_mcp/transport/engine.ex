@@ -7,9 +7,9 @@ defmodule FastestMCP.Transport.Engine do
   HTTP stay aligned as the surface area grows.
   """
 
+  alias FastestMCP.Apps
   alias FastestMCP.Auth
   alias FastestMCP.Auth.Result, as: AuthResult
-  alias FastestMCP.Apps
   alias FastestMCP.ComponentPolicy
   alias FastestMCP.ComponentVisibility
   alias FastestMCP.Context
@@ -18,11 +18,11 @@ defmodule FastestMCP.Transport.Engine do
   alias FastestMCP.Operation
   alias FastestMCP.OperationPipeline
   alias FastestMCP.Pagination
-  alias FastestMCP.Provider
   alias FastestMCP.Protocol
   alias FastestMCP.Protocol.Extensions
   alias FastestMCP.Protocol.HTTPHeaders
   alias FastestMCP.Protocol.Subscriptions
+  alias FastestMCP.Provider
   alias FastestMCP.Registry
   alias FastestMCP.Schema
   alias FastestMCP.Server
@@ -32,8 +32,8 @@ defmodule FastestMCP.Transport.Engine do
   alias FastestMCP.TaskOwner
   alias FastestMCP.TaskWire
   alias FastestMCP.Transport.JSONRPC
-  alias FastestMCP.Transport.Serializer
   alias FastestMCP.Transport.Request
+  alias FastestMCP.Transport.Serializer
 
   @modern_removed_methods MapSet.new([
                             "initialize",
@@ -398,67 +398,65 @@ defmodule FastestMCP.Transport.Engine do
 
   @doc false
   def start_subscription(server_name, %Request{} = request, opts \\ []) when is_list(opts) do
-    try do
-      request = prepare_request!(server_name, request)
-      validate_subscription_request!(request, opts)
-      runtime = fetch_runtime!(server_name)
-      request_opts = request_opts(server_name, request, opts)
+    request = prepare_request!(server_name, request)
+    validate_subscription_request!(request, opts)
+    runtime = fetch_runtime!(server_name)
+    request_opts = request_opts(server_name, request, opts)
 
-      requested_filter =
-        Subscriptions.normalize_filter!(Map.fetch!(request.payload, "notifications"))
+    requested_filter =
+      Subscriptions.normalize_filter!(Map.fetch!(request.payload, "notifications"))
 
-      subscription_profile =
-        OperationPipeline.subscription_profile(
-          server_name,
-          Map.get(requested_filter, "resourceSubscriptions", []),
-          request_opts
-        )
+    subscription_profile =
+      OperationPipeline.subscription_profile(
+        server_name,
+        Map.get(requested_filter, "resourceSubscriptions", []),
+        request_opts
+      )
 
-      access_opts = [owner_fingerprint: subscription_profile.owner_fingerprint]
+    access_opts = [owner_fingerprint: subscription_profile.owner_fingerprint]
 
-      task_ids =
-        authorized_subscription_task_ids(
-          server_name,
-          Map.get(requested_filter, "taskIds", []),
-          access_opts
-        )
+    task_ids =
+      authorized_subscription_task_ids(
+        server_name,
+        Map.get(requested_filter, "taskIds", []),
+        access_opts
+      )
 
-      filter =
-        Subscriptions.narrow(
-          requested_filter,
-          subscription_profile.capabilities,
-          subscription_profile.resource_uris,
-          task_ids
-        )
+    filter =
+      Subscriptions.narrow(
+        requested_filter,
+        subscription_profile.capabilities,
+        subscription_profile.resource_uris,
+        task_ids
+      )
 
-      child_opts = [
-        server_name: runtime.server.name,
-        event_bus: runtime.event_bus,
-        owner: Keyword.get(opts, :owner, self()),
-        target: Keyword.get(opts, :target, Keyword.get(opts, :owner, self())),
-        subscription_id: request.request_id,
-        owner_fingerprint: Keyword.fetch!(access_opts, :owner_fingerprint),
-        filter: filter
-      ]
+    child_opts = [
+      server_name: runtime.server.name,
+      event_bus: runtime.event_bus,
+      owner: Keyword.get(opts, :owner, self()),
+      target: Keyword.get(opts, :target, Keyword.get(opts, :owner, self())),
+      subscription_id: request.request_id,
+      owner_fingerprint: Keyword.fetch!(access_opts, :owner_fingerprint),
+      filter: filter
+    ]
 
-      case DynamicSupervisor.start_child(
-             runtime.session_notification_supervisor,
-             {SubscriptionSubscriber, child_opts}
-           ) do
-        {:ok, subscriber} ->
-          {:ok, subscriber, request}
+    case DynamicSupervisor.start_child(
+           runtime.session_notification_supervisor,
+           {SubscriptionSubscriber, child_opts}
+         ) do
+      {:ok, subscriber} ->
+        {:ok, subscriber, request}
 
-        {:error, reason} ->
-          {:error,
-           %Error{
-             code: :overloaded,
-             message: "subscription could not be started",
-             details: %{reason: inspect(reason)}
-           }}
-      end
-    rescue
-      error in Error -> {:error, error}
+      {:error, reason} ->
+        {:error,
+         %Error{
+           code: :overloaded,
+           message: "subscription could not be started",
+           details: %{reason: inspect(reason)}
+         }}
     end
+  rescue
+    error in Error -> {:error, error}
   end
 
   defp prepare_request!(server_name, %Request{} = request) do
@@ -1383,32 +1381,41 @@ defmodule FastestMCP.Transport.Engine do
   end
 
   defp resolve_tool_descriptor(server_name, target, request, request_opts) do
-    with {:ok, runtime} <- ServerRuntime.fetch(server_name) do
-      operation =
-        transport_lookup_operation(runtime, request, :tool, target, request.method, request_opts)
+    case ServerRuntime.fetch(server_name) do
+      {:ok, runtime} ->
+        operation =
+          transport_lookup_operation(
+            runtime,
+            request,
+            :tool,
+            target,
+            request.method,
+            request_opts
+          )
 
-      local =
-        server_name
-        |> Registry.list_components(:tool)
-        |> Enum.filter(fn tool ->
-          tool_name_matches?(tool, target) and version_matches?(tool, operation.version)
-        end)
+        local =
+          server_name
+          |> Registry.list_components(:tool)
+          |> Enum.filter(fn tool ->
+            tool_name_matches?(tool, target) and version_matches?(tool, operation.version)
+          end)
 
-      provider =
-        runtime.server.providers
-        |> Enum.flat_map(fn provider ->
-          case Provider.get_component(provider, :tool, target, operation) do
-            nil ->
-              []
+        provider =
+          runtime.server.providers
+          |> Enum.flat_map(fn provider ->
+            case Provider.get_component(provider, :tool, target, operation) do
+              nil ->
+                []
 
-            tool ->
-              if version_matches?(tool, operation.version), do: [tool], else: []
-          end
-        end)
+              tool ->
+                if version_matches?(tool, operation.version), do: [tool], else: []
+            end
+          end)
 
-      select_component_candidate(runtime.server, local ++ provider, operation)
-    else
-      _ -> nil
+        select_component_candidate(runtime.server, local ++ provider, operation)
+
+      _ ->
+        nil
     end
   rescue
     _error ->

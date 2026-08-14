@@ -4,8 +4,8 @@ defmodule FastestMCP.Protocol.HTTPHeadersTest do
   import Plug.Conn
   import Plug.Test
 
-  alias FastestMCP.Protocol.HTTPHeaders
   alias FastestMCP.Client
+  alias FastestMCP.Protocol.HTTPHeaders
   alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
   alias FastestMCP.Transport.StreamableHTTP
 

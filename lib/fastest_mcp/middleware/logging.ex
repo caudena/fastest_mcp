@@ -124,8 +124,7 @@ defmodule FastestMCP.Middleware.Logging do
   def format_message(%__MODULE__{}, message) do
     message
     |> ordered_entries()
-    |> Enum.map(fn {key, value} -> "#{key}=#{value}" end)
-    |> Enum.join(" ")
+    |> Enum.map_join(" ", fn {key, value} -> "#{key}=#{value}" end)
   end
 
   defp emit(%__MODULE__{} = middleware, message, level \\ nil) do

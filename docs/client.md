@@ -68,6 +68,41 @@ the replacement session.
 defaults to 1 MiB. Use a smaller positive value when the connected server has a
 tighter response contract.
 
+## OTP Supervision and Readiness
+
+Production clients can be ordinary supervised workers. `start_link/1` does not
+report success until automatic discovery or initialization has completed:
+
+```elixir
+children = [
+  {FastestMCP.Client,
+   target: "https://mcp.example.com/mcp",
+   name: MyApp.MCPClient,
+   protocol_version: :auto}
+]
+
+:ok = FastestMCP.Client.await_ready(MyApp.MCPClient, 10_000)
+%{items: tools} = FastestMCP.Client.list_tools(MyApp.MCPClient)
+```
+
+Every public client operation accepts either `%FastestMCP.Client{}` or a
+standard `GenServer.server()` reference, including local names, Registry names,
+and `{:global, term()}` names. The reference is resolved once per operation;
+request, callback, and remote-task handles retain that exact pid and never jump
+to a replacement connection after a supervisor restart.
+
+`ready?/1` checks negotiation, recovery, and transport usability, while
+`connected?/1` checks process liveness only. `await_ready/2` follows a named
+permanent child through a supervisor replacement until its monotonic deadline.
+Pid and struct references remain pinned. With `auto_initialize: false`, the
+child starts in `:new`; call `initialize/3` or `discover/2`, then await readiness.
+
+The default child id is `FastestMCP.Client`, so multiple unnamed clients need
+explicit `id:` values. The child is permanent with a 20-second shutdown budget.
+Calling `disconnect/1` on a permanent supervised child causes its supervisor to
+restart it; terminate or remove the child through the owning Supervisor when
+the shutdown should be permanent.
+
 On the legacy profile, use `session_stream: true` when you want:
 
 - `notifications/tasks/status`
@@ -241,6 +276,7 @@ The client mirrors the main MCP surfaces:
 - `FastestMCP.Client.list_tools/2`
 - `FastestMCP.Client.list_all_tools/2`
 - `FastestMCP.Client.call_tool/4`
+- `FastestMCP.Client.call_tool_result/4`
 - `FastestMCP.Client.call_tool_task/4`
 - `FastestMCP.Client.list_resources/2`
 - `FastestMCP.Client.list_all_resources/2`
@@ -251,6 +287,30 @@ The client mirrors the main MCP surfaces:
 - `FastestMCP.Client.list_all_prompts/2`
 - `FastestMCP.Client.render_prompt/4`
 - `FastestMCP.Client.complete/4`
+
+`call_tool/4` keeps its compatibility projection, whose return shape depends on
+the result. New application code that needs a stable boundary can use
+`call_tool_result/4`:
+
+```elixir
+%FastestMCP.Client.ToolResult{
+  content: content,
+  structured_content: structured,
+  structured_content_present?: present?,
+  meta: meta,
+  is_error: is_error,
+  raw: raw
+} = FastestMCP.Client.call_tool_result(client, "report", %{"id" => 42})
+```
+
+The struct preserves validated content blocks, any modern JSON structured
+value, empty metadata, the tool-level error flag, and the complete validated
+wire result. `structured_content_present?` distinguishes an absent field from
+explicit JSON `null`. A tool result with `is_error: true` is still a normal
+result struct; protocol, transport, schema, MRTR, and task failures retain the
+existing exception contract. Explicit task-handle options belong to
+`call_tool_task/4`; a server-created modern task is transparently driven to its
+terminal tool result.
 
 On a legacy `2025-11-25` connection, use
 `FastestMCP.Client.set_log_level/3` to send `logging/setLevel` after the server

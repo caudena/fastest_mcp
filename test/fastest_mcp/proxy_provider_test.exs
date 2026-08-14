@@ -7,17 +7,18 @@ defmodule FastestMCP.ProxyProviderTest do
   alias FastestMCP.Error
   alias FastestMCP.InputRequiredResult
   alias FastestMCP.Operation
-  alias FastestMCP.Provider
-  alias FastestMCP.ProviderTransforms.Namespace
-  alias FastestMCP.Protocol.Extensions
-  alias FastestMCP.Protocol.HTTPHeaders
-  alias FastestMCP.Providers.Proxy
   alias FastestMCP.Prompts.Message, as: PromptMessage
   alias FastestMCP.Prompts.Result, as: PromptResult
+  alias FastestMCP.Protocol.Extensions
+  alias FastestMCP.Protocol.HTTPHeaders
+  alias FastestMCP.Provider
+  alias FastestMCP.Providers.Proxy
+  alias FastestMCP.ProviderTransforms.Namespace
   alias FastestMCP.Resources.Content, as: ResourceContent
   alias FastestMCP.Resources.Result, as: ResourceResult
   alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
   alias FastestMCP.Tools.Result, as: ToolResult
+  alias FastestMCP.Transport.HTTPApp
 
   def handle_telemetry(event, measurements, metadata, pid) do
     send(pid, {:proxy_auth_telemetry, event, measurements, metadata})
@@ -41,7 +42,7 @@ defmodule FastestMCP.ProxyProviderTest do
         Plug.Conn.get_req_header(conn, "mcp-param-region")
       })
 
-      FastestMCP.Transport.HTTPApp.call(conn, Keyword.fetch!(opts, :http_app_opts))
+      HTTPApp.call(conn, Keyword.fetch!(opts, :http_app_opts))
     end
   end
 
@@ -1086,7 +1087,7 @@ defmodule FastestMCP.ProxyProviderTest do
 
     plug =
       case Keyword.get(opts, :capture) do
-        nil -> {FastestMCP.Transport.HTTPApp, http_app_opts}
+        nil -> {HTTPApp, http_app_opts}
         test_pid -> {CapturePlug, test_pid: test_pid, http_app_opts: http_app_opts}
       end
 

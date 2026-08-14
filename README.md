@@ -44,7 +44,7 @@ and lifecycle differences.
 | Area | What FastestMCP provides |
 | --- | --- |
 | Server runtime | Module-owned or dynamic servers with supervised execution, bounded concurrency, overload control, and isolated lifecycles |
-| Connected client | Streamable HTTP, stdio, and in-process transports with callbacks, progress, subscriptions, Tasks, and automatic protocol negotiation |
+| Connected client | Supervised Streamable HTTP, stdio, and in-process connections with callbacks, progress, subscriptions, Tasks, automatic protocol negotiation, and end-to-end OpenTelemetry |
 | Components | Tools, resources, resource templates, prompts, completion, runtime mutation, transforms, and visibility policies |
 | Security | Pluggable authentication, RFC 9728 protected-resource metadata, scope-aware authorization, and secure-by-default lexical resource-template screening |
 | Extensibility | Middleware, providers, mounted servers, active negotiated extensions, request-scoped proxying, and bounded tool search |
@@ -111,12 +111,30 @@ client =
 FastestMCP.Client.protocol_version(client)
 # => "2026-07-28"
 
-result = FastestMCP.Client.call_tool(client, "sum", %{"a" => 20, "b" => 22})
-result["structuredContent"]
-# => 42
+%FastestMCP.Client.ToolResult{structured_content: 42} =
+  FastestMCP.Client.call_tool_result(client, "sum", %{"a" => 20, "b" => 22})
 
 :ok = FastestMCP.Client.disconnect(client)
 ```
+
+Production applications can supervise and name the connection instead of
+holding a manually connected handle:
+
+```elixir
+children = [
+  {FastestMCP.Client,
+   target: "http://localhost:4100/mcp",
+   name: MyApp.MCPClient,
+   protocol_version: :auto}
+]
+
+:ok = FastestMCP.Client.await_ready(MyApp.MCPClient, 10_000)
+%{items: tools} = FastestMCP.Client.list_tools(MyApp.MCPClient)
+```
+
+Client operations create OpenTelemetry CLIENT spans and propagate W3C trace
+context through MCP request metadata, so Phoenix request traces continue across
+the remote MCP call without application glue.
 
 The full onboarding path, including transport startup and the first connected
 client call, lives in [docs/onboarding.md](docs/onboarding.md).

@@ -16,26 +16,26 @@ defmodule FastestMCP.Component do
   alias FastestMCP.BackgroundTaskStore
   alias FastestMCP.CallSupervisor
   alias FastestMCP.ComponentCompiler
-  alias FastestMCP.Context
   alias FastestMCP.Components.Prompt
   alias FastestMCP.Components.Resource
   alias FastestMCP.Components.ResourceTemplate
   alias FastestMCP.Components.Tool
+  alias FastestMCP.Context
   alias FastestMCP.Error
   alias FastestMCP.InputValidator
   alias FastestMCP.JSONValue
   alias FastestMCP.Prompts.Message, as: PromptMessage
-  alias FastestMCP.Protocol.Extensions
   alias FastestMCP.Prompts.Result, as: PromptResult
-  alias FastestMCP.ResultNormalizer
+  alias FastestMCP.Protocol.Extensions
   alias FastestMCP.Resources.Content, as: ResourceContent
   alias FastestMCP.Resources.Result, as: ResourceResult
-  alias FastestMCP.TaskConfig
+  alias FastestMCP.ResultNormalizer
   alias FastestMCP.Schema
   alias FastestMCP.Schema.Compiled
+  alias FastestMCP.TaskConfig
   alias FastestMCP.Telemetry
-  alias FastestMCP.Tools.Result, as: ToolResult
   alias FastestMCP.Tools.OutputSchema
+  alias FastestMCP.Tools.Result, as: ToolResult
 
   @duplicate_policies [:error, :warn, :ignore, :replace]
 
@@ -668,10 +668,12 @@ defmodule FastestMCP.Component do
         {name, resolver.(context)}
       rescue
         error ->
-          raise Error,
-            code: :internal_error,
-            message: "failed to resolve injected argument #{inspect(name)}",
-            details: %{reason: Exception.message(error), kind: inspect(error.__struct__)}
+          reraise Error.exception(
+                    code: :internal_error,
+                    message: "failed to resolve injected argument #{inspect(name)}",
+                    details: %{reason: Exception.message(error), kind: inspect(error.__struct__)}
+                  ),
+                  __STACKTRACE__
       end
     end)
   end

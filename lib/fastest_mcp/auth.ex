@@ -30,9 +30,9 @@ defmodule FastestMCP.Auth do
   authenticator.
   """
 
+  alias FastestMCP.Auth.ProtectedResource
   alias FastestMCP.Context
   alias FastestMCP.Error
-  alias FastestMCP.Auth.ProtectedResource
   alias FastestMCP.Protocol.Redactor
 
   defstruct [:provider, options: %{}]

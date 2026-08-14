@@ -3,6 +3,7 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
 
   alias FastestMCP.Client
   alias FastestMCP.Client.Task, as: RemoteTask
+  alias FastestMCP.Client.ToolResult
   alias FastestMCP.Context
   alias FastestMCP.Error
   alias FastestMCP.InputRequiredResult
@@ -394,6 +395,13 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
         end,
         task: [mode: :optional, poll_interval_ms: 10]
       )
+      |> FastestMCP.add_tool(
+        "reject",
+        fn _arguments, _context ->
+          %{isError: true, content: [%{type: "text", text: "rejected"}]}
+        end,
+        task: [mode: :optional, poll_interval_ms: 10]
+      )
 
     start_server!(server_name, server)
     bandit = start_http_transport!(server_name)
@@ -420,6 +428,25 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
     send(worker, :release)
     assert %{"value" => "modern"} = Task.await(call, 3_000)
     refute Client.session_stream_open?(client)
+
+    stable_call =
+      Task.async(fn ->
+        Client.call_tool_result(client, "echo", %{"value" => "stable"}, task_timeout_ms: 2_000)
+      end)
+
+    assert_receive {:task_worker, stable_worker}, 1_000
+    send(stable_worker, :release)
+
+    assert %ToolResult{
+             structured_content: %{"value" => "stable"},
+             structured_content_present?: true,
+             is_error: false
+           } = Task.await(stable_call, 3_000)
+
+    assert %ToolResult{
+             content: [%{"type" => "text", "text" => "rejected"}],
+             is_error: true
+           } = Client.call_tool_result(client, "reject", %{}, task_timeout_ms: 2_000)
 
     assert %RemoteTask{task_id: task_id} =
              task = Client.call_tool_task(client, "echo", %{"value" => "handle"})

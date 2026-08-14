@@ -83,12 +83,10 @@ defmodule FastestMCP.Prompts.Message do
   defp normalize_content(%{} = content) do
     type = Map.get(content, :type, Map.get(content, "type"))
 
-    cond do
-      is_binary(type) ->
-        Map.new(content)
-
-      true ->
-        %{type: "text", text: JSONValue.encode!(content)}
+    if is_binary(type) do
+      Map.new(content)
+    else
+      %{type: "text", text: JSONValue.encode!(content)}
     end
   end
 

@@ -3,10 +3,11 @@ defmodule FastestMCP.ProtocolMatrixTest do
 
   import Plug.Test
 
-  alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
   alias FastestMCP.Registry
+  alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
   alias FastestMCP.Transport.JSONRPC
   alias FastestMCP.Transport.Stdio
+  alias FastestMCP.Transport.StdioAdapter
   alias FastestMCP.Transport.StreamableHTTP
 
   setup do
@@ -460,7 +461,7 @@ defmodule FastestMCP.ProtocolMatrixTest do
 
   test "stdio serve releases its connection session at EOF", %{server_name: server_name} do
     connection_id = {:stdio_eof, make_ref()}
-    session_id = FastestMCP.Transport.StdioAdapter.connection_session_id(connection_id)
+    session_id = StdioAdapter.connection_session_id(connection_id)
 
     input = [
       JSON.encode!(

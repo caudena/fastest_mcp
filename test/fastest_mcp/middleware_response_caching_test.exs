@@ -1,11 +1,11 @@
 defmodule FastestMCP.MiddlewareResponseCachingTest do
   use ExUnit.Case, async: false
 
+  alias FastestMCP.BackgroundTask
+  alias FastestMCP.InputRequiredResult
   alias FastestMCP.Middleware
   alias FastestMCP.Middleware.ResponseCaching
   alias FastestMCP.Operation
-  alias FastestMCP.BackgroundTask
-  alias FastestMCP.InputRequiredResult
 
   test "tool calls are cached for identical requests" do
     middleware = Middleware.response_caching()

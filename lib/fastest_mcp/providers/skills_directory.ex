@@ -11,8 +11,8 @@ defmodule FastestMCP.Providers.SkillsDirectory do
   component sources the same way once they enter the provider layer.
   """
 
-  alias FastestMCP.Provider
   alias FastestMCP.PathSafety
+  alias FastestMCP.Provider
   alias FastestMCP.Providers.Skill
   alias FastestMCP.Providers.Skills.Common
 

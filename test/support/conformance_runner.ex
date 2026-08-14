@@ -206,7 +206,7 @@ defmodule FastestMCP.TestSupport.ConformanceRunner do
           "fieldIssue" => field_issue,
           "response" => %{
             "error" => %{
-              "code" => -32020,
+              "code" => -32_020,
               "data" => %{
                 "actual" => nil,
                 "expected" => "2026-07-28",

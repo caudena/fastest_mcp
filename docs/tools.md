@@ -841,9 +841,12 @@ and execution policy are checked at call time. Ordinary tools remain directly
 callable when their names are already known.
 
 Matching is deterministic and case-insensitive. Exact names rank first,
-followed by name prefixes, name tokens, and then title or description tokens;
-name and version provide stable tie-breaks. `max_scan` bounds raw candidates
-and the returned `truncated` flag reports when that bound was reached.
+followed by name prefixes, name tokens, title or description tokens, and then
+public top-level input-parameter names or descriptions; name and version
+provide stable tie-breaks. Injected parameters, nested properties, defaults,
+examples, enums, references, and output schemas are not indexed. `max_scan`
+bounds raw candidates and the returned `truncated` flag reports when that bound
+was reached.
 Providers with `list_component_page/5` are read in bounded pages. A legacy
 provider that implements only `list_components/3` must materialize its own
 catalog because that older callback cannot expose a page boundary. ToolSearch

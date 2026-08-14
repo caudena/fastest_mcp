@@ -85,7 +85,8 @@ defmodule FastestMCP.Middleware.ToolSearch do
         [
           {search_tool_name, &unused_handler/2,
            [
-             description: "Search the visible tool catalog by name, title, and description.",
+             description:
+               "Search the visible tool catalog by name, title, description, and input parameters.",
              input_schema: search_input_schema()
            ]},
           {call_tool_name, &unused_handler/2,
@@ -268,12 +269,15 @@ defmodule FastestMCP.Middleware.ToolSearch do
     descriptive_tokens =
       tokenize([Map.get(tool, :title), Map.get(tool, :description)] |> Enum.join(" "))
 
+    parameter_tokens = public_parameter_tokens(tool)
+
     category =
       cond do
         name == query -> 0
         String.starts_with?(name, query) -> 1
         tokens_match?(query_tokens, name_tokens) -> 2
         tokens_match?(query_tokens, name_tokens ++ descriptive_tokens) -> 3
+        tokens_match?(query_tokens, name_tokens ++ descriptive_tokens ++ parameter_tokens) -> 4
         true -> nil
       end
 
@@ -313,6 +317,46 @@ defmodule FastestMCP.Middleware.ToolSearch do
       Enum.any?(candidate_tokens, &String.starts_with?(&1, query_token))
     end)
   end
+
+  defp public_parameter_tokens(tool) do
+    properties =
+      case Map.get(tool, :input_schema) do
+        %{"properties" => %{} = properties} -> properties
+        %{properties: %{} = properties} -> properties
+        _other -> %{}
+      end
+
+    injected =
+      tool
+      |> Component.injected_argument_names()
+      |> Enum.map(&to_string/1)
+      |> MapSet.new()
+
+    properties
+    |> Enum.reduce(MapSet.new(), fn {name, schema}, tokens ->
+      name = to_string(name)
+
+      if MapSet.member?(injected, name) do
+        tokens
+      else
+        tokens
+        |> put_tokens(tokenize(name))
+        |> put_tokens(parameter_description_tokens(schema))
+      end
+    end)
+    |> MapSet.to_list()
+  end
+
+  defp parameter_description_tokens(%{"description" => description})
+       when is_binary(description),
+       do: tokenize(description)
+
+  defp parameter_description_tokens(%{description: description}) when is_binary(description),
+    do: tokenize(description)
+
+  defp parameter_description_tokens(_schema), do: []
+
+  defp put_tokens(tokens, values), do: Enum.reduce(values, tokens, &MapSet.put(&2, &1))
 
   defp tokenize(value) do
     value

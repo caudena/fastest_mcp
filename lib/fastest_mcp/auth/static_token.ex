@@ -40,31 +40,29 @@ defmodule FastestMCP.Auth.StaticToken do
   end
 
   defp authenticate_token(token, token_config, required_scopes) do
-    cond do
-      expired?(fetch_field(token_config, :expires_at)) ->
-        {:error, %Error{code: :unauthorized, message: "token expired"}}
+    if expired?(fetch_field(token_config, :expires_at)) do
+      {:error, %Error{code: :unauthorized, message: "token expired"}}
+    else
+      scopes = normalize_list(fetch_field(token_config, :scopes, []))
+      missing_scopes = required_scopes -- scopes
 
-      true ->
-        scopes = normalize_list(fetch_field(token_config, :scopes, []))
-        missing_scopes = required_scopes -- scopes
-
-        if missing_scopes == [] do
-          {:ok,
-           %Result{
-             principal: principal_for(token_config),
-             auth: auth_for(token, token_config, scopes),
-             capabilities: normalize_list(fetch_field(token_config, :capabilities, scopes)),
-             audiences: verified_audiences(token_config),
-             scopes: scopes
-           }}
-        else
-          {:error,
-           %Error{
-             code: :forbidden,
-             message: "insufficient scope",
-             details: %{missing_scopes: missing_scopes}
-           }}
-        end
+      if missing_scopes == [] do
+        {:ok,
+         %Result{
+           principal: principal_for(token_config),
+           auth: auth_for(token, token_config, scopes),
+           capabilities: normalize_list(fetch_field(token_config, :capabilities, scopes)),
+           audiences: verified_audiences(token_config),
+           scopes: scopes
+         }}
+      else
+        {:error,
+         %Error{
+           code: :forbidden,
+           message: "insufficient scope",
+           details: %{missing_scopes: missing_scopes}
+         }}
+      end
     end
   end
 

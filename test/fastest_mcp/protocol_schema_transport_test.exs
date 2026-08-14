@@ -4,8 +4,8 @@ defmodule FastestMCP.ProtocolSchemaTransportTest do
   import Plug.Conn
   import Plug.Test
 
-  alias FastestMCP.Error
   alias FastestMCP.Auth.Result, as: AuthResult
+  alias FastestMCP.Error
   alias FastestMCP.Root
   alias FastestMCP.Session
   alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest

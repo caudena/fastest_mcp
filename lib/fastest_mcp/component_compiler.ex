@@ -12,6 +12,7 @@ defmodule FastestMCP.ComponentCompiler do
   module indirectly through higher-level APIs rather than calling it first.
   """
 
+  alias FastestMCP.Authorization
   alias FastestMCP.Components.Prompt
   alias FastestMCP.Components.Resource
   alias FastestMCP.Components.ResourceTemplate
@@ -20,7 +21,6 @@ defmodule FastestMCP.ComponentCompiler do
   alias FastestMCP.ResourceSecurity
   alias FastestMCP.Schema
   alias FastestMCP.TaskConfig
-  alias FastestMCP.Authorization
 
   @doc "Compiles the given handler into a runtime component."
   def compile(:tool, server_name, name, handler, opts) do

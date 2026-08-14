@@ -5,15 +5,17 @@ defmodule FastestMCP.DocsExamplesTest do
 
   alias FastestMCP.Client
   alias FastestMCP.Client.Task, as: RemoteTask
+  alias FastestMCP.Client.ToolResult
   alias FastestMCP.ComponentManager
   alias FastestMCP.Context
   alias FastestMCP.Error
   alias FastestMCP.Protocol.Extensions
+  alias FastestMCP.Providers.ApplicationSessions
   alias FastestMCP.Providers.Proxy
-  alias FastestMCP.ResourceSecurity
-  alias FastestMCP.ServerExtension
   alias FastestMCP.Resources.Result, as: ResourceResult
   alias FastestMCP.Resources.Text, as: ResourceText
+  alias FastestMCP.ResourceSecurity
+  alias FastestMCP.ServerExtension
   alias FastestMCP.TestSupport.DocsFixture
   alias FastestMCP.TestSupport.DocsFixture.AuthServer
   alias FastestMCP.TestSupport.DocsFixture.InteractiveServer
@@ -508,7 +510,7 @@ defmodule FastestMCP.DocsExamplesTest do
           ]
         }
       end)
-      |> FastestMCP.add_provider(FastestMCP.Providers.ApplicationSessions.new())
+      |> FastestMCP.add_provider(ApplicationSessions.new())
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
     bandit = start_supervised!(DocsFixture.bandit_child_spec(server_name))
@@ -567,6 +569,14 @@ defmodule FastestMCP.DocsExamplesTest do
 
     assert %{"value" => "task"} = RemoteTask.result(task, timeout_ms: 2_000)
 
+    assert %ToolResult{
+             structured_content: %{"value" => "stable"},
+             structured_content_present?: true
+           } =
+             Client.call_tool_result(client, "task_echo", %{"value" => "stable"},
+               task_timeout_ms: 2_000
+             )
+
     assert %Proxy{protocol_version: :mirror, target_type: :http} = Proxy.new(endpoint)
 
     search_server_name =
@@ -577,7 +587,16 @@ defmodule FastestMCP.DocsExamplesTest do
       |> FastestMCP.add_tool(
         "deploy_status",
         fn arguments, _context -> %{"target" => arguments["target"]} end,
-        description: "Deploy status for an environment"
+        description: "Deploy status for an environment",
+        input_schema: %{
+          "type" => "object",
+          "properties" => %{
+            "target" => %{
+              "type" => "string",
+              "description" => "Deployment region or environment"
+            }
+          }
+        }
       )
       |> FastestMCP.add_tool(
         "release_report",
@@ -592,15 +611,21 @@ defmodule FastestMCP.DocsExamplesTest do
 
     assert {:ok, _pid} = FastestMCP.start_server(search_server)
 
-    assert {:ok, in_process_client} =
-             Client.connect({:in_process, search_server_name},
-               protocol_version: "2026-07-28"
-             )
+    client_name = {:global, {__MODULE__, search_server_name}}
+    client_id = {:docs_supervised_client, search_server_name}
 
-    on_exit(fn ->
-      if Client.connected?(in_process_client), do: Client.disconnect(in_process_client)
-      FastestMCP.stop_server(search_server_name)
-    end)
+    _pid =
+      start_supervised!(
+        {Client,
+         target: {:in_process, search_server_name},
+         name: client_name,
+         id: client_id,
+         protocol_version: "2026-07-28"}
+      )
+
+    on_exit(fn -> FastestMCP.stop_server(search_server_name) end)
+
+    assert :ok = Client.await_ready(client_name, 1_000)
 
     assert %{
              "structuredContent" => %{
@@ -610,13 +635,22 @@ defmodule FastestMCP.DocsExamplesTest do
                ],
                "truncated" => false
              }
-           } = Client.call_tool(in_process_client, "search_tools", %{"query" => "deploy"})
+           } = Client.call_tool(client_name, "search_tools", %{"query" => "deploy"})
+
+    assert %{
+             "structuredContent" => %{
+               "tools" => [%{"name" => "deploy_status"}],
+               "truncated" => false
+             }
+           } = Client.call_tool(client_name, "search_tools", %{"query" => "region"})
 
     assert %{"structuredContent" => %{"target" => "production"}} =
-             Client.call_tool(in_process_client, "call_tool", %{
+             Client.call_tool(client_name, "call_tool", %{
                "name" => "deploy_status",
                "arguments" => %{"target" => "production"}
              })
+
+    assert :ok = stop_supervised(client_id)
   end
 
   test "readme and guide links resolve and no compatibility sidecar references remain" do

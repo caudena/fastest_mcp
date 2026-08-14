@@ -602,18 +602,16 @@ defmodule FastestMCP.Transport.StreamableHTTP do
   defp maybe_put_health_server_name(payload, _server_name), do: payload
 
   defp execute_request(runtime, request, opts) do
-    try do
-      payload = Engine.dispatch!(runtime.server.name, request, opts)
-      StreamableHTTPAdapter.encode_success(request, payload)
-    rescue
-      error in Error ->
-        cleanup_failed_initialize(runtime, request)
-        {:application_error, request, public_error(error, runtime.server, request)}
+    payload = Engine.dispatch!(runtime.server.name, request, opts)
+    StreamableHTTPAdapter.encode_success(request, payload)
+  rescue
+    error in Error ->
+      cleanup_failed_initialize(runtime, request)
+      {:application_error, request, public_error(error, runtime.server, request)}
 
-      error ->
-        cleanup_failed_initialize(runtime, request)
-        {:error, error}
-    end
+    error ->
+      cleanup_failed_initialize(runtime, request)
+      {:error, error}
   end
 
   defp stream_modern_subscription(conn, runtime, subscriber) do
@@ -1145,85 +1143,85 @@ defmodule FastestMCP.Transport.StreamableHTTP do
     result_alias = :erlang.alias()
     stream_ref = make_ref()
 
-    with {:ok, sink} <-
-           Session.attach_sink(runtime.server.name, request.session_id, self(),
-             kind: :post,
-             origin_request_id: request.request_id
-           ) do
-      spawned_request = %{
-        request
-        | request_metadata:
-            Map.merge(request.request_metadata, %{
-              session_sink_ref: sink.sink_ref,
-              jsonrpc_request_id: request.request_id
-            })
-      }
-
-      try do
-        {:ok, task_pid} =
-          Task.Supervisor.start_child(runtime.stream_task_supervisor, fn ->
-            result = execute_stream_worker(runtime, spawned_request, opts)
-            send(result_alias, {:stream_dispatch_result, stream_ref, result})
-          end)
-
-        monitor_ref = Process.monitor(task_pid)
-        timeout_ms = Keyword.get(opts, :stream_request_timeout_ms, 60_000)
-        deadline = System.monotonic_time(:millisecond) + timeout_ms
-
-        registration =
-          Session.register_inbound_request(
-            runtime.server.name,
-            request.session_id,
-            request.request_id,
-            task_pid,
-            method: request.method,
-            task_augmented: request.task_request,
-            cancellable: request.method != "initialize",
-            progress_token: Map.get(request.request_metadata, :progress_token)
-          )
+    case Session.attach_sink(runtime.server.name, request.session_id, self(),
+           kind: :post,
+           origin_request_id: request.request_id
+         ) do
+      {:ok, sink} ->
+        spawned_request = %{
+          request
+          | request_metadata:
+              Map.merge(request.request_metadata, %{
+                session_sink_ref: sink.sink_ref,
+                jsonrpc_request_id: request.request_id
+              })
+        }
 
         try do
-          case registration do
-            :ok ->
-              stream_loop(
-                conn,
-                runtime,
-                request,
-                task_pid,
-                monitor_ref,
-                stream_ref,
-                sink.sink_ref,
-                deadline,
-                timeout_ms
-              )
+          {:ok, task_pid} =
+            Task.Supervisor.start_child(runtime.stream_task_supervisor, fn ->
+              result = execute_stream_worker(runtime, spawned_request, opts)
+              send(result_alias, {:stream_dispatch_result, stream_ref, result})
+            end)
 
-            {:error, reason} ->
-              _ = Task.Supervisor.terminate_child(runtime.stream_task_supervisor, task_pid)
+          monitor_ref = Process.monitor(task_pid)
+          timeout_ms = Keyword.get(opts, :stream_request_timeout_ms, 60_000)
+          deadline = System.monotonic_time(:millisecond) + timeout_ms
 
-              deliver_stream_terminal(
-                conn,
-                runtime,
-                request,
-                sink.sink_ref,
-                StreamableHTTPAdapter.encode_jsonrpc_error(
+          registration =
+            Session.register_inbound_request(
+              runtime.server.name,
+              request.session_id,
+              request.request_id,
+              task_pid,
+              method: request.method,
+              task_augmented: request.task_request,
+              cancellable: request.method != "initialize",
+              progress_token: Map.get(request.request_metadata, :progress_token)
+            )
+
+          try do
+            case registration do
+              :ok ->
+                stream_loop(
+                  conn,
+                  runtime,
                   request,
-                  %Error{
-                    code: :overloaded,
-                    message: "request could not be registered",
-                    details: %{reason: inspect(reason)}
-                  }
+                  task_pid,
+                  monitor_ref,
+                  stream_ref,
+                  sink.sink_ref,
+                  deadline,
+                  timeout_ms
                 )
-              )
+
+              {:error, reason} ->
+                _ = Task.Supervisor.terminate_child(runtime.stream_task_supervisor, task_pid)
+
+                deliver_stream_terminal(
+                  conn,
+                  runtime,
+                  request,
+                  sink.sink_ref,
+                  StreamableHTTPAdapter.encode_jsonrpc_error(
+                    request,
+                    %Error{
+                      code: :overloaded,
+                      message: "request could not be registered",
+                      details: %{reason: inspect(reason)}
+                    }
+                  )
+                )
+            end
+          after
+            _ = Session.detach_sink(runtime.server.name, request.session_id, sink.sink_ref)
+            deactivate_stream_result(result_alias, stream_ref)
+            Process.demonitor(monitor_ref, [:flush])
           end
         after
-          _ = Session.detach_sink(runtime.server.name, request.session_id, sink.sink_ref)
           deactivate_stream_result(result_alias, stream_ref)
-          Process.demonitor(monitor_ref, [:flush])
         end
-      after
-        deactivate_stream_result(result_alias, stream_ref)
-      end
-    else
+
       {:error, reason} ->
         case chunk_message(
                conn,
@@ -1502,31 +1500,29 @@ defmodule FastestMCP.Transport.StreamableHTTP do
   end
 
   defp execute_stream_worker(runtime, request, opts) do
-    try do
-      {:ok, Engine.dispatch!(runtime.server.name, request, opts)}
-    rescue
-      error in Error ->
-        {:error, public_error(error, runtime.server, request)}
+    {:ok, Engine.dispatch!(runtime.server.name, request, opts)}
+  rescue
+    error in Error ->
+      {:error, public_error(error, runtime.server, request)}
 
-      error ->
-        {:error, normalize_stream_error(error)}
-    catch
-      :exit, reason ->
-        {:error,
-         %Error{
-           code: :internal_error,
-           message: "streamed request exited",
-           details: %{reason: inspect(reason)}
-         }}
+    error ->
+      {:error, normalize_stream_error(error)}
+  catch
+    :exit, reason ->
+      {:error,
+       %Error{
+         code: :internal_error,
+         message: "streamed request exited",
+         details: %{reason: inspect(reason)}
+       }}
 
-      kind, reason ->
-        {:error,
-         %Error{
-           code: :internal_error,
-           message: "streamed request failed",
-           details: %{kind: inspect(kind), reason: inspect(reason)}
-         }}
-    end
+    kind, reason ->
+      {:error,
+       %Error{
+         code: :internal_error,
+         message: "streamed request failed",
+         details: %{kind: inspect(kind), reason: inspect(reason)}
+       }}
   end
 
   defp encode_stream_success(runtime, request, payload) do

@@ -24,9 +24,8 @@ defmodule FastestMCP.Transport.Stdio do
 
   @doc "Dispatches one request through this transport."
   def dispatch(server_name, request, opts \\ []) do
-    with {:ok, request} <- decode_input(request) do
-      do_dispatch(server_name, request, opts)
-    else
+    case decode_input(request) do
+      {:ok, request} -> do_dispatch(server_name, request, opts)
       {:error, %Error{} = error} -> StdioAdapter.encode_error(error)
     end
   end
@@ -739,16 +738,18 @@ defmodule FastestMCP.Transport.Stdio do
 
   defp stop_stdio_notification_subscriber(%{subscriber: subscriber} = state)
        when is_pid(subscriber) do
-    with {:ok, runtime} <- ServerRuntime.fetch(state.server_name) do
-      _ =
-        DynamicSupervisor.terminate_child(
-          runtime.session_notification_supervisor,
-          subscriber
-        )
+    case ServerRuntime.fetch(state.server_name) do
+      {:ok, runtime} ->
+        _ =
+          DynamicSupervisor.terminate_child(
+            runtime.session_notification_supervisor,
+            subscriber
+          )
 
-      :ok
-    else
-      _other -> :ok
+        :ok
+
+      _other ->
+        :ok
     end
   end
 
@@ -780,13 +781,11 @@ defmodule FastestMCP.Transport.Stdio do
   end
 
   defp write_device!(output_device, envelope, owner) do
-    try do
-      :ok = IO.binwrite(output_device, [JSON.encode!(envelope), "\n"])
-    rescue
-      error -> send(owner, {:stdio_writer_failed, Exception.message(error)})
-    catch
-      kind, reason -> send(owner, {:stdio_writer_failed, {kind, reason}})
-    end
+    :ok = IO.binwrite(output_device, [JSON.encode!(envelope), "\n"])
+  rescue
+    error -> send(owner, {:stdio_writer_failed, Exception.message(error)})
+  catch
+    kind, reason -> send(owner, {:stdio_writer_failed, {kind, reason}})
   end
 
   # Cleanup resources are owned by a separate, non-linked process. A `try`
@@ -1207,29 +1206,30 @@ defmodule FastestMCP.Transport.Stdio do
   end
 
   defp acquire_server_startup_stderr(output_device, stdout_group_leader) do
-    with supervisor when is_pid(supervisor) <-
-           Process.whereis(FastestMCP.ServerSupervisor) do
-      if stdout_output_device?(output_device, stdout_group_leader) do
-        with stderr when is_pid(stderr) <- Process.whereis(:standard_error),
-             {:ok, redirect} <- acquire_process_stderr(supervisor, stderr) do
-          if Process.alive?(supervisor) and process_uses_group_leader?(supervisor, stderr) do
-            {:ok, %{supervisor: supervisor, redirect: redirect, stderr: stderr}}
+    case Process.whereis(FastestMCP.ServerSupervisor) do
+      supervisor when is_pid(supervisor) ->
+        if stdout_output_device?(output_device, stdout_group_leader) do
+          with stderr when is_pid(stderr) <- Process.whereis(:standard_error),
+               {:ok, redirect} <- acquire_process_stderr(supervisor, stderr) do
+            if Process.alive?(supervisor) and process_uses_group_leader?(supervisor, stderr) do
+              {:ok, %{supervisor: supervisor, redirect: redirect, stderr: stderr}}
+            else
+              release_process_stderr(redirect)
+              {:error, {:server_supervisor_redirection_lost, supervisor}}
+            end
           else
-            release_process_stderr(redirect)
-            {:error, {:server_supervisor_redirection_lost, supervisor}}
+            nil ->
+              {:error, :standard_error_not_available}
+
+            {:error, reason} ->
+              {:error, {:cannot_redirect_server_supervisor, supervisor, reason}}
           end
         else
-          nil ->
-            {:error, :standard_error_not_available}
-
-          {:error, reason} ->
-            {:error, {:cannot_redirect_server_supervisor, supervisor, reason}}
+          {:ok, %{supervisor: supervisor, redirect: :unmanaged, stderr: nil}}
         end
-      else
-        {:ok, %{supervisor: supervisor, redirect: :unmanaged, stderr: nil}}
-      end
-    else
-      nil -> {:error, :server_supervisor_not_available}
+
+      nil ->
+        {:error, :server_supervisor_not_available}
     end
   catch
     :exit, reason -> {:error, {:server_supervisor_not_available, reason}}
@@ -1567,17 +1567,19 @@ defmodule FastestMCP.Transport.Stdio do
          %Error{terminate_session_after_delivery: true}
        )
        when is_binary(session_id) and session_id != "" do
-    with {:ok, runtime} <- ServerRuntime.fetch(server_name) do
-      _ =
-        SessionSupervisor.terminate_session(
-          runtime.session_supervisor,
-          server_name,
-          session_id
-        )
+    case ServerRuntime.fetch(server_name) do
+      {:ok, runtime} ->
+        _ =
+          SessionSupervisor.terminate_session(
+            runtime.session_supervisor,
+            server_name,
+            session_id
+          )
 
-      :ok
-    else
-      _other -> :ok
+        :ok
+
+      _other ->
+        :ok
     end
   end
 

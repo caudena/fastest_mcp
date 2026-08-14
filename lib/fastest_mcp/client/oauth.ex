@@ -141,64 +141,65 @@ defmodule FastestMCP.Client.OAuth do
 
   @impl true
   def handle_call({:authorization_header, raw_resource}, _from, state) do
-    with {:ok, resource} <- canonical_resource(raw_resource) do
-      previous_credential = stored_access_credential(state, resource)
+    case canonical_resource(raw_resource) do
+      {:ok, resource} ->
+        previous_credential = stored_access_credential(state, resource)
 
-      result =
-        case Map.get(state.resources, resource) do
-          nil ->
-            {:reply, :none, state}
+        result =
+          case Map.get(state.resources, resource) do
+            nil ->
+              {:reply, :none, state}
 
-          context ->
-            case stored_token(state, context) do
-              nil ->
-                {:reply, :none, state}
+            context ->
+              case stored_token(state, context) do
+                nil ->
+                  {:reply, :none, state}
 
-              token ->
-                cond do
-                  token_current?(token) ->
-                    {:reply, {:ok, bearer_header(token)}, state}
+                token ->
+                  cond do
+                    token_current?(token) ->
+                      {:reply, {:ok, bearer_header(token)}, state}
 
-                  is_binary(token["refresh_token"]) ->
-                    case refresh_token(state, context, token) do
-                      {:ok, refreshed, next_state} ->
-                        {:reply, {:ok, bearer_header(refreshed)}, next_state}
+                    is_binary(token["refresh_token"]) ->
+                      case refresh_token(state, context, token) do
+                        {:ok, refreshed, next_state} ->
+                          {:reply, {:ok, bearer_header(refreshed)}, next_state}
 
-                      {:error, %Error{} = error, next_state} ->
-                        {:reply, {:error, error}, next_state}
-                    end
+                        {:error, %Error{} = error, next_state} ->
+                          {:reply, {:error, error}, next_state}
+                      end
 
-                  reacquirable_grant?(context.grant) ->
-                    next_state = delete_stored_token(state, context)
+                    reacquirable_grant?(context.grant) ->
+                      next_state = delete_stored_token(state, context)
 
-                    challenge = %{
-                      resource_metadata: nil,
-                      scopes: token["scope"] || [],
-                      error: nil
-                    }
+                      challenge = %{
+                        resource_metadata: nil,
+                        scopes: token["scope"] || [],
+                        error: nil
+                      }
 
-                    case perform_authorization(
-                           next_state,
-                           resource,
-                           challenge,
-                           scopes: token["scope"] || []
-                         ) do
-                      {:ok, reacquired, final_state} ->
-                        {:reply, {:ok, bearer_header(reacquired)}, final_state}
+                      case perform_authorization(
+                             next_state,
+                             resource,
+                             challenge,
+                             scopes: token["scope"] || []
+                           ) do
+                        {:ok, reacquired, final_state} ->
+                          {:reply, {:ok, bearer_header(reacquired)}, final_state}
 
-                      {:error, %Error{} = error, final_state} ->
-                        {:reply, {:error, error}, final_state}
-                    end
+                        {:error, %Error{} = error, final_state} ->
+                          {:reply, {:error, error}, final_state}
+                      end
 
-                  true ->
-                    next_state = delete_stored_token(state, context)
-                    {:reply, :none, next_state}
-                end
-            end
-        end
+                    true ->
+                      next_state = delete_stored_token(state, context)
+                      {:reply, :none, next_state}
+                  end
+              end
+          end
 
-      notify_credential_change(result, previous_credential, resource)
-    else
+        notify_credential_change(result, previous_credential, resource)
+
       {:error, reason} ->
         {:reply, {:error, oauth_error(:configuration, reason)}, state}
     end
@@ -214,19 +215,17 @@ defmodule FastestMCP.Client.OAuth do
       previous_credential = token && token["access_token"]
 
       result =
-        cond do
-          attempt == 1 and challenge.error != "insufficient_scope" and
-            is_map(token) and is_binary(token["refresh_token"]) ->
-            case refresh_token(state, context, token) do
-              {:ok, refreshed, next_state} ->
-                {:reply, {:ok, bearer_header(refreshed)}, next_state}
+        if attempt == 1 and challenge.error != "insufficient_scope" and
+             is_map(token) and is_binary(token["refresh_token"]) do
+          case refresh_token(state, context, token) do
+            {:ok, refreshed, next_state} ->
+              {:reply, {:ok, bearer_header(refreshed)}, next_state}
 
-              {:error, _refresh_error, next_state} ->
-                authorize_and_reply(next_state, resource, challenge, opts)
-            end
-
-          true ->
-            authorize_and_reply(state, resource, challenge, opts)
+            {:error, _refresh_error, next_state} ->
+              authorize_and_reply(next_state, resource, challenge, opts)
+          end
+        else
+          authorize_and_reply(state, resource, challenge, opts)
         end
 
       notify_credential_change(result, previous_credential, resource)
@@ -237,19 +236,20 @@ defmodule FastestMCP.Client.OAuth do
   end
 
   def handle_call({:authorize, raw_resource, opts}, _from, state) do
-    with {:ok, resource} <- canonical_resource(raw_resource) do
-      previous_credential = stored_access_credential(state, resource)
+    case canonical_resource(raw_resource) do
+      {:ok, resource} ->
+        previous_credential = stored_access_credential(state, resource)
 
-      challenge = %{
-        resource_metadata: Keyword.get(opts, :resource_metadata),
-        scopes: normalize_scopes(Keyword.get(opts, :scopes, [])),
-        error: nil
-      }
+        challenge = %{
+          resource_metadata: Keyword.get(opts, :resource_metadata),
+          scopes: normalize_scopes(Keyword.get(opts, :scopes, [])),
+          error: nil
+        }
 
-      state
-      |> authorize_and_reply(resource, challenge, opts)
-      |> notify_credential_change(previous_credential, resource)
-    else
+        state
+        |> authorize_and_reply(resource, challenge, opts)
+        |> notify_credential_change(previous_credential, resource)
+
       {:error, reason} ->
         {:reply, {:error, oauth_error(:configuration, reason)}, state}
     end
@@ -852,17 +852,19 @@ defmodule FastestMCP.Client.OAuth do
         {:error, :client_registration, :client_assertion_provider_required}
 
       true ->
-        with {:ok, issuer} <- normalize_client_issuer(client["issuer"]) do
-          {:ok,
-           %{
-             client_id: client_id,
-             client_secret: secret,
-             token_endpoint_auth_method: method,
-             assertion_provider: assertion_provider,
-             issuer: issuer
-           }}
-        else
-          {:error, reason} -> {:error, :client_registration, reason}
+        case normalize_client_issuer(client["issuer"]) do
+          {:ok, issuer} ->
+            {:ok,
+             %{
+               client_id: client_id,
+               client_secret: secret,
+               token_endpoint_auth_method: method,
+               assertion_provider: assertion_provider,
+               issuer: issuer
+             }}
+
+          {:error, reason} ->
+            {:error, :client_registration, reason}
         end
     end
   end

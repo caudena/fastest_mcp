@@ -39,7 +39,7 @@ defmodule FastestMCP.Runtime.BackgroundTaskTest do
         fn _arguments, ctx ->
           send(
             parent,
-            {:task_ctx, self(), Context.is_background_task(ctx), Context.task_id(ctx),
+            {:task_ctx, self(), Context.background_task?(ctx), Context.task_id(ctx),
              Context.origin_request_id(ctx), ctx.transport}
           )
 
