@@ -3,6 +3,8 @@ defmodule FastestMCP.SamplingToolsTest do
 
   alias FastestMCP.Sampling
   alias FastestMCP.SamplingTool
+  alias FastestMCP.Authorization
+  alias FastestMCP.Context
 
   def double(value), do: value * 2
 
@@ -133,6 +135,34 @@ defmodule FastestMCP.SamplingToolsTest do
              SamplingTool.run(tool, %{"query" => "fastestmcp"})
 
     assert_receive {:middleware_hit, "tools/call", "search"}
+  end
+
+  test "sampling tools preserve verified authorization evidence from their context" do
+    server_name =
+      "sampling-tools-auth-" <> Integer.to_string(System.unique_integer([:positive]))
+
+    server =
+      FastestMCP.server(server_name)
+      |> FastestMCP.add_tool("restricted", fn -> "authorized" end,
+        auth: Authorization.require_scopes("sampling:run")
+      )
+
+    assert {:ok, _pid} = FastestMCP.start_server(server)
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+
+    context = %Context{
+      server_name: server_name,
+      request_id: "sampling-request",
+      transport: :in_process,
+      authenticated: true,
+      principal: {"https://issuer.example", "user-1"},
+      verified_scopes: ["sampling:run"]
+    }
+
+    [compiled_tool] = server.tools
+    tool = SamplingTool.from_tool(compiled_tool, context: context)
+
+    assert SamplingTool.run(tool, %{}) == "authorized"
   end
 
   test "prepare_sampling_tools accepts mixed explicit tuples and passthrough sampling tools" do

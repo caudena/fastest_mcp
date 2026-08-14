@@ -19,6 +19,9 @@ defmodule FastestMCP.Transport.StdioAdapter do
     case JSONRPC.decode(message) do
       {:ok, {:request, method, params, request_id}} ->
         with {:ok, {task_request, task_ttl_ms}} <- JSONRPC.task_metadata(params) do
+          auth_input = request_auth_input(params, opts)
+          params = JSONRPC.sanitize_auth_metadata(params)
+
           {:ok,
            %Request{
              method: method,
@@ -38,11 +41,11 @@ defmodule FastestMCP.Transport.StdioAdapter do
                session_id_provided: true,
                connection_id: Keyword.get(opts, :connection_id),
                jsonrpc_request_id: request_id,
-               jsonrpc_envelope: message,
+               jsonrpc_envelope: JSONRPC.sanitize_stored_envelope(message),
                progress_token: get_in(params, ["_meta", "progressToken"]),
                log_level: get_in(params, ["_meta", "io.modelcontextprotocol/logLevel"])
              },
-             auth_input: request_auth_input(params, opts)
+             auth_input: auth_input
            }}
         end
 
@@ -59,7 +62,7 @@ defmodule FastestMCP.Transport.StdioAdapter do
              session_id: session_id,
              session_id_provided: true,
              connection_id: Keyword.get(opts, :connection_id),
-             jsonrpc_envelope: message
+             jsonrpc_envelope: JSONRPC.sanitize_stored_envelope(message)
            },
            auth_input: Map.new(Keyword.get(opts, :auth_input, %{}))
          }}

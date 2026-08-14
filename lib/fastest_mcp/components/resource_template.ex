@@ -12,6 +12,7 @@ defmodule FastestMCP.Components.ResourceTemplate do
   defstruct [
     :server_name,
     :uri_template,
+    :name,
     :version,
     :title,
     :description,
@@ -26,6 +27,7 @@ defmodule FastestMCP.Components.ResourceTemplate do
     :mime_type,
     :compiled,
     :matcher,
+    resource_security: :inherit,
     authorization: [],
     policy_state: %{},
     variables: [],

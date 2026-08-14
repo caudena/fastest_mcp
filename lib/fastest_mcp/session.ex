@@ -313,7 +313,13 @@ defmodule FastestMCP.Session do
       try do
         GenServer.call(pid, :terminate_session, @termination_timeout)
       catch
-        :exit, reason -> {:error, state_store_error(:delete_session, {:session_exit, reason})}
+        :exit, reason ->
+          {:error,
+           SessionStateStore.call_error(
+             :delete_session,
+             "session state storage",
+             {:session_exit, reason}
+           )}
       end
 
     case result do
@@ -1513,32 +1519,7 @@ defmodule FastestMCP.Session do
   end
 
   defp state_store_call(operation, fun) do
-    operation
-    |> normalize_state_store_result(fun.())
-  rescue
-    error -> {:error, state_store_error(operation, error)}
-  catch
-    kind, reason -> {:error, state_store_error(operation, {kind, reason})}
-  end
-
-  defp normalize_state_store_result(:get, {:ok, _value} = result), do: result
-  defp normalize_state_store_result(:get, :error), do: :error
-  defp normalize_state_store_result(operation, :ok) when operation != :get, do: :ok
-
-  defp normalize_state_store_result(operation, {:error, reason}),
-    do: {:error, state_store_error(operation, reason)}
-
-  defp normalize_state_store_result(operation, result),
-    do: {:error, state_store_error(operation, {:invalid_result, result})}
-
-  defp state_store_error(_operation, %Error{} = error), do: error
-
-  defp state_store_error(operation, reason) do
-    %Error{
-      code: :internal_error,
-      message: "session state storage #{operation} failed",
-      details: %{reason: inspect(reason)}
-    }
+    SessionStateStore.call(operation, "session state storage", fun)
   end
 
   defp unwrap_state_store_write!(:ok), do: :ok

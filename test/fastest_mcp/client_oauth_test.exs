@@ -103,17 +103,22 @@ defmodule FastestMCP.ClientOAuthTest do
       end
     end
 
-    assert {:ok, oauth} = OAuth.start_link(oauth_opts(requester))
+    assert {:ok, oauth} =
+             OAuth.start_link(oauth_opts(requester, credential_listener: self()))
+
     assert {:ok, "Bearer short-lived"} = OAuth.authorize(oauth, @resource)
+    assert_receive :oauth_credentials_refreshed
 
     assert_receive {:oauth_http, :post, "https://auth.example.com/token", authorization_opts}
     assert Map.new(authorization_opts[:form])["grant_type"] == "authorization_code"
 
     assert {:ok, "Bearer refreshed"} = OAuth.authorization_header(oauth, @resource)
+    assert_receive :oauth_credentials_refreshed
 
     assert_receive {:oauth_http, :post, "https://auth.example.com/token", refresh_opts}
     assert Map.new(refresh_opts[:form])["grant_type"] == "refresh_token"
     assert {:ok, "Bearer refreshed"} = OAuth.authorization_header(oauth, @resource)
+    refute_receive :oauth_credentials_refreshed, 50
   end
 
   test "rejects a state mismatch without exposing the authorization code" do

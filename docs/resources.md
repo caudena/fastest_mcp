@@ -142,6 +142,43 @@ captures, and templates that would create a hyphen/underscore collision are
 rejected. Literal and expanded fragments are matched consistently for exact
 and templated lookup.
 
+## Resource Template Security
+
+Resource-template captures are screened by a secure-by-default lexical policy
+before component authorization, schema validation, and handler execution. The
+default rejects:
+
+- NUL bytes
+- path traversal that would escape above the logical base
+- leading slash or backslash absolute paths
+- ASCII drive-relative or drive-absolute forms such as `C:temp` and `C:\\temp`
+
+Both slash kinds are treated as path separators. Captures have already been URI
+decoded by the template matcher; FastestMCP does not recursively decode them,
+inspect files, resolve symlinks, or provide a filesystem sandbox. Only binary
+capture values and binary elements of capture lists are screened. A rejected
+capture is indistinguishable on the wire from an unknown resource.
+
+Configure the server-wide policy with `resource_security:`:
+
+```elixir
+FastestMCP.server("resources",
+  resource_security: [
+    reject_path_traversal: true,
+    reject_absolute_paths: true,
+    reject_null_bytes: true,
+    exempt_params: ["opaque-id"]
+  ]
+)
+```
+
+Templates inherit the consuming server's current policy by default. A template
+may supply its own `FastestMCP.ResourceSecurity` options, or explicitly use
+`resource_security: nil` to disable screening for that template. Setting the
+server option to `nil` disables inherited screening. Exemptions apply to the
+named capture only; use them when a value is intentionally opaque, not as a
+substitute for application-level path confinement.
+
 ## Template Parameter Validation and Completion
 
 Resource templates can validate captures and query parameters with

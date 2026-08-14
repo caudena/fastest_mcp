@@ -34,6 +34,11 @@ defmodule FastestMCP.Providers.MountedServer do
 
   @doc "Builds a new value for this module from the supplied options."
   def new(%Server{} = server, opts \\ []) do
+    if server.active_extensions != [] do
+      raise ArgumentError,
+            "mounted child servers cannot declare active_extensions; configure executable extensions on the root server"
+    end
+
     %__MODULE__{
       server: server,
       namespace: normalize_namespace(Keyword.get(opts, :namespace)),
@@ -396,6 +401,7 @@ defmodule FastestMCP.Providers.MountedServer do
       context: context,
       transport: context.transport,
       call_supervisor: parent_operation.call_supervisor,
+      captures: parent_operation.captures,
       arguments: arguments
     }
   end
@@ -419,6 +425,7 @@ defmodule FastestMCP.Providers.MountedServer do
       context: child_context(provider, parent_operation.context),
       transport: parent_operation.transport,
       call_supervisor: parent_operation.call_supervisor,
+      captures: parent_operation.captures,
       arguments: parent_operation.arguments
     }
   end

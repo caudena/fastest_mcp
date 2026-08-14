@@ -214,7 +214,13 @@ defmodule FastestMCP.PaginationTest do
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
-    principal_a = %AuthResult{principal: "principal-a", auth: %{tenant: "a"}}
+
+    principal_a = %AuthResult{
+      principal: "principal-a",
+      auth: %{tenant: "a", token: "credential-a"},
+      audiences: ["https://mcp.example/mcp"],
+      scopes: ["tools:read"]
+    }
 
     first_tools =
       Engine.dispatch!(server_name, %Request{
@@ -246,6 +252,24 @@ defmodule FastestMCP.PaginationTest do
         method: "tools/list",
         transport: :stdio,
         auth_result: %AuthResult{principal: "principal-b", auth: %{tenant: "b"}},
+        payload: %{"cursor" => first_tools.nextCursor}
+      })
+    end
+
+    assert_raise Error, ~r/invalid cursor/, fn ->
+      Engine.dispatch!(server_name, %Request{
+        method: "tools/list",
+        transport: :stdio,
+        auth_result: %{principal_a | scopes: ["tools:read", "tools:admin"]},
+        payload: %{"cursor" => first_tools.nextCursor}
+      })
+    end
+
+    assert_raise Error, ~r/invalid cursor/, fn ->
+      Engine.dispatch!(server_name, %Request{
+        method: "tools/list",
+        transport: :stdio,
+        auth_result: %{principal_a | audiences: ["https://other.example/mcp"]},
         payload: %{"cursor" => first_tools.nextCursor}
       })
     end

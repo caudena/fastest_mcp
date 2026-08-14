@@ -459,6 +459,7 @@ defmodule FastestMCP.Component do
 
         Map.merge(base, %{
           uri: component.uri,
+          name: component.name,
           annotations: component.annotations,
           task: TaskConfig.metadata(task_config),
           execution: task_execution_metadata(task_config),
@@ -471,6 +472,7 @@ defmodule FastestMCP.Component do
 
         Map.merge(base, %{
           uri_template: component.uri_template,
+          name: component.name,
           annotations: component.annotations,
           task: TaskConfig.metadata(task_config),
           execution: task_execution_metadata(task_config),
@@ -628,6 +630,7 @@ defmodule FastestMCP.Component do
         description: Map.get(argument, :description, Map.get(argument, "description")),
         required: Map.get(argument, :required, Map.get(argument, "required", false))
       }
+      |> maybe_put(:title, Map.get(argument, :title, Map.get(argument, "title")))
     end)
   end
 

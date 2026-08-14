@@ -143,6 +143,18 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
     headers = conn |> request_headers() |> normalize_mcp_routing_headers()
     provided_session_id = headers["mcp-session-id"]
 
+    {payload, jsonrpc_envelope} =
+      if method == "__transport/client_response__" do
+        {payload, Keyword.get(opts, :jsonrpc_envelope)}
+      else
+        {
+          JSONRPC.sanitize_auth_metadata(payload),
+          opts
+          |> Keyword.get(:jsonrpc_envelope)
+          |> JSONRPC.sanitize_stored_envelope()
+        }
+      end
+
     body_protocol_version =
       get_in(payload, ["_meta", "io.modelcontextprotocol/protocolVersion"])
 
@@ -163,9 +175,10 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
       task_request: Keyword.get(opts, :task_request, false),
       task_ttl_ms: Keyword.get(opts, :task_ttl_ms),
       payload: payload,
+      transport_authorization: Map.get(headers, "authorization"),
       request_metadata:
         %{
-          headers: headers,
+          headers: public_request_headers(headers),
           method: conn.method,
           path: conn.request_path,
           query_params: conn.query_params,
@@ -173,7 +186,7 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
           session_id_provided: not is_nil(provided_session_id),
           protocol_version: headers["mcp-protocol-version"],
           jsonrpc_request_id: Keyword.fetch!(opts, :request_id),
-          jsonrpc_envelope: Keyword.get(opts, :jsonrpc_envelope),
+          jsonrpc_envelope: jsonrpc_envelope,
           jsonrpc_notification:
             Keyword.fetch!(opts, :protocol) == :jsonrpc and
               is_nil(Keyword.fetch!(opts, :request_id)),
@@ -195,9 +208,10 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
       session_id: session_id,
       protocol: :jsonrpc,
       payload: %{},
+      transport_authorization: Map.get(headers, "authorization"),
       request_metadata:
         %{
-          headers: headers,
+          headers: public_request_headers(headers),
           method: conn.method,
           path: conn.request_path,
           query_params: conn.query_params,
@@ -220,9 +234,10 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
       session_id: session_id,
       protocol: :jsonrpc,
       payload: %{},
+      transport_authorization: Map.get(headers, "authorization"),
       request_metadata:
         %{
-          headers: headers,
+          headers: public_request_headers(headers),
           method: conn.method,
           path: conn.request_path,
           query_params: conn.query_params,
@@ -449,6 +464,8 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
   defp parsed_body_params(_conn), do: :unavailable
 
   defp request_headers(conn), do: Map.new(conn.req_headers)
+
+  defp public_request_headers(headers), do: Map.delete(headers, "authorization")
 
   defp annotate_request_error(%Error{} = error, request_id) do
     jsonrpc_id =

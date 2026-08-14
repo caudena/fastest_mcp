@@ -66,9 +66,15 @@ defmodule FastestMCP.Server do
   alias FastestMCP.Component
   alias FastestMCP.ComponentCompiler
   alias FastestMCP.Elicitation.URL, as: URLElicitation
+  alias FastestMCP.Middleware.ToolInjection
+  alias FastestMCP.Middleware.ToolSearch
   alias FastestMCP.Provider
   alias FastestMCP.Protocol.Extensions
   alias FastestMCP.Providers.MountedServer, as: MountedServerProvider
+  alias FastestMCP.Providers.Proxy, as: ProxyProvider
+  alias FastestMCP.ResourceSecurity
+  alias FastestMCP.Schema
+  alias FastestMCP.ServerExtension
   alias FastestMCP.TaskConfig
 
   defstruct [
@@ -80,11 +86,15 @@ defmodule FastestMCP.Server do
     on_duplicate: :error,
     metadata: %{},
     extensions: %{},
+    active_extensions: [],
     http_routes: [],
     tasks: %TaskConfig{},
+    application_sessions: %{allow_anonymous: false},
+    resource_security: %ResourceSecurity{},
     schema_options: [],
     dependencies: %{},
     middleware: [],
+    tool_search: nil,
     lifespans: [],
     transforms: [],
     providers: [],
@@ -109,11 +119,15 @@ defmodule FastestMCP.Server do
           on_duplicate: :error | :warn | :ignore | :replace,
           metadata: map(),
           extensions: map(),
+          active_extensions: [ServerExtension.t()],
           http_routes: [tuple()],
           tasks: struct(),
+          application_sessions: %{allow_anonymous: boolean()},
+          resource_security: ResourceSecurity.t() | nil,
           schema_options: keyword(),
           dependencies: %{optional(String.t()) => function()},
           middleware: [middleware_entry()],
+          tool_search: ToolSearch.t() | nil,
           lifespans: [FastestMCP.Lifespan.t()],
           transforms: [transform()],
           providers: [Provider.t()],
@@ -127,7 +141,17 @@ defmodule FastestMCP.Server do
   def new(name, opts \\ []) do
     validate_removed_options!(opts)
 
-    %__MODULE__{
+    schema_options = normalize_schema_options(Keyword.get(opts, :schema_options, []))
+    extensions = Extensions.normalize(Keyword.get(opts, :extensions))
+
+    active_extensions =
+      opts
+      |> Keyword.get(:active_extensions, [])
+      |> normalize_active_extensions(schema_options)
+
+    validate_active_extensions!(extensions, active_extensions)
+
+    server = %__MODULE__{
       name: normalize_name(name),
       auth: normalize_auth(Keyword.get(opts, :auth)),
       protected_resource: normalize_protected_resource(Keyword.get(opts, :protected_resource)),
@@ -142,16 +166,25 @@ defmodule FastestMCP.Server do
         |> Map.new()
         |> put_experimental_capabilities(Keyword.get(opts, :experimental_capabilities))
         |> validate_experimental_capabilities!(),
-      extensions: Extensions.normalize(Keyword.get(opts, :extensions)),
+      extensions: extensions,
+      active_extensions: active_extensions,
       http_routes: [],
       tasks: normalize_tasks(Keyword.get(opts, :tasks, false)),
-      schema_options: normalize_schema_options(Keyword.get(opts, :schema_options, [])),
+      application_sessions:
+        normalize_application_sessions(Keyword.get(opts, :application_sessions, [])),
+      resource_security:
+        normalize_resource_security(Keyword.get(opts, :resource_security, %ResourceSecurity{})),
+      schema_options: schema_options,
       dependencies: normalize_dependencies(Keyword.get(opts, :dependencies, %{})),
       middleware: normalize_middleware(opts),
+      tool_search: normalize_tool_search(Keyword.get(opts, :tool_search), schema_options),
       lifespans:
         normalize_lifespans(Keyword.get(opts, :lifespans, Keyword.get(opts, :lifespan, []))),
       transforms: List.wrap(Keyword.get(opts, :transforms, []))
     }
+
+    validate_tool_search_middleware_collisions!(server.middleware, server.tool_search)
+    server
   end
 
   @doc "Adds a tool component to the current definition."
@@ -229,7 +262,17 @@ defmodule FastestMCP.Server do
 
   def add_middleware(%__MODULE__{} = server, %{middleware: middleware} = entry)
       when is_function(middleware, 2) do
+    validate_tool_search_middleware_collisions!([entry], server.tool_search)
     %{server | middleware: server.middleware ++ [entry]}
+  end
+
+  @doc "Enables bounded model-visible tool search on the server."
+  def enable_tool_search(%__MODULE__{} = server, opts \\ []) when is_list(opts) do
+    tool_search = ToolSearch.new(Keyword.put(opts, :schema_options, server.schema_options))
+    validate_tool_search_collisions!(server.tools, tool_search)
+    validate_tool_search_middleware_collisions!(server.middleware, tool_search)
+    validate_tool_search_providers!(server.providers, tool_search)
+    %{server | tool_search: tool_search}
   end
 
   @doc "Adds lifespan hooks to the current definition."
@@ -250,7 +293,10 @@ defmodule FastestMCP.Server do
 
   @doc "Adds a provider to the current definition."
   def add_provider(%__MODULE__{} = server, provider) do
-    %{server | providers: server.providers ++ [Provider.new(provider)]}
+    provider = Provider.new(provider)
+    validate_mounted_active_extensions!(provider)
+    validate_tool_search_provider!(server.tool_search, provider)
+    %{server | providers: server.providers ++ [provider]}
   end
 
   @doc "Mounts another server or provider-backed definition."
@@ -274,6 +320,45 @@ defmodule FastestMCP.Server do
   @doc "Returns all components attached to the server definition."
   def all_components(%__MODULE__{} = server) do
     server.tools ++ server.resources ++ server.resource_templates ++ server.prompts
+  end
+
+  @doc false
+  def active_extension_method(%__MODULE__{} = server, method) when is_binary(method) do
+    Enum.find_value(server.active_extensions, fn extension ->
+      case Enum.find(extension.methods, &(&1.name == method)) do
+        nil -> nil
+        binding -> {extension, binding}
+      end
+    end)
+  end
+
+  @doc false
+  def runtime_lifespans(%__MODULE__{} = server) do
+    extension_lifespans =
+      server.active_extensions
+      |> Enum.map(&ServerExtension.namespaced_lifespan/1)
+      |> Enum.reject(&is_nil/1)
+
+    server.lifespans ++ extension_lifespans
+  end
+
+  @doc false
+  def runtime_middleware(%__MODULE__{} = server) do
+    extension_middleware =
+      server.active_extensions
+      |> Enum.map(&ServerExtension.interceptor_middleware/1)
+      |> Enum.reject(&is_nil/1)
+
+    server.middleware ++ extension_middleware ++ List.wrap(server.tool_search)
+  end
+
+  @doc false
+  def effective_extensions(%__MODULE__{} = server, :legacy),
+    do: Extensions.for_profile(server.extensions, :legacy)
+
+  def effective_extensions(%__MODULE__{} = server, :modern) do
+    active = Map.new(server.active_extensions, &{&1.identifier, &1.settings})
+    Map.merge(Extensions.for_profile(server.extensions, :modern), active)
   end
 
   defp normalize_name(name) when is_atom(name), do: Atom.to_string(name)
@@ -383,6 +468,127 @@ defmodule FastestMCP.Server do
 
   defp normalize_tasks(tasks), do: TaskConfig.new(tasks)
 
+  defp normalize_active_extensions(nil, _schema_options), do: []
+
+  defp normalize_active_extensions(extensions, schema_options) when is_list(extensions) do
+    Enum.map(extensions, fn
+      %ServerExtension{} = extension ->
+        ServerExtension.normalize!(extension, schema_options)
+
+      other ->
+        raise ArgumentError,
+              "active_extensions entries must be FastestMCP.ServerExtension values, got: #{inspect(other)}"
+    end)
+  end
+
+  defp normalize_active_extensions(other, _schema_options) do
+    raise ArgumentError,
+          "active_extensions must be an ordered list of FastestMCP.ServerExtension values, got: #{inspect(other)}"
+  end
+
+  defp validate_active_extensions!(passive_extensions, active_extensions) do
+    identifiers = Enum.map(active_extensions, & &1.identifier)
+
+    duplicate_identifiers = duplicate_values(identifiers)
+
+    if duplicate_identifiers != [] do
+      raise ArgumentError,
+            "active_extensions declares duplicate identifiers: #{Enum.join(duplicate_identifiers, ", ")}"
+    end
+
+    collisions =
+      passive_extensions
+      |> Map.keys()
+      |> MapSet.new()
+      |> MapSet.intersection(MapSet.new(identifiers))
+      |> MapSet.to_list()
+      |> Enum.sort()
+
+    if collisions != [] do
+      raise ArgumentError,
+            "extension identifiers cannot be both passive and active: #{Enum.join(collisions, ", ")}"
+    end
+
+    specialized = Enum.filter(identifiers, &(&1 in [Extensions.apps(), Extensions.tasks()]))
+
+    if specialized != [] do
+      raise ArgumentError,
+            "Apps and Tasks use specialized implementations and cannot be active_extensions: #{Enum.join(specialized, ", ")}"
+    end
+
+    methods =
+      Enum.flat_map(active_extensions, &Enum.map(&1.methods, fn method -> method.name end))
+
+    duplicate_methods = duplicate_values(methods)
+
+    if duplicate_methods != [] do
+      raise ArgumentError,
+            "active extension method ownership is duplicated: #{Enum.join(duplicate_methods, ", ")}"
+    end
+
+    shadowed = methods |> Enum.filter(&Schema.built_in_method?/1) |> Enum.sort()
+
+    if shadowed != [] do
+      raise ArgumentError,
+            "active extensions cannot shadow core or built-in methods: #{Enum.join(shadowed, ", ")}"
+    end
+
+    :ok
+  end
+
+  defp duplicate_values(values) do
+    values
+    |> Enum.frequencies()
+    |> Enum.filter(fn {_value, count} -> count > 1 end)
+    |> Enum.map(&elem(&1, 0))
+    |> Enum.sort()
+  end
+
+  defp validate_mounted_active_extensions!(%Provider{
+         inner: %MountedServerProvider{server: %__MODULE__{active_extensions: [_ | _]}}
+       }) do
+    raise ArgumentError,
+          "mounted child servers cannot declare active_extensions; configure executable extensions on the root server"
+  end
+
+  defp validate_mounted_active_extensions!(%Provider{}), do: :ok
+
+  defp normalize_resource_security(nil), do: nil
+  defp normalize_resource_security(policy), do: ResourceSecurity.new(policy)
+
+  defp normalize_application_sessions(options) when is_list(options) do
+    if Keyword.keyword?(options) do
+      normalize_application_sessions(Map.new(options))
+    else
+      raise ArgumentError,
+            "application_sessions must be a keyword list or map, got: #{inspect(options)}"
+    end
+  end
+
+  defp normalize_application_sessions(options) when is_map(options) do
+    unknown = Map.keys(options) -- [:allow_anonymous, "allow_anonymous"]
+
+    if unknown != [] do
+      raise ArgumentError,
+            "unknown application_sessions options: #{inspect(unknown)}"
+    end
+
+    allow_anonymous =
+      Map.get(options, :allow_anonymous, Map.get(options, "allow_anonymous", false))
+
+    if is_boolean(allow_anonymous) do
+      %{allow_anonymous: allow_anonymous}
+    else
+      raise ArgumentError,
+            "application_sessions allow_anonymous must be a boolean, got: #{inspect(allow_anonymous)}"
+    end
+  end
+
+  defp normalize_application_sessions(other) do
+    raise ArgumentError,
+          "application_sessions must be a keyword list or map, got: #{inspect(other)}"
+  end
+
   defp normalize_schema_options(options) when is_list(options) do
     if Keyword.keyword?(options) do
       options
@@ -455,6 +661,21 @@ defmodule FastestMCP.Server do
           "middleware entries must be functions or middleware structs, got #{inspect(other)}"
   end
 
+  defp normalize_tool_search(nil, _schema_options), do: nil
+  defp normalize_tool_search(false, _schema_options), do: nil
+
+  defp normalize_tool_search(true, schema_options),
+    do: ToolSearch.new(schema_options: schema_options)
+
+  defp normalize_tool_search(opts, schema_options) when is_list(opts) do
+    ToolSearch.new(Keyword.put(opts, :schema_options, schema_options))
+  end
+
+  defp normalize_tool_search(other, _schema_options) do
+    raise ArgumentError,
+          "tool_search must be false, true, or a keyword list, got: #{inspect(other)}"
+  end
+
   defp component_opts(server, opts) do
     opts
     |> Keyword.put_new(:task, server.tasks)
@@ -462,6 +683,7 @@ defmodule FastestMCP.Server do
   end
 
   defp put_component(%__MODULE__{} = server, key, component) do
+    validate_tool_search_component!(server, key, component)
     existing_components = Map.fetch!(server, key)
 
     case Component.registration_action(existing_components, component, server.on_duplicate) do
@@ -475,6 +697,81 @@ defmodule FastestMCP.Server do
         server
     end
   end
+
+  defp validate_tool_search_component!(%__MODULE__{tool_search: nil}, _key, _component), do: :ok
+  defp validate_tool_search_component!(%__MODULE__{}, key, _component) when key != :tools, do: :ok
+
+  defp validate_tool_search_component!(%__MODULE__{tool_search: tool_search}, :tools, component) do
+    validate_tool_search_collisions!([component], tool_search)
+  end
+
+  defp validate_tool_search_collisions!(tools, %ToolSearch{} = tool_search) do
+    reserved = MapSet.new(ToolSearch.reserved_names(tool_search))
+
+    collisions =
+      tools
+      |> Enum.map(&Component.identifier/1)
+      |> Enum.filter(&MapSet.member?(reserved, &1))
+      |> Enum.uniq()
+      |> Enum.sort()
+
+    if collisions != [] do
+      raise ArgumentError,
+            "tool search synthetic names collide with registered tools: #{Enum.join(collisions, ", ")}"
+    end
+
+    :ok
+  end
+
+  defp validate_tool_search_middleware_collisions!(_middleware, nil), do: :ok
+
+  defp validate_tool_search_middleware_collisions!(middleware, %ToolSearch{} = tool_search) do
+    reserved = MapSet.new(ToolSearch.reserved_names(tool_search))
+
+    collisions =
+      middleware
+      |> Enum.flat_map(fn
+        %ToolInjection{} = injection -> ToolInjection.tool_names(injection)
+        _other -> []
+      end)
+      |> Enum.filter(&MapSet.member?(reserved, &1))
+      |> Enum.uniq()
+      |> Enum.sort()
+
+    if collisions != [] do
+      raise ArgumentError,
+            "tool search synthetic names collide with injected tools: #{Enum.join(collisions, ", ")}"
+    end
+
+    :ok
+  end
+
+  defp validate_tool_search_providers!(providers, %ToolSearch{} = tool_search) do
+    Enum.each(providers, &validate_tool_search_provider!(tool_search, &1))
+  end
+
+  defp validate_tool_search_provider!(nil, %Provider{}), do: :ok
+
+  defp validate_tool_search_provider!(%ToolSearch{}, %Provider{} = provider) do
+    if proxy_provider?(provider) do
+      raise ArgumentError,
+            "tool search cannot be combined with request-scoped proxy providers: " <>
+              "opaque upstream cursors cannot provide both bounded scanning and " <>
+              "global synthetic-name collision verification"
+    end
+
+    :ok
+  end
+
+  defp proxy_provider?(%Provider{inner: %ProxyProvider{}}), do: true
+
+  defp proxy_provider?(%Provider{
+         inner: %MountedServerProvider{server: %__MODULE__{} = mounted_server}
+       }) do
+    Enum.any?(mounted_server.providers, &proxy_provider?/1)
+  end
+
+  defp proxy_provider?(%Provider{}), do: false
 
   defp replace_duplicate(%__MODULE__{} = server, key, component) do
     updated =

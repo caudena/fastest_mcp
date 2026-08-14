@@ -801,6 +801,64 @@ That explicit context gives tools access to:
 
 See [Context](context.md) for the full runtime model.
 
+## Bounded Tool Search
+
+For servers with large or provider-backed catalogs, tool search can keep the
+model-facing `tools/list` response small without introducing an index or a
+second catalog cache:
+
+```elixir
+server =
+  FastestMCP.server("large-catalog")
+  |> FastestMCP.add_tool("health", fn _arguments, _ctx -> %{ok: true} end)
+  |> FastestMCP.add_provider(catalog_provider)
+  |> FastestMCP.enable_tool_search(
+    pinned: ["health"],
+    max_results: 20,
+    max_scan: 10_000
+  )
+```
+
+Once enabled, `tools/list` exposes only the visible pinned tools plus
+`search_tools` and `call_tool`. A model can search its current visible catalog
+and then delegate a call by exact name:
+
+```elixir
+FastestMCP.call_tool("large-catalog", "search_tools", %{"query" => "deploy"})
+# => %{"tools" => [...], "truncated" => false}
+
+FastestMCP.call_tool("large-catalog", "call_tool", %{
+  "name" => "deploy_release",
+  "arguments" => %{"environment" => "production"}
+})
+```
+
+Search is request-scoped and always evaluates the model-visible catalog. It
+reuses provider transforms, component visibility, authorization, protocol
+version selection, and Apps metadata negotiation. Delegated calls resolve the
+tool again, so visibility, authorization, input schemas, timeouts, telemetry,
+and execution policy are checked at call time. Ordinary tools remain directly
+callable when their names are already known.
+
+Matching is deterministic and case-insensitive. Exact names rank first,
+followed by name prefixes, name tokens, and then title or description tokens;
+name and version provide stable tie-breaks. `max_scan` bounds raw candidates
+and the returned `truncated` flag reports when that bound was reached.
+Providers with `list_component_page/5` are read in bounded pages. A legacy
+provider that implements only `list_components/3` must materialize its own
+catalog because that older callback cannot expose a page boundary. ToolSearch
+then consumes that returned order directly only up to `max_scan`; it does not
+sort or retain another full-catalog copy.
+
+Request-scoped `FastestMCP.Providers.Proxy` providers cannot be combined with
+ToolSearch. An upstream MCP cursor has opaque ordering, so it cannot support
+both the bounded scan and the global synthetic-name collision guarantee. The
+server builder rejects this composition before connecting upstream.
+
+The two synthetic names are configurable with `search_tool_name:` and
+`call_tool_name:`. They must be distinct and cannot collide with registered or
+provider-backed tools. Recursive synthetic delegation is rejected.
+
 ## Dynamic Tool Changes
 
 If you need to add, disable, enable, or remove tools after startup, use the

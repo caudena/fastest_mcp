@@ -12,9 +12,12 @@ defmodule FastestMCP.Middleware.ResponseCaching do
 
   require Logger
 
+  alias FastestMCP.Auth
   alias FastestMCP.Middleware
   alias FastestMCP.Operation
   alias FastestMCP.Registry
+  alias FastestMCP.BackgroundTask
+  alias FastestMCP.InputRequiredResult
 
   @default_list_ttl_ms 5 * 60_000
   @default_read_ttl_ms 60 * 60_000
@@ -155,7 +158,7 @@ defmodule FastestMCP.Middleware.ResponseCaching do
       when is_function(next, 1) do
     middleware = ensure_runtime(middleware)
 
-    if operation.task_request do
+    if not cacheable_operation?(operation) or auth_scope(operation.context) == :unpartitionable do
       next.(operation)
     else
       case collection_settings(middleware, operation) do
@@ -293,6 +296,14 @@ defmodule FastestMCP.Middleware.ResponseCaching do
          ttl_ms,
          %Operation{} = operation
        ) do
+    if cacheable_result?(result) do
+      store_result(middleware, collection, key, result, ttl_ms, operation)
+    else
+      :ok
+    end
+  end
+
+  defp store_result(middleware, collection, key, result, ttl_ms, operation) do
     size = :erlang.external_size(result)
 
     if size > middleware.max_item_size do
@@ -306,6 +317,53 @@ defmodule FastestMCP.Middleware.ResponseCaching do
       bump_stat(middleware.stats_table, collection, @puts_pos)
     end
   end
+
+  defp cacheable_operation?(%Operation{task_request: true}), do: false
+
+  defp cacheable_operation?(%Operation{context: context}) do
+    not continuation?(context)
+  end
+
+  defp continuation?(nil), do: false
+
+  defp continuation?(context) do
+    metadata = context_value(context, :request_metadata, %{})
+    input_responses = context_value(context, :input_responses, %{})
+    request_state = context_value(context, :request_state)
+
+    metadata_flag?(metadata, :input_responses_provided) or
+      metadata_flag?(metadata, :request_state_provided) or
+      (is_map(input_responses) and map_size(input_responses) > 0) or
+      not is_nil(request_state)
+  end
+
+  defp metadata_flag?(metadata, key) when is_map(metadata) do
+    Map.get(metadata, key, Map.get(metadata, Atom.to_string(key), false)) == true
+  end
+
+  defp metadata_flag?(_metadata, _key), do: false
+
+  defp cacheable_result?(%InputRequiredResult{}), do: false
+  defp cacheable_result?(%BackgroundTask{}), do: false
+
+  defp cacheable_result?(%{} = result) do
+    result_type =
+      Map.get(result, "resultType", Map.get(result, :resultType, Map.get(result, :result_type)))
+
+    is_error =
+      Map.get(
+        result,
+        "isError",
+        Map.get(result, :isError, Map.get(result, "is_error", Map.get(result, :is_error)))
+      )
+
+    result_type not in ["input_required", :input_required, "task", :task] and
+      is_error != true and
+      not Map.has_key?(result, "task") and
+      not Map.has_key?(result, :task)
+  end
+
+  defp cacheable_result?(_result), do: true
 
   defp collection_settings(%__MODULE__{} = middleware, %Operation{method: "tools/list"}) do
     if middleware.list_tools.enabled, do: {"tools/list", middleware.list_tools}, else: nil
@@ -457,17 +515,22 @@ defmodule FastestMCP.Middleware.ResponseCaching do
 
   defp auth_scope(context) do
     principal = context_value(context, :principal)
+    authenticated = context_value(context, :authenticated, false)
     auth = context_value(context, :auth, %{})
     capabilities = context_value(context, :capabilities, [])
+    audiences = context_value(context, :verified_audiences, [])
+    scopes = context_value(context, :verified_scopes, [])
 
-    if is_nil(principal) and auth in [%{}, nil] and capabilities in [[], nil] do
-      :anonymous
-    else
-      %{
-        principal: normalize_term(principal),
-        auth: normalize_term(auth || %{}),
-        capabilities: normalize_term(capabilities || [])
-      }
+    cond do
+      authenticated and is_nil(principal) ->
+        :unpartitionable
+
+      is_nil(principal) and not authenticated and auth in [%{}, nil] and capabilities in [[], nil] and
+        audiences in [[], nil] and scopes in [[], nil] ->
+        :anonymous
+
+      true ->
+        Auth.authorization_partition(context)
     end
   end
 

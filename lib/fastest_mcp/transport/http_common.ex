@@ -226,7 +226,9 @@ defmodule FastestMCP.Transport.HTTPCommon do
 
   defp error_status_and_headers(%Error{code: :forbidden} = error, auth, http_context) do
     headers =
-      if protected_resource(http_context) do
+      if not opaque_authorization_denial?(error) and
+           (not is_nil(protected_resource(http_context)) or
+              Auth.validated_missing_scopes(error) != []) do
         [{"www-authenticate", Auth.www_authenticate(auth, error, http_context)}]
       else
         []
@@ -275,6 +277,15 @@ defmodule FastestMCP.Transport.HTTPCommon do
   end
 
   defp retry_after_header(_details), do: nil
+
+  defp opaque_authorization_denial?(%Error{details: details}) when is_map(details) do
+    Map.get(details, :authorization_denial, Map.get(details, "authorization_denial")) in [
+      :opaque,
+      "opaque"
+    ]
+  end
+
+  defp opaque_authorization_denial?(_error), do: false
 
   defp base_url(conn, opts) do
     case Keyword.get(opts, :base_url) do
@@ -359,7 +370,7 @@ defmodule FastestMCP.Transport.HTTPCommon do
     protected_resource = protected_resource(runtime)
 
     %{
-      headers: Map.new(conn.req_headers),
+      headers: conn.req_headers |> Map.new() |> Map.delete("authorization"),
       method: conn.method,
       path: conn.request_path,
       query_params: conn.query_params,

@@ -36,6 +36,74 @@ Experimental and draft extensions may change independently of the core
 protocol. Configure their identifiers deliberately and review their versioned
 extension contracts when upgrading.
 
+## Active Server Extensions
+
+`extensions:` is an open capability map: FastestMCP preserves and advertises
+its settings but does not execute arbitrary behavior from it. Use the ordered
+`active_extensions:` list when an extension owns server methods or intercepts
+negotiated tool calls:
+
+```elixir
+extension =
+  FastestMCP.ServerExtension.new("com.example/reports",
+    settings: %{"revision" => 1},
+    methods: [
+      FastestMCP.ServerExtension.method(
+        "reports/run",
+        fn params, context ->
+          %{"report" => MyApp.Reports.run(params, context.principal)}
+        end,
+        params_schema: %{
+          "type" => "object",
+          "properties" => %{"name" => %{"type" => "string"}},
+          "required" => ["name"]
+        }
+      )
+    ]
+  )
+
+server =
+  FastestMCP.server("reports",
+    active_extensions: [extension]
+  )
+```
+
+Active methods are available only on `2026-07-28` requests whose current
+client-capability metadata advertises the same extension identifier. They run
+through the ordinary authentication, middleware, telemetry, supervised-call,
+and request-cleanup boundaries. The optional parameter schema is applied after
+the generic JSON-RPC and MCP metadata checks. A handler receives `(params,
+context)` and must return a JSON object.
+
+An extension can also declare one `lifespan:` and one `tool_interceptor:`. Its
+lifespan state is available at `context.lifespan_context[extension_id]`. The
+interceptor has the same two-arity contract as middleware and runs only for a
+modern `tools/call` request that advertises that extension. Because it is
+installed on the root server, it also wraps mounted tools.
+
+FastestMCP rejects duplicate extension identifiers, passive/active identifier
+collisions, duplicate method ownership, and attempts to shadow core, Tasks, or
+other built-in methods. Mounted child servers cannot own active extensions;
+configure them on the consuming root server so negotiation has one boundary.
+Apps and Tasks remain specialized implementations rather than generic active
+extensions.
+
+Clients advertise configured extension settings on every modern request. Use
+the low-level request API for an extension method whose result has no dedicated
+FastestMCP normalizer:
+
+```elixir
+client =
+  FastestMCP.Client.connect!(endpoint,
+    extensions: %{"com.example/reports" => %{"revision" => 1}}
+  )
+
+result = FastestMCP.Client.request(client, "reports/run", %{"name" => "daily"})
+```
+
+Active extension notifications, subscription types, generic output schemas,
+macros, and dynamic plugin loading are outside this API.
+
 ## MCP Apps
 
 `FastestMCP.Apps` builds canonical `ui://` resource content, CSP/permission

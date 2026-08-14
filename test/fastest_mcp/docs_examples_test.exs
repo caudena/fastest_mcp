@@ -4,9 +4,14 @@ defmodule FastestMCP.DocsExamplesTest do
   @moduletag :docs_examples
 
   alias FastestMCP.Client
+  alias FastestMCP.Client.Task, as: RemoteTask
   alias FastestMCP.ComponentManager
   alias FastestMCP.Context
   alias FastestMCP.Error
+  alias FastestMCP.Protocol.Extensions
+  alias FastestMCP.Providers.Proxy
+  alias FastestMCP.ResourceSecurity
+  alias FastestMCP.ServerExtension
   alias FastestMCP.Resources.Result, as: ResourceResult
   alias FastestMCP.Resources.Text, as: ResourceText
   alias FastestMCP.TestSupport.DocsFixture
@@ -426,6 +431,192 @@ defmodule FastestMCP.DocsExamplesTest do
            } = Client.read_resource(client, "config://release")
 
     assert %{"name" => "fastest_mcp", "version" => "0.1.0"} = JSON.decode!(encoded_release)
+  end
+
+  test "application sessions, authorization, extensions, and modern client examples work" do
+    extension_id = "com.example/docs"
+
+    authorization_context = %FastestMCP.Authorization.Context{
+      authenticated: true,
+      verified_scopes: ["reports:read"],
+      capabilities: ["batch"]
+    }
+
+    assert FastestMCP.Authorization.run_checks(
+             [
+               FastestMCP.Authorization.require_scopes("reports:read"),
+               FastestMCP.Authorization.require_capabilities("batch")
+             ],
+             authorization_context
+           )
+
+    assert %ResourceSecurity{} = ResourceSecurity.new()
+
+    extension =
+      ServerExtension.new(extension_id,
+        methods: [
+          ServerExtension.method(
+            "docs/echo",
+            fn params, _context -> %{"echo" => params["value"]} end,
+            params_schema: %{
+              "type" => "object",
+              "properties" => %{"value" => %{"type" => "string"}},
+              "required" => ["value"]
+            }
+          )
+        ]
+      )
+
+    test_pid = self()
+    server_name = "docs-modern-apis-" <> Integer.to_string(System.unique_integer([:positive]))
+
+    server =
+      FastestMCP.server(server_name,
+        application_sessions: [allow_anonymous: true],
+        extensions: %{Extensions.tasks() => %{}},
+        active_extensions: [extension]
+      )
+      |> FastestMCP.add_tool("application_session_round_trip", fn _arguments, context ->
+        session = FastestMCP.ApplicationSession.create!(context)
+        session_id = FastestMCP.ApplicationSession.id(session)
+        session = FastestMCP.ApplicationSession.fetch!(context, session_id)
+        :ok = FastestMCP.ApplicationSession.put(session, :value, "stored")
+        {:ok, stored} = FastestMCP.ApplicationSession.get(session, :value)
+        :ok = FastestMCP.ApplicationSession.delete(session, :value)
+        {:ok, missing} = FastestMCP.ApplicationSession.get(session, :value, "missing")
+        :ok = FastestMCP.ApplicationSession.terminate(session)
+        %{"stored" => stored, "missing" => missing}
+      end)
+      |> FastestMCP.add_tool("report_progress", fn _arguments, context ->
+        :ok = Context.report_progress(context, 1, 1, "done")
+        %{"ok" => true}
+      end)
+      |> FastestMCP.add_tool(
+        "task_echo",
+        fn arguments, _context -> arguments end,
+        task: [mode: :optional, poll_interval_ms: 20]
+      )
+      |> FastestMCP.add_resource("docs://status", fn _arguments, _context -> "ready" end)
+      |> FastestMCP.add_resource_template(
+        "safe://{+path}",
+        fn %{"path" => path}, _context -> %{"path" => path} end
+      )
+      |> FastestMCP.add_prompt("docs_prompt", fn _arguments, _context ->
+        %{
+          messages: [
+            %{role: "user", content: %{type: "text", text: "docs example"}}
+          ]
+        }
+      end)
+      |> FastestMCP.add_provider(FastestMCP.Providers.ApplicationSessions.new())
+
+    assert {:ok, _pid} = FastestMCP.start_server(server)
+    bandit = start_supervised!(DocsFixture.bandit_child_spec(server_name))
+    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+    endpoint = "http://127.0.0.1:#{port}/mcp"
+
+    client =
+      Client.connect!(endpoint,
+        protocol_version: "2026-07-28",
+        response_cache: [max_entries: 32, max_item_size: 100_000],
+        extensions: %{
+          Extensions.tasks() => %{},
+          extension_id => %{}
+        }
+      )
+
+    on_exit(fn ->
+      if Client.connected?(client), do: Client.disconnect(client)
+      if Process.alive?(bandit), do: Supervisor.stop(bandit)
+      FastestMCP.stop_server(server_name)
+    end)
+
+    assert %{"path" => "folder/file.txt"} =
+             FastestMCP.read_resource(server_name, "safe://folder/file.txt")
+
+    error =
+      assert_raise Error, fn ->
+        FastestMCP.read_resource(server_name, "safe://../secret")
+      end
+
+    assert error.code == :not_found
+
+    assert Enum.any?(Client.list_all_tools(client), &(&1["name"] == "task_echo"))
+    assert [%{"name" => "docs_prompt"}] = Client.list_all_prompts(client)
+    assert [%{"uri" => "docs://status"}] = Client.list_all_resources(client)
+    assert [%{"uriTemplate" => "safe://{+path}"}] = Client.list_all_resource_templates(client)
+    assert %{items: _tools} = Client.list_tools(client, cache: :bypass)
+
+    assert %{"echo" => "active", "resultType" => "complete"} =
+             Client.request(client, "docs/echo", %{"value" => "active"})
+
+    assert %{
+             "structuredContent" => %{"stored" => "stored", "missing" => "missing"}
+           } = Client.call_tool(client, "application_session_round_trip", %{})
+
+    assert %{"structuredContent" => %{"ok" => true}} =
+             Client.call_tool(client, "report_progress", %{},
+               progress_handler: fn params -> send(test_pid, {:docs_progress, params}) end
+             )
+
+    assert_receive {:docs_progress, %{"progress" => 1, "total" => 1, "message" => "done"}},
+                   1_000
+
+    task = Client.call_tool_task(client, "task_echo", %{"value" => "task"})
+    assert %RemoteTask{} = task
+
+    assert %{"value" => "task"} = RemoteTask.result(task, timeout_ms: 2_000)
+
+    assert %Proxy{protocol_version: :mirror, target_type: :http} = Proxy.new(endpoint)
+
+    search_server_name =
+      "docs-tool-search-" <> Integer.to_string(System.unique_integer([:positive]))
+
+    search_server =
+      FastestMCP.server(search_server_name)
+      |> FastestMCP.add_tool(
+        "deploy_status",
+        fn arguments, _context -> %{"target" => arguments["target"]} end,
+        description: "Deploy status for an environment"
+      )
+      |> FastestMCP.add_tool(
+        "release_report",
+        fn _arguments, _context -> %{"report" => true} end,
+        title: "Deploy release report"
+      )
+      |> FastestMCP.enable_tool_search(
+        pinned: ["deploy_status"],
+        max_results: 2,
+        max_scan: 8
+      )
+
+    assert {:ok, _pid} = FastestMCP.start_server(search_server)
+
+    assert {:ok, in_process_client} =
+             Client.connect({:in_process, search_server_name},
+               protocol_version: "2026-07-28"
+             )
+
+    on_exit(fn ->
+      if Client.connected?(in_process_client), do: Client.disconnect(in_process_client)
+      FastestMCP.stop_server(search_server_name)
+    end)
+
+    assert %{
+             "structuredContent" => %{
+               "tools" => [
+                 %{"name" => "deploy_status"},
+                 %{"name" => "release_report"}
+               ],
+               "truncated" => false
+             }
+           } = Client.call_tool(in_process_client, "search_tools", %{"query" => "deploy"})
+
+    assert %{"structuredContent" => %{"target" => "production"}} =
+             Client.call_tool(in_process_client, "call_tool", %{
+               "name" => "deploy_status",
+               "arguments" => %{"target" => "production"}
+             })
   end
 
   test "readme and guide links resolve and no compatibility sidecar references remain" do

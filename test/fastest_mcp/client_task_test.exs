@@ -26,7 +26,7 @@ defmodule FastestMCP.ClientTaskTest do
     end)
 
     assert %RemoteTask{task_id: task_id, kind: :tool, target: "echo"} =
-             task = Client.call_tool(client, "echo", %{"value" => "cached"}, task: true)
+             task = Client.call_tool_task(client, "echo", %{"value" => "cached"})
 
     assert %{"taskId" => ^task_id, "status" => "completed"} = RemoteTask.wait(task)
     assert %{"taskId" => ^task_id, "status" => "completed"} = RemoteTask.status(task)

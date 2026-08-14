@@ -17,6 +17,7 @@ defmodule FastestMCP.ComponentCompiler do
   alias FastestMCP.Components.ResourceTemplate
   alias FastestMCP.Components.Tool
   alias FastestMCP.Protocol.URI, as: ProtocolURI
+  alias FastestMCP.ResourceSecurity
   alias FastestMCP.Schema
   alias FastestMCP.TaskConfig
   alias FastestMCP.Authorization
@@ -66,6 +67,7 @@ defmodule FastestMCP.ComponentCompiler do
     %Resource{
       server_name: server_name,
       uri: uri,
+      name: normalize_optional_string(opts[:name]),
       version: normalize_version(opts[:version]),
       title: opts[:title],
       description: opts[:description],
@@ -102,6 +104,7 @@ defmodule FastestMCP.ComponentCompiler do
     %ResourceTemplate{
       server_name: server_name,
       uri_template: to_string(uri_template),
+      name: normalize_optional_string(opts[:name]),
       version: normalize_version(opts[:version]),
       title: opts[:title],
       description: opts[:description],
@@ -112,6 +115,8 @@ defmodule FastestMCP.ComponentCompiler do
       parameters: parameters,
       compiled_parameters: compiled_parameters,
       task: normalize_task(opts[:task]),
+      resource_security:
+        normalize_resource_security(Keyword.get(opts, :resource_security, :inherit)),
       authorization: normalize_authorization(opts),
       tags: normalize_tags(opts[:tags]),
       enabled: Keyword.get(opts, :enabled, true),
@@ -194,6 +199,10 @@ defmodule FastestMCP.ComponentCompiler do
     end
   end
 
+  defp normalize_resource_security(nil), do: nil
+  defp normalize_resource_security(:inherit), do: :inherit
+  defp normalize_resource_security(policy), do: ResourceSecurity.new(policy)
+
   defp normalize_callable!(_type, handler) when is_function(handler) do
     case :erlang.fun_info(handler, :arity) do
       {:arity, 0} ->
@@ -262,6 +271,9 @@ defmodule FastestMCP.ComponentCompiler do
     version
   end
 
+  defp normalize_optional_string(nil), do: nil
+  defp normalize_optional_string(value), do: to_string(value)
+
   defp normalize_authorization(opts) do
     opts
     |> Keyword.get(:authorization, Keyword.get(opts, :auth))
@@ -309,7 +321,7 @@ defmodule FastestMCP.ComponentCompiler do
   end
 
   defp normalize_prompt_argument(%{} = argument) do
-    %{
+    normalized = %{
       name: required_prompt_arg(argument, :name),
       description: Map.get(argument, :description, Map.get(argument, "description")),
       required: Map.get(argument, :required, Map.get(argument, "required", false)),
@@ -318,6 +330,11 @@ defmodule FastestMCP.ComponentCompiler do
           Map.get(argument, :completion, Map.get(argument, "completion"))
         )
     }
+
+    case Map.get(argument, :title, Map.get(argument, "title")) do
+      nil -> normalized
+      title -> Map.put(normalized, :title, title)
+    end
   end
 
   defp normalize_prompt_argument({name, description}) do

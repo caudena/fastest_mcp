@@ -26,6 +26,7 @@ defmodule FastestMCP.OperationPipeline do
   """
 
   alias FastestMCP.Auth
+  alias FastestMCP.CallSupervisor
   alias FastestMCP.Component
   alias FastestMCP.ComponentPolicy
   alias FastestMCP.Context
@@ -38,11 +39,16 @@ defmodule FastestMCP.OperationPipeline do
   alias FastestMCP.Provider
   alias FastestMCP.Protocol
   alias FastestMCP.Registry
+  alias FastestMCP.ResourceSecurity
+  alias FastestMCP.Schema
+  alias FastestMCP.Server
   alias FastestMCP.ServerRuntime
   alias FastestMCP.TaskConfig
   alias FastestMCP.TaskMeta
   alias FastestMCP.TaskOwner
   alias FastestMCP.Telemetry
+
+  require Logger
 
   @resolved_component_key {__MODULE__, :resolved_component}
 
@@ -76,6 +82,25 @@ defmodule FastestMCP.OperationPipeline do
         |> Map.put("supportedVersions", Protocol.supported_versions())
         |> Map.put("capabilities", server_capabilities(server, operation, :modern))
         |> maybe_put("instructions", metadata_value(server.metadata, :instructions))
+      end
+    )
+  end
+
+  @doc false
+  def extension_request(server_name, method, params \\ %{}, opts \\ [])
+      when is_binary(method) and is_map(params) and is_list(opts) do
+    run(
+      server_name,
+      :extension,
+      method,
+      method,
+      extension_arguments(params),
+      opts,
+      fn server, operation ->
+        case Server.active_extension_method(server, method) do
+          {extension, binding} -> execute_extension_method(extension, binding, operation)
+          nil -> extension_method_not_found!(operation)
+        end
       end
     )
   end
@@ -299,6 +324,67 @@ defmodule FastestMCP.OperationPipeline do
     Context.get_request_state(context, @resolved_component_key)
   end
 
+  @doc false
+  def tool_catalog_operation(%Operation{} = operation) do
+    %{
+      operation
+      | method: "tools/list",
+        component_type: :tool,
+        target: nil,
+        audience: :model,
+        component: nil,
+        arguments: %{}
+    }
+  end
+
+  @doc false
+  def visible_tools_named(%Operation{} = operation, names) when is_list(names) do
+    server = operation.context.server
+    operation = tool_catalog_operation(operation)
+
+    names
+    |> Enum.reduce([], fn name, visible ->
+      candidates = exact_component_candidates(server, :tool, to_string(name), operation)
+
+      case select_component_candidate_result(server, candidates, operation) do
+        {:ok, component} -> [component | visible]
+        _hidden_or_missing -> visible
+      end
+    end)
+    |> Enum.reverse()
+  end
+
+  @doc false
+  def tool_name_collisions(%Operation{} = operation, names) when is_list(names) do
+    server = operation.context.server
+    unversioned = %{operation | version: nil}
+
+    Enum.filter(names, fn name ->
+      exact_component_candidates(server, :tool, to_string(name), unversioned) != []
+    end)
+  end
+
+  @doc false
+  def fold_visible_tools(%Operation{} = operation, max_scan, acc, fun)
+      when is_integer(max_scan) and max_scan > 0 and is_function(fun, 2) do
+    server = operation.context.server
+    operation = tool_catalog_operation(operation)
+    state = %{acc: acc, scanned: 0, truncated: false}
+
+    state = fold_tool_candidates(server.tools, server, operation, max_scan, state, fun)
+
+    state =
+      Enum.reduce_while(server.providers, state, fn provider, current ->
+        if current.truncated do
+          {:halt, current}
+        else
+          {:cont, fold_provider_tools(provider, server, operation, max_scan, current, fun)}
+        end
+      end)
+
+    {state.acc, Map.take(state, [:scanned, :truncated])}
+  end
+
   defp list(server_name, component_type, method, opts) do
     server_name
     |> run(component_type, method, nil, %{}, opts, fn server, operation ->
@@ -313,12 +399,12 @@ defmodule FastestMCP.OperationPipeline do
       server, operation ->
         case resolve_resource_target(server, target, operation) do
           {:exact, component, _captures} ->
-            operation = %{operation | component: component}
+            operation = %{operation | component: component, captures: %{}}
             Telemetry.annotate_span(operation)
             execute_component(component, operation)
 
           {:template, component, captures} ->
-            operation = %{operation | component: component}
+            operation = %{operation | component: component, captures: captures}
             Telemetry.annotate_span(operation)
 
             execute_component(component, %{
@@ -350,7 +436,13 @@ defmodule FastestMCP.OperationPipeline do
       arguments,
       opts,
       fn server, operation ->
-        component = resolve_component(server, component_type, target, operation)
+        component =
+          resolve_component(
+            server,
+            operation.component_type,
+            operation.target,
+            operation
+          )
 
         if component do
           operation = %{operation | component: component}
@@ -360,7 +452,7 @@ defmodule FastestMCP.OperationPipeline do
         else
           raise Error,
             code: :not_found,
-            message: "unknown #{component_type} #{inspect(target)}"
+            message: "unknown #{operation.component_type} #{inspect(operation.target)}"
         end
       end
     )
@@ -412,6 +504,8 @@ defmodule FastestMCP.OperationPipeline do
           try do
             operation =
               maybe_authenticate_operation(runtime.server, operation, opts, run_opts)
+
+            operation = validate_operation_before_middleware!(runtime.server, operation)
 
             Telemetry.annotate_span(operation)
 
@@ -533,7 +627,8 @@ defmodule FastestMCP.OperationPipeline do
 
   defp maybe_authenticate_operation(server, operation, opts, run_opts) do
     if Keyword.get(run_opts, :authenticate?, true) and
-         not Keyword.get(opts, :transport_authenticated, false) do
+         not Keyword.get(opts, :transport_authenticated, false) and
+         not operation.context.authenticated do
       authenticate_operation(server, operation, opts)
     else
       operation
@@ -652,7 +747,124 @@ defmodule FastestMCP.OperationPipeline do
     Component.validate_normalized_output(component, result)
   end
 
+  defp validate_post_middleware_result(%{component_type: :extension}, _component, %{} = result),
+    do: result
+
+  defp validate_post_middleware_result(%{component_type: :extension, method: method}, _, result) do
+    raise Error,
+      code: :internal_error,
+      message: "extension method #{inspect(method)} must return a JSON object",
+      details: %{returned: inspect(result)}
+  end
+
   defp validate_post_middleware_result(_operation, _component, result), do: result
+
+  defp validate_operation_before_middleware!(server, %{component_type: :extension} = operation) do
+    case Server.active_extension_method(server, operation.method) do
+      {extension, _binding} ->
+        cond do
+          operation.context.negotiated_protocol_version != "2026-07-28" ->
+            extension_method_not_found!(operation)
+
+          not Extensions.enabled?(
+            operation.context.client_capabilities,
+            extension.identifier
+          ) ->
+            raise Error,
+              code: :missing_required_client_capability,
+              message: "#{operation.method} requires extension #{inspect(extension.identifier)}",
+              details: %{
+                jsonrpc_code: -32_021,
+                requiredCapabilities: %{extensions: %{extension.identifier => %{}}}
+              }
+
+          true ->
+            operation
+        end
+
+      nil ->
+        extension_method_not_found!(operation)
+    end
+  end
+
+  defp validate_operation_before_middleware!(_server, operation), do: operation
+
+  defp execute_extension_method(extension, binding, operation) do
+    params = validate_extension_params!(extension, binding, operation.arguments)
+    trace_context = Telemetry.current_context()
+
+    result =
+      CallSupervisor.invoke(
+        operation.call_supervisor,
+        fn ->
+          Context.with_request(operation.context, fn ->
+            Telemetry.with_context(trace_context, fn ->
+              binding.handler.(params, operation.context)
+            end)
+          end)
+        end,
+        nil
+      )
+
+    case result do
+      {:ok, %{} = value} ->
+        value
+
+      {:ok, other} ->
+        raise Error,
+          code: :internal_error,
+          message: "extension method #{inspect(binding.name)} must return a JSON object",
+          details: %{extension: extension.identifier, returned: inspect(other)}
+
+      {:error, :overloaded} ->
+        raise Error,
+          code: :overloaded,
+          message:
+            "extension method #{inspect(binding.name)} was rejected because the server is overloaded",
+          details: %{resource: :calls, retry_after_seconds: 1}
+
+      {:error, {:exception, %Error{} = error, _stacktrace}} ->
+        raise error
+
+      {:error, {:exception, error, _stacktrace}} ->
+        raise Error,
+          code: :internal_error,
+          message:
+            "extension method #{inspect(binding.name)} crashed: #{Exception.message(error)}",
+          details: %{extension: extension.identifier, kind: inspect(error.__struct__)}
+
+      {:error, {kind, reason}} ->
+        raise Error,
+          code: :internal_error,
+          message: "extension method #{inspect(binding.name)} failed",
+          details: %{extension: extension.identifier, kind: kind, reason: inspect(reason)}
+    end
+  end
+
+  defp validate_extension_params!(_extension, %{compiled_params_schema: nil}, params), do: params
+
+  defp validate_extension_params!(extension, binding, params) do
+    case Schema.validate(binding.compiled_params_schema, params) do
+      {:ok, ^params} ->
+        params
+
+      {:error, schema_error} ->
+        raise Error,
+          code: :invalid_params,
+          message: "invalid parameters for extension method #{inspect(binding.name)}",
+          details: %{
+            jsonrpc_code: -32_602,
+            extension: extension.identifier,
+            violations: schema_error.violations
+          }
+    end
+  end
+
+  defp extension_method_not_found!(operation) do
+    raise Error,
+      code: :method_not_found,
+      message: "unknown #{operation.transport} method #{inspect(operation.method)}"
+  end
 
   defp apply_component_policy(components, server, operation) do
     components
@@ -698,6 +910,13 @@ defmodule FastestMCP.OperationPipeline do
   defp normalize_arguments(arguments) when is_map(arguments), do: arguments
   defp normalize_arguments(arguments) when is_list(arguments), do: Enum.into(arguments, %{})
   defp normalize_arguments(nil), do: %{}
+
+  defp extension_arguments(params) do
+    params
+    |> normalize_arguments()
+    |> Map.delete("_meta")
+    |> Map.delete(:_meta)
+  end
 
   defp completion_capability(visible_prompts, visible_templates) do
     if Enum.any?(visible_prompts, &prompt_has_completion?/1) or
@@ -1087,8 +1306,8 @@ defmodule FastestMCP.OperationPipeline do
     end
   end
 
-  defp configured_extensions(%{extensions: extensions}, profile) do
-    extensions = Extensions.for_profile(extensions, profile)
+  defp configured_extensions(server, profile) do
+    extensions = Server.effective_extensions(server, profile)
     if map_size(extensions) > 0, do: extensions
   end
 
@@ -1140,6 +1359,120 @@ defmodule FastestMCP.OperationPipeline do
 
   defp list_provider_components(providers, component_type, operation) do
     Enum.flat_map(providers, &Provider.list_components(&1, component_type, operation))
+  end
+
+  @tool_fold_page_size 128
+
+  defp fold_provider_tools(provider, server, operation, max_scan, state, fun) do
+    if Provider.component_page_callback?(provider) do
+      fold_paged_provider_tools(
+        provider,
+        server,
+        operation,
+        max_scan,
+        state,
+        fun,
+        nil,
+        max_scan + 1
+      )
+    else
+      candidates = Provider.list_components(provider, :tool, operation)
+      fold_tool_candidates(candidates, server, operation, max_scan, state, fun)
+    end
+  end
+
+  defp fold_paged_provider_tools(
+         _provider,
+         _server,
+         _operation,
+         _max_scan,
+         %{truncated: true} = state,
+         _fun,
+         _after_key,
+         _pages_left
+       ),
+       do: state
+
+  defp fold_paged_provider_tools(
+         _provider,
+         _server,
+         _operation,
+         _max_scan,
+         state,
+         _fun,
+         _after_key,
+         0
+       ),
+       do: %{state | truncated: true}
+
+  defp fold_paged_provider_tools(
+         provider,
+         server,
+         operation,
+         max_scan,
+         state,
+         fun,
+         after_key,
+         pages_left
+       ) do
+    remaining = max_scan - state.scanned
+    limit = min(@tool_fold_page_size, remaining)
+
+    page = Provider.list_component_page(provider, :tool, after_key, limit, operation)
+    state = fold_tool_candidates(page.items, server, operation, max_scan, state, fun)
+
+    cond do
+      state.truncated ->
+        state
+
+      is_nil(page.next_after) ->
+        state
+
+      true ->
+        fold_paged_provider_tools(
+          provider,
+          server,
+          operation,
+          max_scan,
+          state,
+          fun,
+          page.next_after,
+          pages_left - 1
+        )
+    end
+  end
+
+  defp fold_tool_candidates(candidates, server, operation, max_scan, state, fun) do
+    Enum.reduce_while(candidates, state, fn component, current ->
+      if current.scanned >= max_scan do
+        {:halt, %{current | truncated: true}}
+      else
+        current = %{current | scanned: current.scanned + 1}
+
+        current =
+          if version_matches?(component, operation.version) do
+            case ComponentPolicy.apply_result(server, component, operation) do
+              {:ok, visible} ->
+                if negotiated_component_visible?(visible, operation) do
+                  %{current | acc: fun.(visible, current.acc)}
+                else
+                  current
+                end
+
+              {:error, %Error{}} ->
+                current
+            end
+          else
+            current
+          end
+
+        if current.scanned >= max_scan do
+          {:halt, %{current | truncated: true}}
+        else
+          {:cont, current}
+        end
+      end
+    end)
   end
 
   defp visible_components(server, component_type, operation) do
@@ -1445,17 +1778,21 @@ defmodule FastestMCP.OperationPipeline do
     candidates
     |> sort_template_candidates()
     |> Enum.reduce_while(nil, fn {:template, template, captures}, first_error ->
-      case ComponentPolicy.apply_result(server, template, operation) do
-        {:ok, visible_template} ->
-          {:halt, {:template, visible_template, captures}}
+      case prepare_template_candidate(server, template, captures, operation) do
+        {:ok, visible_template, final_captures} ->
+          {:halt, {:template, visible_template, final_captures}}
+
+        {:skip, :security_rejected} ->
+          {:halt, :security_rejected}
+
+        {:skip, _reason} ->
+          {:cont, first_error}
 
         {:error, %Error{} = error} ->
-          case error.code do
-            code when code in [:disabled, :not_visible, :filtered, :forbidden] ->
-              {:cont, first_error || error}
-
-            _other ->
-              {:halt, {:error, error}}
+          if error.code in [:disabled, :not_visible, :filtered, :forbidden] do
+            {:cont, preserve_template_error(first_error, error)}
+          else
+            {:halt, {:error, error}}
           end
       end
     end)
@@ -1463,9 +1800,62 @@ defmodule FastestMCP.OperationPipeline do
       {:template, component, captures} -> {:template, component, captures}
       {:error, %Error{} = error} -> raise error
       %Error{} = error -> raise error
+      :security_rejected -> nil
       nil -> nil
     end
   end
+
+  defp prepare_template_candidate(server, template, _initial_captures, operation) do
+    with {:ok, visible_template} <- ComponentPolicy.prepare_result(server, template, operation),
+         final_captures when is_map(final_captures) <-
+           FastestMCP.Components.ResourceTemplate.match(visible_template, operation.target),
+         :ok <- screen_resource_captures(server, visible_template, final_captures, operation),
+         authorization_operation = %{
+           operation
+           | component: visible_template,
+             captures: final_captures
+         },
+         {:ok, authorized_template} <-
+           ComponentPolicy.authorize_result(visible_template, authorization_operation) do
+      {:ok, authorized_template, final_captures}
+    else
+      nil -> {:skip, :no_longer_matches}
+      {:error, :resource_security} -> {:skip, :security_rejected}
+      {:error, %Error{} = error} -> {:error, error}
+    end
+  end
+
+  defp screen_resource_captures(server, template, captures, operation) do
+    policy =
+      case Map.get(template, :resource_security, :inherit) do
+        :inherit -> Map.get(server, :resource_security, %ResourceSecurity{})
+        policy -> policy
+      end
+
+    case ResourceSecurity.screen(captures, policy) do
+      :ok ->
+        :ok
+
+      {:error, reason, parameter} ->
+        metadata = %{
+          reason: reason,
+          parameter: parameter,
+          template: Component.identifier(template)
+        }
+
+        Context.emit(operation.context, [:resource_security, :rejected], %{count: 1}, metadata)
+
+        Logger.debug(fn ->
+          "resource template parameter rejected by lexical security policy " <>
+            inspect(metadata)
+        end)
+
+        {:error, :resource_security}
+    end
+  end
+
+  defp preserve_template_error(nil, error), do: error
+  defp preserve_template_error(error, _next_error), do: error
 
   defp version_matches?(_component, nil), do: true
 

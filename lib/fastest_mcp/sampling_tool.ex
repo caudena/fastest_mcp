@@ -238,10 +238,15 @@ defmodule FastestMCP.SamplingTool do
             session_id: current.session_id,
             transport: current.transport,
             request_metadata: current.request_metadata,
-            auth_input: context_auth_input(current),
+            transport_authorization: current.transport_authorization,
+            auth_input: %{},
             principal: current.principal,
+            authenticated: current.authenticated,
             auth: current.auth,
-            capabilities: current.capabilities
+            capabilities: current.capabilities,
+            verified_audiences: current.verified_audiences,
+            verified_scopes: current.verified_scopes,
+            transport_authenticated: current.authenticated
           ]
 
         nil ->
@@ -251,31 +256,6 @@ defmodule FastestMCP.SamplingTool do
     context_opts
     |> Keyword.merge(Keyword.drop(opts, [:context, :server_name]))
     |> maybe_put_opt(:version, tool.version)
-  end
-
-  defp context_auth_input(%Context{} = context) do
-    request_metadata = Map.new(context.request_metadata)
-    access_token = Context.access_token(context)
-
-    headers =
-      request_metadata
-      |> Map.get(:headers, Map.get(request_metadata, "headers", %{}))
-      |> Map.new(fn {key, value} -> {to_string(key), value} end)
-
-    has_authorization? =
-      Map.has_key?(headers, "authorization") or
-        Map.has_key?(request_metadata, "authorization") or
-        Map.has_key?(request_metadata, :authorization)
-
-    cond do
-      access_token && not has_authorization? ->
-        request_metadata
-        |> Map.put("headers", Map.put(headers, "authorization", "Bearer " <> access_token))
-        |> Map.put_new("authorization", "Bearer " <> access_token)
-
-      true ->
-        request_metadata
-    end
   end
 
   defp maybe_put_opt(opts, _key, nil), do: opts

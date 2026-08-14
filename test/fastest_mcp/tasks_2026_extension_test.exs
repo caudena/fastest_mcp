@@ -377,7 +377,7 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
     end
   end
 
-  test "a connected modern client follows a server-directed task to its result" do
+  test "a connected modern client transparently drives tasks and supports explicit handles" do
     parent = self()
     server_name = unique_name("tasks-client")
 
@@ -408,10 +408,23 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
 
     on_exit(fn -> if Client.connected?(client), do: Client.disconnect(client) end)
 
-    assert %RemoteTask{task_id: task_id} =
-             task = Client.call_tool(client, "echo", %{"value" => "modern"}, task: false)
+    call =
+      Task.async(fn ->
+        Client.call_tool(client, "echo", %{"value" => "modern"},
+          task: false,
+          task_timeout_ms: 2_000
+        )
+      end)
 
     assert_receive {:task_worker, worker}, 1_000
+    send(worker, :release)
+    assert %{"value" => "modern"} = Task.await(call, 3_000)
+    refute Client.session_stream_open?(client)
+
+    assert %RemoteTask{task_id: task_id} =
+             task = Client.call_tool_task(client, "echo", %{"value" => "handle"})
+
+    assert_receive {:task_worker, handle_worker}, 1_000
 
     listener =
       Client.listen(client, %{"taskIds" => [task_id]},
@@ -422,24 +435,131 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
                     %{"method" => "notifications/subscriptions/acknowledged"}},
                    1_000
 
-    send(worker, :release)
+    result_waiter = Task.async(fn -> RemoteTask.result(task, timeout_ms: 2_000) end)
+    send(handle_worker, :release)
 
     assert_receive {:task_notification,
                     %{
                       "method" => "notifications/tasks",
-                      "params" => %{
-                        "taskId" => ^task_id,
-                        "status" => "completed",
-                        "result" => %{"structuredContent" => %{"value" => "modern"}}
-                      }
+                      "params" => %{"taskId" => ^task_id, "status" => "completed"}
                     }},
                    1_000
 
-    assert %{"taskId" => ^task_id, "status" => "completed"} =
-             RemoteTask.wait(task, timeout_ms: 2_000)
-
-    assert %{"value" => "modern"} = RemoteTask.result(task, timeout_ms: 2_000)
+    assert %{"value" => "handle"} = Task.await(result_waiter, 3_000)
+    assert %{"taskId" => ^task_id, "status" => "completed"} = RemoteTask.status(task)
     assert :ok = Client.cancel(listener, "test complete")
+
+    assert %RemoteTask{} =
+             compatibility_task =
+             Client.call_tool(client, "echo", %{"value" => "compatibility"}, task: true)
+
+    assert_receive {:task_worker, compatibility_worker}, 1_000
+    send(compatibility_worker, :release)
+
+    assert %{"value" => "compatibility"} =
+             RemoteTask.result(compatibility_task, timeout_ms: 2_000)
+
+    refute Client.session_stream_open?(client)
+  end
+
+  test "transparent modern tasks fulfill input-required callbacks with task context" do
+    parent = self()
+    server_name = unique_name("tasks-client-input")
+
+    server =
+      FastestMCP.server(server_name, extensions: tasks_extensions())
+      |> FastestMCP.add_tool(
+        "ask",
+        fn _arguments, context ->
+          case Context.input_responses(context) do
+            responses when map_size(responses) == 0 ->
+              InputRequiredResult.new(%{
+                "answer" => %{
+                  "method" => "elicitation/create",
+                  "params" => %{
+                    "message" => "Answer",
+                    "requestedSchema" => %{"type" => "object", "properties" => %{}}
+                  }
+                }
+              })
+
+            %{"answer" => answer} ->
+              %{"answer" => answer}
+          end
+        end,
+        task: [mode: :optional, poll_interval_ms: 10]
+      )
+
+    start_server!(server_name, server)
+    bandit = start_http_transport!(server_name)
+    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+
+    client =
+      Client.connect!("http://127.0.0.1:#{port}/mcp",
+        protocol_version: @modern_version,
+        extensions: tasks_extensions(),
+        client_info: @client_info,
+        elicitation_handler: fn _message, _params, context ->
+          send(parent, {:task_callback_context, context.task_id})
+          {:accept, %{"answer" => "yes"}}
+        end
+      )
+
+    on_exit(fn -> if Client.connected?(client), do: Client.disconnect(client) end)
+
+    assert %{"answer" => %{"action" => "accept", "content" => %{"answer" => "yes"}}} =
+             Client.call_tool(client, "ask", %{}, task_timeout_ms: 2_000)
+
+    assert_receive {:task_callback_context, task_id}, 1_000
+    assert is_binary(task_id)
+    refute Client.session_stream_open?(client)
+  end
+
+  test "transparent task timeout leaves the remote task running" do
+    parent = self()
+    server_name = unique_name("tasks-client-timeout")
+
+    server =
+      FastestMCP.server(server_name, extensions: tasks_extensions())
+      |> FastestMCP.add_tool(
+        "block",
+        fn _arguments, _context ->
+          send(parent, {:blocking_task_worker, self()})
+
+          receive do
+            :release -> %{released: true}
+          end
+        end,
+        task: [mode: :optional, poll_interval_ms: 10]
+      )
+
+    start_server!(server_name, server)
+    bandit = start_http_transport!(server_name)
+    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+
+    client =
+      Client.connect!("http://127.0.0.1:#{port}/mcp",
+        protocol_version: @modern_version,
+        extensions: tasks_extensions(),
+        client_info: @client_info
+      )
+
+    on_exit(fn -> if Client.connected?(client), do: Client.disconnect(client) end)
+
+    call =
+      Task.async(fn ->
+        try do
+          Client.call_tool(client, "block", %{}, task_timeout_ms: 50)
+        rescue
+          error in Error -> {:error, error}
+        end
+      end)
+
+    assert_receive {:blocking_task_worker, worker}, 1_000
+    assert {:error, %Error{code: :timeout}} = Task.await(call, 2_000)
+    assert Process.alive?(worker)
+    refute Client.session_stream_open?(client)
+    send(worker, :release)
   end
 
   test "modern task response descriptors accept discriminators and result metadata" do

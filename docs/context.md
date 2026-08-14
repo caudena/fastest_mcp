@@ -123,7 +123,8 @@ The context carries several different lifetimes of data:
 
 - request state for one operation
 - session state shared across requests with the same session id
-- auth state such as principal and capabilities
+- auth state such as principal, authentication status, verified scopes and
+  audiences, and application capabilities
 - task state when the operation is running as a background task
 - lifespan context produced at server startup
 - dependency resolvers declared on the server
@@ -245,6 +246,51 @@ Context.set_state(ctx, :current_upload, socket, serializable: false)
 the session backend. Use that for values that should stay local to the current
 call and should not be serialized or shared across requests.
 
+## Application Sessions
+
+Application sessions hold application-owned state independently of the MCP
+transport session. They use the same configured `SessionStateStore`, but their
+keys live in a separate hashed namespace.
+
+Use the authenticated caller's private bucket when state should follow the same
+principal across modern HTTP, stdio, legacy sessions, and background work:
+
+```elixir
+alias FastestMCP.ApplicationSession
+
+FastestMCP.add_tool(server, "remember_preference", fn %{"theme" => theme}, ctx ->
+  session = ApplicationSession.current!(ctx)
+  :ok = ApplicationSession.put(session, :theme, theme)
+  %{"stored" => true}
+end)
+```
+
+Use an explicit session when the application needs an opaque handle:
+
+```elixir
+{:ok, session} = ApplicationSession.create(ctx)
+session_id = ApplicationSession.id(session)
+
+# In a later authenticated request:
+{:ok, session} = ApplicationSession.fetch(ctx, session_id)
+{:ok, theme} = ApplicationSession.get(session, :theme, "system")
+```
+
+Explicit sessions are scoped to the verified principal. Unknown, terminated,
+and foreign identifiers return the same invalid-parameter error. Termination
+deletes the entire explicit-session namespace.
+
+Anonymous explicit sessions are disabled by default. Opt in only when the
+random session identifier is intended to act as a bearer capability:
+
+```elixir
+FastestMCP.server("app", application_sessions: [allow_anonymous: true])
+```
+
+`ApplicationSession.current/1` always requires an authenticated principal,
+even when anonymous explicit sessions are enabled. The application should use
+a globally unambiguous verified principal, such as `{issuer, subject}`.
+
 ## Request State
 
 Request state is scratch storage for the current operation only.
@@ -302,7 +348,10 @@ Authenticators write normalized auth results back onto the context:
 
 - `ctx.principal`
 - `ctx.auth`
+- `ctx.authenticated`
 - `ctx.capabilities`
+- `ctx.verified_scopes`
+- `ctx.verified_audiences`
 - `Context.client_id/1`
 
 That gives tools, prompts, middleware, and providers one consistent view of
@@ -325,6 +374,12 @@ came from HTTP:
 Use these helpers when handler behavior legitimately depends on request
 metadata. Keep that explicit; avoid pretending the transport does not exist
 when it actually matters.
+
+Incoming `Authorization` is deliberately absent from the public HTTP header
+snapshots and from context inspection. Authentication still receives the raw
+header at the transport boundary. `Context.access_token/1` remains the narrow,
+explicit accessor for live-request code that needs the bearer token, while the
+transport credential is not copied into background or detached task context.
 
 ## Background Task Context
 

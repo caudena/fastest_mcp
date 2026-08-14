@@ -26,6 +26,7 @@ defmodule FastestMCP.Registry do
   @server_owners_table :fastest_mcp_server_owners
   @middleware_runtime_table :fastest_mcp_middleware_runtime
   @middleware_runtime_instances_table :fastest_mcp_middleware_runtime_instances
+  @component_visibility_table :fastest_mcp_component_visibility
 
   @doc "Starts the process owned by this module."
   def start_link(opts \\ []) do
@@ -43,6 +44,7 @@ defmodule FastestMCP.Registry do
     create_table(@server_owners_table, :set)
     create_table(@middleware_runtime_table, :set)
     create_table(@middleware_runtime_instances_table, :bag)
+    create_table(@component_visibility_table, :set)
     {:ok, %{claims: %{}, monitors: %{}}}
   end
 
@@ -349,6 +351,34 @@ defmodule FastestMCP.Registry do
     |> Enum.reverse()
   end
 
+  @doc false
+  def component_visibility_rules(server_name) do
+    server_name = to_string(server_name)
+
+    case lookup(@component_visibility_table, server_name) do
+      [{^server_name, rules}] when is_list(rules) -> rules
+      _other -> []
+    end
+  end
+
+  @doc false
+  def append_component_visibility_rules(server_name, rules) when is_list(rules) do
+    GenServer.call(
+      __MODULE__,
+      {:append_component_visibility_rules, to_string(server_name), rules}
+    )
+  end
+
+  @doc false
+  def reset_component_visibility_rules(server_name) do
+    GenServer.call(__MODULE__, {:reset_component_visibility_rules, to_string(server_name)})
+  end
+
+  @doc false
+  def delete_component_visibility_rules(server_name) do
+    GenServer.call(__MODULE__, {:delete_component_visibility_rules, to_string(server_name)})
+  end
+
   @impl true
   def handle_call({:claim, kind, key, pid, token}, _from, state) do
     {reply, state} = claim_entry(state, kind, key, pid, token)
@@ -365,6 +395,27 @@ defmodule FastestMCP.Registry do
   def handle_call({:claim_with_status, kind, key, pid, token}, _from, state) do
     {reply, state} = claim_entry(state, kind, key, pid, token)
     {:reply, reply, state}
+  end
+
+  def handle_call(
+        {:append_component_visibility_rules, server_name, rules},
+        _from,
+        state
+      ) do
+    next_rules = component_visibility_rules(server_name) ++ rules
+    true = :ets.insert(@component_visibility_table, {server_name, next_rules})
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:reset_component_visibility_rules, server_name}, _from, state) do
+    changed? = :ets.member(@component_visibility_table, server_name)
+    true = :ets.delete(@component_visibility_table, server_name)
+    {:reply, if(changed?, do: :changed, else: :unchanged), state}
+  end
+
+  def handle_call({:delete_component_visibility_rules, server_name}, _from, state) do
+    true = :ets.delete(@component_visibility_table, server_name)
+    {:reply, :ok, state}
   end
 
   @impl true

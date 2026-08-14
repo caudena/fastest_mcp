@@ -5,6 +5,7 @@ defmodule FastestMCP.ProtocolSchemaTransportTest do
   import Plug.Test
 
   alias FastestMCP.Error
+  alias FastestMCP.Auth.Result, as: AuthResult
   alias FastestMCP.Root
   alias FastestMCP.Session
   alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
@@ -180,6 +181,72 @@ defmodule FastestMCP.ProtocolSchemaTransportTest do
 
     assert {:error, %Error{code: :invalid_params}} =
              JSONRPC.validate_client_request(reconstructed_would_pass)
+  end
+
+  test "adapters extract wire auth without retaining it in payloads, envelopes, or inspection" do
+    secret = "wire-auth-secret"
+
+    envelope = %{
+      "jsonrpc" => "2.0",
+      "id" => 92,
+      "method" => "tools/list",
+      "params" => %{
+        "_meta" => %{
+          "fastestmcp" => %{
+            "auth" => %{"token" => secret},
+            "trace" => "retained"
+          }
+        }
+      }
+    }
+
+    assert {:ok, %Request{} = stdio_request} =
+             StdioAdapter.decode(envelope, connection_id: :private_schema_envelope)
+
+    assert stdio_request.auth_input == %{"token" => secret}
+    assert get_in(stdio_request.payload, ["_meta", "fastestmcp", "auth"]) == nil
+    assert get_in(stdio_request.payload, ["_meta", "fastestmcp", "trace"]) == "retained"
+
+    assert get_in(stdio_request.request_metadata, [
+             :jsonrpc_envelope,
+             "params",
+             "_meta",
+             "fastestmcp",
+             "auth"
+           ]) == nil
+
+    refute inspect(stdio_request) =~ secret
+
+    conn =
+      :post
+      |> conn("/mcp", JSON.encode!(envelope))
+      |> put_req_header("content-type", "application/json")
+      |> put_req_header("accept", "application/json, text/event-stream")
+      |> put_req_header("authorization", "Bearer " <> secret)
+      |> put_req_header("mcp-session-id", "private-envelope-session")
+      |> put_req_header("mcp-protocol-version", ProtocolTest.protocol_version())
+
+    assert {:ok, %Request{} = http_request} = StreamableHTTPAdapter.decode(conn)
+    assert http_request.auth_input["authorization"] == "Bearer " <> secret
+    assert http_request.transport_authorization == "Bearer " <> secret
+    assert get_in(http_request.payload, ["_meta", "fastestmcp", "auth"]) == nil
+
+    assert get_in(http_request.request_metadata, [
+             :jsonrpc_envelope,
+             "params",
+             "_meta",
+             "fastestmcp",
+             "auth"
+           ]) == nil
+
+    refute inspect(http_request) =~ secret
+
+    request_with_auth_result = %Request{
+      method: "tools/list",
+      auth_result: %AuthResult{auth: %{token: secret}}
+    }
+
+    refute inspect(request_with_auth_result) =~ secret
   end
 
   test "recursive metadata validation accepts peer extensions and rejects server forgeries" do

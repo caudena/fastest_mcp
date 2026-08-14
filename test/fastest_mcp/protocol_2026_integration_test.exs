@@ -60,6 +60,33 @@ defmodule FastestMCP.Protocol2026IntegrationTest do
             }
         end
       end)
+      |> FastestMCP.add_tool("mrtr_loop", fn _arguments, _context ->
+        InputRequiredResult.new(nil, request_state: "again")
+      end)
+      |> FastestMCP.add_tool("mrtr_order", fn _arguments, context ->
+        case Context.input_responses(context) do
+          responses when map_size(responses) == 0 ->
+            InputRequiredResult.new(%{
+              "z" => %{
+                "method" => "elicitation/create",
+                "params" => %{
+                  "message" => "Z",
+                  "requestedSchema" => %{"type" => "object", "properties" => %{}}
+                }
+              },
+              "a" => %{
+                "method" => "elicitation/create",
+                "params" => %{
+                  "message" => "A",
+                  "requestedSchema" => %{"type" => "object", "properties" => %{}}
+                }
+              }
+            })
+
+          responses ->
+            %{response_keys: responses |> Map.keys() |> Enum.sort()}
+        end
+      end)
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
 
@@ -146,6 +173,8 @@ defmodule FastestMCP.Protocol2026IntegrationTest do
 
     assert Enum.map(tools_list, & &1["name"]) == [
              "echo",
+             "mrtr_loop",
+             "mrtr_order",
              "mrtr_state_rounds",
              "workspace_root"
            ]
@@ -193,6 +222,71 @@ defmodule FastestMCP.Protocol2026IntegrationTest do
              "request_state_omitted" => true,
              "response_keys" => ["second"]
            }
+  end
+
+  test "MRTR uses the connection round limit and validates per-call overrides", %{
+    endpoint: endpoint
+  } do
+    client =
+      Client.connect!(endpoint,
+        client_info: %{"name" => "mrtr-limit-client", "version" => "1.0.0"},
+        max_mrtr_rounds: 1
+      )
+
+    on_exit(fn -> if Client.connected?(client), do: Client.disconnect(client) end)
+
+    error = assert_raise FastestMCP.Error, fn -> Client.call_tool(client, "mrtr_loop", %{}) end
+    assert error.code == :overloaded
+    assert error.details.max_mrtr_rounds == 1
+
+    override_error =
+      assert_raise FastestMCP.Error, fn ->
+        Client.call_tool(client, "mrtr_loop", %{}, max_mrtr_rounds: 2)
+      end
+
+    assert override_error.details.max_mrtr_rounds == 2
+
+    assert_raise ArgumentError, "max_mrtr_rounds must be a positive integer, got 0", fn ->
+      Client.call_tool(client, "mrtr_loop", %{}, max_mrtr_rounds: 0)
+    end
+  end
+
+  test "MRTR callbacks run deterministically and share the call deadline", %{endpoint: endpoint} do
+    parent = self()
+
+    client =
+      Client.connect!(endpoint,
+        client_info: %{"name" => "mrtr-order-client", "version" => "1.0.0"},
+        elicitation_handler: fn _message, _params, context ->
+          send(parent, {:input_callback, context.request_id})
+          {:accept, %{}}
+        end
+      )
+
+    on_exit(fn -> if Client.connected?(client), do: Client.disconnect(client) end)
+
+    assert %{"structuredContent" => %{"response_keys" => ["a", "z"]}} =
+             Client.call_tool(client, "mrtr_order", %{})
+
+    assert_receive {:input_callback, "a"}
+    assert_receive {:input_callback, "z"}
+
+    assert :ok =
+             Client.set_elicitation_handler(client, fn _message, _params, _context ->
+               send(parent, {:slow_callback_started, self()})
+               Process.sleep(2_000)
+               {:accept, %{}}
+             end)
+
+    timeout_error =
+      assert_raise FastestMCP.Error, fn ->
+        Client.call_tool(client, "mrtr_order", %{}, timeout_ms: 250)
+      end
+
+    assert timeout_error.code == :timeout
+    assert_receive {:slow_callback_started, callback_pid}
+    ref = Process.monitor(callback_pid)
+    assert_receive {:DOWN, ^ref, :process, ^callback_pid, _reason}, 1_000
   end
 
   test "input-required capability validation merges every missing requirement" do

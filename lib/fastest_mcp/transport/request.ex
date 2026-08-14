@@ -11,6 +11,7 @@ defmodule FastestMCP.Transport.Request do
   operation pipeline can stay transport-agnostic.
   """
 
+  @derive {Inspect, except: [:auth_input, :auth_result, :transport_authorization]}
   defstruct [
     :method,
     :transport,
@@ -18,6 +19,7 @@ defmodule FastestMCP.Transport.Request do
     :request_id,
     :auth_result,
     :protocol_version,
+    :transport_authorization,
     protocol: :native,
     task_request: false,
     task_ttl_ms: nil,
@@ -33,6 +35,7 @@ defmodule FastestMCP.Transport.Request do
           request_id: String.t() | integer() | nil,
           auth_result: FastestMCP.Auth.Result.t() | nil,
           protocol_version: String.t() | nil,
+          transport_authorization: String.t() | nil,
           protocol: :native | :jsonrpc,
           task_request: boolean(),
           task_ttl_ms: pos_integer() | nil,

@@ -101,9 +101,15 @@ for required_path in \
   mix.exs \
   docs/client.md \
   docs/auth.md \
+  docs/context.md \
   docs/extensions.md \
   docs/phoenix-deployment.md \
+  docs/progress.md \
   docs/protocol-versions.md \
+  docs/providers-and-mounting.md \
+  docs/resources.md \
+  docs/runtime-state-and-storage.md \
+  docs/tools.md \
   docs/transports.md \
   docs/compatibility-and-scope.md \
   priv/schema/README.md \

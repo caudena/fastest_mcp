@@ -19,6 +19,15 @@ defmodule FastestMCP.Protocol do
     "2025-11-25" => :legacy
   }
 
+  @cache_hinted_methods MapSet.new(~w(
+    server/discover
+    tools/list
+    prompts/list
+    resources/list
+    resources/templates/list
+    resources/read
+  ))
+
   @type version :: String.t()
   @type profile :: :modern | :legacy | :unsupported
 
@@ -75,6 +84,13 @@ defmodule FastestMCP.Protocol do
         profile
     end
   end
+
+  @doc false
+  @spec cache_hinted_method?(term()) :: boolean()
+  def cache_hinted_method?(method) when is_binary(method),
+    do: MapSet.member?(@cache_hinted_methods, method)
+
+  def cache_hinted_method?(_method), do: false
 
   @doc "Returns the protocol version string for the given input."
   def version(metadata_or_server, default \\ @current_version)

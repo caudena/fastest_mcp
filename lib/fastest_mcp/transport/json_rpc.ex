@@ -102,6 +102,41 @@ defmodule FastestMCP.Transport.JSONRPC do
     do: {:error, invalid_request("JSON-RPC message must be an object")}
 
   @doc false
+  def sanitize_auth_metadata(%{} = params) do
+    case Map.get(params, "_meta") do
+      %{} = meta ->
+        case Map.get(meta, "fastestmcp") do
+          %{} = fastestmcp ->
+            sanitized_fastestmcp = Map.delete(fastestmcp, "auth")
+
+            sanitized_meta =
+              if map_size(sanitized_fastestmcp) == 0 do
+                Map.delete(meta, "fastestmcp")
+              else
+                Map.put(meta, "fastestmcp", sanitized_fastestmcp)
+              end
+
+            Map.put(params, "_meta", sanitized_meta)
+
+          _other ->
+            params
+        end
+
+      _other ->
+        params
+    end
+  end
+
+  def sanitize_auth_metadata(value), do: value
+
+  @doc false
+  def sanitize_stored_envelope(%{"params" => %{} = params} = envelope) do
+    Map.put(envelope, "params", sanitize_auth_metadata(params))
+  end
+
+  def sanitize_stored_envelope(envelope), do: envelope
+
+  @doc false
   @spec validate_client_request(Request.t()) :: :ok | {:error, Error.t()}
   def validate_client_request(%Request{protocol: protocol}) when protocol != :jsonrpc, do: :ok
 
@@ -115,6 +150,50 @@ defmodule FastestMCP.Transport.JSONRPC do
       request.request_id,
       payload
     )
+  end
+
+  @doc false
+  @spec validate_generic_client_request(map(), String.t()) :: :ok | {:error, Error.t()}
+  def validate_generic_client_request(%{} = payload, protocol_version)
+      when is_binary(protocol_version) do
+    case decode(payload,
+           direction: :client_to_server,
+           protocol_version: protocol_version
+         ) do
+      {:ok, {:request, method, _params, request_id}} ->
+        validate_protocol_request(
+          protocol_version,
+          :client_to_server,
+          method,
+          request_id,
+          payload
+        )
+
+      {:ok, _other} ->
+        {:error, invalid_request("JSON-RPC message must be a request")}
+
+      {:error, %Error{} = error} ->
+        {:error, error}
+    end
+  end
+
+  @doc false
+  @spec validate_generic_server_response(map(), String.t()) :: :ok | {:error, Error.t()}
+  def validate_generic_server_response(%{} = payload, protocol_version)
+      when is_binary(protocol_version) do
+    case decode(payload,
+           direction: :server_to_client,
+           protocol_version: protocol_version
+         ) do
+      {:ok, {:response, _request_id, _response}} ->
+        :ok
+
+      {:ok, _other} ->
+        {:error, invalid_request("JSON-RPC message must be a response")}
+
+      {:error, %Error{} = error} ->
+        {:error, error}
+    end
   end
 
   @doc "Builds a JSON-RPC success response."

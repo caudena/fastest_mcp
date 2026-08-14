@@ -25,6 +25,61 @@
   Authorization connected-client grants through explicit host callbacks;
   FastestMCP remains a resource server/client toolkit, not an authorization
   server or identity provider
+- add ordered modern active server extensions with negotiated request methods,
+  parameter schemas, namespaced lifespans, and tool-call interceptors while
+  keeping passive extension capability data separate
+
+### Runtime state
+
+- add application sessions on the existing session-state backend, including
+  authenticated per-principal buckets, opaque explicit handles, termination,
+  and an opt-in anonymous bearer mode
+- add bounded request-scoped tool search with pinned list entries, deterministic
+  ranking, provider pagination, model-visible policy enforcement, and a
+  synthetic call path that revalidates the selected tool at execution time
+
+### Authorization and resource safety
+
+- carry verified OAuth scopes, audiences, authentication state, arguments, and
+  resource-template captures through component authorization; scope checks now
+  use verified token scopes while capability checks remain a separate explicit
+  helper
+- return `401` for missing or invalid authentication and a `403`
+  `insufficient_scope` challenge with the exact missing scopes for verified
+  tokens, while keeping opaque authorization denials generic
+- screen decoded resource-template parameters for traversal, absolute paths,
+  and null bytes by default after transforms and canonical rematching; rejected
+  values remain indistinguishable from an unknown resource on the wire
+
+### Connected client
+
+- make modern tool calls transparently drive server-created tasks while adding
+  `call_tool_task/4` for explicit handles, a separate 60-second task deadline,
+  adaptive polling, notification wakeups, and bounded MRTR interaction rounds
+- add an opt-in bounded response cache for positive-TTL modern discovery,
+  component-list, and resource-read results, with per-call use, refresh, and
+  bypass controls plus authentication, roots, recovery, and notification
+  invalidation
+- add bounded `list_all_tools/2`, `list_all_prompts/2`,
+  `list_all_resources/2`, and `list_all_resource_templates/2` helpers backed by
+  one shared cursor-safe paginator
+- add request-scoped `progress_handler:` callbacks with automatic progress
+  tokens and task-lifetime routing through the existing progress subsystem
+- add `Client.connect({:in_process, server_name}, opts)` through a supervised
+  connected transport that preserves JSON-RPC, authentication, lifecycle,
+  callback, progress, cancellation, task, and subscription behavior without
+  bypassing the shared server engine
+
+### Providers
+
+- add a request-scoped HTTP and stdio proxy provider that mirrors or pins the
+  protocol version, preserves modern results and MRTR continuations, forwards
+  progress, and bounds upstream catalog pagination
+- keep remote tasks, subscriptions, shared client pools, and credential
+  forwarding out of the proxy default; HTTP authorization forwarding requires
+  an exact trusted-origin allowlist; reject Proxy and bounded ToolSearch on the
+  same server because opaque upstream cursors cannot provide a global
+  synthetic-name collision proof within a bounded scan
 
 ### Verification and release gates
 

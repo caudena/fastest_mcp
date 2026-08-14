@@ -33,6 +33,7 @@ defmodule FastestMCP.Auth do
   alias FastestMCP.Context
   alias FastestMCP.Error
   alias FastestMCP.Auth.ProtectedResource
+  alias FastestMCP.Protocol.Redactor
 
   defstruct [:provider, options: %{}]
 
@@ -124,6 +125,9 @@ defmodule FastestMCP.Auth do
                resolve_assign_option(Map.get(opts, :principal, value), value, input, context),
              capabilities:
                resolve_assign_option(Map.get(opts, :capabilities, []), value, input, context),
+             audiences:
+               resolve_assign_option(Map.get(opts, :audiences, []), value, input, context),
+             scopes: resolve_assign_option(Map.get(opts, :scopes, []), value, input, context),
              auth:
                resolve_assign_option(
                  Map.get(opts, :auth, %{source: :assign, assign: assign}),
@@ -205,6 +209,73 @@ defmodule FastestMCP.Auth do
     |> then(&("auth-sha256:" <> &1))
   end
 
+  @doc "Returns a stable fingerprint derived only from a verified principal."
+  def principal_fingerprint(nil) do
+    raise ArgumentError, "principal fingerprint requires a non-nil verified principal"
+  end
+
+  def principal_fingerprint(principal) do
+    principal
+    |> :erlang.term_to_binary([:deterministic])
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.url_encode64(padding: false)
+    |> then(&("principal-sha256:" <> &1))
+  end
+
+  @doc false
+  def authorization_partition(%Context{} = context) do
+    context
+    |> result_from_context()
+    |> authorization_partition()
+    |> Map.put(:authenticated, context.authenticated)
+  end
+
+  def authorization_partition(%Result{} = result) do
+    result = normalize_result(result)
+
+    %{
+      authenticated: true,
+      principal:
+        if(is_nil(result.principal),
+          do: :missing,
+          else: principal_fingerprint(result.principal)
+        ),
+      auth_digest: redacted_digest(result.auth),
+      capabilities: result.capabilities |> Redactor.redact() |> deterministic_digest(),
+      verified_audiences: Enum.sort(result.audiences),
+      verified_scopes: Enum.sort(result.scopes)
+    }
+  end
+
+  def authorization_partition(context) when is_map(context) do
+    audiences = fetch_field(context, :verified_audiences, fetch_field(context, :audiences, []))
+    scopes = fetch_field(context, :verified_scopes, fetch_field(context, :scopes, []))
+
+    %Result{
+      principal: fetch_field(context, :principal),
+      auth: fetch_field(context, :auth, %{}),
+      capabilities: fetch_field(context, :capabilities, []),
+      audiences: audiences,
+      scopes: scopes
+    }
+    |> authorization_partition()
+    |> Map.put(:authenticated, fetch_field(context, :authenticated, false))
+  end
+
+  defp redacted_digest(value) do
+    value
+    |> Redactor.redact()
+    |> deterministic_digest()
+  end
+
+  defp deterministic_digest(value) do
+    value
+    |> :erlang.term_to_binary([:deterministic])
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.url_encode64(padding: false)
+    |> then(&("sha256:" <> &1))
+  end
+
   @doc "Builds the WWW-Authenticate header value for an auth error."
   def www_authenticate(nil, %Error{} = error, http_context) do
     protected_or_default_www_authenticate(error, http_context)
@@ -213,6 +284,24 @@ defmodule FastestMCP.Auth do
   def www_authenticate(%__MODULE__{}, %Error{} = error, http_context) do
     protected_or_default_www_authenticate(error, http_context)
   end
+
+  @doc false
+  def validated_missing_scopes(%Error{code: :forbidden, details: details})
+      when is_map(details) do
+    case fetch_field(details, :missing_scopes, []) do
+      scopes when is_list(scopes) and scopes != [] ->
+        if Enum.all?(scopes, &valid_scope_token?/1) do
+          scopes |> Enum.uniq() |> Enum.sort()
+        else
+          []
+        end
+
+      _other ->
+        []
+    end
+  end
+
+  def validated_missing_scopes(%Error{}), do: []
 
   defp validate!(%__MODULE__{provider: provider} = auth) do
     unless Code.ensure_loaded?(provider) and function_exported?(provider, :authenticate, 3) do
@@ -391,20 +480,34 @@ defmodule FastestMCP.Auth do
   defp normalize_map(nil), do: %{}
   defp normalize_map(map) when is_map(map), do: map
 
-  defp default_www_authenticate(%Error{} = error) do
-    ~s(Bearer error="#{bearer_error_code(error)}", error_description="#{escape_header_value(error.message)}")
+  @doc false
+  def default_www_authenticate(%Error{} = error) do
+    [~s(error="#{bearer_error_code(error)}")]
+    |> maybe_append_scope(validated_missing_scopes(error))
+    |> Kernel.++([~s(error_description="#{escape_header_value(error.message)}")])
+    |> then(&("Bearer " <> Enum.join(&1, ", ")))
   end
 
   defp protected_or_default_www_authenticate(%Error{} = error, http_context) do
     case fetch_field(normalize_map(http_context), :protected_resource) do
       %ProtectedResource{} = protected_resource ->
+        baseline_scopes =
+          fetch_field(
+            http_context,
+            :expected_scopes,
+            protected_resource.required_scopes
+          )
+
+        missing_scopes = validated_missing_scopes(error)
+
+        challenge_scopes =
+          case missing_scopes do
+            [] -> List.wrap(baseline_scopes)
+            scopes -> Enum.uniq(scopes)
+          end
+
         ProtectedResource.www_authenticate(protected_resource,
-          scopes:
-            fetch_field(
-              http_context,
-              :expected_scopes,
-              protected_resource.required_scopes
-            ),
+          scopes: challenge_scopes,
           error: error,
           error_description: error.message
         )
@@ -416,6 +519,20 @@ defmodule FastestMCP.Auth do
 
   defp bearer_error_code(%Error{code: :forbidden}), do: "insufficient_scope"
   defp bearer_error_code(_error), do: "invalid_token"
+
+  defp maybe_append_scope(parameters, []), do: parameters
+
+  defp maybe_append_scope(parameters, scopes) do
+    parameters ++ [~s(scope="#{Enum.join(scopes, " ")}")]
+  end
+
+  defp valid_scope_token?(value) when is_binary(value) and value != "" do
+    value
+    |> :binary.bin_to_list()
+    |> Enum.all?(fn byte -> byte == 0x21 or byte in 0x23..0x5B or byte in 0x5D..0x7E end)
+  end
+
+  defp valid_scope_token?(_value), do: false
 
   defp escape_header_value(value) do
     value

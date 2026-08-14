@@ -98,6 +98,7 @@ defmodule FastestMCP.Context do
   require Logger
 
   @excluded_http_headers ["accept", "content-length", "content-type", "host"]
+  @private_http_headers ["authorization"]
   @visibility_rules_key {:fastest_mcp, :visibility_rules}
   @logging_levels [
     "debug",
@@ -124,6 +125,7 @@ defmodule FastestMCP.Context do
                                  ])
   @notification_envelope_keys MapSet.new(["jsonrpc", "method", "params"])
 
+  @derive {Inspect, except: [:auth, :transport_authorization]}
   defstruct [
     :server_name,
     :server,
@@ -135,7 +137,11 @@ defmodule FastestMCP.Context do
     :request_state,
     :event_bus,
     :task_store,
+    :session_state_store,
+    :application_session_scope,
     :principal,
+    :transport_authorization,
+    authenticated: false,
     auth: %{},
     capabilities: [],
     verified_audiences: [],
@@ -160,7 +166,11 @@ defmodule FastestMCP.Context do
           request_state: String.t() | nil,
           event_bus: pid() | atom(),
           task_store: pid() | atom() | nil,
+          session_state_store: map() | nil,
+          application_session_scope: String.t(),
           principal: any(),
+          transport_authorization: String.t() | nil,
+          authenticated: boolean(),
           auth: map(),
           capabilities: [any()],
           verified_audiences: [String.t()],
@@ -178,15 +188,40 @@ defmodule FastestMCP.Context do
   def build(server_name, opts \\ []) do
     request_id = "req-" <> Integer.to_string(System.unique_integer([:positive]))
     transport = Keyword.get(opts, :transport, :in_process)
-    request_metadata = Map.new(Keyword.get(opts, :request_metadata, %{}))
+
+    raw_request_metadata =
+      opts
+      |> Keyword.get(:request_metadata, %{})
+      |> Map.new()
+
+    {request_metadata, metadata_authorization} =
+      split_transport_authorization(raw_request_metadata)
+
+    transport_authorization =
+      opts
+      |> Keyword.get(:transport_authorization)
+      |> normalize_transport_authorization()
+      |> Kernel.||(metadata_authorization)
+
+    request_metadata =
+      request_metadata
+      |> Map.put_new(:input_responses_provided, Keyword.has_key?(opts, :input_responses))
+      |> Map.put_new(:request_state_provided, Keyword.has_key?(opts, :request_state))
+
     state_scope = context_state_scope(opts, request_metadata)
     session_id = context_session_id(opts, state_scope)
     event_bus = Keyword.get(opts, :event_bus, EventBus)
     server = Keyword.get(opts, :server)
     task_store = Keyword.get(opts, :task_store)
+    session_state_store = Keyword.get(opts, :session_state_store)
+
+    application_session_scope =
+      to_string(Keyword.get(opts, :application_session_scope, server_name))
+
     session_supervisor = Keyword.get(opts, :session_supervisor, SessionSupervisor)
     terminated_session_store = Keyword.get(opts, :terminated_session_store)
     principal = Keyword.get(opts, :principal)
+    authenticated = Keyword.get(opts, :authenticated, false)
     auth = normalize_map(Keyword.get(opts, :auth, %{}))
     capabilities = normalize_capabilities(Keyword.get(opts, :capabilities, []))
     verified_audiences = List.wrap(Keyword.get(opts, :verified_audiences, []))
@@ -211,7 +246,11 @@ defmodule FastestMCP.Context do
       request_state: request_state,
       event_bus: event_bus,
       task_store: task_store,
+      session_state_store: session_state_store,
+      application_session_scope: application_session_scope,
       principal: principal,
+      transport_authorization: transport_authorization,
+      authenticated: authenticated,
       auth: auth,
       capabilities: capabilities,
       verified_audiences: verified_audiences,
@@ -320,11 +359,28 @@ defmodule FastestMCP.Context do
     :ok
   end
 
+  @doc "Registers cleanup work to run when the current request scope exits."
+  def register_cleanup(%__MODULE__{} = context, cleanup) when is_function(cleanup, 0) do
+    maybe_register_dependency_cleanup(context, nil, cleanup)
+  end
+
+  def register_cleanup(%__MODULE__{} = context, cleanup) when is_function(cleanup, 1) do
+    maybe_register_dependency_cleanup(context, nil, fn -> cleanup.(context) end)
+  end
+
+  def register_cleanup(%__MODULE__{}, cleanup) do
+    raise ArgumentError,
+          "request cleanup must be a zero-arity function or a one-arity context callback, got: #{inspect(cleanup)}"
+  end
+
   @doc "Returns the MRTR responses supplied with the current modern request."
   def input_responses(%__MODULE__{} = context), do: context.input_responses
 
   @doc "Returns the opaque MRTR state echoed by the client, if present."
   def request_state(%__MODULE__{} = context), do: context.request_state
+
+  @doc false
+  def transport_authorization(%__MODULE__{} = context), do: context.transport_authorization
 
   @doc "Builds a new server definition."
   def server(%__MODULE__{} = context), do: context.server
@@ -467,6 +523,7 @@ defmodule FastestMCP.Context do
     %{
       context
       | principal: result.principal,
+        authenticated: true,
         auth: normalize_map(result.auth),
         capabilities: normalize_capabilities(result.capabilities),
         verified_audiences: audiences,
@@ -890,10 +947,12 @@ defmodule FastestMCP.Context do
         nil -> %{}
       end
 
+    public_headers = Map.drop(headers, @private_http_headers)
+
     if Keyword.get(opts, :include_all, false) do
-      headers
+      public_headers
     else
-      Map.drop(headers, @excluded_http_headers)
+      Map.drop(public_headers, @excluded_http_headers)
     end
   end
 
@@ -913,6 +972,8 @@ defmodule FastestMCP.Context do
       context
       | request_id: "task-req-" <> Integer.to_string(System.unique_integer([:positive])),
         transport: :background_task,
+        transport_authorization: nil,
+        request_metadata: context.request_metadata |> split_transport_authorization() |> elem(0),
         task_metadata: task_metadata
     }
   end
@@ -1492,11 +1553,14 @@ defmodule FastestMCP.Context do
       session_id: context.session_id,
       transport: context.transport,
       request_metadata: context.request_metadata,
+      transport_authorization: context.transport_authorization,
       principal: context.principal,
+      authenticated: context.authenticated,
       auth: context.auth,
       capabilities: context.capabilities,
       verified_audiences: context.verified_audiences,
       verified_scopes: context.verified_scopes,
+      transport_authenticated: context.authenticated,
       task_metadata: context.task_metadata
     ]
   end
@@ -1540,6 +1604,7 @@ defmodule FastestMCP.Context do
     context
     |> request_metadata_value(:headers)
     |> normalize_headers()
+    |> Map.drop(@private_http_headers)
   end
 
   defp request_context_meta(%__MODULE__{} = context) do
@@ -1554,6 +1619,8 @@ defmodule FastestMCP.Context do
       |> Map.delete("query_params")
       |> Map.delete(:request_stream_sink)
       |> Map.delete("request_stream_sink")
+      |> Map.delete(:authorization)
+      |> Map.delete("authorization")
       |> Map.new(fn {key, value} ->
         normalized_key = if is_atom(key), do: Atom.to_string(key), else: key
         {normalized_key, value}
@@ -1568,17 +1635,22 @@ defmodule FastestMCP.Context do
     end
   end
 
-  defp request_access_token(%__MODULE__{} = context) do
-    headers = request_metadata_headers(context)
+  defp auth_access_token(%__MODULE__{} = context) do
+    Map.get(context.auth, :token, Map.get(context.auth, "token"))
+  end
 
-    case Map.get(headers, "authorization", Map.get(headers, :authorization)) do
+  defp request_access_token(%__MODULE__{} = context) do
+    context.transport_authorization
+    |> Kernel.||(legacy_request_authorization(context.request_metadata))
+    |> case do
       "Bearer " <> token when token != "" -> token
       _other -> nil
     end
   end
 
-  defp auth_access_token(%__MODULE__{} = context) do
-    Map.get(context.auth, :token, Map.get(context.auth, "token"))
+  defp legacy_request_authorization(request_metadata) do
+    {_public_metadata, authorization} = split_transport_authorization(request_metadata)
+    authorization
   end
 
   defp auth_value(%__MODULE__{} = context, key) do
@@ -1685,6 +1757,49 @@ defmodule FastestMCP.Context do
         {key |> to_string() |> String.downcase(), to_string(value)}
     end)
   end
+
+  defp split_transport_authorization(request_metadata) do
+    headers =
+      request_metadata
+      |> Map.get(:headers, Map.get(request_metadata, "headers", %{}))
+      |> Map.new()
+
+    authorization =
+      headers
+      |> Enum.find_value(fn {key, value} ->
+        if authorization_key?(key),
+          do: normalize_transport_authorization(value)
+      end)
+      |> Kernel.||(
+        request_metadata
+        |> Enum.find_value(fn {key, value} ->
+          if authorization_key?(key),
+            do: normalize_transport_authorization(value)
+        end)
+      )
+
+    public_headers =
+      Map.reject(headers, fn {key, _value} ->
+        authorization_key?(key)
+      end)
+
+    public_metadata =
+      request_metadata
+      |> Map.reject(fn {key, _value} -> authorization_key?(key) end)
+      |> Map.delete(:headers)
+      |> Map.delete("headers")
+      |> Map.put(:headers, public_headers)
+
+    {public_metadata, authorization}
+  end
+
+  defp normalize_transport_authorization(value) when is_binary(value) and value != "", do: value
+  defp normalize_transport_authorization(_value), do: nil
+
+  defp authorization_key?(key) when is_binary(key) or is_atom(key),
+    do: String.downcase(to_string(key)) == "authorization"
+
+  defp authorization_key?(_key), do: false
 
   defp normalize_extension_notification(notification) do
     canonical_keys = Enum.map(Map.keys(notification), &canonical_notification_key/1)

@@ -37,10 +37,7 @@ defmodule FastestMCP.HTTPContextTest do
              method: "POST",
              path: "/mcp",
              query_params: %{"demo" => "1"},
-             headers: %{
-               "authorization" => "Bearer request-token",
-               "x-demo-header" => "ABC"
-             }
+             headers: %{"x-demo-header" => "ABC"}
            } ==
              FastestMCP.call_tool(server_name, "request_tool", %{},
                request_metadata: request_metadata
@@ -57,17 +54,14 @@ defmodule FastestMCP.HTTPContextTest do
              method: "POST",
              path: "/mcp",
              query_params: %{"demo" => "1"},
-             headers: %{
-               "authorization" => "Bearer request-token",
-               "x-demo-header" => "ABC"
-             }
+             headers: %{"x-demo-header" => "ABC"}
            } ==
              FastestMCP.read_resource(server_name, "request://snapshot",
                request_metadata: request_metadata
              )
   end
 
-  test "http_headers excludes problematic headers by default and background tasks keep the snapshot" do
+  test "http_headers excludes private headers and background tasks keep only the public snapshot" do
     server_name = "http-headers-task-" <> Integer.to_string(System.unique_integer([:positive]))
 
     server =
@@ -106,15 +100,11 @@ defmodule FastestMCP.HTTPContextTest do
       )
 
     assert %{
-             access_token: "tenant-token",
+             access_token: nil,
              method: "POST",
-             filtered: %{
-               "authorization" => "Bearer tenant-token",
-               "x-tenant-id" => "tenant-123"
-             },
+             filtered: %{"x-tenant-id" => "tenant-123"},
              all: %{
                "accept" => "application/json",
-               "authorization" => "Bearer tenant-token",
                "content-length" => "42",
                "content-type" => "application/json",
                "host" => "example.test",
@@ -175,18 +165,102 @@ defmodule FastestMCP.HTTPContextTest do
                    "path" => "/mcp",
                    "query_params" => %{"demo" => "1"},
                    "headers" => %{
-                     "authorization" => "Bearer fresh-token",
                      "content-type" => "application/json",
                      "x-demo-header" => "ABC"
                    }
                  },
-                 "filtered_headers" => %{
-                   "authorization" => "Bearer fresh-token",
-                   "x-demo-header" => "ABC"
-                 }
+                 "filtered_headers" => %{"x-demo-header" => "ABC"}
                }
              }
            } = JSON.decode!(conn.resp_body)
+  end
+
+  test "HTTP authorization stays private while authentication and trusted proxy forwarding can use it" do
+    server_name =
+      "http-private-authorization-" <> Integer.to_string(System.unique_integer([:positive]))
+
+    secret = "Bearer handler-private-secret"
+    test_pid = self()
+
+    telemetry_handler =
+      "http-private-authorization-telemetry-" <>
+        Integer.to_string(System.unique_integer([:positive]))
+
+    :telemetry.attach_many(
+      telemetry_handler,
+      [[:fastest_mcp, :operation, :start], [:fastest_mcp, :operation, :stop]],
+      &__MODULE__.handle_telemetry/4,
+      test_pid
+    )
+
+    on_exit(fn -> :telemetry.detach(telemetry_handler) end)
+
+    authenticator = fn input, context ->
+      send(
+        test_pid,
+        {:auth_input, input, Context.transport_authorization(context), inspect(context)}
+      )
+
+      {:ok, %{principal: {"https://auth.example.com", "user-1"}, auth: %{source: :test}}}
+    end
+
+    server =
+      FastestMCP.server(server_name, auth: authenticator)
+      |> FastestMCP.add_tool("inspect_private", fn _arguments, ctx ->
+        request_context = Context.request_context(ctx)
+
+        %{
+          context: inspect(ctx),
+          request_metadata: inspect(ctx.request_metadata),
+          request_headers: Context.http_request(ctx).headers,
+          public_headers: Context.http_headers(ctx, include_all: true),
+          request_context_headers: request_context.headers,
+          request_context_meta: request_context.meta
+        }
+      end)
+
+    assert {:ok, _pid} = FastestMCP.start_server(server)
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+
+    response =
+      ProtocolTest.modern_http_request(
+        server_name,
+        1,
+        "tools/call",
+        %{"name" => "inspect_private", "arguments" => %{}},
+        headers: [
+          {"authorization", secret},
+          {"mcp-name", "inspect_private"},
+          {"x-visible", "yes"}
+        ]
+      )
+
+    assert response.status == 200
+    refute response.resp_body =~ "handler-private-secret"
+
+    result = JSON.decode!(response.resp_body)["result"]["structuredContent"]
+    assert result["request_headers"]["x-visible"] == "yes"
+    assert result["public_headers"]["x-visible"] == "yes"
+    assert result["request_context_headers"]["x-visible"] == "yes"
+    refute Map.has_key?(result["request_headers"], "authorization")
+    refute Map.has_key?(result["public_headers"], "authorization")
+    refute Map.has_key?(result["request_context_headers"], "authorization")
+
+    assert_receive {:auth_input,
+                    %{"authorization" => ^secret, "headers" => %{"authorization" => ^secret}},
+                    nil, auth_context_inspect},
+                   1_000
+
+    refute auth_context_inspect =~ "handler-private-secret"
+
+    for _event <- 1..2 do
+      assert_receive {:credential_telemetry, _event_name, metadata}, 1_000
+      refute inspect(metadata) =~ "handler-private-secret"
+    end
+  end
+
+  def handle_telemetry(event_name, _measurements, metadata, test_pid) do
+    send(test_pid, {:credential_telemetry, event_name, metadata})
   end
 
   defp http_request_payload(ctx) do

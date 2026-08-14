@@ -24,6 +24,8 @@ defmodule FastestMCP.Transport.Engine do
   alias FastestMCP.Protocol.HTTPHeaders
   alias FastestMCP.Protocol.Subscriptions
   alias FastestMCP.Registry
+  alias FastestMCP.Schema
+  alias FastestMCP.Server
   alias FastestMCP.ServerRuntime
   alias FastestMCP.Session
   alias FastestMCP.SubscriptionSubscriber
@@ -47,7 +49,7 @@ defmodule FastestMCP.Transport.Engine do
 
     request_opts =
       request_opts(server_name, request, opts)
-      |> put_server_extensions(server_name)
+      |> put_server_extensions(server_name, request)
 
     result =
       case request.method do
@@ -377,9 +379,18 @@ defmodule FastestMCP.Transport.Engine do
           end
 
         method ->
-          raise Error,
-            code: :method_not_found,
-            message: "unknown #{request.transport} method #{inspect(method)}"
+          case active_extension_method(server_name, method) do
+            {_extension, _binding} ->
+              OperationPipeline.extension_request(
+                server_name,
+                method,
+                request.payload,
+                request_opts
+              )
+
+            nil ->
+              method_not_found!(request)
+          end
       end
 
     finalize_result(server_name, request, result)
@@ -454,6 +465,7 @@ defmodule FastestMCP.Transport.Engine do
     request = resolve_protocol_version(server_name, request)
     reject_removed_modern_method!(request)
     validate_protocol_request!(request)
+    validate_active_extension_request!(server_name, request)
     validate_tasks_extension!(server_name, request)
     request = normalize_wire_task_request(server_name, request)
     ensure_protocol_session!(server_name, request)
@@ -595,6 +607,57 @@ defmodule FastestMCP.Transport.Engine do
   end
 
   defp validate_tasks_extension!(_server_name, _request), do: :ok
+
+  defp validate_active_extension_request!(server_name, %Request{} = request) do
+    binding =
+      if Schema.built_in_method?(request.method) do
+        nil
+      else
+        active_extension_method(server_name, request.method)
+      end
+
+    case binding do
+      {extension, _binding} ->
+        cond do
+          request.protocol_version != "2026-07-28" ->
+            method_not_found!(request)
+
+          is_nil(request.request_id) ->
+            raise Error,
+              code: :invalid_request,
+              message:
+                "active extension method #{inspect(request.method)} is request/response only"
+
+          not Extensions.enabled?(request_client_capabilities(request), extension.identifier) ->
+            raise Error,
+              code: :missing_required_client_capability,
+              message: "#{request.method} requires extension #{inspect(extension.identifier)}",
+              details: %{
+                jsonrpc_code: -32_021,
+                requiredCapabilities: %{extensions: %{extension.identifier => %{}}}
+              }
+
+          true ->
+            :ok
+        end
+
+      nil ->
+        :ok
+    end
+  end
+
+  defp active_extension_method(server_name, method) do
+    server_name
+    |> fetch_runtime!()
+    |> Map.fetch!(:server)
+    |> Server.active_extension_method(method)
+  end
+
+  defp request_client_capabilities(%Request{payload: payload}) do
+    payload
+    |> Map.get("_meta", %{})
+    |> Map.get("io.modelcontextprotocol/clientCapabilities", %{})
+  end
 
   defp require_tasks_extension!(server_name, method, payload) do
     runtime = fetch_runtime!(server_name)
@@ -911,17 +974,26 @@ defmodule FastestMCP.Transport.Engine do
     |> Keyword.put(:principal, auth_result.principal)
     |> Keyword.put(:auth, auth_result.auth)
     |> Keyword.put(:capabilities, auth_result.capabilities)
+    |> Keyword.put(:verified_audiences, auth_result.audiences)
+    |> Keyword.put(:verified_scopes, auth_result.scopes)
+    |> Keyword.put(:authenticated, true)
     |> Keyword.put(:transport_authenticated, true)
   end
 
   defp put_transport_auth(opts, _request), do: opts
 
   defp request_opts(server_name, request, opts) do
+    request_metadata =
+      request.request_metadata
+      |> Map.put(:input_responses_provided, Map.has_key?(request.payload, "inputResponses"))
+      |> Map.put(:request_state_provided, Map.has_key?(request.payload, "requestState"))
+
     Keyword.merge(
       opts,
       transport: request.transport,
       session_id: request.session_id,
-      request_metadata: request.request_metadata,
+      request_metadata: request_metadata,
+      transport_authorization: request.transport_authorization,
       auth_input: request.auth_input,
       task: request.task_request,
       task_ttl_ms: request.task_ttl_ms,
@@ -963,9 +1035,19 @@ defmodule FastestMCP.Transport.Engine do
 
   defp put_negotiated_context(opts, _server_name, _request), do: opts
 
-  defp put_server_extensions(opts, server_name) do
+  defp put_server_extensions(opts, server_name, request) do
     runtime = fetch_runtime!(server_name)
-    Keyword.put(opts, :server_extensions, runtime.server.extensions)
+
+    extensions =
+      case Protocol.profile(request.protocol_version) do
+        profile when profile in [:modern, :legacy] ->
+          Server.effective_extensions(runtime.server, profile)
+
+        :unsupported ->
+          runtime.server.extensions
+      end
+
+    Keyword.put(opts, :server_extensions, extensions)
   end
 
   defp request_auth_identity(%Request{auth_result: %AuthResult{} = auth_result}) do
@@ -1204,8 +1286,6 @@ defmodule FastestMCP.Transport.Engine do
       message: "unknown #{request.transport} method #{inspect(request.method)}"
   end
 
-  @cacheable_modern_methods ~w(server/discover tools/list prompts/list resources/list resources/templates/list resources/read)
-
   defp finalize_result(
          server_name,
          %Request{protocol: :jsonrpc, protocol_version: "2026-07-28"} = request,
@@ -1216,7 +1296,7 @@ defmodule FastestMCP.Transport.Engine do
       |> Map.put_new("resultType", "complete")
       |> put_server_info(server_name)
 
-    if request.method in @cacheable_modern_methods and result["resultType"] == "complete" do
+    if Protocol.cache_hinted_method?(request.method) and result["resultType"] == "complete" do
       result
       |> Map.put_new("ttlMs", 0)
       |> Map.put_new("cacheScope", "private")
@@ -1367,6 +1447,7 @@ defmodule FastestMCP.Transport.Engine do
       task_store: Map.get(runtime, :task_store),
       lifespan_context: Map.get(runtime, :lifespan_context, %{}),
       dependencies: runtime.server.dependencies,
+      transport_authorization: request.transport_authorization,
       request_metadata:
         request.request_metadata
         |> Map.new()
@@ -1661,7 +1742,7 @@ defmodule FastestMCP.Transport.Engine do
   defp pagination_fingerprint(runtime, request, request_opts, _items) do
     %{
       runtime_generation: Map.fetch!(runtime, :runtime_generation),
-      principal: pagination_principal(runtime, request),
+      authorization: pagination_authorization(runtime, request),
       session_id: request.session_id,
       audience: Keyword.get(request_opts, :audience, :model),
       version: Keyword.get(request_opts, :version),
@@ -1687,19 +1768,21 @@ defmodule FastestMCP.Transport.Engine do
     end
   end
 
-  defp pagination_principal(_runtime, %Request{auth_result: %AuthResult{} = auth_result}) do
-    Auth.identity_fingerprint(auth_result.principal, auth_result.auth)
+  defp pagination_authorization(_runtime, %Request{auth_result: %AuthResult{} = auth_result}) do
+    Auth.authorization_partition(auth_result)
   end
 
-  defp pagination_principal(%{server: %{auth: nil}}, _request), do: "anonymous"
+  defp pagination_authorization(%{server: %{auth: nil}}, _request), do: :anonymous
 
-  defp pagination_principal(_runtime, %Request{auth_input: auth_input}) do
-    (auth_input || %{})
-    |> Map.new()
-    |> :erlang.term_to_binary([:deterministic])
-    |> then(&:crypto.hash(:sha256, &1))
-    |> Base.url_encode64(padding: false)
-    |> then(&("auth-input-sha256:" <> &1))
+  defp pagination_authorization(runtime, %Request{} = request) do
+    context =
+      runtime
+      |> transport_lookup_context(request)
+      |> maybe_authenticate_transport_lookup_context(runtime.server, request.auth_input || %{})
+
+    context
+    |> Auth.result_from_context()
+    |> Auth.authorization_partition()
   end
 
   defp task_pagination_key(task) do

@@ -309,12 +309,22 @@ defmodule FastestMCP.Transport.Serializer do
   defp resource_content(uri, default_mime_type, %{} = content, opts) do
     content_uri = fetch(content, :uri) || uri
     mime_type = fetch(content, :mime_type) || default_mime_type
-    body = fetch(content, :content)
 
-    %{"uri" => content_uri}
-    |> maybe_put("mimeType", mime_type)
-    |> maybe_put("_meta", apps_meta(fetch_meta(content), opts))
-    |> Map.merge(resource_body(mime_type, body))
+    base =
+      %{"uri" => content_uri}
+      |> maybe_put("mimeType", mime_type)
+      |> maybe_put("_meta", apps_meta(fetch_meta(content), opts))
+
+    cond do
+      Map.has_key?(content, :text) or Map.has_key?(content, "text") ->
+        Map.put(base, "text", fetch(content, :text))
+
+      Map.has_key?(content, :blob) or Map.has_key?(content, "blob") ->
+        Map.put(base, "blob", encode_binary(fetch(content, :blob)))
+
+      true ->
+        Map.merge(base, resource_body(mime_type, fetch(content, :content)))
+    end
   end
 
   defp apps_meta(meta, opts) do

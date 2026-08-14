@@ -8,7 +8,7 @@ defmodule FastestMCP.AuthorizationTransformTest do
     @behaviour FastestMCP.Auth
 
     def authenticate(input, _context, _opts) do
-      capabilities =
+      scopes =
         case Map.get(input, "token") do
           "admin-token" -> ["admin"]
           "api-token" -> ["api"]
@@ -20,7 +20,8 @@ defmodule FastestMCP.AuthorizationTransformTest do
        %{
          principal: %{"sub" => "user-123"},
          auth: %{provider: :scope_auth},
-         capabilities: capabilities
+         capabilities: scopes,
+         scopes: scopes
        }}
     end
   end

@@ -948,10 +948,7 @@ defmodule FastestMCP.ClientHTTPTest do
 
     assert is_map(Client.initialize(client))
 
-    assert %{
-             "authorization" => "Bearer dev-token",
-             "x-trace-id" => "trace-123"
-           } = Client.call_tool(client, "headers", %{})
+    assert %{"x-trace-id" => "trace-123"} = Client.call_tool(client, "headers", %{})
 
     assert %{"ok" => true} = Client.call_tool(client, "notify", %{}, progress_token: "token-2")
 

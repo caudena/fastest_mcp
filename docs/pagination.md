@@ -70,8 +70,9 @@ slicing. A cursor cannot be moved between methods, sessions with different
 visibility, principals, or runtime generations.
 
 Providers may implement the optional page callback to filter and limit at the
-source. Existing providers use the streaming fallback, so the wire contract
-does not require every provider to change at once.
+source. Providers that implement only `list_components/3`, or whose transforms
+change key ordering, use that callback's materialized list. The shared pipeline
+bounds the page it emits but cannot make a legacy all-components callback lazy.
 
 ## Example
 

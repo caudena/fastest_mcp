@@ -98,15 +98,20 @@ defmodule FastestMCP.Transport.StreamableHTTP do
         send_resp(conn, 202, "")
 
       {:application_error, %FastestMCP.Transport.Request{protocol: :jsonrpc} = request,
-       %Error{} = error, _auth, _http_context} ->
-        status = application_error_status(request, error)
+       %Error{} = error, auth, http_context} ->
+        payload = StreamableHTTPAdapter.encode_jsonrpc_error(request, error)
 
         conn =
-          HTTPCommon.json(
-            conn,
-            status,
-            StreamableHTTPAdapter.encode_jsonrpc_error(request, error)
-          )
+          if error.code in [:unauthorized, :forbidden] do
+            {status, headers, payload} =
+              HTTPCommon.error_response(error, auth, http_context, payload)
+
+            conn
+            |> put_response_headers(headers)
+            |> HTTPCommon.json(status, payload)
+          else
+            HTTPCommon.json(conn, application_error_status(request, error), payload)
+          end
 
         terminate_session_after_delivery(server_name, request, error)
         conn
@@ -255,6 +260,12 @@ defmodule FastestMCP.Transport.StreamableHTTP do
   end
 
   defp modern_request_attempt?(_request), do: false
+
+  defp put_response_headers(conn, headers) do
+    Enum.reduce(headers, conn, fn {key, value}, current ->
+      put_resp_header(current, key, value)
+    end)
+  end
 
   defp authentication_error(conn, opts, error) do
     case StreamableHTTPAdapter.decode(conn, opts) do

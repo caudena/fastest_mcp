@@ -1,8 +1,8 @@
 # Client
 
-`FastestMCP.Client` is a connected MCP client for streamable HTTP and stdio.
-It keeps negotiated protocol state, auth, request tracking, callbacks, and
-remote task handles in one OTP process.
+`FastestMCP.Client` is a connected MCP client for streamable HTTP, stdio, and
+an Elixir-owned in-process server runtime. It keeps negotiated protocol state,
+auth, request tracking, callbacks, and remote task handles in one OTP process.
 
 It is the right API when you need:
 
@@ -120,6 +120,45 @@ send credentials in protocol metadata by default. The old non-standard
 `legacy_stdio_auth_metadata: true` is set for a controlled legacy peer. Prefer
 child environment or another host-owned stdio credential channel.
 
+## Connected In-Process Server
+
+When the client and an already-running FastestMCP server live in the same BEAM,
+connect by server name:
+
+```elixir
+{:ok, _server} =
+  FastestMCP.start_server(
+    FastestMCP.server("local-mcp")
+    |> FastestMCP.add_tool("echo", fn arguments, _context -> arguments end)
+  )
+
+client =
+  FastestMCP.Client.connect!({:in_process, "local-mcp"},
+    protocol_version: :auto,
+    auth_input: %{"token" => "application-owned-token"}
+  )
+```
+
+This is a connected transport, not a privileged direct-call shortcut. A
+supervised connection coordinator JSON-encodes and decodes every envelope and
+runs it through the existing JSON-RPC, stdio adapter, transport engine,
+serializer, authentication, and legacy session lifecycle. It supports modern
+discovery, legacy initialization, concurrent modern requests, callbacks,
+progress, cancellation, tasks, and long-lived subscriptions with the same
+Client APIs used by network transports.
+
+The public client session id remains `nil`, as it does for stdio; the server
+loop owns its internal transport session. Stopping the named server closes the
+connection and fails outstanding requests. In-process connections do not use
+stdio child restart or HTTP session recovery.
+
+Use `auth_input:` or `FastestMCP.Client.set_auth_input/2` for authentication.
+The effective current or per-call auth input is attached to each request for
+normal server authentication. HTTP and process-launch options are rejected:
+`oauth:`, `headers:`, `authorization:`, `access_token:`, `session_id:`,
+`session_stream:`, SSE options, `env:`, `legacy_stdio_auth_metadata:`, and
+`stdio_restart:`.
+
 ## Protected Servers
 
 ```elixir
@@ -200,11 +239,16 @@ FastestMCP.Client.call_tool(client, "secure.echo", %{"message" => "hi"},
 The client mirrors the main MCP surfaces:
 
 - `FastestMCP.Client.list_tools/2`
+- `FastestMCP.Client.list_all_tools/2`
 - `FastestMCP.Client.call_tool/4`
+- `FastestMCP.Client.call_tool_task/4`
 - `FastestMCP.Client.list_resources/2`
+- `FastestMCP.Client.list_all_resources/2`
 - `FastestMCP.Client.list_resource_templates/2`
+- `FastestMCP.Client.list_all_resource_templates/2`
 - `FastestMCP.Client.read_resource/3`
 - `FastestMCP.Client.list_prompts/2`
+- `FastestMCP.Client.list_all_prompts/2`
 - `FastestMCP.Client.render_prompt/4`
 - `FastestMCP.Client.complete/4`
 
@@ -262,10 +306,45 @@ Connected list helpers return a stable page-map shape:
   FastestMCP.Client.list_prompts(client)
 ```
 
+Use the corresponding `list_all_*` helper when the caller needs the complete
+catalog. The shared paginator preserves server order and empty-string cursors,
+rejects cursor cycles, and defaults to at most 256 pages and 100,000 items.
+Override those bounds with `max_pages:` and `max_items:`. A failure returns no
+partial list.
+
+## Modern Response Cache
+
+Modern complete discovery, list, and resource-read results may include a
+positive `ttlMs`. The connected client can retain their normalized values in
+its existing GenServer:
+
+```elixir
+client =
+  FastestMCP.Client.connect!(endpoint,
+    response_cache: [max_entries: 128, max_item_size: 1_000_000]
+  )
+
+FastestMCP.Client.list_tools(client, cache: :use)
+FastestMCP.Client.list_tools(client, cache: :refresh)
+FastestMCP.Client.list_tools(client, cache: :bypass)
+```
+
+The cache is disabled by default; `response_cache: true` uses the limits shown
+above. It applies only to `server/discover`, the four component list methods,
+and `resources/read` on a selected `2026-07-28` connection. Cursor pages,
+MRTR continuations, asynchronous requests, progress-bearing requests, and
+requests with scoped callbacks bypass it. Request-scoped credentials also
+bypass it rather than entering a cache key. Authentication, roots, connection
+recovery, server identity, and relevant catalog notifications partition or
+invalidate cached values.
+
 ## Remote Task Handles
 
 When a server returns a task, the Elixir client wraps it in
-`%FastestMCP.Client.Task{}`.
+`%FastestMCP.Client.Task{}`. An ordinary modern `call_tool/4` transparently
+drives a server-created task to its final tool result. Use `call_tool_task/4`
+when the caller needs the handle itself; `task: :handle` is equivalent and
+`task: true` remains a compatibility alias.
 
 Tool example:
 
@@ -273,11 +352,10 @@ Tool example:
 alias FastestMCP.Client.Task, as: RemoteTask
 
 task =
-  FastestMCP.Client.call_tool(
+  FastestMCP.Client.call_tool_task(
     client,
     "slow_report",
-    %{"id" => 42},
-    task: true
+    %{"id" => 42}
   )
 
 RemoteTask.status(task)
@@ -304,6 +382,14 @@ Tasks v1 augments `tools/call` and keeps separate `tasks/list` and
 `tasks/result` methods. FastestMCP does not translate between the two wires.
 Prompt and resource tasks remain available through the local in-process Elixir
 API when the application owns both the runtime and task.
+
+Descriptor discovery, the initial RPC, and synchronous MRTR use `timeout_ms`.
+Once a modern task is returned, its independent `task_timeout_ms` defaults to
+60 seconds. The client polls with a bounded adaptive delay and wakes early when
+an active modern subscription delivers a task notification. `RemoteTask.wait/2`
+remains observational: it may return `"input_required"` without invoking
+interaction callbacks, while `RemoteTask.result/2` drives those callbacks and
+sends the resulting `tasks/update`.
 
 ## Task Listing
 
@@ -417,6 +503,9 @@ client =
 Modern `2026-07-28` interactions use input-required MRTR results instead. The
 client invokes the same configured roots, sampling, and elicitation handlers,
 then retries with a fresh request id and the latest opaque request state.
+One monotonic deadline covers the request legs and callbacks. The default
+limit is eight interaction rounds; configure it at connection time with
+`max_mrtr_rounds:` or override it with a positive per-call value.
 
 The non-standard `tasks/sendInput` wire method and its connected-client helper
 were removed in 0.2. Interactive remote tasks use the standard `tasks/result`

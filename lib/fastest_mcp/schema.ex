@@ -280,7 +280,35 @@ defmodule FastestMCP.Schema do
     }
   }
 
+  @built_in_methods [
+                      @client_requests,
+                      @server_requests,
+                      @client_notifications,
+                      @server_notifications,
+                      @server_results,
+                      @client_results
+                    ]
+                    |> Enum.flat_map(fn versions ->
+                      versions
+                      |> Map.values()
+                      |> Enum.flat_map(&Map.keys/1)
+                    end)
+                    |> Kernel.++(
+                      @task_results
+                      |> Map.values()
+                      |> Enum.flat_map(&Map.keys/1)
+                      |> Enum.map(fn {_direction, method} -> method end)
+                    )
+                    |> Kernel.++(["__transport/client_response__"])
+                    |> MapSet.new()
+
   @type raw :: boolean() | map()
+
+  @doc false
+  def built_in_method?(method) when is_binary(method),
+    do: MapSet.member?(@built_in_methods, method)
+
+  def built_in_method?(_method), do: false
 
   @doc "Compiles a JSON Schema into a reusable validator."
   @spec compile(raw(), keyword()) :: {:ok, Compiled.t()} | {:error, Error.t()}

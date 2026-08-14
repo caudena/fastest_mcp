@@ -324,6 +324,11 @@ defmodule FastestMCP.ClientStdioTest do
 
     on_exit(fn -> if Client.connected?(client), do: Client.disconnect(client) end)
 
+    assert %{"structuredContent" => %{"name" => "fast"}} =
+             Client.call_tool(client, "fast", %{})
+
+    catalog_generation = :sys.get_state(client.pid).tool_catalog.generation
+
     listener =
       Client.listen(
         client,
@@ -363,6 +368,10 @@ defmodule FastestMCP.ClientStdioTest do
 
     refute second_subscription_id == first_subscription_id
     assert first_subscription_id == listener.request_id
+
+    restarted_state = :sys.get_state(client.pid)
+    assert restarted_state.tool_catalog.generation > catalog_generation
+    refute restarted_state.tool_catalog_ready?
 
     assert %{"structuredContent" => %{"name" => "fast"}} =
              Client.call_tool(client, "fast", %{})

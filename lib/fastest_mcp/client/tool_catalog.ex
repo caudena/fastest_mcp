@@ -40,6 +40,9 @@ defmodule FastestMCP.Client.ToolCatalog do
     %{catalog | expires_at_ms: System.monotonic_time(:millisecond) + ttl_ms}
   end
 
+  def build(tools, generation, schema_options, nil),
+    do: build(tools, generation, schema_options)
+
   def fresh?(%__MODULE__{expires_at_ms: nil}), do: true
 
   def fresh?(%__MODULE__{expires_at_ms: expires_at_ms}) do

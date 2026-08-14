@@ -4,6 +4,8 @@ defmodule FastestMCP.MiddlewareResponseCachingTest do
   alias FastestMCP.Middleware
   alias FastestMCP.Middleware.ResponseCaching
   alias FastestMCP.Operation
+  alias FastestMCP.BackgroundTask
+  alias FastestMCP.InputRequiredResult
 
   test "tool calls are cached for identical requests" do
     middleware = Middleware.response_caching()
@@ -152,6 +154,63 @@ defmodule FastestMCP.MiddlewareResponseCachingTest do
     assert %{hits: 1, misses: 2, puts: 2} = ResponseCaching.statistics(middleware)["tools/call"]
   end
 
+  test "verified evidence and redacted non-secret auth claims partition cache entries" do
+    middleware = Middleware.response_caching()
+    on_exit(fn -> ResponseCaching.close(middleware) end)
+    counter = start_counter()
+
+    operation = %Operation{
+      server_name: "cache-evidence",
+      method: "tools/call",
+      target: "profile",
+      arguments: %{},
+      transport: :streamable_http,
+      context: %{
+        authenticated: true,
+        principal: "alice",
+        auth: %{token: "credential-a", tenant: "acme"},
+        capabilities: ["read"],
+        verified_audiences: ["https://mcp.example/mcp"],
+        verified_scopes: ["profile:read"]
+      }
+    }
+
+    rotated_credential =
+      put_in(operation.context.auth.token, "credential-b")
+
+    different_scope =
+      put_in(operation.context.verified_scopes, ["profile:write"])
+
+    different_claim =
+      put_in(operation.context.auth.tenant, "other")
+
+    assert :first ==
+             ResponseCaching.call(middleware, operation, fn _operation ->
+               increment(counter)
+               :first
+             end)
+
+    assert :first ==
+             ResponseCaching.call(middleware, rotated_credential, fn _operation ->
+               increment(counter)
+               :rotated
+             end)
+
+    assert :scope ==
+             ResponseCaching.call(middleware, different_scope, fn _operation ->
+               increment(counter)
+               :scope
+             end)
+
+    assert :claim ==
+             ResponseCaching.call(middleware, different_claim, fn _operation ->
+               increment(counter)
+               :claim
+             end)
+
+    assert count(counter) == 3
+  end
+
   test "explicit sessions partition cache entries while implicit sessions share" do
     middleware = Middleware.response_caching()
     on_exit(fn -> ResponseCaching.close(middleware) end)
@@ -293,6 +352,84 @@ defmodule FastestMCP.MiddlewareResponseCachingTest do
     assert message =~ "Skipping cache for tools/call"
 
     assert %{misses: 2, puts: 0, skipped_too_large: 2} =
+             ResponseCaching.statistics(middleware)["tools/call"]
+  end
+
+  test "MRTR continuations bypass lookup and storage even with empty values" do
+    middleware = Middleware.response_caching()
+    on_exit(fn -> ResponseCaching.close(middleware) end)
+    counter = start_counter()
+
+    base = %Operation{
+      server_name: "cache-continuation",
+      method: "tools/call",
+      target: "continue",
+      arguments: %{},
+      transport: :streamable_http
+    }
+
+    for metadata <- [
+          %{input_responses_provided: true},
+          %{request_state_provided: true}
+        ] do
+      operation = %{
+        base
+        | context: %{
+            input_responses: %{},
+            request_state: nil,
+            request_metadata: metadata
+          }
+      }
+
+      for _ <- 1..2 do
+        assert :continued ==
+                 ResponseCaching.call(middleware, operation, fn _operation ->
+                   increment(counter)
+                   :continued
+                 end)
+      end
+    end
+
+    assert count(counter) == 4
+
+    assert %{hits: 0, misses: 0, puts: 0} =
+             ResponseCaching.statistics(middleware)["tools/call"]
+  end
+
+  test "input-required, task, and tool-error results are never cached" do
+    middleware = Middleware.response_caching()
+    on_exit(fn -> ResponseCaching.close(middleware) end)
+
+    operation = %Operation{
+      server_name: "cache-nonterminal",
+      method: "tools/call",
+      target: "work",
+      arguments: %{},
+      transport: :in_process
+    }
+
+    results = [
+      InputRequiredResult.new(nil, request_state: "next"),
+      %BackgroundTask{server_name: "cache-nonterminal", task_id: "task-1"},
+      %{"resultType" => "task", "taskId" => "task-2"},
+      %{content: [%{type: "text", text: "no"}], isError: true}
+    ]
+
+    Enum.each(results, fn result ->
+      counter = start_counter()
+
+      for _ <- 1..2 do
+        assert ^result =
+                 ResponseCaching.call(middleware, operation, fn _operation ->
+                   increment(counter)
+                   result
+                 end)
+      end
+
+      assert count(counter) == 2
+    end)
+
+    assert %{hits: 0, misses: 8, puts: 0} =
              ResponseCaching.statistics(middleware)["tools/call"]
   end
 

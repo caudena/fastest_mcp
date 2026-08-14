@@ -90,6 +90,79 @@ server =
 Use this when you want provider behavior, but your source is still local
 Elixir code.
 
+### Optional application-session tools
+
+FastestMCP ships a small provider for clients that should create and terminate
+explicit application sessions themselves:
+
+```elixir
+server =
+  FastestMCP.server("application")
+  |> FastestMCP.add_provider(FastestMCP.Providers.ApplicationSessions.new())
+```
+
+It exposes `application_session_create` and
+`application_session_terminate`. The provider is never installed
+automatically. State reads and writes remain application-specific and use the
+`FastestMCP.ApplicationSession` API inside handlers.
+
+## Request-scoped proxy providers
+
+`FastestMCP.Providers.Proxy` exposes an HTTP or stdio MCP server through the
+normal provider boundary:
+
+```elixir
+proxy =
+  FastestMCP.Providers.Proxy.new("https://upstream.example.com/mcp",
+    protocol_version: :mirror,
+    max_pages: 256,
+    max_items: 100_000
+  )
+
+server =
+  FastestMCP.server("gateway")
+  |> FastestMCP.add_provider(proxy)
+```
+
+`:mirror` uses the frontend request's exact protocol version. You can instead
+pin `"2026-07-28"` or `"2025-11-25"`; `:auto` is intentionally rejected so an
+upstream failure cannot trigger a protocol downgrade. Each frontend operation
+opens one upstream client, reuses it while resolving and invoking a component,
+and closes it when the operation finishes, including error exits. Clients are
+not pooled across requests.
+
+The proxy walks upstream tool, prompt, resource, and resource-template catalogs
+with bounded pagination. It preserves ordinary content, arbitrary modern
+`structuredContent`, resource documents, prompt results, Apps metadata, MRTR
+`inputResponses`/`requestState`, and progress. Remote task handles,
+subscriptions, notifications, roots mirroring, and callback execution are not
+proxied. Unsupported upstream component capabilities appear as empty catalogs.
+
+Proxy providers cannot be combined with bounded ToolSearch. Opaque upstream
+cursors cannot prove the absence of a synthetic-name collision without an
+unbounded catalog walk, so the server builder rejects that composition before
+opening an upstream connection. Use ordinary proxied listing, or expose a
+separate locally bounded/searchable provider whose source has a real keyset
+page contract.
+
+Incoming credentials are isolated by default. Authorization forwarding is an
+explicit HTTP-only deployment choice:
+
+```elixir
+FastestMCP.Providers.Proxy.new("https://upstream.example.com/mcp",
+  forward_authorization: true,
+  trusted_origins: ["https://upstream.example.com"]
+)
+```
+
+The trusted entry must be the upstream endpoint's exact origin. Only the
+incoming `Authorization` header is forwarded, and forwarding cannot be combined
+with separately configured upstream OAuth or authorization. Do not enable this
+for origins that are not under the same credential trust boundary.
+The credential stays outside public request metadata, header snapshots,
+request-context snapshots, inspection, and telemetry while the request is live,
+and it is cleared before background or detached execution.
+
 ## OpenAPI-backed Providers
 
 OpenAPI support is the fastest way to turn an existing HTTP API into a tool
@@ -209,20 +282,6 @@ Provider-backed components can be reshaped without changing the source:
 - stacked provider transforms
 
 See [Transforms](transforms.md) for the detailed patterns.
-
-## What FastestMCP Does Not Ship Yet
-
-FastestMCP v0.2 does not yet expose filesystem or proxy providers as public
-built-ins. The current provider surface focuses on:
-
-- mounted FastestMCP servers
-- explicit local providers
-- OpenAPI-backed providers
-- skills providers
-- custom provider implementations
-
-That keeps the public surface focused on provider shapes already exercised by
-the runtime and test suite.
 
 ## Why This Shape
 

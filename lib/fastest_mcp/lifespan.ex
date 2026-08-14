@@ -12,7 +12,7 @@ defmodule FastestMCP.Lifespan do
   on key conflicts. Cleanup runs in reverse order.
   """
 
-  defstruct [:enter, :exit]
+  defstruct [:enter, :exit, :namespace]
 
   require Logger
 
@@ -24,7 +24,7 @@ defmodule FastestMCP.Lifespan do
              | {map(), cleanup()}
              | {:ok, map(), cleanup()})
   @type exit :: nil | (-> any()) | (map() -> any()) | (FastestMCP.Server.t(), map() -> any())
-  @type t :: %__MODULE__{enter: enter(), exit: exit()}
+  @type t :: %__MODULE__{enter: enter(), exit: exit(), namespace: String.t() | nil}
 
   @doc "Builds a new value for this module from the supplied options."
   def new(%__MODULE__{} = lifespan), do: lifespan
@@ -38,6 +38,11 @@ defmodule FastestMCP.Lifespan do
       when is_function(enter, 1) and
              (is_nil(exit) or is_function(exit, 0) or is_function(exit, 1) or is_function(exit, 2)) do
     %__MODULE__{enter: enter, exit: exit}
+  end
+
+  @doc false
+  def namespaced(namespace, lifespan) when is_binary(namespace) and namespace != "" do
+    %{new(lifespan) | namespace: namespace}
   end
 
   @doc "Runs all configured lifespan enter hooks and collects cleanup callbacks."
@@ -81,22 +86,22 @@ defmodule FastestMCP.Lifespan do
 
     case lifespan.enter.(server) do
       %{} = state ->
-        {:ok, state, wrap_exit(server, lifespan.exit, state)}
+        successful_enter(lifespan, state, wrap_exit(server, lifespan.exit, state))
 
       {:ok, %{} = state} ->
-        {:ok, state, wrap_exit(server, lifespan.exit, state)}
+        successful_enter(lifespan, state, wrap_exit(server, lifespan.exit, state))
 
       {%{} = state, cleanup} ->
-        {:ok, state, wrap_cleanup(cleanup, state)}
+        successful_enter(lifespan, state, wrap_cleanup(cleanup, state))
 
       {:ok, %{} = state, cleanup} ->
-        {:ok, state, wrap_cleanup(cleanup, state)}
+        successful_enter(lifespan, state, wrap_cleanup(cleanup, state))
 
       nil ->
-        {:ok, %{}, wrap_exit(server, lifespan.exit, %{})}
+        successful_enter(lifespan, %{}, wrap_exit(server, lifespan.exit, %{}))
 
       {:ok, nil} ->
-        {:ok, %{}, wrap_exit(server, lifespan.exit, %{})}
+        successful_enter(lifespan, %{}, wrap_exit(server, lifespan.exit, %{}))
 
       other ->
         {:error, {:invalid_lifespan_result, other}}
@@ -108,6 +113,12 @@ defmodule FastestMCP.Lifespan do
     kind, reason ->
       {:error, {kind, reason}}
   end
+
+  defp successful_enter(%__MODULE__{namespace: nil}, state, cleanup),
+    do: {:ok, state, cleanup}
+
+  defp successful_enter(%__MODULE__{namespace: namespace}, state, cleanup),
+    do: {:ok, %{namespace => state}, cleanup}
 
   defp wrap_exit(_server, nil, _state), do: nil
   defp wrap_exit(_server, exit, _state) when is_function(exit, 0), do: exit

@@ -5,7 +5,10 @@ credentials or framework state into normalized request context:
 
 - `ctx.principal`
 - `ctx.auth`
+- `ctx.authenticated`
 - `ctx.capabilities`
+- `ctx.verified_scopes`
+- `ctx.verified_audiences`
 - `Context.client_id/1`
 
 Your application verifies sessions, tokens, cookies, or upstream identity using
@@ -24,7 +27,8 @@ FastestMCP.server("app")
        %{
          principal: %{"sub" => to_string(user.id)},
          auth: %{source: :app, user_id: user.id},
-         capabilities: MyApp.MCPScopes.for_user(user)
+         scopes: MyApp.MCPScopes.for_user(user),
+         audiences: ["https://mcp.example.com/mcp"]
        }}
 
     :error ->
@@ -51,7 +55,8 @@ defmodule MyApp.MCPAuth do
        %FastestMCP.Auth.Result{
          principal: %{"sub" => to_string(user.id)},
          auth: %{source: :app, user_id: user.id},
-         capabilities: MyApp.MCPScopes.for_user(user)
+         scopes: MyApp.MCPScopes.for_user(user),
+         audiences: ["https://mcp.example.com/mcp"]
        }}
     end
   end
@@ -95,7 +100,8 @@ FastestMCP.server(MyApp.MCPServer)
 |> FastestMCP.add_auth(
   FastestMCP.Auth.from_assign(:current_user,
     principal: fn user -> %{"sub" => to_string(user.id)} end,
-    capabilities: fn user -> MyApp.MCPScopes.for_user(user) end,
+    scopes: fn user -> MyApp.MCPScopes.for_user(user) end,
+    audiences: fn _user -> ["https://mcp.example.com/mcp"] end,
     auth: fn user -> %{source: :phoenix, user_id: user.id} end
   )
 )
@@ -152,12 +158,32 @@ Authorization rules can also filter list results with tags:
 FastestMCP.Authorization.restrict_tag("internal")
 ```
 
-Authorization is fail closed. A component check authorizes only when it returns
-`true` or `:ok`. `false`, `nil`, malformed return values, exceptions, throws,
-and exits all deny access; a binary `{:error, message}` also denies with that
-message. When multiple versions share an identity, an unauthorized higher
-version is skipped so an authorized lower version can remain visible, while an
-explicit request for the unauthorized version is rejected.
+`require_scopes/1` checks only scopes verified by the authenticator. It never
+uses client capabilities or unverified token claims. A dynamic resolver receives
+`%FastestMCP.Authorization.Context{}` and runs once per authorization decision:
+
+```elixir
+FastestMCP.Authorization.require_scopes(fn authz ->
+  if authz.arguments["confidential"], do: ["reports:confidential"], else: ["reports:read"]
+end)
+```
+
+The authorization context includes the authenticated state, verified scopes and
+audiences, operation target and arguments, and canonical decoded resource-template
+captures. Use `require_capabilities/1` when the application intentionally wants
+a capability-based check instead:
+
+```elixir
+FastestMCP.Authorization.require_capabilities(["internal-tools"])
+```
+
+Authorization is fail closed. A custom function check authorizes only when it
+returns `true` or `:ok`. `false`, `nil`, malformed return values, exceptions,
+throws, exits, and error tuples all deny access. Custom checks are opaque: their
+denial details are not exposed on the wire. When multiple versions share an
+identity, an unauthorized higher version is skipped so an authorized lower
+version can remain visible, while an explicit request for the unauthorized
+version is rejected.
 
 ## HTTP Behavior
 
@@ -167,6 +193,12 @@ before dispatch. A legacy initialize identity is bound to its session; a
 different principal cannot reuse that session id. Modern requests are
 stateless authentication boundaries. Component authorization still runs in
 the operation pipeline after transport authentication.
+
+List operations silently omit unauthorized components. Direct access with a
+verified token that lacks one or more declared scopes returns HTTP 403 and an
+`insufficient_scope` challenge containing the union of missing scopes. If any
+custom, capability, or failed dynamic check also denies the operation, the
+response remains a generic 403 and does not disclose scope requirements.
 
 Without protected-resource configuration, HTTP auth failures use a plain
 bearer challenge:

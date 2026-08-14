@@ -86,8 +86,10 @@ defmodule FastestMCP.Provider do
   visibility, and authorization.
 
   Provider transforms intentionally disable this callback because an arbitrary
-  rename can change ordering. Those providers retain the correct streaming
-  keyset fallback in `FastestMCP.OperationPipeline`.
+  rename can change ordering. Transformed providers and providers without this
+  callback use their materialized `list_components/3` result. Consumers still
+  bound the number of candidates they process, but the shared pipeline cannot
+  make that legacy callback lazy.
   """
   def list_component_page(
         %__MODULE__{inner: %module{}} = provider,

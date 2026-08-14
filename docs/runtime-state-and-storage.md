@@ -25,6 +25,7 @@ The backend powers:
 - `Context.get_state/3`
 - `Context.set_state/4`
 - `Context.delete_state/2`
+- `FastestMCP.ApplicationSession`
 
 Negotiation and lifecycle (`:new`, `:initializing`, `:initialized`) remain owned
 by the supervised per-session runtime rather than the state backend.
@@ -50,6 +51,16 @@ Context.set_state(ctx, :current_socket, socket, serializable: false)
 
 That is useful for values that should stay local to the current call and should
 not be shared across requests or stored in the backend.
+
+Application sessions reuse this backend without creating another process or
+storage contract. Their namespaces are distinct from MCP transport session
+ids. The current application session is derived from the verified principal;
+explicit sessions use random public ids plus a private existence marker.
+
+The backend determines persistence across runtime restarts. The built-in memory
+backend is lost with the server runtime. A shared or durable custom backend can
+retain application-session values, but it does not distribute the rest of MCP
+session or task coordination.
 
 ### Background Task State
 

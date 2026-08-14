@@ -118,6 +118,8 @@ defmodule FastestMCP do
   defdelegate add_dependency(server, name, resolver), to: Server
   @doc "Adds middleware to the current definition."
   defdelegate add_middleware(server, middleware), to: Server
+  @doc "Enables bounded model-visible tool search on the server."
+  defdelegate enable_tool_search(server, opts \\ []), to: Server
   @doc "Adds a transform to the current definition."
   defdelegate add_transform(server, transform), to: Server
   @doc "Adds a provider to the current definition."

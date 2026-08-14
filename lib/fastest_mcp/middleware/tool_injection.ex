@@ -78,7 +78,7 @@ defmodule FastestMCP.Middleware.ToolInjection do
   @doc "Runs the middleware around the next operation."
   def call(%__MODULE__{} = middleware, %Operation{method: "tools/list"} = operation, next)
       when is_function(next, 1) do
-    visible_tools = apply_list_policy(middleware.tools, operation)
+    visible_tools = visible_tools(middleware, operation)
     visible_names = MapSet.new(visible_tools, & &1.name)
 
     base_tools =
@@ -95,29 +95,59 @@ defmodule FastestMCP.Middleware.ToolInjection do
         next
       )
       when is_function(next, 1) do
-    case Map.fetch(middleware.tools_by_name, to_string(target)) do
-      {:ok, tool} ->
-        case ComponentPolicy.apply_result(operation.context.server, tool, operation) do
-          {:ok, visible_tool} ->
-            operation = %{operation | component: visible_tool}
-            FastestMCP.Telemetry.annotate_span(operation)
-            OperationPipeline.record_resolved_component(operation.context, visible_tool)
-            Component.execute(visible_tool, operation)
+    case prepare_tool(middleware, target, operation) do
+      {:ok, visible_tool} ->
+        execute_tool(visible_tool, operation)
 
-          {:error, %Error{code: code}} when code in [:disabled, :filtered, :not_visible] ->
-            next.(operation)
-
-          {:error, %Error{} = error} ->
-            raise error
-        end
-
-      :error ->
+      :not_found ->
         next.(operation)
+
+      :hidden ->
+        next.(operation)
+
+      {:error, %Error{} = error} ->
+        raise error
     end
   end
 
   def call(_middleware, %Operation{} = operation, next) when is_function(next, 1) do
     next.(operation)
+  end
+
+  @doc false
+  def visible_tools(%__MODULE__{} = middleware, %Operation{} = operation) do
+    apply_list_policy(middleware.tools, operation)
+  end
+
+  @doc false
+  def tool_names(%__MODULE__{} = middleware), do: Enum.map(middleware.tools, & &1.name)
+
+  @doc false
+  def prepare_tool(%__MODULE__{} = middleware, target, %Operation{} = operation) do
+    case Map.fetch(middleware.tools_by_name, to_string(target)) do
+      {:ok, tool} ->
+        case ComponentPolicy.apply_result(operation.context.server, tool, operation) do
+          {:ok, visible_tool} ->
+            {:ok, visible_tool}
+
+          {:error, %Error{code: code}} when code in [:disabled, :filtered, :not_visible] ->
+            :hidden
+
+          {:error, %Error{} = error} ->
+            {:error, error}
+        end
+
+      :error ->
+        :not_found
+    end
+  end
+
+  @doc false
+  def execute_tool(tool, %Operation{} = operation) do
+    operation = %{operation | component: tool}
+    FastestMCP.Telemetry.annotate_span(operation)
+    OperationPipeline.record_resolved_component(operation.context, tool)
+    Component.execute(tool, operation)
   end
 
   defp normalize_tool(%FastestMCP.Components.Tool{} = tool, _opts), do: tool
@@ -213,8 +243,12 @@ defmodule FastestMCP.Middleware.ToolInjection do
       transport: Map.get(context, :transport, :in_process),
       request_metadata: Map.get(context, :request_metadata, %{}),
       principal: Map.get(context, :principal),
+      authenticated: Map.get(context, :authenticated, false),
       auth: Map.get(context, :auth, %{}),
       capabilities: Map.get(context, :capabilities, []),
+      verified_audiences: Map.get(context, :verified_audiences, []),
+      verified_scopes: Map.get(context, :verified_scopes, []),
+      transport_authenticated: Map.get(context, :authenticated, false),
       task_metadata: Map.get(context, :task_metadata, %{})
     ]
   end

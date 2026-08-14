@@ -4,9 +4,9 @@ defmodule FastestMCP.MixProject do
   def project do
     [
       app: :fastest_mcp,
-      version: "0.2.0",
+      version: "0.3.0",
       description:
-        "BEAM-native MCP toolkit for supervised Elixir servers, clients, auth, and transports",
+        "Production-grade Model Context Protocol (MCP) SDK for Elixir and Phoenix. Complete server and client support for MCP 2026-07-28 and 2025-11-25, with OAuth authentication, MCP Apps, Tasks, Streamable HTTP, stdio, strict validation, observability, and a FastMCP-inspired DSL.",
       source_url: "https://github.com/caudena/fastest_mcp",
       homepage_url: "https://github.com/caudena/fastest_mcp",
       elixir: "~> 1.19",
@@ -148,6 +148,7 @@ defmodule FastestMCP.MixProject do
         FastestMCP.ServerModule,
         FastestMCP.Server,
         FastestMCP.Context,
+        FastestMCP.ApplicationSession,
         FastestMCP.Apps,
         FastestMCP.InputRequiredResult,
         FastestMCP.RequestContext,
@@ -185,12 +186,21 @@ defmodule FastestMCP.MixProject do
         FastestMCP.Auth.ProtectedResource,
         FastestMCP.Auth.Result,
         FastestMCP.Auth.StaticToken,
+        FastestMCP.Authorization,
+        FastestMCP.Authorization.Check,
+        FastestMCP.Authorization.Context,
         FastestMCP.ComponentManager,
         FastestMCP.Error,
         FastestMCP.Interact,
         FastestMCP.Middleware,
+        FastestMCP.Middleware.ToolSearch,
         FastestMCP.Operation,
         FastestMCP.Provider,
+        FastestMCP.Providers.ApplicationSessions,
+        FastestMCP.Providers.Proxy,
+        FastestMCP.ResourceSecurity,
+        FastestMCP.ServerExtension,
+        FastestMCP.ServerExtension.Method,
         FastestMCP.Sampling,
         FastestMCP.Schema,
         FastestMCP.Schema.Compiled,
@@ -232,7 +242,9 @@ defmodule FastestMCP.MixProject do
       ],
       licenses: ["Apache-2.0"],
       links: %{
-        "GitHub" => "https://github.com/caudena/fastest_mcp"
+        "Documentation" => "https://hexdocs.pm/fastest_mcp",
+        "GitHub" => "https://github.com/caudena/fastest_mcp",
+        "Changelog" => "https://github.com/caudena/fastest_mcp/blob/master/CHANGELOG.md"
       }
     ]
   end
