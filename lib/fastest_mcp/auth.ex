@@ -41,7 +41,8 @@ defmodule FastestMCP.Auth do
   @type t :: %__MODULE__{provider: module(), options: map()}
 
   @callback authenticate(input(), Context.t(), map()) ::
-              {:ok, Result.t() | map()} | {:error, Error.t() | atom() | {atom(), String.t()}}
+              {:ok, __MODULE__.Result.t() | map()}
+              | {:error, Error.t() | atom() | {atom(), String.t()}}
 
   defmodule Result do
     @moduledoc """

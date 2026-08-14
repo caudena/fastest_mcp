@@ -36,4 +36,29 @@ defmodule FastestMCP.Components.Tool do
     visibility: [:model],
     meta: %{}
   ]
+
+  @type t :: %__MODULE__{
+          server_name: String.t() | atom() | nil,
+          name: String.t() | nil,
+          version: String.t() | nil,
+          title: String.t() | nil,
+          description: String.t() | nil,
+          icons: list() | nil,
+          annotations: map() | nil,
+          input_schema: boolean() | map() | nil,
+          compiled_input_schema: term(),
+          completions: term(),
+          inject: term(),
+          task: term(),
+          timeout: non_neg_integer() | nil,
+          output_schema: boolean() | map() | nil,
+          compiled_output_schema: term(),
+          compiled: term(),
+          authorization: list(),
+          policy_state: map(),
+          tags: MapSet.t(),
+          enabled: boolean(),
+          visibility: list(),
+          meta: map()
+        }
 end

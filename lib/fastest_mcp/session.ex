@@ -1979,7 +1979,6 @@ defmodule FastestMCP.Session do
     case validation do
       {:ok, ^payload} -> :ok
       {:error, %FastestMCP.Schema.Error{} = error} -> {:error, {method, error}}
-      {:error, %Error{} = error} -> {:error, error}
     end
   end
 

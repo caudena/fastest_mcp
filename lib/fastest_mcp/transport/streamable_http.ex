@@ -299,10 +299,10 @@ defmodule FastestMCP.Transport.StreamableHTTP do
         end
 
       {:response, status, payload} ->
-        {:ok, status, maybe_put_health_server_name(payload, runtime.server.name)}
+        {:ok, status, payload}
 
       {:response, status, payload, headers} ->
-        {:ok, status, maybe_put_health_server_name(payload, runtime.server.name), headers}
+        {:ok, status, payload, headers}
 
       {:error, %Error{} = error} ->
         request = %FastestMCP.Transport.Request{
@@ -441,7 +441,7 @@ defmodule FastestMCP.Transport.StreamableHTTP do
   end
 
   defp verify_session_identity(runtime, request) do
-    auth_result = request.auth_result || %FastestMCP.Auth.Result{}
+    auth_result = request.auth_result
 
     identity =
       FastestMCP.Auth.identity_fingerprint(auth_result.principal, auth_result.auth)
@@ -594,12 +594,6 @@ defmodule FastestMCP.Transport.StreamableHTTP do
        }}
     end
   end
-
-  defp maybe_put_health_server_name(%{status: "ok"} = payload, server_name) do
-    Map.put(payload, :server_name, to_string(server_name))
-  end
-
-  defp maybe_put_health_server_name(payload, _server_name), do: payload
 
   defp execute_request(runtime, request, opts) do
     payload = Engine.dispatch!(runtime.server.name, request, opts)

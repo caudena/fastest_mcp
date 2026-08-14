@@ -1099,7 +1099,7 @@ defmodule FastestMCP.BackgroundTaskStore do
     end
   end
 
-  defp reconcile_runtime_tasks(state), do: reconcile_runtime_tasks(state, nil, MapSet.new())
+  defp reconcile_runtime_tasks(state), do: reconcile_runtime_tasks(state, nil, %{})
 
   defp reconcile_runtime_tasks(state, cursor, seen_cursors) do
     opts = [page_size: @startup_reconciliation_page_size, cursor: cursor]
@@ -1111,7 +1111,7 @@ defmodule FastestMCP.BackgroundTaskStore do
           if is_nil(next_cursor) do
             :ok
           else
-            reconcile_runtime_tasks(state, next_cursor, MapSet.put(seen_cursors, next_cursor))
+            reconcile_runtime_tasks(state, next_cursor, Map.put(seen_cursors, next_cursor, true))
           end
         end
 
@@ -1165,7 +1165,7 @@ defmodule FastestMCP.BackgroundTaskStore do
   defp validate_reconciliation_cursor(nil, _seen_cursors), do: :ok
 
   defp validate_reconciliation_cursor(cursor, seen_cursors) do
-    if MapSet.member?(seen_cursors, cursor),
+    if Map.has_key?(seen_cursors, cursor),
       do: {:error, {:repeated_task_cursor, cursor}},
       else: :ok
   end
@@ -1884,8 +1884,6 @@ defmodule FastestMCP.BackgroundTaskStore do
 
   defp call_timeout(:infinity), do: :infinity
   defp call_timeout(timeout) when is_integer(timeout) and timeout >= 0, do: timeout + 100
-
-  defp put_task_monitor(task_monitors, _task_id, _pid, nil), do: task_monitors
 
   defp put_task_monitor(task_monitors, task_id, pid, monitor_ref),
     do: Map.put(task_monitors, monitor_ref, {task_id, pid})

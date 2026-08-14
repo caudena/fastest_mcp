@@ -355,6 +355,20 @@ defmodule FastestMCP.Schema do
   end
 
   @doc false
+  @spec validate_source(Compiled.t() | raw(), term()) :: {:ok, term()} | {:error, Error.t()}
+  def validate_source(source, value) when is_map(source) or is_boolean(source) do
+    case Compiled.cast(source) do
+      {:ok, compiled} ->
+        validate(compiled, value)
+
+      :error ->
+        with {:ok, compiled} <- compile(source) do
+          validate(compiled, value)
+        end
+    end
+  end
+
+  @doc false
   def validate(%Compiled{} = compiled, value, opts) when is_list(opts) do
     timeout_ms = timeout_option!(opts, :validation_timeout_ms, @default_validation_timeout_ms)
 
@@ -832,7 +846,6 @@ defmodule FastestMCP.Schema do
          true <- is_map(definitions) do
       {:ok, definitions}
     else
-      {:error, %Error{} = error} -> {:error, error}
       _other -> {:error, compile_error("could not load the vendored MCP Tasks extension schema")}
     end
   end

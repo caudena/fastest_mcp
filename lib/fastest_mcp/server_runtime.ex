@@ -55,7 +55,6 @@ defmodule FastestMCP.ServerRuntime do
         case FastestMCP.ServerSupervisor.stop_server(owner_pid) do
           :ok -> :ok
           {:error, :not_found} -> Supervisor.stop(owner_pid, :shutdown)
-          other -> other
         end
 
       {:error, :not_found} ->
@@ -63,7 +62,6 @@ defmodule FastestMCP.ServerRuntime do
           case FastestMCP.ServerSupervisor.stop_server(pid) do
             :ok -> :ok
             {:error, :not_found} -> GenServer.stop(pid, :shutdown)
-            other -> other
           end
         end
     end

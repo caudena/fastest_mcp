@@ -1199,7 +1199,7 @@ defmodule FastestMCP.Transport.Engine do
               context
 
             auth ->
-              case Auth.resolve(auth, context, request.auth_input || %{}) do
+              case Auth.resolve(auth, context, request.auth_input) do
                 {:ok, authenticated_context} -> authenticated_context
                 {:error, %Error{} = error} -> raise error
               end
@@ -1425,7 +1425,7 @@ defmodule FastestMCP.Transport.Engine do
   defp transport_lookup_operation(runtime, request, component_type, target, method, request_opts) do
     context =
       transport_lookup_context(runtime, request)
-      |> maybe_authenticate_transport_lookup_context(runtime.server, request.auth_input || %{})
+      |> maybe_authenticate_transport_lookup_context(runtime.server, request.auth_input)
 
     %Operation{
       server_name: runtime.server.name,
@@ -1669,14 +1669,6 @@ defmodule FastestMCP.Transport.Engine do
 
   defp filter_invalid_header_tools(page, _request), do: page
 
-  defp paginated_response(server_name, request, request_opts, items, key, serializer)
-       when is_list(items) and is_function(serializer, 1) do
-    page = wire_page(server_name, request, request_opts, items)
-
-    %{key => Enum.map(page.items, serializer)}
-    |> maybe_put(:nextCursor, page.next_cursor)
-  end
-
   defp paginated_response(
          _server_name,
          _request,
@@ -1729,7 +1721,7 @@ defmodule FastestMCP.Transport.Engine do
 
   defp put_tool_parameter_header_validator(request_opts, _request), do: request_opts
 
-  defp wire_page(server_name, request, request_opts, items, opts \\ []) do
+  defp wire_page(server_name, request, request_opts, items, opts) do
     runtime = fetch_runtime!(server_name)
 
     Pagination.wire_page(
@@ -1785,7 +1777,7 @@ defmodule FastestMCP.Transport.Engine do
     context =
       runtime
       |> transport_lookup_context(request)
-      |> maybe_authenticate_transport_lookup_context(runtime.server, request.auth_input || %{})
+      |> maybe_authenticate_transport_lookup_context(runtime.server, request.auth_input)
 
     context
     |> Auth.result_from_context()

@@ -18,4 +18,9 @@ defmodule FastestMCP.Schema.Compiled do
 
   @doc false
   def root(%__MODULE__{root: root}), do: root
+
+  @doc false
+  @spec cast(term()) :: {:ok, t()} | :error
+  def cast(%__MODULE__{} = compiled), do: {:ok, compiled}
+  def cast(_value), do: :error
 end

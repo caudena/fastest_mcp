@@ -577,7 +577,7 @@ defmodule FastestMCP.Client do
   @doc "Returns whether a server-initiated callback has been cancelled."
   def callback_cancelled?(%CallbackContext{client: %__MODULE__{pid: pid}} = context) do
     case context.cancellation_ref do
-      cancellation_ref when is_reference(cancellation_ref) ->
+      cancellation_ref when not is_nil(cancellation_ref) ->
         :atomics.get(cancellation_ref, 1) == 1
 
       nil ->
@@ -3640,7 +3640,7 @@ defmodule FastestMCP.Client do
       terminal_error = %{
         error
         | details:
-            Map.merge(error.details || %{}, %{
+            Map.merge(error.details, %{
               restart_attempts: state.stdio_restart_attempt,
               restart_exhausted: true
             })
@@ -5370,9 +5370,6 @@ defmodule FastestMCP.Client do
                       error.violations,
                       "task-result"
                     )
-
-            {:error, %Error{} = error} ->
-              raise error
           end
         end
 
@@ -6835,9 +6832,6 @@ defmodule FastestMCP.Client do
            details: %{violations: error.violations},
            exposure: %{mask_error_details: true, component_type: :client_callback}
          }}
-
-      {:error, %Error{} = error} ->
-        {:error, error}
     end
   end
 
@@ -7248,7 +7242,7 @@ defmodule FastestMCP.Client do
   end
 
   defp mark_callback_cancelled(%CallbackContext{cancellation_ref: cancellation_ref})
-       when is_reference(cancellation_ref) do
+       when not is_nil(cancellation_ref) do
     :ok = :atomics.put(cancellation_ref, 1, 1)
   end
 
@@ -7430,8 +7424,6 @@ defmodule FastestMCP.Client do
     end
   end
 
-  defp parse_task_request(_params), do: {false, 60_000}
-
   defp fetch_task_request(params) do
     cond do
       Map.has_key?(params, "task") -> Map.fetch(params, "task")
@@ -7552,9 +7544,6 @@ defmodule FastestMCP.Client do
           message: "client callback returned an invalid #{method} result",
           details: %{violations: error.violations},
           exposure: %{mask_error_details: true, component_type: :client_callback}
-
-      {:error, %Error{} = error} ->
-        raise error
     end
   end
 
@@ -8269,9 +8258,6 @@ defmodule FastestMCP.Client do
            error.violations,
            response["id"]
          )}
-
-      {:error, %Error{} = error} ->
-        {:error, error}
     end
   end
 
@@ -8327,9 +8313,6 @@ defmodule FastestMCP.Client do
            error.violations,
            response["id"]
          )}
-
-      {:error, %Error{} = error} ->
-        {:error, error}
     end
   end
 
@@ -9089,9 +9072,6 @@ defmodule FastestMCP.Client do
              message: "invalid #{method} notification",
              details: %{violations: error.violations}
            }}
-
-        {:error, %Error{} = error} ->
-          {:error, error}
       end
     end
   end

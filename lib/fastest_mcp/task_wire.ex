@@ -181,7 +181,7 @@ defmodule FastestMCP.TaskWire do
     |> maybe_put("statusMessage", status_message_override || status_message(task))
     |> maybe_put("inputRequests", if(status == "input_required", do: input_requests(task)))
     |> maybe_put("result", if(status == "completed", do: serialized_result(task, opts)))
-    |> maybe_put("error", if(status == "failed", do: serialized_error(task, :modern)))
+    |> maybe_put("error", if(status == "failed", do: serialized_error(task)))
     |> maybe_put("resultType", if(result_type?, do: "complete"))
   end
 
@@ -234,24 +234,21 @@ defmodule FastestMCP.TaskWire do
   defp serialize_component_result(_task, result) when is_map(result), do: result
   defp serialize_component_result(_task, result), do: %{"value" => result}
 
-  defp serialized_error(%{error: %Error{} = error}, profile),
-    do: JSONRPC.error_object(error, protocol_version: protocol_version(profile))
+  defp serialized_error(%{error: %Error{} = error}),
+    do: JSONRPC.error_object(error, protocol_version: Protocol.current_version())
 
-  defp serialized_error(%{failure_message: message}, profile) when is_binary(message) do
+  defp serialized_error(%{failure_message: message}) when is_binary(message) do
     JSONRPC.error_object(%Error{code: :internal_error, message: message},
-      protocol_version: protocol_version(profile)
+      protocol_version: Protocol.current_version()
     )
   end
 
-  defp serialized_error(_task, profile) do
+  defp serialized_error(_task) do
     JSONRPC.error_object(
       %Error{code: :internal_error, message: "background task failed"},
-      protocol_version: protocol_version(profile)
+      protocol_version: Protocol.current_version()
     )
   end
-
-  defp protocol_version(:modern), do: Protocol.current_version()
-  defp protocol_version(:legacy), do: "2025-11-25"
 
   defp task_id(%{task_id: value}), do: to_string(value)
   defp task_id(%{id: value}), do: to_string(value)

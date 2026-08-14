@@ -1429,9 +1429,6 @@ defmodule FastestMCP.Transport.Stdio do
           config ->
             {:error, {:unsupported_stdout_logger_handler, config}}
         end
-
-      other ->
-        {:error, {:cannot_inspect_logger_handlers, other}}
     end
   catch
     kind, reason -> {:error, {:cannot_inspect_logger_handlers, {kind, reason}}}

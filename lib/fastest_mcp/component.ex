@@ -386,8 +386,7 @@ defmodule FastestMCP.Component do
 
   defp cached_schema(nil, _cache, _schema_options, _existing), do: nil
 
-  defp cached_schema(schema, cache, schema_options, existing)
-       when is_reference(cache) or is_integer(cache) do
+  defp cached_schema(schema, cache, schema_options, existing) when not is_nil(cache) do
     {:ok, digest} = Schema.digest(schema)
 
     case :ets.lookup(cache, digest) do

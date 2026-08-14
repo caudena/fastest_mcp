@@ -1147,7 +1147,6 @@ defmodule FastestMCP.Client.OAuth do
       {:ok, token}
     else
       {:error, stage, reason} -> {:error, stage, reason}
-      {:error, reason} -> {:error, :token_exchange, sanitize_reason(reason)}
     end
   end
 

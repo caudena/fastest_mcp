@@ -132,8 +132,6 @@ defmodule FastestMCP.Protocol.Meta do
       else: {:error, "invalid _meta key name #{inspect(key)}"}
   end
 
-  defp validate_name(_name, key), do: {:error, "invalid _meta key name #{inspect(key)}"}
-
   defp reserved_prefix?([_first, second | _rest]),
     do: MapSet.member?(@reserved_second_labels, String.downcase(second))
 

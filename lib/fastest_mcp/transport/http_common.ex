@@ -534,8 +534,6 @@ defmodule FastestMCP.Transport.HTTPCommon do
     FunctionClauseError -> {:error, :invalid_origin}
   end
 
-  defp parse_serialized_http_origin(_origin), do: {:error, :invalid_origin}
-
   defp validate_origin_port(nil), do: :ok
 
   defp validate_origin_port(port) do

@@ -856,6 +856,8 @@ defmodule FastestMCP.Context do
   end
 
   @doc "Registers URL elicitation descriptors and raises the standard -32042 error."
+  @spec require_url_elicitation!(t(), term(), term()) :: no_return()
+  @spec require_url_elicitation!(t(), term(), term(), keyword()) :: no_return()
   def require_url_elicitation!(%__MODULE__{} = context, message, url_or_builder, opts \\ []) do
     require_client_capability!(
       context,

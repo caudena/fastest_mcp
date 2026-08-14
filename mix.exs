@@ -173,6 +173,7 @@ defmodule FastestMCP.MixProject do
         FastestMCP.Client.ProtocolError,
         FastestMCP.Client.Request,
         FastestMCP.Client.Task,
+        FastestMCP.Client.ToolResult,
         FastestMCP.Client.URLElicitation,
         FastestMCP.Protocol,
         FastestMCP.Protocol.Extensions,

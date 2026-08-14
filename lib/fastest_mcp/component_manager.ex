@@ -49,7 +49,10 @@ defmodule FastestMCP.ComponentManager do
 
   defstruct [:server_name, :pid]
 
+  @type t :: %__MODULE__{server_name: String.t(), pid: pid()}
+
   @doc "Starts the process owned by this module."
+  @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
     server_name = opts |> Keyword.fetch!(:server_name) |> to_string()
 
@@ -60,7 +63,7 @@ defmodule FastestMCP.ComponentManager do
         on_duplicate:
           Component.normalize_duplicate_policy!(Keyword.get(opts, :on_duplicate, :error))
       },
-      opts
+      Keyword.drop(opts, [:server_name, :on_duplicate])
     )
   end
 

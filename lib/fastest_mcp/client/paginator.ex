@@ -38,7 +38,7 @@ defmodule FastestMCP.Client.Paginator do
   def fetch_all_with_meta(fetch_page, opts \\ []) when is_function(fetch_page, 1) do
     with {:ok, max_pages} <- positive_limit(opts, :max_pages, @default_max_pages),
          {:ok, max_items} <- positive_limit(opts, :max_items, @default_max_items) do
-      walk(fetch_page, nil, MapSet.new(), [], :unset, nil, 0, 0, max_pages, max_items)
+      walk(fetch_page, nil, %{}, [], :unset, nil, 0, 0, max_pages, max_items)
     end
   end
 
@@ -101,7 +101,7 @@ defmodule FastestMCP.Client.Paginator do
                page_count: page_count + 1
              }}
 
-          MapSet.member?(seen, next_cursor) ->
+          Map.has_key?(seen, next_cursor) ->
             {:error,
              %Error{
                code: :invalid_request,
@@ -113,7 +113,7 @@ defmodule FastestMCP.Client.Paginator do
             walk(
               fetch_page,
               next_cursor,
-              MapSet.put(seen, next_cursor),
+              Map.put(seen, next_cursor, true),
               [items | pages],
               page_ttl(ttl_ms, page),
               page_cache_scope(cache_scope, page),

@@ -33,7 +33,7 @@ defmodule FastestMCP.Telemetry do
 
   @doc "Returns the active OpenTelemetry tracer."
   def get_tracer do
-    OpenTelemetry.get_tracer(@instrumentation_name)
+    OpenTelemetry.get_tracer(:fastest_mcp)
   end
 
   @doc "Returns the current tracing context."

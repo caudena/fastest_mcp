@@ -458,8 +458,6 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
   defp parsed_body_params(%Plug.Conn{body_params: body_params}) when is_map(body_params),
     do: {:ok, body_params}
 
-  defp parsed_body_params(_conn), do: :unavailable
-
   defp request_headers(conn), do: Map.new(conn.req_headers)
 
   defp public_request_headers(headers), do: Map.delete(headers, "authorization")
