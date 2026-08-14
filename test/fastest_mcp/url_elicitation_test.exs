@@ -143,7 +143,7 @@ defmodule FastestMCP.URLElicitationTest do
              }
            }
 
-    compiled = Schema.compile_protocol_definition!("URLElicitationRequiredError")
+    compiled = Schema.compile_protocol_definition!("2025-11-25", "URLElicitationRequiredError")
     assert {:ok, ^response} = Schema.validate(compiled, response)
   end
 end

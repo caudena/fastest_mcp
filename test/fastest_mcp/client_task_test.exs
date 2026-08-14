@@ -26,7 +26,7 @@ defmodule FastestMCP.ClientTaskTest do
     end)
 
     assert %RemoteTask{task_id: task_id, kind: :tool, target: "echo"} =
-             task = Client.call_tool(client, "echo", %{"value" => "cached"}, task: true)
+             task = Client.call_tool_task(client, "echo", %{"value" => "cached"})
 
     assert %{"taskId" => ^task_id, "status" => "completed"} = RemoteTask.wait(task)
     assert %{"taskId" => ^task_id, "status" => "completed"} = RemoteTask.status(task)
@@ -261,6 +261,10 @@ defmodule FastestMCP.ClientTaskTest do
 
   defp connect_client!(bandit, opts \\ []) do
     {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
-    Client.connect!("http://127.0.0.1:#{port}/mcp", opts)
+
+    Client.connect!(
+      "http://127.0.0.1:#{port}/mcp",
+      Keyword.put_new(opts, :protocol_version, "2025-11-25")
+    )
   end
 end

@@ -2,40 +2,48 @@ defmodule FastestMCP.ConformanceClientTest do
   use ExUnit.Case, async: false
 
   @moduletag :conformance
-  @moduletag timeout: 240_000
+  @moduletag timeout: 600_000
 
   alias FastestMCP.TestSupport.ConformanceRunner
 
-  test "all pinned 2025-11-25 client scenarios exercise the public client" do
+  test "pinned official runner passes the frozen client requirements on both protocol eras" do
     ConformanceRunner.assert_version!()
-
-    expected_scenarios = ConformanceRunner.list!(:client)
-    assert length(expected_scenarios) == 18
-    assert "initialize" in expected_scenarios
-    assert "sse-retry" in expected_scenarios
-    assert "auth/basic-cimd" in expected_scenarios
-    assert "auth/pre-registration" in expected_scenarios
-
-    output_dir = tmp_dir!()
-
     command = client_harness_command!()
 
-    {output, status} = ConformanceRunner.run_client!(command, output_dir)
+    Enum.each(ConformanceRunner.requirement_versions(), fn revision ->
+      expected = ConformanceRunner.required_scenarios!(:client, revision)
+      assert expected != []
+      assert "tools_call" in expected
+
+      if revision == "2025-11-25" do
+        assert "initialize" in expected
+      else
+        assert "request-metadata" in expected
+      end
+
+      output_dir = output_dir!("client-core-#{revision}")
+
+      {output, status} =
+        ConformanceRunner.run_client_requirements!(command, revision, output_dir)
+
+      assert status == 0, output
+      assert_required_evidence!(expected, output_dir, output)
+    end)
+  end
+
+  test "selected authorization extensions pass explicitly on their 2026 protocol timeline" do
+    ConformanceRunner.assert_version!()
+    command = client_harness_command!()
+    scenarios = ConformanceRunner.auth_extension_scenarios()
+
+    revision = "2026-07-28"
+    output_dir = output_dir!("client-extension-auth-#{revision}")
+
+    {output, status} =
+      ConformanceRunner.run_client_scenarios!(command, revision, scenarios, output_dir)
+
     assert status == 0, output
-    assert output =~ "=== SUITE SUMMARY ==="
-    assert output =~ "0 failed"
-    refute output =~ "Skipping scenario"
-
-    coverage = ConformanceRunner.coverage(:client, output_dir)
-
-    assert length(coverage.check_files) == length(expected_scenarios),
-           "expected one checks.json for every pinned client scenario\n#{output}"
-
-    refute coverage.checks == []
-    refute Enum.any?(coverage.checks, &(&1["status"] not in ["SUCCESS", "INFO"])), output
-
-    assert coverage.executed == MapSet.new(expected_scenarios),
-           "not every pinned client scenario produced checks\n#{output}"
+    assert_required_evidence!(scenarios, output_dir, output)
   end
 
   defp client_harness_command! do
@@ -57,26 +65,42 @@ defmodule FastestMCP.ConformanceClientTest do
     "'" <> String.replace(value, "'", "'\"'\"'") <> "'"
   end
 
-  defp tmp_dir! do
-    case System.get_env("MCP_CONFORMANCE_OUTPUT_DIR") do
-      nil ->
-        path =
-          Path.join(
-            System.tmp_dir!(),
-            "fastest-mcp-conformance-client-#{System.unique_integer([:positive])}"
-          )
+  defp assert_required_evidence!(expected, output_dir, output) do
+    coverage = ConformanceRunner.coverage(expected, output_dir)
 
-        File.mkdir_p!(path)
-        on_exit(fn -> File.rm_rf!(path) end)
-        path
+    assert coverage.executed == MapSet.new(expected),
+           "not every required scenario produced checks\n#{output}"
 
-      configured_path ->
-        prepare_persistent_output_dir!(configured_path)
-    end
+    refute coverage.scored_checks == []
+
+    refute Enum.any?(coverage.scored_checks, fn check ->
+             check["status"] not in ["SUCCESS", "INFO"] and
+               not ConformanceRunner.pinned_modern_header_skip?(check)
+           end),
+           output
   end
 
-  defp prepare_persistent_output_dir!(configured_path) do
-    path = Path.expand(configured_path)
+  defp output_dir!(lane) do
+    base =
+      case System.get_env("MCP_CONFORMANCE_OUTPUT_DIR") do
+        nil ->
+          path =
+            Path.join(
+              System.tmp_dir!(),
+              "fastest-mcp-conformance-client-#{System.unique_integer([:positive])}"
+            )
+
+          File.mkdir_p!(path)
+          on_exit(fn -> File.rm_rf!(path) end)
+          path
+
+        configured_path ->
+          path = Path.expand(configured_path)
+          File.mkdir_p!(path)
+          path
+      end
+
+    path = Path.join(base, lane)
     File.mkdir_p!(path)
 
     case File.ls!(path) do

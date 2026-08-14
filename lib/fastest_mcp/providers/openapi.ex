@@ -850,9 +850,9 @@ defmodule FastestMCP.Providers.OpenAPI do
     %{"anyOf" => [schema, %{"type" => "null"}]}
   end
 
-  defp resolve_refs(value), do: resolve_refs(value, stringify_keys(value), MapSet.new())
+  defp resolve_refs(value), do: resolve_refs(value, stringify_keys(value), %{})
 
-  defp resolve_refs(value, spec), do: resolve_refs(value, spec, MapSet.new())
+  defp resolve_refs(value, spec), do: resolve_refs(value, spec, %{})
 
   defp resolve_refs(value, spec, visited) when is_map(value) do
     case Map.get(value, "$ref") do
@@ -884,10 +884,10 @@ defmodule FastestMCP.Providers.OpenAPI do
   end
 
   defp merge_ref(ref, referenced, value, spec, visited) do
-    if MapSet.member?(visited, ref) do
+    if Map.has_key?(visited, ref) do
       value
     else
-      do_merge_ref(ref, referenced, value, spec, MapSet.put(visited, ref))
+      do_merge_ref(ref, referenced, value, spec, Map.put(visited, ref, true))
     end
   end
 

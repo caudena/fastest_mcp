@@ -2,13 +2,12 @@ defmodule FastestMCP.InitializationTest do
   use ExUnit.Case, async: false
 
   alias FastestMCP.Client
-  alias FastestMCP.Protocol
   alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
 
   test "initialize returns server info and middleware can observe and modify the result" do
     server_name = "initialize-" <> Integer.to_string(System.unique_integer([:positive]))
     test_pid = self()
-    protocol_version = Protocol.current_version()
+    protocol_version = ProtocolTest.protocol_version()
 
     middleware = fn operation, next ->
       send(
@@ -128,7 +127,7 @@ defmodule FastestMCP.InitializationTest do
 
     result = FastestMCP.initialize(server_name)
 
-    assert result["protocolVersion"] == Protocol.current_version()
+    assert result["protocolVersion"] == ProtocolTest.protocol_version()
     refute Map.has_key?(result["capabilities"], "resources")
     refute Map.has_key?(result["capabilities"], "tasks")
 
@@ -184,7 +183,7 @@ defmodule FastestMCP.InitializationTest do
 
   test "stdio and HTTP initialize requests use the shared engine" do
     server_name = "transport-init-" <> Integer.to_string(System.unique_integer([:positive]))
-    protocol_version = Protocol.current_version()
+    protocol_version = ProtocolTest.protocol_version()
 
     server =
       FastestMCP.server(server_name,
@@ -349,6 +348,7 @@ defmodule FastestMCP.InitializationTest do
 
     client =
       Client.connect!("http://127.0.0.1:#{port}/mcp",
+        protocol_version: "2025-11-25",
         sampling_handler: fn _messages, _params ->
           %{"content" => [%{"type" => "text", "text" => "sampled"}]}
         end,
@@ -405,6 +405,7 @@ defmodule FastestMCP.InitializationTest do
     client =
       Client.connect!("http://127.0.0.1:#{port}/mcp",
         auto_initialize: false,
+        protocol_version: "2025-11-25",
         roots: [],
         sampling_handler: fn _messages, _params ->
           %{"content" => [%{"type" => "text", "text" => "sampled"}]}

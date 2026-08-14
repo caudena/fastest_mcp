@@ -29,7 +29,7 @@ defmodule FastestMCP.Client.CallbackContext do
           task_id: String.t() | nil,
           sampling_tools: term(),
           sampling_context: term(),
-          cancellation_ref: reference() | nil,
+          cancellation_ref: :atomics.atomics_ref() | nil,
           cancelled?: boolean()
         }
 

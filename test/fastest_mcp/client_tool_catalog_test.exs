@@ -24,7 +24,7 @@ defmodule FastestMCP.ClientToolCatalogTest do
             conn,
             id,
             %{
-              "protocolVersion" => FastestMCP.Protocol.current_version(),
+              "protocolVersion" => "2025-11-25",
               "capabilities" => %{
                 "tools" => %{},
                 "tasks" => %{"requests" => %{"tools" => %{"call" => %{}}}}
@@ -40,6 +40,7 @@ defmodule FastestMCP.ClientToolCatalogTest do
         %{"id" => id, "method" => "tools/list", "params" => params} ->
           cursor = Map.get(params, "cursor")
           mode = Agent.get(state, & &1.mode)
+          authorization = conn |> get_req_header("authorization") |> List.first()
 
           request_number =
             Agent.get_and_update(state, fn current ->
@@ -57,7 +58,7 @@ defmodule FastestMCP.ClientToolCatalogTest do
             end
           end
 
-          reply(conn, id, catalog_page(mode, cursor))
+          reply(conn, id, catalog_page(mode, cursor, authorization))
 
         %{"id" => id, "method" => "tools/call", "params" => params} ->
           Agent.update(state, fn current ->
@@ -80,15 +81,20 @@ defmodule FastestMCP.ClientToolCatalogTest do
       end
     end
 
-    defp catalog_page(:repeated_cursor, nil) do
+    defp catalog_page(:auth_partition, nil, authorization) do
+      token = String.replace_prefix(authorization || "anonymous", "Bearer ", "")
+      %{"tools" => [echo_descriptor("#{token}_tool")]}
+    end
+
+    defp catalog_page(:repeated_cursor, nil, _authorization) do
       %{"tools" => [echo_descriptor()], "nextCursor" => "repeat"}
     end
 
-    defp catalog_page(:repeated_cursor, "repeat") do
+    defp catalog_page(:repeated_cursor, "repeat", _authorization) do
       %{"tools" => [], "nextCursor" => "repeat"}
     end
 
-    defp catalog_page(_mode, nil) do
+    defp catalog_page(_mode, nil, _authorization) do
       %{
         "tools" => [
           %{
@@ -105,7 +111,7 @@ defmodule FastestMCP.ClientToolCatalogTest do
       }
     end
 
-    defp catalog_page(_mode, "page-2") do
+    defp catalog_page(_mode, "page-2", _authorization) do
       %{
         "tools" => [
           echo_descriptor(),
@@ -118,9 +124,9 @@ defmodule FastestMCP.ClientToolCatalogTest do
       }
     end
 
-    defp echo_descriptor do
+    defp echo_descriptor(name \\ "echo") do
       %{
-        "name" => "echo",
+        "name" => name,
         "inputSchema" => %{
           "type" => "object",
           "properties" => %{"value" => %{"type" => "integer"}},
@@ -175,6 +181,7 @@ defmodule FastestMCP.ClientToolCatalogTest do
     assert required_task.code == :method_not_found
     assert %{"value" => 3} = Client.call_tool(client, "echo", %{"value" => 3}, task: false)
     assert length(Agent.get(state, & &1.calls)) == 3
+    assert Agent.get(state, & &1.list_requests) == 2
   end
 
   test "direct tool results are checked against the catalog output schema" do
@@ -201,7 +208,23 @@ defmodule FastestMCP.ClientToolCatalogTest do
     assert error.message == "tools/list returned a repeated cursor"
   end
 
-  defp start_client(mode) do
+  test "catalogs stay fresh without legacy TTL hints and invalidate on auth setters" do
+    {client, state} = start_client(:auth_partition, access_token: "alpha")
+
+    assert %{"value" => 1} = Client.call_tool(client, "alpha_tool", %{"value" => 1})
+    assert %{"value" => 2} = Client.call_tool(client, "alpha_tool", %{"value" => 2})
+    assert Agent.get(state, & &1.list_requests) == 1
+
+    assert :ok = Client.set_access_token(client, "beta")
+    assert %{"value" => 3} = Client.call_tool(client, "beta_tool", %{"value" => 3})
+    assert Agent.get(state, & &1.list_requests) == 2
+
+    assert :ok = Client.set_auth_input(client, authorization: "Bearer gamma")
+    assert %{"value" => 4} = Client.call_tool(client, "gamma_tool", %{"value" => 4})
+    assert Agent.get(state, & &1.list_requests) == 3
+  end
+
+  defp start_client(mode, opts \\ []) do
     state = start_supervised!({Agent, fn -> %{mode: mode, list_requests: 0, calls: []} end})
 
     bandit =
@@ -210,7 +233,12 @@ defmodule FastestMCP.ClientToolCatalogTest do
       )
 
     {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
-    client = Client.connect!("http://127.0.0.1:#{port}/mcp")
+
+    client =
+      Client.connect!(
+        "http://127.0.0.1:#{port}/mcp",
+        Keyword.merge([protocol_version: "2025-11-25"], opts)
+      )
 
     on_exit(fn ->
       if Client.connected?(client), do: Client.disconnect(client)

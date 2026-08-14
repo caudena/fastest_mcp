@@ -24,9 +24,8 @@ defmodule FastestMCP.Transport.Stdio do
 
   @doc "Dispatches one request through this transport."
   def dispatch(server_name, request, opts \\ []) do
-    with {:ok, request} <- decode_input(request) do
-      do_dispatch(server_name, request, opts)
-    else
+    case decode_input(request) do
+      {:ok, request} -> do_dispatch(server_name, request, opts)
       {:error, %Error{} = error} -> StdioAdapter.encode_error(error)
     end
   end
@@ -200,6 +199,8 @@ defmodule FastestMCP.Transport.Stdio do
       writer: writer,
       sink_ref: nil,
       subscriber: nil,
+      modern_subscriptions: %{},
+      modern_requests: %{},
       workers: %{},
       terminated?: false,
       opts: opts
@@ -244,8 +245,12 @@ defmodule FastestMCP.Transport.Stdio do
           stdio_serve_loop(next, state_key)
         end
 
+      {:fastest_mcp_subscription_notification, notification} ->
+        write_stdio(state.writer, notification)
+        stdio_serve_loop(state, state_key)
+
       {:DOWN, monitor, :process, _worker, _reason} ->
-        next = %{state | workers: Map.delete(state.workers, monitor)}
+        next = handle_stdio_worker_down(state, monitor)
         Process.put(state_key, next)
         stdio_serve_loop(next, state_key)
 
@@ -268,7 +273,7 @@ defmodule FastestMCP.Transport.Stdio do
       encoded ->
         case decode_input(encoded) do
           {:ok, payload} ->
-            handle_stdio_payload(payload, ensure_stdio_sink(state))
+            handle_stdio_payload(payload, state)
 
           {:error, %Error{} = error} ->
             write_stdio(state.writer, StdioAdapter.encode_error(error))
@@ -280,6 +285,8 @@ defmodule FastestMCP.Transport.Stdio do
   defp handle_stdio_payload(payload, state) do
     case StdioAdapter.decode(payload, state.opts) do
       {:ok, %{method: "__transport/client_response__"} = request} ->
+        state = ensure_stdio_sink(state)
+
         _ =
           Session.resolve_peer_response(
             state.server_name,
@@ -291,11 +298,152 @@ defmodule FastestMCP.Transport.Stdio do
         state
 
       {:ok, request} ->
-        start_stdio_dispatch(state, request)
+        state =
+          if request.protocol_version == "2026-07-28", do: state, else: ensure_stdio_sink(state)
+
+        dispatch_modern_stdio_control(state, request)
 
       {:error, %Error{} = error} ->
         write_stdio(state.writer, StdioAdapter.encode_error(error))
         state
+    end
+  end
+
+  defp dispatch_modern_stdio_control(
+         state,
+         %{protocol_version: "2026-07-28", method: "subscriptions/listen"} = request
+       ) do
+    request_id_in_use? =
+      Map.has_key?(state.modern_subscriptions, request.request_id) or
+        Map.has_key?(state.modern_requests, request.request_id)
+
+    case Engine.start_subscription(state.server_name, request,
+           owner: self(),
+           target: self(),
+           request_id_in_use?: request_id_in_use?
+         ) do
+      {:ok, subscriber, validated_request} ->
+        track_modern_stdio_subscription(state, validated_request, subscriber)
+
+      {:error, %Error{} = error} ->
+        error =
+          ErrorExposure.public_error(error,
+            server: fetch_server(state.server_name),
+            request: request
+          )
+
+        write_stdio(state.writer, StdioAdapter.encode_error(request, error))
+        state
+    end
+  end
+
+  defp dispatch_modern_stdio_control(
+         state,
+         %{protocol_version: "2026-07-28", method: "notifications/cancelled"} = request
+       ) do
+    request_id = Map.get(request.payload, "requestId")
+
+    if Map.has_key?(state.modern_subscriptions, request_id) do
+      cancel_modern_stdio_subscription(state, request_id, "cancelled")
+    else
+      cancel_modern_stdio_request(state, request_id)
+    end
+  end
+
+  defp dispatch_modern_stdio_control(state, request), do: start_stdio_dispatch(state, request)
+
+  defp track_modern_stdio_subscription(state, request, subscriber) do
+    monitor = Process.monitor(subscriber)
+
+    put_in(state.modern_subscriptions[request.request_id], %{
+      pid: subscriber,
+      monitor: monitor,
+      request: request
+    })
+  end
+
+  defp cancel_modern_stdio_subscription(state, request_id, reason) do
+    case Map.pop(state.modern_subscriptions, request_id) do
+      {nil, _subscriptions} ->
+        state
+
+      {%{pid: subscriber, monitor: monitor, request: request}, subscriptions} ->
+        Process.demonitor(monitor, [:flush])
+
+        with {:ok, runtime} <- ServerRuntime.fetch(state.server_name) do
+          _ =
+            DynamicSupervisor.terminate_child(
+              runtime.session_notification_supervisor,
+              subscriber
+            )
+        end
+
+        write_stdio(state.writer, modern_subscription_cancelled(request_id, reason))
+
+        write_stdio(
+          state.writer,
+          StdioAdapter.encode_success(request, %{
+            "resultType" => "complete",
+            "_meta" => %{"io.modelcontextprotocol/subscriptionId" => request_id}
+          })
+        )
+
+        %{state | modern_subscriptions: subscriptions}
+    end
+  end
+
+  defp modern_subscription_cancelled(request_id, reason) do
+    %{
+      "jsonrpc" => "2.0",
+      "method" => "notifications/cancelled",
+      "params" => %{
+        "requestId" => request_id,
+        "reason" => reason,
+        "_meta" => %{"io.modelcontextprotocol/subscriptionId" => request_id}
+      }
+    }
+  end
+
+  defp cancel_modern_stdio_request(state, request_id) do
+    case Map.pop(state.modern_requests, request_id) do
+      {nil, _requests} ->
+        state
+
+      {%{pid: worker, monitor: monitor}, requests} ->
+        Process.demonitor(monitor, [:flush])
+        if Process.alive?(worker), do: Process.exit(worker, :shutdown)
+
+        %{
+          state
+          | modern_requests: requests,
+            workers: Map.delete(state.workers, monitor)
+        }
+    end
+  end
+
+  defp handle_stdio_worker_down(state, monitor) do
+    case Enum.find(state.modern_subscriptions, fn {_id, entry} -> entry.monitor == monitor end) do
+      {request_id, _entry} ->
+        subscriptions = Map.delete(state.modern_subscriptions, request_id)
+
+        write_stdio(
+          state.writer,
+          modern_subscription_cancelled(request_id, "server ended subscription")
+        )
+
+        %{state | modern_subscriptions: subscriptions}
+
+      nil ->
+        modern_requests =
+          Map.reject(state.modern_requests, fn {_request_id, entry} ->
+            entry.monitor == monitor
+          end)
+
+        %{
+          state
+          | workers: Map.delete(state.workers, monitor),
+            modern_requests: modern_requests
+        }
     end
   end
 
@@ -311,7 +459,7 @@ defmodule FastestMCP.Transport.Stdio do
   end
 
   defp dispatch_initialized_notification(state, request) do
-    request = put_stdio_sink(request, state.sink_ref)
+    request = put_stdio_sinks(request, state)
     {response, error} = dispatch_normalized(state.server_name, request, state.opts)
     write_stdio(state.writer, response)
 
@@ -326,7 +474,7 @@ defmodule FastestMCP.Transport.Stdio do
   defp start_supervised_stdio_dispatch(state, request) do
     case ServerRuntime.fetch(state.server_name) do
       {:ok, runtime} ->
-        request = put_stdio_sink(request, state.sink_ref)
+        request = put_stdio_sinks(request, state)
         parent = self()
 
         case Task.Supervisor.start_child(runtime.stream_task_supervisor, fn ->
@@ -336,7 +484,10 @@ defmodule FastestMCP.Transport.Stdio do
           {:ok, worker} ->
             monitor = Process.monitor(worker)
             state = %{state | workers: Map.put(state.workers, monitor, worker)}
-            maybe_register_stdio_request(state, request, worker)
+
+            state
+            |> maybe_track_modern_stdio_request(request, worker, monitor)
+            |> maybe_register_stdio_request(request, worker)
 
           {:error, reason} ->
             error = %Error{
@@ -361,6 +512,18 @@ defmodule FastestMCP.Transport.Stdio do
     end
   end
 
+  defp maybe_track_modern_stdio_request(
+         state,
+         %{protocol_version: "2026-07-28", request_id: request_id},
+         worker,
+         monitor
+       )
+       when is_binary(request_id) or is_integer(request_id) do
+    put_in(state.modern_requests[request_id], %{pid: worker, monitor: monitor})
+  end
+
+  defp maybe_track_modern_stdio_request(state, _request, _worker, _monitor), do: state
+
   defp dispatch_normalized(server_name, request, opts) do
     with_stderr_group_leader(fn ->
       try do
@@ -383,6 +546,9 @@ defmodule FastestMCP.Transport.Stdio do
   defp maybe_register_stdio_request(state, %{request_id: nil}, _worker), do: state
 
   defp maybe_register_stdio_request(state, %{method: "initialize"}, _worker), do: state
+
+  defp maybe_register_stdio_request(state, %{protocol_version: "2026-07-28"}, _worker),
+    do: state
 
   defp maybe_register_stdio_request(state, request, worker) do
     case Session.register_inbound_request(
@@ -471,18 +637,44 @@ defmodule FastestMCP.Transport.Stdio do
     }
   end
 
+  defp put_stdio_sinks(request, state) do
+    request
+    |> put_stdio_sink(state.sink_ref)
+    |> put_modern_stdio_request_sink(state.writer)
+  end
+
+  defp put_modern_stdio_request_sink(
+         %{protocol_version: "2026-07-28"} = request,
+         writer
+       ) do
+    %{
+      request
+      | request_metadata:
+          Map.put(request.request_metadata, :request_stream_sink, {writer, :stdio})
+    }
+  end
+
+  defp put_modern_stdio_request_sink(request, _writer), do: request
+
   defp handle_stdio_dispatch_result(state, worker, request, {response, error}) do
     terminate? = terminate_after_delivery?(error)
 
     delivery =
-      if is_nil(request.request_id) or request.method == "initialize" do
-        :deliver
-      else
-        Session.finish_inbound_request(
-          state.server_name,
-          state.session_id,
-          request.request_id
-        )
+      cond do
+        is_nil(request.request_id) or request.method == "initialize" ->
+          :deliver
+
+        request.protocol_version == "2026-07-28" ->
+          if Map.has_key?(state.modern_requests, request.request_id),
+            do: :deliver,
+            else: :suppress
+
+        true ->
+          Session.finish_inbound_request(
+            state.server_name,
+            state.session_id,
+            request.request_id
+          )
       end
 
     if (delivery != :suppress or terminate?) and response != :no_response do
@@ -490,6 +682,7 @@ defmodule FastestMCP.Transport.Stdio do
     end
 
     state = drop_stdio_worker_by_pid(state, worker)
+    state = %{state | modern_requests: Map.delete(state.modern_requests, request.request_id)}
 
     if terminate? do
       terminate_session_after_delivery(state.server_name, request, error)
@@ -513,6 +706,7 @@ defmodule FastestMCP.Transport.Stdio do
 
   defp cleanup_stdio_state(state) do
     stop_stdio_notification_subscriber(state)
+    stop_modern_stdio_subscriptions(state)
 
     if is_reference(state.sink_ref) do
       _ = Session.detach_sink(state.server_name, state.session_id, state.sink_ref)
@@ -526,18 +720,36 @@ defmodule FastestMCP.Transport.Stdio do
     :ok
   end
 
+  defp stop_modern_stdio_subscriptions(state) do
+    with {:ok, runtime} <- ServerRuntime.fetch(state.server_name) do
+      Enum.each(state.modern_subscriptions, fn {_request_id, entry} ->
+        Process.demonitor(entry.monitor, [:flush])
+
+        _ =
+          DynamicSupervisor.terminate_child(
+            runtime.session_notification_supervisor,
+            entry.pid
+          )
+      end)
+    end
+
+    :ok
+  end
+
   defp stop_stdio_notification_subscriber(%{subscriber: subscriber} = state)
        when is_pid(subscriber) do
-    with {:ok, runtime} <- ServerRuntime.fetch(state.server_name) do
-      _ =
-        DynamicSupervisor.terminate_child(
-          runtime.session_notification_supervisor,
-          subscriber
-        )
+    case ServerRuntime.fetch(state.server_name) do
+      {:ok, runtime} ->
+        _ =
+          DynamicSupervisor.terminate_child(
+            runtime.session_notification_supervisor,
+            subscriber
+          )
 
-      :ok
-    else
-      _other -> :ok
+        :ok
+
+      _other ->
+        :ok
     end
   end
 
@@ -546,6 +758,10 @@ defmodule FastestMCP.Transport.Stdio do
   defp writer_loop(output_device, owner) do
     receive do
       {:fastest_mcp_session_message, _sink_ref, _event_id, envelope} ->
+        write_device!(output_device, envelope, owner)
+        writer_loop(output_device, owner)
+
+      {:fastest_mcp_request_stream_message, :stdio, envelope} ->
         write_device!(output_device, envelope, owner)
         writer_loop(output_device, owner)
 
@@ -565,13 +781,11 @@ defmodule FastestMCP.Transport.Stdio do
   end
 
   defp write_device!(output_device, envelope, owner) do
-    try do
-      :ok = IO.binwrite(output_device, [JSON.encode!(envelope), "\n"])
-    rescue
-      error -> send(owner, {:stdio_writer_failed, Exception.message(error)})
-    catch
-      kind, reason -> send(owner, {:stdio_writer_failed, {kind, reason}})
-    end
+    :ok = IO.binwrite(output_device, [JSON.encode!(envelope), "\n"])
+  rescue
+    error -> send(owner, {:stdio_writer_failed, Exception.message(error)})
+  catch
+    kind, reason -> send(owner, {:stdio_writer_failed, {kind, reason}})
   end
 
   # Cleanup resources are owned by a separate, non-linked process. A `try`
@@ -992,29 +1206,30 @@ defmodule FastestMCP.Transport.Stdio do
   end
 
   defp acquire_server_startup_stderr(output_device, stdout_group_leader) do
-    with supervisor when is_pid(supervisor) <-
-           Process.whereis(FastestMCP.ServerSupervisor) do
-      if stdout_output_device?(output_device, stdout_group_leader) do
-        with stderr when is_pid(stderr) <- Process.whereis(:standard_error),
-             {:ok, redirect} <- acquire_process_stderr(supervisor, stderr) do
-          if Process.alive?(supervisor) and process_uses_group_leader?(supervisor, stderr) do
-            {:ok, %{supervisor: supervisor, redirect: redirect, stderr: stderr}}
+    case Process.whereis(FastestMCP.ServerSupervisor) do
+      supervisor when is_pid(supervisor) ->
+        if stdout_output_device?(output_device, stdout_group_leader) do
+          with stderr when is_pid(stderr) <- Process.whereis(:standard_error),
+               {:ok, redirect} <- acquire_process_stderr(supervisor, stderr) do
+            if Process.alive?(supervisor) and process_uses_group_leader?(supervisor, stderr) do
+              {:ok, %{supervisor: supervisor, redirect: redirect, stderr: stderr}}
+            else
+              release_process_stderr(redirect)
+              {:error, {:server_supervisor_redirection_lost, supervisor}}
+            end
           else
-            release_process_stderr(redirect)
-            {:error, {:server_supervisor_redirection_lost, supervisor}}
+            nil ->
+              {:error, :standard_error_not_available}
+
+            {:error, reason} ->
+              {:error, {:cannot_redirect_server_supervisor, supervisor, reason}}
           end
         else
-          nil ->
-            {:error, :standard_error_not_available}
-
-          {:error, reason} ->
-            {:error, {:cannot_redirect_server_supervisor, supervisor, reason}}
+          {:ok, %{supervisor: supervisor, redirect: :unmanaged, stderr: nil}}
         end
-      else
-        {:ok, %{supervisor: supervisor, redirect: :unmanaged, stderr: nil}}
-      end
-    else
-      nil -> {:error, :server_supervisor_not_available}
+
+      nil ->
+        {:error, :server_supervisor_not_available}
     end
   catch
     :exit, reason -> {:error, {:server_supervisor_not_available, reason}}
@@ -1214,9 +1429,6 @@ defmodule FastestMCP.Transport.Stdio do
           config ->
             {:error, {:unsupported_stdout_logger_handler, config}}
         end
-
-      other ->
-        {:error, {:cannot_inspect_logger_handlers, other}}
     end
   catch
     kind, reason -> {:error, {:cannot_inspect_logger_handlers, {kind, reason}}}
@@ -1352,17 +1564,19 @@ defmodule FastestMCP.Transport.Stdio do
          %Error{terminate_session_after_delivery: true}
        )
        when is_binary(session_id) and session_id != "" do
-    with {:ok, runtime} <- ServerRuntime.fetch(server_name) do
-      _ =
-        SessionSupervisor.terminate_session(
-          runtime.session_supervisor,
-          server_name,
-          session_id
-        )
+    case ServerRuntime.fetch(server_name) do
+      {:ok, runtime} ->
+        _ =
+          SessionSupervisor.terminate_session(
+            runtime.session_supervisor,
+            server_name,
+            session_id
+          )
 
-      :ok
-    else
-      _other -> :ok
+        :ok
+
+      _other ->
+        :ok
     end
   end
 

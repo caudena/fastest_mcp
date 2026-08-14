@@ -74,17 +74,15 @@ defmodule FastestMCP.CallWorker do
   defp stop_runner(_runner), do: :ok
 
   defp run_fun(fun) do
-    try do
-      {:ok, fun.()}
-    rescue
-      error ->
-        {:error, {:exception, error, __STACKTRACE__}}
-    catch
-      :exit, reason ->
-        {:error, {:exit, reason}}
+    {:ok, fun.()}
+  rescue
+    error ->
+      {:error, {:exception, error, __STACKTRACE__}}
+  catch
+    :exit, reason ->
+      {:error, {:exit, reason}}
 
-      kind, reason ->
-        {:error, {kind, reason}}
-    end
+    kind, reason ->
+      {:error, {kind, reason}}
   end
 end

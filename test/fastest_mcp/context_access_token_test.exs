@@ -54,4 +54,40 @@ defmodule FastestMCP.ContextAccessTokenTest do
 
     assert Context.access_token(context) == nil
   end
+
+  test "request authorization is private to the live request and cleared for background work" do
+    secret = "Bearer private-transport-token"
+
+    assert {:ok, context} =
+             Context.build("context-private-authorization",
+               transport: :streamable_http,
+               state_scope: :request,
+               request_metadata: %{
+                 headers: %{"authorization" => secret, "x-demo" => "1"},
+                 authorization: secret
+               }
+             )
+
+    assert Context.transport_authorization(context) == secret
+    assert Context.access_token(context) == "private-transport-token"
+    assert context.request_metadata.headers == %{"x-demo" => "1"}
+    refute inspect(context) =~ "private-transport-token"
+    refute inspect(Context.request_context(context)) =~ "private-transport-token"
+    refute inspect(Context.http_headers(context, include_all: true)) =~ "private-transport-token"
+
+    background = Context.for_background_task(context, "task-1")
+    assert Context.transport_authorization(background) == nil
+    refute inspect(background) =~ "private-transport-token"
+  end
+
+  test "context inspection excludes credential-bearing custom auth state" do
+    context = %Context{
+      server_name: "context-private-auth-inspect",
+      request_id: "req-private-auth",
+      auth: %{token: "custom-auth-secret", tenant: "acme"}
+    }
+
+    assert Context.access_token(context) == "custom-auth-secret"
+    refute inspect(context) =~ "custom-auth-secret"
+  end
 end

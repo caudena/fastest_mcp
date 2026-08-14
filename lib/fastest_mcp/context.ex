@@ -79,13 +79,16 @@ defmodule FastestMCP.Context do
   alias FastestMCP.BackgroundTaskStore
   alias FastestMCP.ComponentVisibility
   alias FastestMCP.Elicitation
-  alias FastestMCP.EventBus
+  alias FastestMCP.Elicitation.URL, as: URLElicitation
   alias FastestMCP.Error
+  alias FastestMCP.EventBus
   alias FastestMCP.HTTPRequest
   alias FastestMCP.JSONValue
   alias FastestMCP.OperationPipeline
   alias FastestMCP.PeerTask
   alias FastestMCP.Protocol
+  alias FastestMCP.Protocol.Progress, as: ProgressProtocol
+  alias FastestMCP.Protocol.Redactor
   alias FastestMCP.Protocol.Sampling, as: SamplingProtocol
   alias FastestMCP.RequestContext
   alias FastestMCP.SamplingTool
@@ -96,6 +99,7 @@ defmodule FastestMCP.Context do
   require Logger
 
   @excluded_http_headers ["accept", "content-length", "content-type", "host"]
+  @private_http_headers ["authorization"]
   @visibility_rules_key {:fastest_mcp, :visibility_rules}
   @logging_levels [
     "debug",
@@ -122,6 +126,7 @@ defmodule FastestMCP.Context do
                                  ])
   @notification_envelope_keys MapSet.new(["jsonrpc", "method", "params"])
 
+  @derive {Inspect, except: [:auth, :transport_authorization]}
   defstruct [
     :server_name,
     :server,
@@ -130,9 +135,14 @@ defmodule FastestMCP.Context do
     :transport,
     :state_scope,
     :negotiated_protocol_version,
+    :request_state,
     :event_bus,
     :task_store,
+    :session_state_store,
+    :application_session_scope,
     :principal,
+    :transport_authorization,
+    authenticated: false,
     auth: %{},
     capabilities: [],
     verified_audiences: [],
@@ -142,6 +152,7 @@ defmodule FastestMCP.Context do
     lifespan_context: %{},
     dependencies: %{},
     request_metadata: %{},
+    input_responses: %{},
     task_metadata: %{}
   ]
 
@@ -153,9 +164,14 @@ defmodule FastestMCP.Context do
           transport: atom(),
           state_scope: :request | :session,
           negotiated_protocol_version: String.t() | nil,
+          request_state: String.t() | nil,
           event_bus: pid() | atom(),
           task_store: pid() | atom() | nil,
+          session_state_store: map() | nil,
+          application_session_scope: String.t(),
           principal: any(),
+          transport_authorization: String.t() | nil,
+          authenticated: boolean(),
           auth: map(),
           capabilities: [any()],
           verified_audiences: [String.t()],
@@ -165,6 +181,7 @@ defmodule FastestMCP.Context do
           lifespan_context: map(),
           dependencies: map(),
           request_metadata: map(),
+          input_responses: map(),
           task_metadata: map()
         }
 
@@ -172,15 +189,40 @@ defmodule FastestMCP.Context do
   def build(server_name, opts \\ []) do
     request_id = "req-" <> Integer.to_string(System.unique_integer([:positive]))
     transport = Keyword.get(opts, :transport, :in_process)
-    request_metadata = Map.new(Keyword.get(opts, :request_metadata, %{}))
+
+    raw_request_metadata =
+      opts
+      |> Keyword.get(:request_metadata, %{})
+      |> Map.new()
+
+    {request_metadata, metadata_authorization} =
+      split_transport_authorization(raw_request_metadata)
+
+    transport_authorization =
+      opts
+      |> Keyword.get(:transport_authorization)
+      |> normalize_transport_authorization()
+      |> Kernel.||(metadata_authorization)
+
+    request_metadata =
+      request_metadata
+      |> Map.put_new(:input_responses_provided, Keyword.has_key?(opts, :input_responses))
+      |> Map.put_new(:request_state_provided, Keyword.has_key?(opts, :request_state))
+
     state_scope = context_state_scope(opts, request_metadata)
     session_id = context_session_id(opts, state_scope)
     event_bus = Keyword.get(opts, :event_bus, EventBus)
     server = Keyword.get(opts, :server)
     task_store = Keyword.get(opts, :task_store)
+    session_state_store = Keyword.get(opts, :session_state_store)
+
+    application_session_scope =
+      to_string(Keyword.get(opts, :application_session_scope, server_name))
+
     session_supervisor = Keyword.get(opts, :session_supervisor, SessionSupervisor)
     terminated_session_store = Keyword.get(opts, :terminated_session_store)
     principal = Keyword.get(opts, :principal)
+    authenticated = Keyword.get(opts, :authenticated, false)
     auth = normalize_map(Keyword.get(opts, :auth, %{}))
     capabilities = normalize_capabilities(Keyword.get(opts, :capabilities, []))
     verified_audiences = List.wrap(Keyword.get(opts, :verified_audiences, []))
@@ -188,9 +230,11 @@ defmodule FastestMCP.Context do
     client_capabilities = normalize_map(Keyword.get(opts, :client_capabilities, %{}))
     server_capabilities = normalize_map(Keyword.get(opts, :server_capabilities, %{}))
     negotiated_protocol_version = Keyword.get(opts, :negotiated_protocol_version)
+    request_state = Keyword.get(opts, :request_state)
     lifespan_context = Map.new(Keyword.get(opts, :lifespan_context, %{}))
     dependencies = normalize_dependencies(Keyword.get(opts, :dependencies, %{}))
     task_metadata = Map.new(Keyword.get(opts, :task_metadata, %{}))
+    input_responses = Map.new(Keyword.get(opts, :input_responses, %{}))
 
     context = %__MODULE__{
       server_name: to_string(server_name),
@@ -200,9 +244,14 @@ defmodule FastestMCP.Context do
       transport: transport,
       state_scope: state_scope,
       negotiated_protocol_version: negotiated_protocol_version,
+      request_state: request_state,
       event_bus: event_bus,
       task_store: task_store,
+      session_state_store: session_state_store,
+      application_session_scope: application_session_scope,
       principal: principal,
+      transport_authorization: transport_authorization,
+      authenticated: authenticated,
       auth: auth,
       capabilities: capabilities,
       verified_audiences: verified_audiences,
@@ -212,6 +261,7 @@ defmodule FastestMCP.Context do
       lifespan_context: lifespan_context,
       dependencies: dependencies,
       request_metadata: request_metadata,
+      input_responses: input_responses,
       task_metadata: task_metadata
     }
 
@@ -310,6 +360,29 @@ defmodule FastestMCP.Context do
     :ok
   end
 
+  @doc "Registers cleanup work to run when the current request scope exits."
+  def register_cleanup(%__MODULE__{} = context, cleanup) when is_function(cleanup, 0) do
+    maybe_register_dependency_cleanup(context, nil, cleanup)
+  end
+
+  def register_cleanup(%__MODULE__{} = context, cleanup) when is_function(cleanup, 1) do
+    maybe_register_dependency_cleanup(context, nil, fn -> cleanup.(context) end)
+  end
+
+  def register_cleanup(%__MODULE__{}, cleanup) do
+    raise ArgumentError,
+          "request cleanup must be a zero-arity function or a one-arity context callback, got: #{inspect(cleanup)}"
+  end
+
+  @doc "Returns the MRTR responses supplied with the current modern request."
+  def input_responses(%__MODULE__{} = context), do: context.input_responses
+
+  @doc "Returns the opaque MRTR state echoed by the client, if present."
+  def request_state(%__MODULE__{} = context), do: context.request_state
+
+  @doc false
+  def transport_authorization(%__MODULE__{} = context), do: context.transport_authorization
+
   @doc "Builds a new server definition."
   def server(%__MODULE__{} = context), do: context.server
 
@@ -386,8 +459,10 @@ defmodule FastestMCP.Context do
     end
   rescue
     _error in KeyError ->
-      raise ArgumentError,
-            "unknown dependency #{inspect(name)} for server #{inspect(context.server_name)}"
+      reraise ArgumentError.exception(
+                "unknown dependency #{inspect(name)} for server #{inspect(context.server_name)}"
+              ),
+              __STACKTRACE__
   end
 
   @doc "Stores session-scoped state for the current session."
@@ -451,6 +526,7 @@ defmodule FastestMCP.Context do
     %{
       context
       | principal: result.principal,
+        authenticated: true,
         auth: normalize_map(result.auth),
         capabilities: normalize_capabilities(result.capabilities),
         verified_audiences: audiences,
@@ -467,7 +543,12 @@ defmodule FastestMCP.Context do
   def log(%__MODULE__{} = context, level, data, opts \\ []) do
     level = normalize_log_level(level)
 
-    result = Session.log(context.server_name, context.session_id, level, data, opts)
+    result =
+      if context.negotiated_protocol_version == "2026-07-28" do
+        deliver_modern_log(context, level, data, opts)
+      else
+        Session.log(context.server_name, context.session_id, level, data, opts)
+      end
 
     if result == :ok do
       emit(
@@ -483,6 +564,44 @@ defmodule FastestMCP.Context do
     end
 
     result
+  end
+
+  defp deliver_modern_log(context, level, data, opts) do
+    requested_level = request_log_level(context)
+
+    cond do
+      is_nil(requested_level) ->
+        :filtered
+
+      log_level_index(level) < log_level_index(requested_level) ->
+        :filtered
+
+      true ->
+        case request_stream_sink(context) do
+          {pid, stream_ref} when is_pid(pid) ->
+            params =
+              %{
+                "level" => level,
+                "data" => Redactor.redact(data, opts)
+              }
+              |> maybe_put_map("logger", Keyword.get(opts, :logger))
+
+            send(
+              pid,
+              {:fastest_mcp_request_stream_message, stream_ref,
+               %{
+                 "jsonrpc" => "2.0",
+                 "method" => "notifications/message",
+                 "params" => params
+               }}
+            )
+
+            :ok
+
+          _other ->
+            {:error, :request_stream_unavailable}
+        end
+    end
   end
 
   @doc "Sends a raw MCP notification to the connected client session stream."
@@ -580,44 +699,42 @@ defmodule FastestMCP.Context do
       |> maybe_put_sampling_tool_choice(tools, Keyword.get(opts, :tool_choice, :auto))
       |> maybe_put_task_request(opts)
 
-    cond do
-      is_background_task(context) ->
-        case task_store(context) do
-          nil ->
-            raise RuntimeError, "background task context is missing its task store"
+    if background_task?(context) do
+      case task_store(context) do
+        nil ->
+          raise RuntimeError, "background task context is missing its task store"
 
-          store ->
-            case BackgroundTaskStore.sample(
-                   store,
-                   task_id(context),
-                   params,
-                   Keyword.get(opts, :timeout_ms, 60_000)
-                 ) do
-              {:ok, result} ->
-                validate_sampling_result!(result, tools, opts)
+        store ->
+          case BackgroundTaskStore.sample(
+                 store,
+                 task_id(context),
+                 params,
+                 Keyword.get(opts, :timeout_ms, 60_000)
+               ) do
+            {:ok, result} ->
+              validate_sampling_result!(result, tools, opts)
 
-              {:error, %Error{} = error} ->
-                raise error
+            {:error, %Error{} = error} ->
+              raise error
 
-              {:error, :not_found} ->
-                raise Error,
-                  code: :not_found,
-                  message: "unknown background task #{inspect(task_id(context))}"
-            end
-        end
+            {:error, :not_found} ->
+              raise Error,
+                code: :not_found,
+                message: "unknown background task #{inspect(task_id(context))}"
+          end
+      end
+    else
+      result =
+        send_client_request(
+          context,
+          "sampling/createMessage",
+          params,
+          Keyword.get(opts, :timeout_ms, 60_000),
+          opts
+        )
 
-      true ->
-        result =
-          send_client_request(
-            context,
-            "sampling/createMessage",
-            params,
-            Keyword.get(opts, :timeout_ms, 60_000),
-            opts
-          )
-
-        result = validate_sampling_result!(result, tools, opts)
-        normalize_peer_task_or_result(context, result, :sampling, "sampling/createMessage")
+      result = validate_sampling_result!(result, tools, opts)
+      normalize_peer_task_or_result(context, result, :sampling, "sampling/createMessage")
     end
   end
 
@@ -629,13 +746,13 @@ defmodule FastestMCP.Context do
       "connected client did not declare roots support"
     )
 
-    if not Keyword.get(opts, :refresh, false) do
+    if Keyword.get(opts, :refresh, false) do
+      request_and_cache_roots(context, opts)
+    else
       case Session.cached_roots(context.server_name, context.session_id) do
         roots when is_list(roots) -> roots
         _other -> request_and_cache_roots(context, opts)
       end
-    else
-      request_and_cache_roots(context, opts)
     end
   end
 
@@ -705,7 +822,7 @@ defmodule FastestMCP.Context do
         context,
         "elicitation/create",
         elicitation
-        |> FastestMCP.Elicitation.URL.to_params()
+        |> URLElicitation.to_params()
         |> maybe_put_task_request(opts),
         Keyword.get(opts, :timeout_ms, 60_000),
         opts
@@ -739,6 +856,8 @@ defmodule FastestMCP.Context do
   end
 
   @doc "Registers URL elicitation descriptors and raises the standard -32042 error."
+  @spec require_url_elicitation!(t(), term(), term()) :: no_return()
+  @spec require_url_elicitation!(t(), term(), term(), keyword()) :: no_return()
   def require_url_elicitation!(%__MODULE__{} = context, message, url_or_builder, opts \\ []) do
     require_client_capability!(
       context,
@@ -747,7 +866,7 @@ defmodule FastestMCP.Context do
     )
 
     elicitation = build_and_register_url_elicitation!(context, message, url_or_builder, opts)
-    raise FastestMCP.Elicitation.URL.required_error([elicitation])
+    raise URLElicitation.required_error([elicitation])
   end
 
   @doc "Returns the current access token available on the context."
@@ -831,10 +950,12 @@ defmodule FastestMCP.Context do
         nil -> %{}
       end
 
+    public_headers = Map.drop(headers, @private_http_headers)
+
     if Keyword.get(opts, :include_all, false) do
-      headers
+      public_headers
     else
-      Map.drop(headers, @excluded_http_headers)
+      Map.drop(public_headers, @excluded_http_headers)
     end
   end
 
@@ -854,14 +975,18 @@ defmodule FastestMCP.Context do
       context
       | request_id: "task-req-" <> Integer.to_string(System.unique_integer([:positive])),
         transport: :background_task,
+        transport_authorization: nil,
+        request_metadata: context.request_metadata |> split_transport_authorization() |> elem(0),
         task_metadata: task_metadata
     }
   end
 
   @doc "Returns whether the context belongs to background-task execution."
+  @deprecated "Use background_task?/1"
+  # credo:disable-for-next-line Credo.Check.Readability.PredicateFunctionNames
   def is_background_task(%__MODULE__{} = context), do: not is_nil(task_id(context))
   @doc "Returns whether the context belongs to background-task execution."
-  def background_task?(%__MODULE__{} = context), do: is_background_task(context)
+  def background_task?(%__MODULE__{} = context), do: not is_nil(task_id(context))
 
   @doc "Returns the current background-task id, if any."
   def task_id(%__MODULE__{} = context) do
@@ -879,49 +1004,100 @@ defmodule FastestMCP.Context do
 
   @doc "Records a progress update."
   def report_progress(%__MODULE__{} = context, current, total \\ nil, message \\ nil) do
-    progress =
-      %{}
-      |> maybe_put(:current, current)
-      |> maybe_put(:total, total)
-      |> maybe_put(:message, message)
-      |> Map.put(:reported_at, System.system_time(:millisecond))
+    with {:ok, next_total} <- validate_progress_update(context, current, total) do
+      progress =
+        %{}
+        |> maybe_put(:current, current)
+        |> maybe_put(:total, total)
+        |> maybe_put(:message, message)
+        |> Map.put(:reported_at, System.system_time(:millisecond))
 
-    case {task_store(context), task_id(context)} do
-      {store, task_id} when not is_nil(store) and is_binary(task_id) and task_id != "" ->
-        BackgroundTaskStore.report_progress(store, task_id, progress)
+      stored? = store_task_progress(context, progress)
+      delivery = deliver_progress(context, current, total, message)
 
-      _other ->
-        :ok
-    end
-
-    delivery =
-      case progress_token(context) do
-        nil ->
-          {:error, :missing_progress_token}
-
-        _token ->
-          Session.report_progress(
-            context.server_name,
-            context.session_id,
-            protocol_request_id(context),
-            %{
-              "progress" => current
-            }
-            |> maybe_put_map("total", total)
-            |> maybe_put_map("message", message)
-          )
+      if modern_progress?(context) and (delivery == :ok or stored?) do
+        put_request_state(context, :progress_update, %{current: current, total: next_total})
       end
 
-    emit(context, [:task, :progress], progress, %{task_id: task_id(context)})
-    delivery
+      emit(context, [:task, :progress], progress, %{task_id: task_id(context)})
+      delivery
+    end
   end
+
+  defp validate_progress_update(%__MODULE__{} = context, current, total) do
+    if modern_progress?(context) do
+      previous = get_request_state(context, :progress_update, %{current: nil, total: nil})
+      supplied_total = if is_nil(total), do: :absent, else: {:provided, total}
+
+      ProgressProtocol.validate_update(
+        current,
+        previous.current,
+        supplied_total,
+        previous.total
+      )
+    else
+      {:ok, total}
+    end
+  end
+
+  defp store_task_progress(%__MODULE__{} = context, progress) do
+    case {task_store(context), task_id(context)} do
+      {store, task_id} when not is_nil(store) and is_binary(task_id) and task_id != "" ->
+        BackgroundTaskStore.report_progress(store, task_id, progress) == :ok
+
+      _other ->
+        false
+    end
+  end
+
+  defp deliver_progress(%__MODULE__{} = context, current, total, message) do
+    case progress_token(context) do
+      nil ->
+        {:error, :missing_progress_token}
+
+      token ->
+        params =
+          %{
+            "progressToken" => token,
+            "progress" => current
+          }
+          |> maybe_put_map("total", total)
+          |> maybe_put_map("message", message)
+
+        case request_stream_sink(context) do
+          {pid, stream_ref} when is_pid(pid) ->
+            send(
+              pid,
+              {:fastest_mcp_request_stream_message, stream_ref,
+               %{
+                 "jsonrpc" => "2.0",
+                 "method" => "notifications/progress",
+                 "params" => params
+               }}
+            )
+
+            :ok
+
+          _other ->
+            Session.report_progress(
+              context.server_name,
+              context.session_id,
+              protocol_request_id(context),
+              Map.delete(params, "progressToken")
+            )
+        end
+    end
+  end
+
+  defp modern_progress?(%__MODULE__{negotiated_protocol_version: "2026-07-28"}), do: true
+  defp modern_progress?(%__MODULE__{}), do: false
 
   @doc "Requests interactive input for a background task."
   def elicit(%__MODULE__{} = context, message, response_type, opts \\ []) do
     request = Elicitation.request(message, response_type, opts)
 
     cond do
-      is_background_task(context) ->
+      background_task?(context) ->
         case task_store(context) do
           nil ->
             raise RuntimeError, "background task context is missing its task store"
@@ -1124,6 +1300,16 @@ defmodule FastestMCP.Context do
     request_metadata_value(context, :progress_token)
   end
 
+  defp request_stream_sink(%__MODULE__{} = context) do
+    request_metadata_value(context, :request_stream_sink)
+  end
+
+  defp request_log_level(%__MODULE__{} = context) do
+    request_metadata_value(context, :log_level)
+  end
+
+  defp log_level_index(level), do: Enum.find_index(@logging_levels, &(&1 == level)) || 0
+
   defp send_client_request(%__MODULE__{} = context, method, params, timeout_ms, opts) do
     request_opts =
       session_delivery_opts(context,
@@ -1280,7 +1466,17 @@ defmodule FastestMCP.Context do
     if Protocol.capability?(context.client_capabilities, path) do
       :ok
     else
-      raise Error, code: :method_not_found, message: message
+      if context.negotiated_protocol_version == "2026-07-28" do
+        raise Error,
+          code: :missing_required_client_capability,
+          message: message,
+          details: %{
+            jsonrpc_code: -32_021,
+            requiredCapabilities: Protocol.capabilities_map([path])
+          }
+      else
+        raise Error, code: :method_not_found, message: message
+      end
     end
   end
 
@@ -1335,7 +1531,7 @@ defmodule FastestMCP.Context do
 
     principal_fingerprint = Auth.identity_fingerprint(context.principal, context.auth)
 
-    FastestMCP.Elicitation.URL.new!(message, url_or_builder,
+    URLElicitation.new!(message, url_or_builder,
       session_id: context.session_id,
       principal_fingerprint: principal_fingerprint,
       allowed_hosts: allowed_hosts,
@@ -1362,11 +1558,14 @@ defmodule FastestMCP.Context do
       session_id: context.session_id,
       transport: context.transport,
       request_metadata: context.request_metadata,
+      transport_authorization: context.transport_authorization,
       principal: context.principal,
+      authenticated: context.authenticated,
       auth: context.auth,
       capabilities: context.capabilities,
       verified_audiences: context.verified_audiences,
       verified_scopes: context.verified_scopes,
+      transport_authenticated: context.authenticated,
       task_metadata: context.task_metadata
     ]
   end
@@ -1410,6 +1609,7 @@ defmodule FastestMCP.Context do
     context
     |> request_metadata_value(:headers)
     |> normalize_headers()
+    |> Map.drop(@private_http_headers)
   end
 
   defp request_context_meta(%__MODULE__{} = context) do
@@ -1422,6 +1622,10 @@ defmodule FastestMCP.Context do
       |> Map.delete("path")
       |> Map.delete(:query_params)
       |> Map.delete("query_params")
+      |> Map.delete(:request_stream_sink)
+      |> Map.delete("request_stream_sink")
+      |> Map.delete(:authorization)
+      |> Map.delete("authorization")
       |> Map.new(fn {key, value} ->
         normalized_key = if is_atom(key), do: Atom.to_string(key), else: key
         {normalized_key, value}
@@ -1436,17 +1640,22 @@ defmodule FastestMCP.Context do
     end
   end
 
-  defp request_access_token(%__MODULE__{} = context) do
-    headers = request_metadata_headers(context)
+  defp auth_access_token(%__MODULE__{} = context) do
+    Map.get(context.auth, :token, Map.get(context.auth, "token"))
+  end
 
-    case Map.get(headers, "authorization", Map.get(headers, :authorization)) do
+  defp request_access_token(%__MODULE__{} = context) do
+    context.transport_authorization
+    |> Kernel.||(legacy_request_authorization(context.request_metadata))
+    |> case do
       "Bearer " <> token when token != "" -> token
       _other -> nil
     end
   end
 
-  defp auth_access_token(%__MODULE__{} = context) do
-    Map.get(context.auth, :token, Map.get(context.auth, "token"))
+  defp legacy_request_authorization(request_metadata) do
+    {_public_metadata, authorization} = split_transport_authorization(request_metadata)
+    authorization
   end
 
   defp auth_value(%__MODULE__{} = context, key) do
@@ -1554,6 +1763,49 @@ defmodule FastestMCP.Context do
     end)
   end
 
+  defp split_transport_authorization(request_metadata) do
+    headers =
+      request_metadata
+      |> Map.get(:headers, Map.get(request_metadata, "headers", %{}))
+      |> Map.new()
+
+    authorization =
+      headers
+      |> Enum.find_value(fn {key, value} ->
+        if authorization_key?(key),
+          do: normalize_transport_authorization(value)
+      end)
+      |> Kernel.||(
+        request_metadata
+        |> Enum.find_value(fn {key, value} ->
+          if authorization_key?(key),
+            do: normalize_transport_authorization(value)
+        end)
+      )
+
+    public_headers =
+      Map.reject(headers, fn {key, _value} ->
+        authorization_key?(key)
+      end)
+
+    public_metadata =
+      request_metadata
+      |> Map.reject(fn {key, _value} -> authorization_key?(key) end)
+      |> Map.delete(:headers)
+      |> Map.delete("headers")
+      |> Map.put(:headers, public_headers)
+
+    {public_metadata, authorization}
+  end
+
+  defp normalize_transport_authorization(value) when is_binary(value) and value != "", do: value
+  defp normalize_transport_authorization(_value), do: nil
+
+  defp authorization_key?(key) when is_binary(key) or is_atom(key),
+    do: String.downcase(to_string(key)) == "authorization"
+
+  defp authorization_key?(_key), do: false
+
   defp normalize_extension_notification(notification) do
     canonical_keys = Enum.map(Map.keys(notification), &canonical_notification_key/1)
 
@@ -1610,12 +1862,13 @@ defmodule FastestMCP.Context do
   end
 
   defp validate_sampling_capabilities!(context, tools, include_context) do
-    cond do
-      not sampling_base_capability?(context) ->
-        raise Error,
-          code: :method_not_found,
-          message: "connected client did not declare sampling support"
+    require_client_capability!(
+      context,
+      ["sampling"],
+      "connected client did not declare sampling support"
+    )
 
+    cond do
       not is_nil(tools) and not client_sampling_capability?(context, "tools") ->
         raise Error,
           code: :bad_request,
@@ -1630,10 +1883,6 @@ defmodule FastestMCP.Context do
       true ->
         :ok
     end
-  end
-
-  defp sampling_base_capability?(%__MODULE__{client_capabilities: capabilities}) do
-    is_map(Map.get(capabilities, "sampling", Map.get(capabilities, :sampling)))
   end
 
   defp validate_peer_task_capability!(context, opts, request_path) do

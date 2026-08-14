@@ -27,6 +27,7 @@ defmodule FastestMCP.Operation do
     :schema_options,
     task_request: false,
     task_ttl_ms: nil,
+    captures: %{},
     arguments: %{}
   ]
 
@@ -47,6 +48,7 @@ defmodule FastestMCP.Operation do
           schema_options: keyword(),
           task_request: boolean(),
           task_ttl_ms: pos_integer() | nil,
+          captures: map(),
           arguments: map()
         }
 end

@@ -32,16 +32,16 @@ defmodule FastestMCP.Middleware do
   `FastestMCP.add_middleware/2`.
   """
 
+  alias FastestMCP.Middleware.DetailedTiming
   alias FastestMCP.Middleware.ErrorHandling
   alias FastestMCP.Middleware.Logging
-  alias FastestMCP.Middleware.DetailedTiming
   alias FastestMCP.Middleware.Ping
   alias FastestMCP.Middleware.RateLimiting
   alias FastestMCP.Middleware.ResponseCaching
   alias FastestMCP.Middleware.ResponseLimiting
+  alias FastestMCP.Middleware.Retry
   alias FastestMCP.Middleware.SlidingWindowRateLimiting
   alias FastestMCP.Middleware.Timing
-  alias FastestMCP.Middleware.Retry
   alias FastestMCP.Middleware.ToolInjection
 
   @doc false

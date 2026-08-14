@@ -56,57 +56,57 @@ defmodule FastestMCP.Resources.Directory do
 
   @doc "Lists files in the configured directory."
   def list_files(%__MODULE__{} = directory) do
-    try do
-      validate_directory!(directory.path)
-      real_root = PathSafety.realpath!(directory.path)
+    validate_directory!(directory.path)
+    real_root = PathSafety.realpath!(directory.path)
 
-      directory.path
-      |> walk(real_root, directory.recursive, directory.include_hidden, MapSet.new())
-      |> elem(0)
-    rescue
-      error ->
-        raise Error,
-          code: :internal_error,
-          message:
-            "Error listing directory #{inspect(directory.path)}: #{Exception.message(error)}"
-    end
+    directory.path
+    |> walk(real_root, directory.recursive, directory.include_hidden, MapSet.new())
+    |> elem(0)
+  rescue
+    error ->
+      reraise Error.exception(
+                code: :internal_error,
+                message:
+                  "Error listing directory #{inspect(directory.path)}: #{Exception.message(error)}"
+              ),
+              __STACKTRACE__
   end
 
   @doc "Reads the directory listing and returns a normalized resource result."
   def read(%__MODULE__{} = directory) do
-    try do
-      files = list_files(directory)
+    files = list_files(directory)
 
-      entries =
-        Enum.map(files, fn path ->
-          %{
-            path: path,
-            relative_path: Path.relative_to(path, directory.path),
-            name: Path.basename(path),
-            size_bytes: file_size(path)
-          }
-        end)
-
-      Result.new(
-        [
-          Content.new(entries, mime_type: directory.mime_type)
-        ],
-        meta: %{
-          count: length(entries),
-          path: directory.path,
-          recursive: directory.recursive
+    entries =
+      Enum.map(files, fn path ->
+        %{
+          path: path,
+          relative_path: Path.relative_to(path, directory.path),
+          name: Path.basename(path),
+          size_bytes: file_size(path)
         }
-      )
-    rescue
-      error in [Error] ->
-        reraise error, __STACKTRACE__
+      end)
 
-      error ->
-        raise Error,
-          code: :internal_error,
-          message:
-            "Error reading directory #{inspect(directory.path)}: #{Exception.message(error)}"
-    end
+    Result.new(
+      [
+        Content.new(entries, mime_type: directory.mime_type)
+      ],
+      meta: %{
+        count: length(entries),
+        path: directory.path,
+        recursive: directory.recursive
+      }
+    )
+  rescue
+    error in [Error] ->
+      reraise error, __STACKTRACE__
+
+    error ->
+      reraise Error.exception(
+                code: :internal_error,
+                message:
+                  "Error reading directory #{inspect(directory.path)}: #{Exception.message(error)}"
+              ),
+              __STACKTRACE__
   end
 
   defp validate_directory!(path) do

@@ -7,6 +7,58 @@ defmodule FastestMCP.StreamableHTTPEventStreamTest do
   alias FastestMCP.Session
   alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
 
+  @modern_version "2026-07-28"
+
+  test "closing a modern request SSE stream cancels its handler" do
+    parent = self()
+    server_name = "http-modern-close-cancel-#{System.unique_integer([:positive])}"
+
+    server =
+      FastestMCP.server(server_name)
+      |> FastestMCP.add_tool("block_after_progress", fn _arguments, context ->
+        send(parent, {:modern_handler_started, self()})
+        :ok = Context.report_progress(context, 1, 1)
+
+        receive do
+          :release -> "released"
+        after
+          10_000 -> "timed out"
+        end
+      end)
+
+    assert {:ok, _pid} = FastestMCP.start_server(server)
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+
+    port = start_http(server_name)
+
+    payload =
+      ProtocolTest.jsonrpc_request(901, "tools/call", %{
+        "name" => "block_after_progress",
+        "arguments" => %{},
+        "_meta" =>
+          modern_meta()
+          |> Map.put("progressToken", "cancel-progress")
+      })
+
+    {:ok, socket, response, stream_state} =
+      open_stream(port, modern_post_payload(payload, "tools/call", "block_after_progress"))
+
+    assert response.status == 200
+    assert response.headers["x-accel-buffering"] == "no"
+    assert_receive {:modern_handler_started, handler}, 1_000
+    handler_monitor = Process.monitor(handler)
+
+    assert {:ok, stream, _stream_state} =
+             recv_stream_until(socket, stream_state, "notifications/progress", 1_000)
+
+    assert stream =~ "cancel-progress"
+
+    :ok = :inet.setopts(socket, linger: {true, 0})
+    :ok = :gen_tcp.close(socket)
+
+    assert_receive {:DOWN, ^handler_monitor, :process, ^handler, _reason}, 2_500
+  end
+
   test "streamable HTTP uses event-stream framing for tool calls" do
     server_name = "http-event-stream-#{System.unique_integer([:positive])}"
 
@@ -621,6 +673,40 @@ defmodule FastestMCP.StreamableHTTPEventStreamTest do
       body
     ]
     |> IO.iodata_to_binary()
+  end
+
+  defp modern_post_payload(payload, method, name) do
+    body = JSON.encode!(payload)
+
+    [
+      "POST /mcp HTTP/1.1\r\n",
+      "Host: 127.0.0.1\r\n",
+      "Content-Type: application/json\r\n",
+      "Accept: application/json, text/event-stream\r\n",
+      "MCP-Protocol-Version: ",
+      @modern_version,
+      "\r\n",
+      "Mcp-Method: ",
+      method,
+      "\r\n",
+      "Mcp-Name: ",
+      name,
+      "\r\n",
+      "Content-Length: ",
+      Integer.to_string(byte_size(body)),
+      "\r\n",
+      "Connection: keep-alive\r\n\r\n",
+      body
+    ]
+    |> IO.iodata_to_binary()
+  end
+
+  defp modern_meta do
+    %{
+      "io.modelcontextprotocol/protocolVersion" => @modern_version,
+      "io.modelcontextprotocol/clientCapabilities" => %{},
+      "io.modelcontextprotocol/clientInfo" => %{"name" => "raw-test", "version" => "1.0.0"}
+    }
   end
 
   defp open_session_stream(port, session_id, last_event_id \\ nil) do

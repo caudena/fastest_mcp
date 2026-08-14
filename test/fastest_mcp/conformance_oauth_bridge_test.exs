@@ -50,5 +50,11 @@ defmodule FastestMCP.ConformanceOAuthBridgeTest do
 
     assert ConformanceOAuthBridge.physical_url("http://localhost:4321/mcp") ==
              "http://localhost:4321/mcp"
+
+    assert ConformanceOAuthBridge.logical_url("http://localhost:4321/token") ==
+             "https://localhost:4321/token"
+
+    assert ConformanceOAuthBridge.logical_url("https://auth.example.com/token") ==
+             "https://auth.example.com/token"
   end
 end

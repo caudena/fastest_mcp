@@ -32,6 +32,7 @@ defmodule FastestMCP.Transport.SSEDecoder do
         }
 
   @doc "Creates a bounded incremental SSE decoder."
+  @spec new(keyword()) :: t()
   def new(opts \\ []) do
     max_event_bytes = Keyword.get(opts, :max_event_bytes, @default_max_event_bytes)
     max_seen_event_ids = Keyword.get(opts, :max_seen_event_ids, @default_max_seen_event_ids)
@@ -40,7 +41,9 @@ defmodule FastestMCP.Transport.SSEDecoder do
          is_integer(max_seen_event_ids) and max_seen_event_ids > 0 do
       %__MODULE__{
         max_event_bytes: max_event_bytes,
-        max_seen_event_ids: max_seen_event_ids
+        max_seen_event_ids: max_seen_event_ids,
+        seen_event_ids: MapSet.new(),
+        seen_event_id_order: :queue.new()
       }
     else
       raise ArgumentError, "max_event_bytes and max_seen_event_ids must be positive integers"

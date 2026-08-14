@@ -12,8 +12,8 @@ defmodule FastestMCP.TaskNotificationSubscriber do
 
   use GenServer
 
-  alias FastestMCP.EventBus
   alias FastestMCP.BackgroundTaskStore
+  alias FastestMCP.EventBus
 
   @doc "Builds a child specification for supervising this module."
   def child_spec(opts) do

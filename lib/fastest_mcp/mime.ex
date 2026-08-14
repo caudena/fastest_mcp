@@ -6,6 +6,8 @@ defmodule FastestMCP.MIME do
   comparisons are case-insensitive.
   """
 
+  alias Plug.Conn.Utils, as: PlugConnUtils
+
   @doc "Returns the normalized media type without parameters."
   def normalize(value) when is_binary(value) do
     value
@@ -34,17 +36,18 @@ defmodule FastestMCP.MIME do
 
   @doc "Returns whether an HTTP Accept header explicitly permits the media type."
   def accepts?(header_values, media_type) do
-    with {:ok, expected_type, expected_subtype, _params} <-
-           parse_content_type(to_string(media_type)) do
-      header_values
-      |> List.wrap()
-      |> Enum.flat_map(&Plug.Conn.Utils.list(to_string(&1)))
-      |> Enum.with_index()
-      |> Enum.flat_map(&accept_match(&1, expected_type, expected_subtype))
-      |> effective_quality()
-      |> Kernel.>(0.0)
-    else
-      :error -> false
+    case parse_content_type(to_string(media_type)) do
+      {:ok, expected_type, expected_subtype, _params} ->
+        header_values
+        |> List.wrap()
+        |> Enum.flat_map(&PlugConnUtils.list(to_string(&1)))
+        |> Enum.with_index()
+        |> Enum.flat_map(&accept_match(&1, expected_type, expected_subtype))
+        |> effective_quality()
+        |> Kernel.>(0.0)
+
+      :error ->
+        false
     end
   end
 
@@ -145,6 +148,6 @@ defmodule FastestMCP.MIME do
     end
   end
 
-  defp parse_content_type(value), do: Plug.Conn.Utils.content_type(value)
-  defp parse_media_type(value), do: Plug.Conn.Utils.media_type(value)
+  defp parse_content_type(value), do: PlugConnUtils.content_type(value)
+  defp parse_media_type(value), do: PlugConnUtils.media_type(value)
 end

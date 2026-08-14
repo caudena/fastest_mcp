@@ -5,7 +5,10 @@ credentials or framework state into normalized request context:
 
 - `ctx.principal`
 - `ctx.auth`
+- `ctx.authenticated`
 - `ctx.capabilities`
+- `ctx.verified_scopes`
+- `ctx.verified_audiences`
 - `Context.client_id/1`
 
 Your application verifies sessions, tokens, cookies, or upstream identity using
@@ -24,7 +27,8 @@ FastestMCP.server("app")
        %{
          principal: %{"sub" => to_string(user.id)},
          auth: %{source: :app, user_id: user.id},
-         capabilities: MyApp.MCPScopes.for_user(user)
+         scopes: MyApp.MCPScopes.for_user(user),
+         audiences: ["https://mcp.example.com/mcp"]
        }}
 
     :error ->
@@ -51,7 +55,8 @@ defmodule MyApp.MCPAuth do
        %FastestMCP.Auth.Result{
          principal: %{"sub" => to_string(user.id)},
          auth: %{source: :app, user_id: user.id},
-         capabilities: MyApp.MCPScopes.for_user(user)
+         scopes: MyApp.MCPScopes.for_user(user),
+         audiences: ["https://mcp.example.com/mcp"]
        }}
     end
   end
@@ -95,7 +100,8 @@ FastestMCP.server(MyApp.MCPServer)
 |> FastestMCP.add_auth(
   FastestMCP.Auth.from_assign(:current_user,
     principal: fn user -> %{"sub" => to_string(user.id)} end,
-    capabilities: fn user -> MyApp.MCPScopes.for_user(user) end,
+    scopes: fn user -> MyApp.MCPScopes.for_user(user) end,
+    audiences: fn _user -> ["https://mcp.example.com/mcp"] end,
     auth: fn user -> %{source: :phoenix, user_id: user.id} end
   )
 )
@@ -152,21 +158,47 @@ Authorization rules can also filter list results with tags:
 FastestMCP.Authorization.restrict_tag("internal")
 ```
 
-Authorization is fail closed. A component check authorizes only when it returns
-`true` or `:ok`. `false`, `nil`, malformed return values, exceptions, throws,
-and exits all deny access; a binary `{:error, message}` also denies with that
-message. When multiple versions share an identity, an unauthorized higher
-version is skipped so an authorized lower version can remain visible, while an
-explicit request for the unauthorized version is rejected.
+`require_scopes/1` checks only scopes verified by the authenticator. It never
+uses client capabilities or unverified token claims. A dynamic resolver receives
+`%FastestMCP.Authorization.Context{}` and runs once per authorization decision:
+
+```elixir
+FastestMCP.Authorization.require_scopes(fn authz ->
+  if authz.arguments["confidential"], do: ["reports:confidential"], else: ["reports:read"]
+end)
+```
+
+The authorization context includes the authenticated state, verified scopes and
+audiences, operation target and arguments, and canonical decoded resource-template
+captures. Use `require_capabilities/1` when the application intentionally wants
+a capability-based check instead:
+
+```elixir
+FastestMCP.Authorization.require_capabilities(["internal-tools"])
+```
+
+Authorization is fail closed. A custom function check authorizes only when it
+returns `true` or `:ok`. `false`, `nil`, malformed return values, exceptions,
+throws, exits, and error tuples all deny access. Custom checks are opaque: their
+denial details are not exposed on the wire. When multiple versions share an
+identity, an unauthorized higher version is skipped so an authorized lower
+version can remain visible, while an explicit request for the unauthorized
+version is rejected.
 
 ## HTTP Behavior
 
-When a server configures auth, FastestMCP authenticates every inbound HTTP
-initialize, request, notification, client response, POST stream, GET stream,
-and DELETE before dispatch. The successful initialize identity is bound to the
-session; a different principal cannot reuse the session id. Component
-authorization still runs in the operation pipeline after transport
-authentication.
+When a server configures auth, FastestMCP authenticates every applicable
+inbound HTTP request, notification, client response, and control operation
+before dispatch. A legacy initialize identity is bound to its session; a
+different principal cannot reuse that session id. Modern requests are
+stateless authentication boundaries. Component authorization still runs in
+the operation pipeline after transport authentication.
+
+List operations silently omit unauthorized components. Direct access with a
+verified token that lacks one or more declared scopes returns HTTP 403 and an
+`insufficient_scope` challenge containing the union of missing scopes. If any
+custom, capability, or failed dynamic check also denies the operation, the
+response remains a generic 403 and does not disclose scope requirements.
 
 Without protected-resource configuration, HTTP auth failures use a plain
 bearer challenge:
@@ -193,8 +225,12 @@ server =
   )
 ```
 
-The public HTTP app serves the path-derived metadata document on the same
-resource origin. For the example above it is:
+The path-derived metadata document must be served on the same resource origin.
+For a standalone FastestMCP listener the HTTP app serves it directly. A Phoenix
+application that forwards only `/mcp` must separately mount
+`FastestMCP.Transport.WellKnownHTTP` outside its authenticated pipeline, as
+shown in [Phoenix Deployment](phoenix-deployment.md). For the example above the
+public URL is:
 
 ```text
 https://mcp.example.com/.well-known/oauth-protected-resource/mcp
@@ -244,9 +280,25 @@ verified audience and scope evidence returned by that boundary. Configure
 `FastestMCP.Auth.ProtectedResource` only together with an authenticator;
 protected-resource HTTP fails closed when no authenticator exists.
 
-The connected-client OAuth flow and its host-owned browser/token-store
-boundaries are documented in [Client](client.md). They do not turn FastestMCP
-into an authorization server.
+## Connected-Client Extension Grants
+
+The connected client also supports the draft OAuth Client Credentials and
+stable Enterprise-Managed Authorization extensions. They stay under the
+existing `oauth:` option as tagged `grant:` values. Client Credentials accepts
+a host secret or an arity-one `private_key_jwt` assertion provider.
+Enterprise-Managed Authorization accepts an arity-one host identity provider
+and explicit pre-registration or Client ID Metadata Document registration.
+Selecting either tagged grant is the explicit opt-in and automatically
+declares its matching extension capability on every modern MCP request.
+
+These grants change how a client obtains a bearer token. They do not add token,
+login, IdP, or authorization routes to a FastestMCP server. Exact shapes and
+maturity labels are documented in [Protocol Extensions](extensions.md).
+
+The connected-client OAuth flow and its host-owned browser, signing,
+enterprise identity, and token-store boundaries are documented in
+[Client](client.md). The Phoenix resource-server deployment boundary is in
+[Phoenix Deployment](phoenix-deployment.md).
 
 ## Why This Shape
 

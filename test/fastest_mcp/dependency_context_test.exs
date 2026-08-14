@@ -63,7 +63,7 @@ defmodule FastestMCP.DependencyContextTest do
 
           send(
             parent,
-            {:task_ctx, Context.is_background_task(ctx), Context.server(ctx).name,
+            {:task_ctx, Context.background_task?(ctx), Context.server(ctx).name,
              is_pid(Context.task_store(ctx)), first == second}
           )
 

@@ -30,6 +30,14 @@ defmodule FastestMCP.ComponentPolicy do
 
   @doc false
   def apply_result(server, component, operation) do
+    with {:ok, transformed} <- prepare_result(server, component, operation),
+         {:ok, authorized} <- authorize_result(transformed, operation) do
+      {:ok, authorized}
+    end
+  end
+
+  @doc false
+  def prepare_result(server, component, operation) do
     transformed =
       Enum.reduce(server.transforms, component, fn transform, current ->
         if current, do: transform.(current, operation), else: nil
@@ -61,10 +69,15 @@ defmodule FastestMCP.ComponentPolicy do
          }}
 
       true ->
-        case Authorization.authorize_component(transformed, operation.context, operation) do
-          :ok -> {:ok, transformed}
-          {:error, %Error{} = error} -> {:error, error}
-        end
+        {:ok, transformed}
+    end
+  end
+
+  @doc false
+  def authorize_result(component, operation) do
+    case Authorization.authorize_component(component, operation.context, operation) do
+      :ok -> {:ok, component}
+      {:error, %Error{} = error} -> {:error, error}
     end
   end
 

@@ -76,26 +76,24 @@ defmodule FastestMCP.Middleware.Retry do
   end
 
   defp do_call(middleware, operation, next, attempt) do
-    try do
-      next.(operation)
-    rescue
-      error ->
-        stacktrace = __STACKTRACE__
+    next.(operation)
+  rescue
+    error ->
+      stacktrace = __STACKTRACE__
 
-        if attempt < middleware.max_retries and should_retry?(middleware, error) do
-          delay = calculate_delay(middleware, attempt)
+      if attempt < middleware.max_retries and should_retry?(middleware, error) do
+        delay = calculate_delay(middleware, attempt)
 
-          middleware.logger.(
-            "Request #{operation.method || "unknown"} failed (attempt #{attempt + 1}/#{middleware.max_retries + 1}): " <>
-              "#{error_summary(error)}. Retrying in #{format_delay(delay)}s..."
-          )
+        middleware.logger.(
+          "Request #{operation.method || "unknown"} failed (attempt #{attempt + 1}/#{middleware.max_retries + 1}): " <>
+            "#{error_summary(error)}. Retrying in #{format_delay(delay)}s..."
+        )
 
-          Process.sleep(max(1, round(delay * 1_000)))
-          do_call(middleware, operation, next, attempt + 1)
-        else
-          reraise error, stacktrace
-        end
-    end
+        Process.sleep(max(1, round(delay * 1_000)))
+        do_call(middleware, operation, next, attempt + 1)
+      else
+        reraise error, stacktrace
+      end
   end
 
   defp retryable_component_crash?(details, retry_exceptions) when is_map(details) do

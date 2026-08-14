@@ -221,9 +221,6 @@ defmodule FastestMCP.Root do
 
   defp format_error(:not_file_uri), do: "MCP roots must use a file:// URI"
 
-  defp format_error(:remote_file_authority),
-    do: "MCP roots must refer to the local file authority"
-
   defp format_error(:invalid_file_authority), do: "MCP root file authority is invalid"
   defp format_error(:file_uri_query), do: "MCP root file URIs cannot contain a query"
   defp format_error(:file_uri_fragment), do: "MCP root file URIs cannot contain a fragment"

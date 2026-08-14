@@ -6,6 +6,7 @@ defmodule FastestMCP.AuthContractTest do
 
   alias FastestMCP.Error
   alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
+  alias FastestMCP.Transport.StreamableHTTP
 
   defmodule StaticProvider do
     @behaviour FastestMCP.Auth
@@ -48,6 +49,38 @@ defmodule FastestMCP.AuthContractTest do
       FastestMCP.server("invalid-auth-" <> Integer.to_string(System.unique_integer([:positive])))
       |> FastestMCP.add_auth(InvalidProvider)
     end
+  end
+
+  test "principal and authorization partitions never depend on raw credentials" do
+    principal = {"https://issuer.example", "user-123"}
+
+    assert FastestMCP.Auth.principal_fingerprint(principal) ==
+             FastestMCP.Auth.principal_fingerprint(principal)
+
+    left = %FastestMCP.Auth.Result{
+      principal: principal,
+      auth: %{token: "token-a", nested: %{client_secret: "secret-a"}, tenant: "acme"},
+      capabilities: ["tools:call"],
+      audiences: ["https://mcp.example/mcp"],
+      scopes: ["tools:read"]
+    }
+
+    right = %{
+      left
+      | auth: %{
+          token: "token-b",
+          nested: %{client_secret: "secret-b"},
+          tenant: "acme"
+        }
+    }
+
+    assert FastestMCP.Auth.authorization_partition(left) ==
+             FastestMCP.Auth.authorization_partition(right)
+
+    changed_claim = %{right | auth: Map.put(right.auth, :tenant, "other")}
+
+    refute FastestMCP.Auth.authorization_partition(left) ==
+             FastestMCP.Auth.authorization_partition(changed_claim)
   end
 
   test "module authenticator enriches context for direct calls and rejects invalid credentials" do
@@ -194,7 +227,7 @@ defmodule FastestMCP.AuthContractTest do
              JSON.decode!(conn.resp_body)
   end
 
-  test "HTTP auth errors use the plain bearer challenge" do
+  test "HTTP auth errors use bearer challenges without protected-resource metadata" do
     server_name = "auth-http-errors-" <> Integer.to_string(System.unique_integer([:positive]))
 
     server =
@@ -239,7 +272,10 @@ defmodule FastestMCP.AuthContractTest do
       )
 
     assert forbidden_conn.status == 403
-    assert get_resp_header(forbidden_conn, "www-authenticate") == []
+
+    assert get_resp_header(forbidden_conn, "www-authenticate") == [
+             ~s(Bearer error="insufficient_scope", scope="tools:call", error_description="insufficient scope")
+           ]
 
     assert %{
              "jsonrpc" => "2.0",
@@ -247,6 +283,66 @@ defmodule FastestMCP.AuthContractTest do
              "error" => %{"data" => %{"fastestmcp" => %{"code" => "forbidden"}}}
            } =
              JSON.decode!(forbidden_conn.resp_body)
+  end
+
+  test "plain insufficient-scope challenges sort exact validated scope tokens" do
+    error = %Error{
+      code: :forbidden,
+      message: "missing grants",
+      details: %{missing_scopes: ["files:write", "files:admin", "files:write"]}
+    }
+
+    assert FastestMCP.Auth.validated_missing_scopes(error) == ["files:admin", "files:write"]
+
+    assert FastestMCP.Auth.default_www_authenticate(error) ==
+             ~s(Bearer error="insufficient_scope", scope="files:admin files:write", error_description="missing grants")
+
+    invalid = %{error | details: %{missing_scopes: ["files:admin\n"]}}
+    assert FastestMCP.Auth.validated_missing_scopes(invalid) == []
+    refute FastestMCP.Auth.default_www_authenticate(invalid) =~ "scope="
+  end
+
+  test "component scope denial includes exact missing scopes without protected-resource metadata" do
+    server_name =
+      "auth-http-component-scope-" <> Integer.to_string(System.unique_integer([:positive]))
+
+    authenticator = fn _input, _context ->
+      {:ok,
+       %{
+         principal: {"https://auth.example.com", "user-1"},
+         scopes: ["files:read"],
+         audiences: ["https://mcp.example.com/mcp"]
+       }}
+    end
+
+    server =
+      FastestMCP.server(server_name, auth: authenticator)
+      |> FastestMCP.add_tool("admin", fn -> "secret" end,
+        auth: FastestMCP.Authorization.require_scopes(["files:write", "files:admin"])
+      )
+
+    assert {:ok, _pid} = FastestMCP.start_server(server)
+
+    response =
+      ProtocolTest.modern_http_request(
+        server_name,
+        1,
+        "tools/call",
+        %{"name" => "admin", "arguments" => %{}},
+        headers: [
+          {"authorization", "Bearer verified-token"},
+          {"mcp-name", "admin"}
+        ]
+      )
+
+    assert response.status == 403
+
+    assert get_resp_header(response, "www-authenticate") == [
+             ~s(Bearer error="insufficient_scope", scope="files:admin files:write", error_description="access token does not grant the required scopes")
+           ]
+
+    assert get_in(JSON.decode!(response.resp_body), ["error", "data", "fastestmcp", "code"]) ==
+             "forbidden"
   end
 
   test "from_assign supports direct auth input" do
@@ -258,11 +354,19 @@ defmodule FastestMCP.AuthContractTest do
         FastestMCP.Auth.from_assign(:current_user,
           principal: fn user -> %{"sub" => to_string(user.id)} end,
           capabilities: fn user -> user.scopes end,
+          scopes: fn user -> user.scopes end,
+          audiences: fn user -> user.audiences end,
           auth: fn user -> %{source: :phoenix, user_id: user.id} end
         )
       )
       |> FastestMCP.add_tool("whoami", fn _args, ctx ->
-        %{principal: ctx.principal, auth: ctx.auth, capabilities: ctx.capabilities}
+        %{
+          principal: ctx.principal,
+          auth: ctx.auth,
+          capabilities: ctx.capabilities,
+          verified_scopes: ctx.verified_scopes,
+          verified_audiences: ctx.verified_audiences
+        }
       end)
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
@@ -270,12 +374,18 @@ defmodule FastestMCP.AuthContractTest do
     assert %{
              principal: %{"sub" => "123"},
              auth: %{source: :phoenix, user_id: 123},
-             capabilities: ["tools:call"]
+             capabilities: ["tools:call"],
+             verified_scopes: ["tools:call"],
+             verified_audiences: ["https://mcp.example/mcp"]
            } ==
              FastestMCP.call_tool(server_name, "whoami", %{},
                auth_input: %{
                  "assigns" => %{
-                   "current_user" => %{id: 123, scopes: ["tools:call"]}
+                   "current_user" => %{
+                     id: 123,
+                     scopes: ["tools:call"],
+                     audiences: ["https://mcp.example/mcp"]
+                   }
                  }
                }
              )
@@ -328,7 +438,7 @@ defmodule FastestMCP.AuthContractTest do
       |> put_req_header("mcp-protocol-version", ProtocolTest.protocol_version())
       |> assign(:current_user, %{id: 456, scopes: ["tools:call"]})
       |> assign(:admin_secret, "not copied")
-      |> FastestMCP.Transport.StreamableHTTP.call(
+      |> StreamableHTTP.call(
         server_name: server_name,
         auth_assigns: [:current_user],
         allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"],
@@ -360,7 +470,7 @@ defmodule FastestMCP.AuthContractTest do
       |> put_req_header("accept", "application/json, text/event-stream")
       |> put_req_header("mcp-session-id", "auth-assign-session")
       |> put_req_header("mcp-protocol-version", ProtocolTest.protocol_version())
-      |> FastestMCP.Transport.StreamableHTTP.call(
+      |> StreamableHTTP.call(
         server_name: server_name,
         auth_assigns: [:current_user],
         allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"],

@@ -2,8 +2,10 @@ defmodule FastestMCP.VisibilityTest do
   use ExUnit.Case, async: false
 
   alias FastestMCP.Component
+  alias FastestMCP.ComponentVisibility
   alias FastestMCP.Context
   alias FastestMCP.Error
+  alias FastestMCP.Registry
 
   test "audience filtering hides components outside their visibility" do
     server_name = "visibility-" <> Integer.to_string(System.unique_integer([:positive]))
@@ -430,6 +432,49 @@ defmodule FastestMCP.VisibilityTest do
 
     assert Enum.all?(activated, fn {_session_id, sees_tool?} -> sees_tool? end)
     assert Enum.all?(non_activated, fn {_session_id, sees_tool?} -> not sees_tool? end)
+  end
+
+  test "visibility storage survives concurrent server teardown and short-lived readers" do
+    removed_server =
+      "visibility-owner-removed-" <> Integer.to_string(System.unique_integer([:positive]))
+
+    surviving_server =
+      "visibility-owner-surviving-" <> Integer.to_string(System.unique_integer([:positive]))
+
+    for server_name <- [removed_server, surviving_server] do
+      server =
+        FastestMCP.server(server_name)
+        |> FastestMCP.add_tool("visible", fn _args, _ctx -> :ok end)
+
+      assert {:ok, _pid} = FastestMCP.start_server(server)
+      :ok = FastestMCP.disable_components(server_name, names: ["visible"])
+    end
+
+    on_exit(fn -> FastestMCP.stop_server(surviving_server) end)
+
+    assert :ets.info(:fastest_mcp_component_visibility, :owner) ==
+             Process.whereis(Registry)
+
+    readers =
+      for _index <- 1..32 do
+        Task.async(fn ->
+          for _iteration <- 1..64 do
+            assert [%{action: :disable}] =
+                     ComponentVisibility.server_rules(surviving_server)
+
+            Process.sleep(0)
+          end
+        end)
+      end
+
+    assert :ok = FastestMCP.stop_server(removed_server)
+    Enum.each(readers, &Task.await(&1, 2_000))
+
+    assert [] == ComponentVisibility.server_rules(removed_server)
+    assert [%{action: :disable}] = ComponentVisibility.server_rules(surviving_server)
+
+    assert :ets.info(:fastest_mcp_component_visibility, :owner) ==
+             Process.whereis(Registry)
   end
 
   test "server-scoped visibility is authoritative over session re-enables" do

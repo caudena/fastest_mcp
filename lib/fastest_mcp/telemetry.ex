@@ -1,6 +1,6 @@
 defmodule FastestMCP.Telemetry do
   @moduledoc """
-  OpenTelemetry helpers for FastestMCP server-side tracing.
+  OpenTelemetry helpers for FastestMCP server and connected-client tracing.
   The runtime keeps emitting `:telemetry` events as its stable internal signal,
   while this module adds OpenTelemetry spans and W3C trace propagation on top.
 
@@ -18,6 +18,7 @@ defmodule FastestMCP.Telemetry do
   alias FastestMCP.Context
   alias FastestMCP.Operation
   alias OpenTelemetry.Ctx
+  alias OpenTelemetry.Span
 
   @instrumentation_name "fastest_mcp"
   @traceparent_key "traceparent"
@@ -32,7 +33,7 @@ defmodule FastestMCP.Telemetry do
 
   @doc "Returns the active OpenTelemetry tracer."
   def get_tracer do
-    OpenTelemetry.get_tracer(@instrumentation_name)
+    OpenTelemetry.get_tracer(:fastest_mcp)
   end
 
   @doc "Returns the current tracing context."
@@ -135,6 +136,124 @@ defmodule FastestMCP.Telemetry do
     Map.merge(normalize_binary_map(metadata), headers)
   end
 
+  @doc "Injects an explicit trace context into MCP `_meta` without rewriting other JSON values."
+  def inject_mcp_trace_context(metadata, context \\ current_context()) when is_map(metadata) do
+    carrier =
+      context
+      |> :otel_propagator_text_map.inject_from([])
+      |> Enum.reduce(%{}, fn
+        {key, value}, acc when key in [@traceparent_key, @tracestate_key] and is_binary(value) ->
+          Map.put(acc, key, value)
+
+        _entry, acc ->
+          acc
+      end)
+
+    if map_size(carrier) == 0, do: metadata, else: Map.merge(metadata, carrier)
+  end
+
+  @doc false
+  def start_client_span(parent_context, method, target, attrs \\ %{}) do
+    attrs =
+      %{
+        "rpc.system" => "mcp",
+        "rpc.method" => method,
+        "gen_ai.system" => "mcp",
+        "gen_ai.operation.name" => method,
+        "mcp.method.name" => method,
+        "fastestmcp.component.target" => target
+      }
+      |> Map.merge(Map.new(attrs))
+      |> clean_attributes()
+
+    span_ctx =
+      :otel_tracer.start_span(
+        parent_context,
+        get_tracer(),
+        client_span_name(method, target),
+        %{kind: :client, attributes: attrs}
+      )
+
+    %{
+      span_ctx: span_ctx,
+      context: :otel_tracer.set_current_span(parent_context, span_ctx)
+    }
+  end
+
+  @doc false
+  def with_client_span(method, target, attrs, fun) when is_function(fun, 1) do
+    with_client_span(current_context(), method, target, attrs, fun)
+  end
+
+  @doc false
+  def with_client_span(parent_context, method, target, attrs, fun) when is_function(fun, 1) do
+    trace = start_client_span(parent_context, method, target, attrs)
+
+    with_context(trace.context, fn ->
+      try do
+        result = fun.(trace)
+        finish_client_span(trace, :ok)
+        result
+      rescue
+        error ->
+          finish_client_span(trace, {:error, error})
+          reraise error, __STACKTRACE__
+      catch
+        kind, reason ->
+          finish_client_span(trace, {:error, {kind, reason}})
+          :erlang.raise(kind, reason, __STACKTRACE__)
+      end
+    end)
+  end
+
+  @doc false
+  def annotate_client_span(%{span_ctx: span_ctx}, attrs) when is_map(attrs) do
+    _ = Span.set_attributes(span_ctx, clean_attributes(attrs))
+    :ok
+  end
+
+  @doc false
+  def add_client_span_event(%{span_ctx: span_ctx}, name, attrs \\ %{}) do
+    _ = Span.add_event(span_ctx, name, clean_attributes(Map.new(attrs)))
+    :ok
+  end
+
+  @doc false
+  def mark_client_tool_error(%{span_ctx: span_ctx}) do
+    _ = Span.set_attribute(span_ctx, "error.type", "tool_error")
+    _ = :otel_span.set_status(span_ctx, :error, "MCP tool returned an error result")
+    :ok
+  end
+
+  @doc false
+  def finish_client_span(%{span_ctx: span_ctx}, outcome) do
+    case outcome do
+      :ok ->
+        :ok
+
+      {:error, %module{}} ->
+        _ =
+          Span.set_attribute(
+            span_ctx,
+            "error.type",
+            module |> inspect() |> String.trim_leading("Elixir.")
+          )
+
+        _ = :otel_span.set_status(span_ctx, :error, "MCP client operation failed")
+
+      {:error, {kind, _reason}} when kind in [:throw, :exit] ->
+        _ = Span.set_attribute(span_ctx, "error.type", Atom.to_string(kind))
+        _ = :otel_span.set_status(span_ctx, :error, "MCP client operation failed")
+
+      {:error, _reason} ->
+        _ = Span.set_attribute(span_ctx, "error.type", "client_error")
+        _ = :otel_span.set_status(span_ctx, :error, "MCP client operation failed")
+    end
+
+    _ = Span.end_span(span_ctx)
+    :ok
+  end
+
   @doc "Builds the span name for the given operation."
   def span_name(%Operation{method: "resources/read"}), do: "resources/read"
   def span_name(%Operation{method: method, target: nil}), do: method
@@ -229,12 +348,17 @@ defmodule FastestMCP.Telemetry do
 
   defp candidate_carriers(metadata) do
     [
+      get_in(metadata, [:jsonrpc_envelope, "params", "_meta"]),
+      get_in(metadata, ["jsonrpc_envelope", "params", "_meta"]),
       metadata,
       Map.get(metadata, :headers),
       Map.get(metadata, "headers")
     ]
     |> Enum.reject(&is_nil/1)
   end
+
+  defp client_span_name(method, nil), do: method
+  defp client_span_name(method, target), do: method <> " " <> to_string(target)
 
   defp normalize_trace_entries(map) when is_map(map) do
     map

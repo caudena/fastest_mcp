@@ -11,7 +11,7 @@ defmodule FastestMCP.TestSupport.ConformanceOAuthBridge do
     "registration_endpoint"
   ]
 
-  # @modelcontextprotocol/conformance 0.1.16 serves its OAuth authorization
+  # The pinned conformance runner serves its OAuth authorization
   # server on loopback HTTP, despite MCP 2025-11-25 requiring HTTPS for the
   # authorization server and its endpoints. Keep that defect outside runtime
   # code: production OAuth sees logical HTTPS metadata, while this test-only
@@ -19,6 +19,7 @@ defmodule FastestMCP.TestSupport.ConformanceOAuthBridge do
   # The protected-resource `resource` identifier is intentionally untouched.
   def request(method, logical_url, opts) do
     physical_url = physical_url(logical_url)
+    opts = rewrite_fixture_request(opts)
 
     case HTTP.request(method, physical_url, opts) do
       {:ok, status, headers, body} ->
@@ -40,8 +41,25 @@ defmodule FastestMCP.TestSupport.ConformanceOAuthBridge do
          ) do
       {:ok, status, headers, _body} when status in 300..399 ->
         case response_header(headers, "location") do
-          nil -> {:error, :authorization_redirect_missing}
-          location -> {:ok, URI.merge(request.authorization_url, location) |> URI.to_string()}
+          nil ->
+            {:error, :authorization_redirect_missing}
+
+          location ->
+            redirect = URI.merge(request.authorization_url, location)
+            query = URI.decode_query(redirect.query || "")
+
+            query =
+              case query["iss"] do
+                issuer when is_binary(issuer) -> Map.put(query, "iss", logical_url(issuer))
+                _other -> query
+              end
+
+            redirect = %{
+              redirect
+              | query: if(map_size(query) == 0, do: nil, else: URI.encode_query(query))
+            }
+
+            {:ok, URI.to_string(redirect)}
         end
 
       {:ok, status, _headers, _body} ->
@@ -62,6 +80,10 @@ defmodule FastestMCP.TestSupport.ConformanceOAuthBridge do
   @doc false
   def physical_url(url) when is_binary(url), do: rewrite_loopback_scheme(url, "https", "http")
 
+  @doc false
+  def logical_url(url) when is_binary(url), do: rewrite_loopback_scheme(url, "http", "https")
+  def logical_url(value), do: value
+
   defp rewrite_metadata_response(headers, body) do
     with {:ok, document} when is_map(document) <- JSON.decode(body),
          rewritten when rewritten != document <- logical_metadata(document) do
@@ -69,6 +91,29 @@ defmodule FastestMCP.TestSupport.ConformanceOAuthBridge do
       {replace_content_length(headers, byte_size(body)), body}
     else
       _unchanged_or_non_json -> {headers, body}
+    end
+  end
+
+  # alpha.11's enterprise-managed fixture verifies the ID-JAG against its
+  # physical HTTP authorization-server issuer. Production continues to send
+  # the exact logical HTTPS issuer discovered from metadata; only the
+  # token-exchange form sent to the pinned fixture is translated here.
+  defp rewrite_fixture_request(opts) do
+    case Keyword.fetch(opts, :form) do
+      {:ok, form} -> Keyword.put(opts, :form, rewrite_fixture_form(form))
+      :error -> opts
+    end
+  end
+
+  defp rewrite_fixture_form(form) do
+    if List.keyfind(form, "grant_type", 0) ==
+         {"grant_type", "urn:ietf:params:oauth:grant-type:token-exchange"} do
+      Enum.map(form, fn
+        {"audience", audience} -> {"audience", physical_url(audience)}
+        pair -> pair
+      end)
+    else
+      form
     end
   end
 
@@ -87,9 +132,6 @@ defmodule FastestMCP.TestSupport.ConformanceOAuthBridge do
       end
     end)
   end
-
-  defp logical_url(url) when is_binary(url), do: rewrite_loopback_scheme(url, "http", "https")
-  defp logical_url(value), do: value
 
   defp rewrite_loopback_scheme(url, source_scheme, target_scheme) do
     case URI.parse(url) do

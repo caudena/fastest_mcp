@@ -1,6 +1,7 @@
 defmodule FastestMCP.MiddlewareToolInjectionTest do
   use ExUnit.Case, async: false
 
+  alias FastestMCP.Authorization
   alias FastestMCP.Error
   alias FastestMCP.Middleware
 
@@ -200,6 +201,32 @@ defmodule FastestMCP.MiddlewareToolInjectionTest do
 
     assert %{"result" => %{"theme" => "sunrise"}} =
              FastestMCP.call_tool(server_name, "read_resource", %{"uri" => "config://app"})
+  end
+
+  test "resource helper tools preserve verified authorization evidence in nested calls" do
+    server_name =
+      "resource-tools-auth-" <> Integer.to_string(System.unique_integer([:positive]))
+
+    server =
+      FastestMCP.server(server_name)
+      |> FastestMCP.add_resource("config://private", fn _arguments, _ctx -> "authorized" end,
+        auth: Authorization.require_scopes("resources:read")
+      )
+      |> FastestMCP.add_middleware(Middleware.resource_tools())
+
+    assert {:ok, _pid} = FastestMCP.start_server(server)
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+
+    assert %{"result" => "authorized"} ==
+             FastestMCP.call_tool(
+               server_name,
+               "read_resource",
+               %{"uri" => "config://private"},
+               authenticated: true,
+               transport_authenticated: true,
+               principal: {"https://issuer.example", "user-1"},
+               verified_scopes: ["resources:read"]
+             )
   end
 
   test "multiple tool injection middlewares can be stacked" do

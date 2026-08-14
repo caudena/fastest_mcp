@@ -145,7 +145,7 @@ defmodule FastestMCP.ProviderTransformTest do
     end
   end
 
-  test "provider and transformed tool schemas enforce the shared object-root contract" do
+  test "provider inputs retain object roots while transformed outputs accept JSON schemas" do
     base_tool =
       ComponentCompiler.compile(
         :tool,
@@ -198,13 +198,11 @@ defmodule FastestMCP.ProviderTransformTest do
 
     on_exit(fn -> FastestMCP.stop_server(invalid_transform_server) end)
 
-    error =
-      assert_raise Error, fn ->
-        FastestMCP.initialize(invalid_transform_server)
-      end
+    assert %{"protocolVersion" => "2025-11-25"} =
+             FastestMCP.initialize(invalid_transform_server)
 
-    assert error.code == :internal_error
-    assert error.message =~ "tool output_schema must be a JSON Schema object"
+    assert [%{output_schema: %{"type" => "array"}}] =
+             FastestMCP.list_tools(invalid_transform_server)
   end
 
   test "provider schema refresh uses runtime schema options and the digest cache" do

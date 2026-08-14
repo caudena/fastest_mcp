@@ -25,7 +25,7 @@ defmodule FastestMCP.NestedOperationContextTest do
              FastestMCP.call_tool(server_name, "outer", %{}, session_id: "nested-session")
   end
 
-  test "nested task submissions inherit caller session and access token" do
+  test "nested task submissions inherit caller session but not the transport credential" do
     server_name = "nested-task-" <> Integer.to_string(System.unique_integer([:positive]))
 
     server =
@@ -61,7 +61,7 @@ defmodule FastestMCP.NestedOperationContextTest do
     assert FastestMCP.fetch_task(server_name, task_id, session_id: "nested-session").session_id ==
              "nested-session"
 
-    assert %{session_id: "nested-session", access_token: "nested-token"} ==
+    assert %{session_id: "nested-session", access_token: nil} ==
              FastestMCP.await_task(server_name, task_id, 1_000, session_id: "nested-session")
   end
 

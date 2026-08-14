@@ -332,9 +332,8 @@ defmodule FastestMCP.Auth.ProtectedResource do
   end
 
   defp parse_absolute_https_uri(value) do
-    with {:ok, %URI{scheme: "https"} = uri} <- parse_absolute_http_uri(value) do
-      {:ok, uri}
-    else
+    case parse_absolute_http_uri(value) do
+      {:ok, %URI{scheme: "https"} = uri} -> {:ok, uri}
       _other -> {:error, :https_required}
     end
   end

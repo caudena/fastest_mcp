@@ -10,9 +10,9 @@ defmodule FastestMCP.Client.Task do
 
       create task remotely
       -> register the remote task handle in the client
-      -> wait on notifications/tasks/status when available
+      -> wait on task notifications when available
       -> fall back to tasks/get polling when needed
-      -> cache the final tasks/result payload
+      -> cache the final result payload
   """
 
   defstruct [:client, :task_id, :kind, :target]
@@ -41,14 +41,19 @@ defmodule FastestMCP.Client.Task do
     FastestMCP.Client.wait_for_task(task.client, task.task_id, opts)
   end
 
-  @doc "Fetches and caches the final result using tasks/result."
+  @doc "Fetches and caches the final task result."
   def result(%__MODULE__{} = task, opts \\ []) do
     FastestMCP.Client.remote_task_result(task.client, task, opts)
   end
 
-  @doc "Cancels the remote task and updates the cached status."
+  @doc "Signals cancellation to the remote task."
   def cancel(%__MODULE__{} = task, opts \\ []) do
     FastestMCP.Client.cancel_remote_task(task.client, task.task_id, opts)
+  end
+
+  @doc "Supplies responses to outstanding input requests for this task."
+  def update(%__MODULE__{} = task, input_responses, opts \\ []) when is_map(input_responses) do
+    FastestMCP.Client.update_task(task.client, task.task_id, input_responses, opts)
   end
 
   @doc "Registers a callback for task status changes."

@@ -13,21 +13,24 @@ defmodule FastestMCP.Transport.Serializer do
 
   @content_block_types MapSet.new(["text", "image", "audio", "resource", "resource_link"])
 
+  alias FastestMCP.Apps
   alias FastestMCP.Base64
   alias FastestMCP.Error
   alias FastestMCP.JSONValue
   alias FastestMCP.MIME
-  alias FastestMCP.Protocol.Content
-  alias FastestMCP.Protocol.Meta
   alias FastestMCP.Prompts.Message, as: PromptMessage
   alias FastestMCP.Prompts.Result, as: PromptResult
+  alias FastestMCP.Protocol.Content
+  alias FastestMCP.Protocol.Meta
   alias FastestMCP.Resources.Content, as: ResourceContent
   alias FastestMCP.Resources.Result, as: ResourceResult
-  alias FastestMCP.Tools.Result, as: ToolResult
   alias FastestMCP.Tools.OutputSchema
+  alias FastestMCP.Tools.Result, as: ToolResult
 
   @doc "Serializes tool metadata for transport exposure."
-  def tool_metadata(tool) do
+  def tool_metadata(tool, opts \\ []) do
+    output_schema = OutputSchema.prepare(fetch(tool, :output_schema))
+
     %{
       "name" => fetch(tool, :name),
       "title" => fetch(tool, :title) || fetch(tool, :name),
@@ -36,8 +39,11 @@ defmodule FastestMCP.Transport.Serializer do
     }
     |> maybe_put("icons", normalize_json(fetch(tool, :icons)))
     |> maybe_put("annotations", normalize_json(fetch(tool, :annotations)))
-    |> maybe_put("outputSchema", OutputSchema.prepare(fetch(tool, :output_schema)))
-    |> maybe_put("execution", normalize_json(fetch(tool, :execution)))
+    |> maybe_put("outputSchema", compatible_output_schema(output_schema, opts))
+    |> maybe_put(
+      "execution",
+      if(modern?(opts), do: nil, else: normalize_json(fetch(tool, :execution)))
+    )
     |> Map.put(
       "_meta",
       normalize_json(
@@ -123,25 +129,27 @@ defmodule FastestMCP.Transport.Serializer do
   end
 
   @doc "Serializes a tool result for transport exposure."
-  def tool_result(result, tool \\ nil)
+  def tool_result(result, tool \\ nil), do: tool_result(result, tool, [])
 
-  def tool_result(%ToolResult{} = result, tool) do
+  @doc false
+  def tool_result(%ToolResult{} = result, tool, opts) do
     result
     |> ToolResult.to_map()
-    |> tool_result(tool)
+    |> tool_result(tool, opts)
   end
 
-  def tool_result(result, _tool) do
+  def tool_result(result, tool, opts) do
     payload =
       cond do
         explicit_tool_result?(result) ->
           structured_content = structured_content_payload!(result)
+          structured_content = compatible_structured_content(structured_content, opts)
 
           content = tool_result_content_payload(result, structured_content)
 
           %{}
           |> Map.put("content", normalize_content_payload(content))
-          |> maybe_put("structuredContent", structured_content)
+          |> put_explicit_structured_content(result, structured_content, opts)
           |> maybe_put("_meta", normalize_output_meta(fetch_meta(result)))
           |> put_is_error(result)
 
@@ -157,31 +165,41 @@ defmodule FastestMCP.Transport.Serializer do
         true ->
           normalized = normalize_json(result)
 
-          %{"content" => [text_block(normalized)]}
-          |> maybe_put(
-            "structuredContent",
-            if(is_map(normalized), do: normalized)
-          )
+          payload = %{"content" => [text_block(normalized)]}
+
+          if modern?(opts) do
+            Map.put(payload, "structuredContent", normalized)
+          else
+            maybe_put(payload, "structuredContent", map_or_nil(normalized))
+          end
       end
 
-    payload
+    validate_apps_tool_fallback!(payload, tool, opts)
   end
 
   @doc "Serializes a resource result for transport exposure."
-  def resource_result(uri, mime_type, result) do
+  def resource_result(uri, mime_type, result), do: resource_result(uri, mime_type, result, [])
+
+  @doc false
+  def resource_result(uri, mime_type, result, opts) do
     cond do
       match?(%ResourceResult{}, result) ->
-        resource_result(uri, mime_type, %{
-          contents: result.contents,
-          meta: result.meta
-        })
+        resource_result(
+          uri,
+          mime_type,
+          %{contents: result.contents, meta: result.meta},
+          opts
+        )
 
       is_map(result) and not is_nil(fetch(result, :contents)) ->
-        %{"contents" => Enum.map(fetch(result, :contents), &resource_content(uri, mime_type, &1))}
-        |> maybe_put("_meta", normalize_output_meta(fetch_meta(result)))
+        %{
+          "contents" =>
+            Enum.map(fetch(result, :contents), &resource_content(uri, mime_type, &1, opts))
+        }
+        |> maybe_put("_meta", apps_meta(fetch_meta(result), opts))
 
       match?(%ResourceContent{}, result) ->
-        %{"contents" => [resource_content(uri, mime_type, result)]}
+        %{"contents" => [resource_content(uri, mime_type, result, opts)]}
 
       true ->
         %{
@@ -274,24 +292,48 @@ defmodule FastestMCP.Transport.Serializer do
     %{"text" => JSON.encode!(normalize_json(value))}
   end
 
-  defp resource_content(uri, default_mime_type, %ResourceContent{} = content) do
-    resource_content(uri, default_mime_type, %{
-      uri: Map.get(content, :uri),
-      content: content.content,
-      mime_type: content.mime_type,
-      meta: content.meta
-    })
+  defp resource_content(uri, default_mime_type, %ResourceContent{} = content, opts) do
+    resource_content(
+      uri,
+      default_mime_type,
+      %{
+        uri: Map.get(content, :uri),
+        content: content.content,
+        mime_type: content.mime_type,
+        meta: content.meta
+      },
+      opts
+    )
   end
 
-  defp resource_content(uri, default_mime_type, %{} = content) do
+  defp resource_content(uri, default_mime_type, %{} = content, opts) do
     content_uri = fetch(content, :uri) || uri
     mime_type = fetch(content, :mime_type) || default_mime_type
-    body = fetch(content, :content)
 
-    %{"uri" => content_uri}
-    |> maybe_put("mimeType", mime_type)
-    |> maybe_put("_meta", normalize_output_meta(fetch_meta(content)))
-    |> Map.merge(resource_body(mime_type, body))
+    base =
+      %{"uri" => content_uri}
+      |> maybe_put("mimeType", mime_type)
+      |> maybe_put("_meta", apps_meta(fetch_meta(content), opts))
+
+    cond do
+      Map.has_key?(content, :text) or Map.has_key?(content, "text") ->
+        Map.put(base, "text", fetch(content, :text))
+
+      Map.has_key?(content, :blob) or Map.has_key?(content, "blob") ->
+        Map.put(base, "blob", encode_binary(fetch(content, :blob)))
+
+      true ->
+        Map.merge(base, resource_body(mime_type, fetch(content, :content)))
+    end
+  end
+
+  defp apps_meta(meta, opts) do
+    meta
+    |> normalize_output_meta()
+    |> Apps.filter_meta(
+      Keyword.get(opts, :client_capabilities, %{}),
+      Keyword.get(opts, :server_extensions, %{})
+    )
   end
 
   defp explicit_tool_result?(value) when is_map(value) do
@@ -314,8 +356,23 @@ defmodule FastestMCP.Transport.Serializer do
     if Map.has_key?(result, :content) or Map.has_key?(result, "content") do
       fetch(result, :content)
     else
-      structured_content || []
+      [text_block(structured_content)]
     end
+  end
+
+  defp validate_apps_tool_fallback!(payload, tool, opts) do
+    apps_tool? =
+      Apps.enabled?(Keyword.get(opts, :server_extensions, %{})) and
+        is_map(tool) and
+        not is_nil(Apps.resource_uri(fetch_meta(tool)))
+
+    if apps_tool? and Map.get(payload, "content") == [] do
+      raise Error,
+        code: :internal_error,
+        message: "MCP Apps tools must return a non-empty content fallback"
+    end
+
+    payload
   end
 
   defp structured_content_payload!(result) do
@@ -532,12 +589,38 @@ defmodule FastestMCP.Transport.Serializer do
 
   defp binary_mime_type?(mime_type), do: MIME.binary?(mime_type)
 
-  defp normalize_structured_content!(%{} = value), do: normalize_json(value)
+  defp normalize_structured_content!(value), do: normalize_json(value)
 
-  defp normalize_structured_content!(_value) do
-    raise Error,
-      code: :internal_error,
-      message: "tool structuredContent must be an object"
+  defp modern?(opts) when is_list(opts),
+    do: Keyword.get(opts, :protocol_version) == "2026-07-28"
+
+  defp modern?(_opts), do: false
+
+  defp map_or_nil(value) when is_map(value), do: value
+  defp map_or_nil(_value), do: nil
+
+  defp compatible_structured_content(value, opts) do
+    if modern?(opts), do: value, else: map_or_nil(value)
+  end
+
+  defp put_explicit_structured_content(payload, result, value, opts) do
+    present? =
+      Enum.any?(
+        [:structuredContent, "structuredContent", :structured_content, "structured_content"],
+        &Map.has_key?(result, &1)
+      )
+
+    if modern?(opts) and present? do
+      Map.put(payload, "structuredContent", value)
+    else
+      maybe_put(payload, "structuredContent", value)
+    end
+  end
+
+  defp compatible_output_schema(nil, _opts), do: nil
+
+  defp compatible_output_schema(schema, opts) do
+    if modern?(opts) or fetch(schema, :type) in [nil, "object"], do: schema
   end
 
   defp fetch(map, key, default \\ nil) when is_map(map) do

@@ -2,10 +2,11 @@ defmodule FastestMCP.Transport.WellKnownHTTP do
   @moduledoc """
   RFC 9728 Protected Resource Metadata plug.
 
-  The main HTTP app reads this value from the running server's
-  `:protected_resource` option and serves it on the MCP resource's own origin.
-  A direct Plug mount may still provide the value explicitly. Unconfigured
-  well-known routes return `404`.
+  The plug reads this value from the running server's `:protected_resource`
+  option and serves it on the MCP resource's own origin. Mount it separately at
+  the path-derived root route when Phoenix forwards the MCP app under `/mcp`;
+  that forward cannot receive `/.well-known/...` requests. A direct Plug mount
+  may still provide the value explicitly. Unconfigured routes return `404`.
   """
 
   import Plug.Conn

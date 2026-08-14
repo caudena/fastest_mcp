@@ -2,14 +2,12 @@ defmodule FastestMCP.ClientInitializeVersionTest do
   use ExUnit.Case, async: false
 
   alias FastestMCP.Client
-  alias FastestMCP.Protocol
+  @legacy_version "2025-11-25"
 
   defmodule VersionCapturePlug do
     @behaviour Plug
 
     import Plug.Conn
-
-    alias FastestMCP.Protocol
 
     @impl true
     def init(opts), do: opts
@@ -31,7 +29,7 @@ defmodule FastestMCP.ClientInitializeVersionTest do
               "jsonrpc" => "2.0",
               "id" => id,
               "result" => %{
-                "protocolVersion" => Protocol.current_version(),
+                "protocolVersion" => "2025-11-25",
                 "capabilities" => %{},
                 "serverInfo" => %{"name" => "version-capture", "version" => "1.0.0"}
               }
@@ -46,13 +44,13 @@ defmodule FastestMCP.ClientInitializeVersionTest do
 
   @initialize_cases [
     omitted: %{},
-    current: %{"protocolVersion" => Protocol.current_version()},
+    current: %{"protocolVersion" => @legacy_version},
     stale_string_key: %{"protocolVersion" => "2025-03-26"},
     stale_atom_key: %{protocolVersion: "2025-03-26"}
   ]
 
   test "HTTP initialization always emits exactly one library-owned protocol version" do
-    current_version = Protocol.current_version()
+    current_version = @legacy_version
 
     bandit =
       start_supervised!(
@@ -64,7 +62,8 @@ defmodule FastestMCP.ClientInitializeVersionTest do
     for {case_name, params} <- @initialize_cases do
       client =
         Client.connect!("http://127.0.0.1:#{port}/mcp",
-          auto_initialize: false
+          auto_initialize: false,
+          protocol_version: @legacy_version
         )
 
       assert %{"protocolVersion" => ^current_version} = Client.initialize(client, params)
@@ -84,12 +83,13 @@ defmodule FastestMCP.ClientInitializeVersionTest do
 
   test "stdio initialization always emits exactly one library-owned protocol version" do
     elixir = System.find_executable("elixir") || flunk("elixir executable not found on PATH")
-    current_version = Protocol.current_version()
+    current_version = @legacy_version
 
     for {case_name, params} <- @initialize_cases do
       client =
         Client.connect!({:stdio, elixir, version_capture_stdio_server_args()},
-          auto_initialize: false
+          auto_initialize: false,
+          protocol_version: @legacy_version
         )
 
       assert %{
@@ -102,6 +102,36 @@ defmodule FastestMCP.ClientInitializeVersionTest do
 
       Client.disconnect(client)
     end
+  end
+
+  test "an explicit modern pin cannot enter the manual legacy initialize lifecycle" do
+    elixir = System.find_executable("elixir") || flunk("elixir executable not found on PATH")
+
+    client =
+      Client.connect!({:stdio, elixir, version_capture_stdio_server_args()},
+        auto_initialize: false,
+        protocol_version: "2026-07-28"
+      )
+
+    on_exit(fn -> if Client.connected?(client), do: Client.disconnect(client) end)
+
+    assert_raise FastestMCP.Error, ~r/legacy-only API/, fn -> Client.initialize(client) end
+    assert Client.protocol_version(client) == nil
+  end
+
+  test "an explicit legacy pin cannot enter modern discovery" do
+    elixir = System.find_executable("elixir") || flunk("elixir executable not found on PATH")
+
+    client =
+      Client.connect!({:stdio, elixir, version_capture_stdio_server_args()},
+        auto_initialize: false,
+        protocol_version: @legacy_version
+      )
+
+    on_exit(fn -> if Client.connected?(client), do: Client.disconnect(client) end)
+
+    assert_raise FastestMCP.Error, ~r/modern-only API/, fn -> Client.discover(client) end
+    assert Client.protocol_version(client) == nil
   end
 
   defp protocol_version_field_count(body) do
@@ -133,7 +163,7 @@ defmodule FastestMCP.ClientInitializeVersionTest do
               "jsonrpc" => "2.0",
               "id" => request["id"],
               "result" => %{
-                "protocolVersion" => FastestMCP.Protocol.current_version(),
+                "protocolVersion" => "2025-11-25",
                 "capabilities" => %{},
                 "serverInfo" => %{
                   "name" => "wire-#{field_count}-#{version}",

@@ -2,13 +2,15 @@ defmodule FastestMCP.AuthorizationTest do
   use ExUnit.Case, async: false
 
   alias FastestMCP.Authorization
+  alias FastestMCP.Context
   alias FastestMCP.Error
+  alias FastestMCP.Operation
 
   defmodule ScopeAuth do
     @behaviour FastestMCP.Auth
 
     def authenticate(input, _context, _opts) do
-      capabilities =
+      scopes =
         case Map.get(input, "token") do
           "admin-token" -> ["admin"]
           "reader-token" -> ["read"]
@@ -19,7 +21,8 @@ defmodule FastestMCP.AuthorizationTest do
        %{
          principal: %{"sub" => "user-123"},
          auth: %{provider: :scope_auth},
-         capabilities: capabilities
+         capabilities: scopes,
+         scopes: scopes
        }}
     end
   end
@@ -30,7 +33,9 @@ defmodule FastestMCP.AuthorizationTest do
 
     context = %Authorization.Context{
       component: component,
-      capabilities: ["admin"],
+      authenticated: true,
+      capabilities: ["feature-a"],
+      verified_scopes: ["admin"],
       principal: %{"sub" => "user-123"},
       method: "tools/call",
       server_name: "authz",
@@ -40,6 +45,8 @@ defmodule FastestMCP.AuthorizationTest do
 
     assert Authorization.run_checks(Authorization.require_scopes("admin"), context)
     refute Authorization.run_checks(Authorization.require_scopes("write"), context)
+    assert Authorization.run_checks(Authorization.require_capabilities("feature-a"), context)
+    refute Authorization.run_checks(Authorization.require_capabilities("admin"), context)
     assert Authorization.run_checks(Authorization.restrict_tag("admin"), context)
 
     refute Authorization.run_checks(
@@ -51,7 +58,8 @@ defmodule FastestMCP.AuthorizationTest do
   test "authorization errors propagate while generic check failures are masked" do
     context = %Authorization.Context{
       component: FastestMCP.ComponentCompiler.compile(:tool, "authz", "tool", fn -> :ok end, []),
-      capabilities: ["read"],
+      authenticated: true,
+      verified_scopes: ["read"],
       principal: %{"sub" => "user-123"},
       method: "tools/call",
       server_name: "authz",
@@ -73,6 +81,99 @@ defmodule FastestMCP.AuthorizationTest do
     for malformed <- [false, nil, :unexpected, {:error, :not_binary}, %{}] do
       refute Authorization.run_checks(fn _ctx -> malformed end, context)
     end
+  end
+
+  test "scope checks union missing scopes, run dynamic resolvers once, and expose operation data" do
+    test_pid = self()
+
+    component =
+      FastestMCP.ComponentCompiler.compile(
+        :resource_template,
+        "authz",
+        "files://{+path}",
+        fn args -> args end,
+        auth: [
+          Authorization.require_scopes("write"),
+          Authorization.require_scopes(fn auth_context ->
+            send(test_pid, {:scope_context, auth_context})
+            ["admin"]
+          end)
+        ]
+      )
+
+    context = %Context{
+      server_name: "authz",
+      request_id: "request-1",
+      transport: :in_process,
+      authenticated: true,
+      principal: {"https://issuer.example", "user-123"},
+      verified_audiences: ["https://mcp.example/mcp"],
+      verified_scopes: ["read"]
+    }
+
+    operation = %Operation{
+      server_name: "authz",
+      method: "resources/read",
+      component_type: :resource_template,
+      target: "files://guides/start.md",
+      component: component,
+      context: context,
+      transport: :in_process,
+      audience: :model,
+      captures: %{"path" => "guides/start.md"},
+      arguments: %{"locale" => "en"}
+    }
+
+    assert {:error,
+            %Error{
+              code: :forbidden,
+              details: %{missing_scopes: ["admin", "write"]}
+            }} = Authorization.authorize_component(component, context, operation)
+
+    assert_received {:scope_context,
+                     %Authorization.Context{
+                       authenticated: true,
+                       target: "files://guides/start.md",
+                       arguments: %{"locale" => "en"},
+                       captures: %{"path" => "guides/start.md"},
+                       verified_audiences: ["https://mcp.example/mcp"],
+                       verified_scopes: ["read"]
+                     }}
+
+    refute_received {:scope_context, _context}
+  end
+
+  test "an opaque denial suppresses otherwise discoverable missing scope details" do
+    component =
+      FastestMCP.ComponentCompiler.compile(:tool, "authz", "private", fn -> :ok end,
+        auth: [Authorization.require_scopes("admin"), fn _context -> false end]
+      )
+
+    context = %Context{
+      server_name: "authz",
+      request_id: "request-1",
+      transport: :in_process,
+      authenticated: true,
+      principal: "user-123",
+      verified_scopes: []
+    }
+
+    operation = %Operation{
+      server_name: "authz",
+      method: "tools/call",
+      component_type: :tool,
+      target: "private",
+      context: context,
+      transport: :in_process,
+      audience: :model,
+      arguments: %{}
+    }
+
+    assert {:error,
+            %Error{
+              code: :forbidden,
+              details: %{authorization_denial: :opaque}
+            }} = Authorization.authorize_component(component, context, operation)
   end
 
   test "component authorization filters list results and rejects direct calls" do
@@ -121,7 +222,7 @@ defmodule FastestMCP.AuthorizationTest do
       end
 
     assert denial.code == :forbidden
-    assert denial.message == "need admin approval"
+    assert denial.message == ~s(not authorized to access tool "custom_denial")
 
     assert "admin" ==
              FastestMCP.call_tool(server_name, "admin_tool", %{},
@@ -162,5 +263,35 @@ defmodule FastestMCP.AuthorizationTest do
              FastestMCP.call_tool(parent_name, "child_admin_tool", %{},
                auth_input: %{"token" => "admin-token"}
              )
+  end
+
+  test "nested same-server calls preserve verified authorization evidence" do
+    server_name = "authz-nested-" <> Integer.to_string(System.unique_integer([:positive]))
+
+    server =
+      FastestMCP.server(server_name)
+      |> FastestMCP.add_auth(ScopeAuth)
+      |> FastestMCP.add_tool("inner", fn -> "authorized" end,
+        auth: Authorization.require_scopes("admin")
+      )
+      |> FastestMCP.add_tool("outer", fn _arguments, _context ->
+        FastestMCP.call_tool(server_name, "inner", %{})
+      end)
+
+    assert {:ok, _pid} = FastestMCP.start_server(server)
+    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+
+    assert "authorized" ==
+             FastestMCP.call_tool(server_name, "outer", %{},
+               auth_input: %{"token" => "admin-token"}
+             )
+
+    error =
+      assert_raise Error, fn ->
+        FastestMCP.call_tool(server_name, "outer", %{}, auth_input: %{"token" => "reader-token"})
+      end
+
+    assert error.code == :forbidden
+    assert error.details == %{missing_scopes: ["admin"]}
   end
 end

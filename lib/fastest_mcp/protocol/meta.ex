@@ -6,7 +6,16 @@ defmodule FastestMCP.Protocol.Meta do
   @label ~r/^[A-Za-z](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/
   @name ~r/^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/
   @reserved_second_labels MapSet.new(["modelcontextprotocol", "mcp"])
-  @standard_reserved_keys ["io.modelcontextprotocol/related-task"]
+  @standard_reserved_keys [
+    "io.modelcontextprotocol/clientCapabilities",
+    "io.modelcontextprotocol/clientInfo",
+    "io.modelcontextprotocol/logLevel",
+    "io.modelcontextprotocol/protocolVersion",
+    "io.modelcontextprotocol/related-task",
+    "io.modelcontextprotocol/serverInfo",
+    "io.modelcontextprotocol/subscriptionId"
+  ]
+  @logging_levels ~w(debug info notice warning error critical alert emergency)
 
   @type source :: :application | :peer | :protocol
 
@@ -123,8 +132,6 @@ defmodule FastestMCP.Protocol.Meta do
       else: {:error, "invalid _meta key name #{inspect(key)}"}
   end
 
-  defp validate_name(_name, key), do: {:error, "invalid _meta key name #{inspect(key)}"}
-
   defp reserved_prefix?([_first, second | _rest]),
     do: MapSet.member?(@reserved_second_labels, String.downcase(second))
 
@@ -141,7 +148,53 @@ defmodule FastestMCP.Protocol.Meta do
   defp validate_reserved_value("io.modelcontextprotocol/related-task", _value),
     do: {:error, "related-task metadata must be an object"}
 
+  defp validate_reserved_value("io.modelcontextprotocol/protocolVersion", value)
+       when is_binary(value),
+       do: :ok
+
+  defp validate_reserved_value("io.modelcontextprotocol/protocolVersion", _value),
+    do: {:error, "protocolVersion metadata must be a string"}
+
+  defp validate_reserved_value("io.modelcontextprotocol/clientCapabilities", value)
+       when is_map(value),
+       do: :ok
+
+  defp validate_reserved_value("io.modelcontextprotocol/clientCapabilities", _value),
+    do: {:error, "clientCapabilities metadata must be an object"}
+
+  defp validate_reserved_value("io.modelcontextprotocol/logLevel", value)
+       when value in @logging_levels,
+       do: :ok
+
+  defp validate_reserved_value("io.modelcontextprotocol/logLevel", _value),
+    do: {:error, "logLevel metadata must be a valid MCP logging level"}
+
+  defp validate_reserved_value("io.modelcontextprotocol/subscriptionId", value)
+       when is_binary(value) or is_integer(value),
+       do: :ok
+
+  defp validate_reserved_value("io.modelcontextprotocol/subscriptionId", _value),
+    do: {:error, "subscriptionId metadata must be a string or integer request ID"}
+
+  defp validate_reserved_value("io.modelcontextprotocol/clientInfo", value),
+    do: validate_implementation(value, "clientInfo")
+
+  defp validate_reserved_value("io.modelcontextprotocol/serverInfo", value),
+    do: validate_implementation(value, "serverInfo")
+
   defp validate_reserved_value(_key, _value), do: :ok
+
+  defp validate_implementation(value, label) when is_map(value) do
+    name = Map.get(value, "name", Map.get(value, :name))
+    version = Map.get(value, "version", Map.get(value, :version))
+
+    if is_binary(name) and is_binary(version),
+      do: :ok,
+      else: {:error, "#{label} metadata must contain string name and version fields"}
+  end
+
+  defp validate_implementation(_value, label),
+    do: {:error, "#{label} metadata must be an object"}
 
   defp normalize_key(key)
        when is_binary(key) or is_atom(key) or is_integer(key) or is_float(key) or is_boolean(key),

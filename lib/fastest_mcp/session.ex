@@ -39,7 +39,7 @@ defmodule FastestMCP.Session do
 
   require Logger
 
-  @supported_protocol_version Protocol.current_version()
+  @supported_protocol_version "2025-11-25"
   @termination_timeout 5_000
   @default_max_request_ids 100_000
   @default_request_timeout_ms 60_000
@@ -313,7 +313,13 @@ defmodule FastestMCP.Session do
       try do
         GenServer.call(pid, :terminate_session, @termination_timeout)
       catch
-        :exit, reason -> {:error, state_store_error(:delete_session, {:session_exit, reason})}
+        :exit, reason ->
+          {:error,
+           SessionStateStore.call_error(
+             :delete_session,
+             "session state storage",
+             {:session_exit, reason}
+           )}
       end
 
     case result do
@@ -342,18 +348,16 @@ defmodule FastestMCP.Session do
 
   @doc "Returns whether the session is subscribed to the given concrete URI."
   def subscribed_to_resource?(server_name, session_id, uri) do
-    with {:ok, pid} <- Registry.lookup_session(server_name, session_id) do
-      GenServer.call(pid, {:subscribed_to_resource?, to_string(uri)})
-    else
+    case Registry.lookup_session(server_name, session_id) do
+      {:ok, pid} -> GenServer.call(pid, {:subscribed_to_resource?, to_string(uri)})
       _ -> false
     end
   end
 
   @doc "Lists resource subscriptions for the given session."
   def subscribed_resources(server_name, session_id) do
-    with {:ok, pid} <- Registry.lookup_session(server_name, session_id) do
-      GenServer.call(pid, :subscribed_resources)
-    else
+    case Registry.lookup_session(server_name, session_id) do
+      {:ok, pid} -> GenServer.call(pid, :subscribed_resources)
       _ -> []
     end
   end
@@ -367,9 +371,8 @@ defmodule FastestMCP.Session do
 
   @doc "Returns negotiated client info for the given session."
   def client_info(server_name, session_id) do
-    with {:ok, pid} <- Registry.lookup_session(server_name, session_id) do
-      GenServer.call(pid, :client_info)
-    else
+    case Registry.lookup_session(server_name, session_id) do
+      {:ok, pid} -> GenServer.call(pid, :client_info)
       _ -> nil
     end
   end
@@ -1299,25 +1302,23 @@ defmodule FastestMCP.Session do
         _from,
         state
       ) do
-    cond do
-      state.lifecycle_state != :new ->
-        {:reply, {:error, {:invalid_transition, state.lifecycle_state}}, touch(state)}
+    if state.lifecycle_state != :new do
+      {:reply, {:error, {:invalid_transition, state.lifecycle_state}}, touch(state)}
+    else
+      client_capabilities = normalize_client_capabilities(client_capabilities)
+      server_capabilities = Protocol.normalize_capabilities(server_capabilities)
 
-      true ->
-        client_capabilities = normalize_client_capabilities(client_capabilities)
-        server_capabilities = Protocol.normalize_capabilities(server_capabilities)
+      next_state = %{
+        touch(state)
+        | lifecycle_state: :initializing,
+          protocol_version: @supported_protocol_version,
+          client_capabilities: client_capabilities,
+          server_capabilities: server_capabilities,
+          client_info: client_info,
+          auth_identity: auth_identity
+      }
 
-        next_state = %{
-          touch(state)
-          | lifecycle_state: :initializing,
-            protocol_version: @supported_protocol_version,
-            client_capabilities: client_capabilities,
-            server_capabilities: server_capabilities,
-            client_info: client_info,
-            auth_identity: auth_identity
-        }
-
-        {:reply, :ok, next_state}
+      {:reply, :ok, next_state}
     end
   end
 
@@ -1513,32 +1514,7 @@ defmodule FastestMCP.Session do
   end
 
   defp state_store_call(operation, fun) do
-    operation
-    |> normalize_state_store_result(fun.())
-  rescue
-    error -> {:error, state_store_error(operation, error)}
-  catch
-    kind, reason -> {:error, state_store_error(operation, {kind, reason})}
-  end
-
-  defp normalize_state_store_result(:get, {:ok, _value} = result), do: result
-  defp normalize_state_store_result(:get, :error), do: :error
-  defp normalize_state_store_result(operation, :ok) when operation != :get, do: :ok
-
-  defp normalize_state_store_result(operation, {:error, reason}),
-    do: {:error, state_store_error(operation, reason)}
-
-  defp normalize_state_store_result(operation, result),
-    do: {:error, state_store_error(operation, {:invalid_result, result})}
-
-  defp state_store_error(_operation, %Error{} = error), do: error
-
-  defp state_store_error(operation, reason) do
-    %Error{
-      code: :internal_error,
-      message: "session state storage #{operation} failed",
-      details: %{reason: inspect(reason)}
-    }
+    SessionStateStore.call(operation, "session state storage", fun)
   end
 
   defp unwrap_state_store_write!(:ok), do: :ok
@@ -1978,16 +1954,31 @@ defmodule FastestMCP.Session do
     kind = if task_augmented, do: :task_response, else: :response
 
     validation =
-      if Schema.protocol_supported?(:client_to_server, kind, method) do
-        Schema.validate_protocol(:client_to_server, kind, method, payload)
+      if Schema.protocol_supported?(
+           @supported_protocol_version,
+           :client_to_server,
+           kind,
+           method
+         ) do
+        Schema.validate_protocol(
+          @supported_protocol_version,
+          :client_to_server,
+          kind,
+          method,
+          payload
+        )
       else
-        Schema.validate_protocol(:client_to_server, :response, payload)
+        Schema.validate_protocol(
+          @supported_protocol_version,
+          :client_to_server,
+          :response,
+          payload
+        )
       end
 
     case validation do
       {:ok, ^payload} -> :ok
       {:error, %FastestMCP.Schema.Error{} = error} -> {:error, {method, error}}
-      {:error, %Error{} = error} -> {:error, error}
     end
   end
 
@@ -2085,8 +2076,19 @@ defmodule FastestMCP.Session do
 
     with :ok <- validate_protocol_related_task(envelope, related_task_id),
          :ok <- validate_protocol_meta(envelope, :application, allowed_reserved) do
-      if Schema.protocol_supported?(:server_to_client, :request, method) do
-        case Schema.validate_protocol(:server_to_client, :request, method, envelope) do
+      if Schema.protocol_supported?(
+           @supported_protocol_version,
+           :server_to_client,
+           :request,
+           method
+         ) do
+        case Schema.validate_protocol(
+               @supported_protocol_version,
+               :server_to_client,
+               :request,
+               method,
+               envelope
+             ) do
           {:ok, ^envelope} ->
             :ok
 

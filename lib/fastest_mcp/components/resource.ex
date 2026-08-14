@@ -15,6 +15,7 @@ defmodule FastestMCP.Components.Resource do
   defstruct [
     :server_name,
     :uri,
+    :name,
     :version,
     :title,
     :description,

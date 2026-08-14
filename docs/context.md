@@ -123,7 +123,8 @@ The context carries several different lifetimes of data:
 
 - request state for one operation
 - session state shared across requests with the same session id
-- auth state such as principal and capabilities
+- auth state such as principal, authentication status, verified scopes and
+  audiences, and application capabilities
 - task state when the operation is running as a background task
 - lifespan context produced at server startup
 - dependency resolvers declared on the server
@@ -245,6 +246,51 @@ Context.set_state(ctx, :current_upload, socket, serializable: false)
 the session backend. Use that for values that should stay local to the current
 call and should not be serialized or shared across requests.
 
+## Application Sessions
+
+Application sessions hold application-owned state independently of the MCP
+transport session. They use the same configured `SessionStateStore`, but their
+keys live in a separate hashed namespace.
+
+Use the authenticated caller's private bucket when state should follow the same
+principal across modern HTTP, stdio, legacy sessions, and background work:
+
+```elixir
+alias FastestMCP.ApplicationSession
+
+FastestMCP.add_tool(server, "remember_preference", fn %{"theme" => theme}, ctx ->
+  session = ApplicationSession.current!(ctx)
+  :ok = ApplicationSession.put(session, :theme, theme)
+  %{"stored" => true}
+end)
+```
+
+Use an explicit session when the application needs an opaque handle:
+
+```elixir
+{:ok, session} = ApplicationSession.create(ctx)
+session_id = ApplicationSession.id(session)
+
+# In a later authenticated request:
+{:ok, session} = ApplicationSession.fetch(ctx, session_id)
+{:ok, theme} = ApplicationSession.get(session, :theme, "system")
+```
+
+Explicit sessions are scoped to the verified principal. Unknown, terminated,
+and foreign identifiers return the same invalid-parameter error. Termination
+deletes the entire explicit-session namespace.
+
+Anonymous explicit sessions are disabled by default. Opt in only when the
+random session identifier is intended to act as a bearer capability:
+
+```elixir
+FastestMCP.server("app", application_sessions: [allow_anonymous: true])
+```
+
+`ApplicationSession.current/1` always requires an authenticated principal,
+even when anonymous explicit sessions are enabled. The application should use
+a globally unambiguous verified principal, such as `{issuer, subject}`.
+
 ## Request State
 
 Request state is scratch storage for the current operation only.
@@ -302,7 +348,10 @@ Authenticators write normalized auth results back onto the context:
 
 - `ctx.principal`
 - `ctx.auth`
+- `ctx.authenticated`
 - `ctx.capabilities`
+- `ctx.verified_scopes`
+- `ctx.verified_audiences`
 - `Context.client_id/1`
 
 That gives tools, prompts, middleware, and providers one consistent view of
@@ -326,11 +375,17 @@ Use these helpers when handler behavior legitimately depends on request
 metadata. Keep that explicit; avoid pretending the transport does not exist
 when it actually matters.
 
+Incoming `Authorization` is deliberately absent from the public HTTP header
+snapshots and from context inspection. Authentication still receives the raw
+header at the transport boundary. `Context.access_token/1` remains the narrow,
+explicit accessor for live-request code that needs the bearer token, while the
+transport credential is not copied into background or detached task context.
+
 ## Background Task Context
 
 When an operation runs as a background task, the context reflects that:
 
-- `Context.is_background_task/1`
+- `Context.background_task?/1`
 - `Context.task_id/1`
 - `Context.origin_request_id/1`
 - `Context.task_store/1`
@@ -415,9 +470,10 @@ Several higher-level features are just context operations:
 
 Sampling lets the server ask the connected client model to generate content.
 Form elicitation asks for schema-validated structured input, while URL
-elicitation coordinates an identity-bound out-of-band interaction. Roots let a
-server request the client's canonical `file://` boundaries. All of these use
-the same session coordinator over streamable HTTP and stdio.
+elicitation coordinates an identity-bound out-of-band interaction. On the
+legacy profile these peer operations use the session coordinator over HTTP or
+stdio. Modern handlers return `InputRequiredResult` and the client performs
+the corresponding MRTR interaction without a session.
 
 `Context.sample/3`, `Context.elicit/4`, and `Context.elicit_url/4` return an
 immediate result by default. With `task: true`, sampling and elicitation return
@@ -434,9 +490,9 @@ See:
 - [Sampling and Interaction](sampling-and-interaction.md)
 - [Background Tasks](background-tasks.md)
 
-## Client Roots and Peer Ping
+## Legacy Client Roots and Peer Ping
 
-`Context.list_roots/2` requests the connected client's current filesystem
+On `2025-11-25`, `Context.list_roots/2` requests the connected client's current filesystem
 roots after verifying the negotiated `roots` capability. Successful results
 are parsed into `%FastestMCP.Root{}` values and cached on the exact session:
 
@@ -457,6 +513,11 @@ the server's local filesystem.
 `Context.ping_peer/2` sends an outbound MCP ping through the same session path
 and returns `:ok` only for the standard empty-object result.
 
+Core `2026-07-28` has no independent roots callback or ping method. Modern
+tools, prompts, and resource reads request roots through an
+`InputRequiredResult`; the connected client reuses its configured roots
+handler during that MRTR round.
+
 When the client negotiated `tasks.list`, `Context.list_peer_tasks/2` returns
 `%{items: tasks, next_cursor: cursor}` for tasks owned by that peer. Continue
 with the opaque `cursor:` only; a `page_size:` option is ignored and never sent
@@ -471,8 +532,8 @@ FastestMCP exposes nested resource and prompt helpers directly on the context:
 - `Context.list_prompts/1`
 - `Context.render_prompt/3`
 
-Those helpers preserve the current session, auth, request metadata, and task
-context when one component needs to call another surface inside the same
+Those helpers preserve the current auth, request metadata, task context, and
+legacy session when one component needs to call another surface inside the same
 server.
 
 Example:
@@ -518,7 +579,7 @@ Context also owns session-local visibility rules:
 - `Context.disable_components/2`
 - `Context.reset_visibility/1`
 
-These rules let one session reveal or hide tools, resources, resource
+These rules let one legacy session reveal or hide tools, resources, resource
 templates, and prompts without mutating the global registry for every client.
 
 Selectors support:
@@ -538,10 +599,10 @@ Visibility changes can produce session-specific:
 
 when the visible set actually changes for that session.
 
-## Direct Notifications
+## Legacy Direct Notifications
 
-`Context.send_notification/3` lets a handler send a raw MCP notification over
-the active client session stream:
+`Context.send_notification/3` lets a legacy handler send a raw MCP notification
+over the active client session stream:
 
 ```elixir
 alias FastestMCP.Context

@@ -75,17 +75,21 @@ Use this layer when you care about:
 - progress or log notifications
 - streamable HTTP behavior
 
-For raw transport tests, exercise the full lifecycle: initialize without a
-session header, retain the server-issued id, send `notifications/initialized`,
-then include both the session id and `MCP-Protocol-Version: 2025-11-25` on later
-requests. Each POST must contain one JSON-RPC message rather than a batch.
+For a raw `2025-11-25` transport test, exercise the full lifecycle: initialize
+without a session header, retain the server-issued id, send
+`notifications/initialized`, then include both the session id and
+`MCP-Protocol-Version: 2025-11-25` on later requests. A raw `2026-07-28` test
+instead sends `server/discover` and then carries modern protocol, client, and
+capability metadata on each stateless request. Each POST contains one JSON-RPC
+message rather than a batch in either profile.
 
-The repository's `test/support/raw_peer.ex` is a minimal spec-shaped peer used
-by `raw_peer_acceptance_matrix_test.exs` to run one shared roots, sampling,
-form/URL elicitation, requester-task, and ping workflow over unprotected HTTP
+The repository's `test/support/raw_peer.ex` is a minimal legacy spec-shaped
+peer used by `raw_peer_acceptance_matrix_test.exs` to run roots, sampling,
+form/URL elicitation, requester-task, and ping workflows over unprotected HTTP
 JSON + GET SSE, unprotected POST SSE, protected-resource HTTP JSON + GET SSE,
-and stdio. Richer raw-peer tests add progress, cancellation, task status, and
-failure cases. The emulator is intentionally lower-level than
+and stdio. Separate modern raw-peer tests cover request-scoped MRTR,
+subscriptions, progress, cancellation, and task status without legacy ping or
+session replay. The emulator is intentionally lower-level than
 `FastestMCP.Client`, so a client helper cannot accidentally hide a server wire
 defect.
 
@@ -138,33 +142,44 @@ This repo also keeps a docs fixture and a docs example test lane so guide
 snippets keep matching real runtime behavior. That is worth copying into your
 own application when your server becomes a shared internal platform.
 
-The 0.2 release gate pins
-`@modelcontextprotocol/conformance@0.1.16` in
+The release gate uses
+`@modelcontextprotocol/conformance@0.2.0-alpha.11` in
 `test/conformance/package-lock.json`, installs it with `npm ci`, and invokes it
-with `npx --no-install` plus explicit `--spec-version 2025-11-25`. Conformance
-is split into independently visible lanes:
+with `npx --no-install`. It runs the runner's frozen requirement sets rather
+than a moving active suite:
 
-1. native ExUnit and real subprocess/TCP tests
-2. all 32 official server scenarios through a narrowly scoped test-only runner
-   compatibility adapter
-3. all 18 official client scenarios through a test-only adapter that calls public
-   `FastestMCP.Client` APIs
+1. the 30 server and 18 client scenarios required by `2025-11-25`
+2. the 37 server and 32 client scenarios required by `2026-07-28`
+3. nine selected Tasks scenarios and three selected authorization-extension
+   scenarios, each forced because extensions have independent version timelines
 
-Runner `0.1.16` advertises its new SSE scenarios for `2025-11-25` but sends
-`MCP-Protocol-Version: 2025-03-26` on their manually constructed follow-up
-requests. Its client `sse-retry` scenario also returns `2025-03-26` from
-`initialize` despite being selected as `2025-11-25`. Production continues to
-reject that stale protocol version. The test-only adapters change only those
-exact runner values, and unit tests prove current, absent, unrelated, and later
-response values remain untouched. Both official lanes require the exact
-scenario count, one evidence file per scenario, no skipped scenario, no failure
-or warning status, and a zero exit status. No expected-failure baseline or
-manual failure allowance is part of the release gate.
+The gate parses the official requirement listing, requires every expected
+scenario to produce a `checks.json`, and rejects empty evidence and every
+unexpected status. There is no general expected-failure baseline or protocol
+translator. Four alpha.11 defects are isolated by exact evidence checks:
 
-A green shimmed runner is not evidence of full support. Native feature tests,
-raw-peer transport tests, schema checksum verification, docs with warnings as
-errors, and fresh-package consumer smoke tests remain
-independent release requirements.
+- its frozen 2025 SSE-retry fixture replies with `2025-03-26`; a loopback-only
+  scenario proxy rewrites that one initialize response to the requirements
+  revision without changing production negotiation
+- its Tasks wire validator applies core `CallToolResult` to the extension's
+  valid flat `CreateTaskResult`; only that exact diagnostic is tolerated, while
+  every Tasks semantic check must pass
+- its modern standard-header fixture asks for removed `initialize` and
+  `notifications/initialized` requests; only those two exact skips are accepted
+- its stateless fixture expects `-32602` when a present 2026 protocol header has
+  no matching body protocol field, while the final HTTP transport rule requires
+  `HeaderMismatch` (`-32020`); only those two exact diagnostics are accepted
+
+The runner currently has no Apps scenario. Its Tasks status-notification
+scenario is also unexecutable while the upstream fixture moves to
+`subscriptions/listen`; FastestMCP does not report either as an official pass.
+Native Apps metadata/round-trip tests and native task subscription/demultiplexing
+tests own those release gates instead.
+
+Official runner evidence is one layer, not the whole support claim. Native
+feature tests, raw-peer transport tests, schema validation, docs
+with warnings as errors, and a fresh-package consumer exercised over both
+protocol revisions and transports remain independent release requirements.
 
 ## Why This Shape
 

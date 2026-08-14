@@ -1,0 +1,5 @@
+# revision	schema	license
+2025-11-25	mcp-2025-11-25.schema.json	LICENSE.upstream
+2026-07-28	mcp-2026-07-28.schema.json	LICENSE.upstream-2026-07-28
+ext-apps@v1.0.0	mcp-apps-v1.0.0.schema.json	LICENSE.upstream-apps
+ext-tasks@draft	mcp-tasks-extension.schema.json	LICENSE.upstream-tasks

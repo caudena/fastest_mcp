@@ -64,6 +64,7 @@ defmodule FastestMCP.SamplingTest do
     client =
       Client.connect!(
         "http://127.0.0.1:#{port}/mcp",
+        protocol_version: "2025-11-25",
         sampling_handler: fn messages, params ->
           send(test_pid, {:sampling_seen, messages, params})
           sampling_result([%{"type" => "text", "text" => "summary"}])
@@ -132,6 +133,7 @@ defmodule FastestMCP.SamplingTest do
     client =
       Client.connect!(
         "http://127.0.0.1:#{port}/mcp",
+        protocol_version: "2025-11-25",
         sampling_handler: fn messages, params ->
           send(test_pid, {:sampling_messages_seen, messages, params})
           sampling_result([%{"type" => "text", "text" => "ok"}])
@@ -610,7 +612,12 @@ defmodule FastestMCP.SamplingTest do
       )
 
     {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
-    client = Client.connect!("http://127.0.0.1:#{port}/mcp", opts)
+
+    client =
+      Client.connect!(
+        "http://127.0.0.1:#{port}/mcp",
+        Keyword.put_new(opts, :protocol_version, "2025-11-25")
+      )
 
     on_exit(fn ->
       if Client.connected?(client), do: Client.disconnect(client)

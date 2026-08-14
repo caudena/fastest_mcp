@@ -71,7 +71,7 @@ defmodule FastestMCP.ContextConvenienceTest do
              transport: :streamable_http,
              path: "/mcp",
              query_params: %{"page" => "1"},
-             headers: %{"authorization" => "Bearer token", "x-demo" => "1"},
+             headers: %{"x-demo" => "1"},
              meta: %{"custom" => "meta"}
            } = Context.request_context(context)
   end

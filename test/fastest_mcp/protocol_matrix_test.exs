@@ -3,10 +3,11 @@ defmodule FastestMCP.ProtocolMatrixTest do
 
   import Plug.Test
 
-  alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
   alias FastestMCP.Registry
+  alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
   alias FastestMCP.Transport.JSONRPC
   alias FastestMCP.Transport.Stdio
+  alias FastestMCP.Transport.StdioAdapter
   alias FastestMCP.Transport.StreamableHTTP
 
   setup do
@@ -14,7 +15,7 @@ defmodule FastestMCP.ProtocolMatrixTest do
 
     server =
       FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+      |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end, task: true)
       |> FastestMCP.add_resource("existing://resource", fn _arguments, _ctx -> "ok" end)
       |> FastestMCP.add_prompt("existing-prompt", fn _arguments, _ctx -> "ok" end)
 
@@ -157,6 +158,12 @@ defmodule FastestMCP.ProtocolMatrixTest do
 
     assert tool_response.status == 200
     assert_jsonrpc_error(JSON.decode!(tool_response.resp_body), -32_602, "not_found")
+
+    modern_missing =
+      ProtocolTest.modern_http_request(server_name, 9, "missing/method")
+
+    assert modern_missing.status == 404
+    assert_jsonrpc_error(JSON.decode!(modern_missing.resp_body), -32_601, "method_not_found")
   end
 
   test "rejected notifications use empty HTTP errors while stdio remains silent", %{
@@ -454,7 +461,7 @@ defmodule FastestMCP.ProtocolMatrixTest do
 
   test "stdio serve releases its connection session at EOF", %{server_name: server_name} do
     connection_id = {:stdio_eof, make_ref()}
-    session_id = FastestMCP.Transport.StdioAdapter.connection_session_id(connection_id)
+    session_id = StdioAdapter.connection_session_id(connection_id)
 
     input = [
       JSON.encode!(

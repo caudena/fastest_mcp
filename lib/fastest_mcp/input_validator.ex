@@ -53,25 +53,9 @@ defmodule FastestMCP.InputValidator do
   def validate(_component, arguments), do: normalize_arguments(arguments)
 
   @doc "Validates input data against a raw or compiled JSON Schema."
-  def validate_schema(%Compiled{} = compiled, value), do: validate_compiled(compiled, value)
-
-  def validate_schema(schema, value) when is_map(schema) or is_boolean(schema) do
-    schema
-    |> Schema.compile!()
-    |> validate_compiled(value)
-  end
-
-  defp validate_schema(%Compiled{} = compiled, _schema, value),
-    do: validate_compiled(compiled, value)
-
-  defp validate_schema(nil, schema, value) do
-    schema
-    |> Schema.compile!()
-    |> validate_compiled(value)
-  end
-
-  defp validate_compiled(compiled, value) do
-    case Schema.validate(compiled, value) do
+  @spec validate_schema(Compiled.t() | Schema.raw(), term()) :: term()
+  def validate_schema(source, value) do
+    case Schema.validate_source(source, value) do
       {:ok, ^value} ->
         value
 
@@ -81,6 +65,10 @@ defmodule FastestMCP.InputValidator do
           message: schema_error.message,
           details: %{schema: %{violations: schema_error.violations}}
     end
+  end
+
+  defp validate_schema(compiled, schema, value) do
+    validate_schema(compiled || schema, value)
   end
 
   defp normalize_arguments(arguments) when is_map(arguments) do

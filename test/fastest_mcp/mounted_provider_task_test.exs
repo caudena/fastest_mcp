@@ -17,7 +17,7 @@ defmodule FastestMCP.MountedProviderTaskTest do
         fn %{"a" => a, "b" => b}, ctx ->
           send(
             parent,
-            {:child_task_ctx, ctx.server_name, Context.is_background_task(ctx),
+            {:child_task_ctx, ctx.server_name, Context.background_task?(ctx),
              Context.task_id(ctx), Context.origin_request_id(ctx)}
           )
 

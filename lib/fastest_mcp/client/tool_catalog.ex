@@ -2,9 +2,10 @@ defmodule FastestMCP.Client.ToolCatalog do
   @moduledoc false
 
   alias FastestMCP.Component
+  alias FastestMCP.Protocol.HTTPHeaders
   alias FastestMCP.Schema
 
-  defstruct generation: 0, descriptors: %{}, errors: %{}
+  defstruct generation: 0, descriptors: %{}, errors: %{}, expires_at_ms: nil
 
   @type descriptor :: %{
           name: String.t(),
@@ -12,13 +13,15 @@ defmodule FastestMCP.Client.ToolCatalog do
           task_support: :forbidden | :optional | :required,
           input_validator: FastestMCP.Schema.Compiled.t(),
           output_validator: FastestMCP.Schema.Compiled.t() | nil,
+          http_headers: [HTTPHeaders.annotation()],
           raw: map()
         }
 
   @type t :: %__MODULE__{
           generation: non_neg_integer(),
           descriptors: %{optional({String.t(), String.t() | nil}) => descriptor()},
-          errors: map()
+          errors: map(),
+          expires_at_ms: integer() | nil
         }
 
   def new(generation \\ 0) when is_integer(generation) and generation >= 0,
@@ -29,6 +32,21 @@ defmodule FastestMCP.Client.ToolCatalog do
     Enum.reduce(tools, new(generation), fn tool, catalog ->
       put_tool(catalog, tool, schema_options)
     end)
+  end
+
+  def build(tools, generation, schema_options, ttl_ms)
+      when is_integer(ttl_ms) and ttl_ms >= 0 do
+    catalog = build(tools, generation, schema_options)
+    %{catalog | expires_at_ms: System.monotonic_time(:millisecond) + ttl_ms}
+  end
+
+  def build(tools, generation, schema_options, nil),
+    do: build(tools, generation, schema_options)
+
+  def fresh?(%__MODULE__{expires_at_ms: nil}), do: true
+
+  def fresh?(%__MODULE__{expires_at_ms: expires_at_ms}) do
+    System.monotonic_time(:millisecond) < expires_at_ms
   end
 
   def lookup(%__MODULE__{} = catalog, name, version \\ nil) do
@@ -83,7 +101,8 @@ defmodule FastestMCP.Client.ToolCatalog do
   defp compile_descriptor(tool, name, version, schema_options) do
     with {:ok, input_validator} <- compile_required_schema(tool["inputSchema"], schema_options),
          {:ok, output_validator} <- compile_optional_schema(tool["outputSchema"], schema_options),
-         {:ok, task_support} <- task_support(tool) do
+         {:ok, task_support} <- task_support(tool),
+         {:ok, http_headers} <- HTTPHeaders.annotations(tool["inputSchema"]) do
       %{
         name: name,
         version: version,
@@ -93,6 +112,7 @@ defmodule FastestMCP.Client.ToolCatalog do
           task_support: task_support,
           input_validator: input_validator,
           output_validator: output_validator,
+          http_headers: http_headers,
           raw: tool
         }
       }

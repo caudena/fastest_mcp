@@ -243,16 +243,19 @@ defmodule FastestMCP.Elicitation do
       "credit card"
     ]
 
-    if Enum.any?([message | sensitive_schema_texts(schema)], fn text ->
-         normalized = normalize_sensitive_text(text)
-         words = normalized |> String.split(" ", trim: true) |> MapSet.new()
+    sensitive? =
+      Enum.any?([message | sensitive_schema_texts(schema)], fn text ->
+        normalized = normalize_sensitive_text(text)
+        words = normalized |> String.split(" ", trim: true) |> MapSet.new()
 
-         Enum.any?(sensitive_terms, &MapSet.member?(words, &1)) or
-           Enum.any?(
-             sensitive_phrases,
-             &String.contains?(" " <> normalized <> " ", " " <> &1 <> " ")
-           )
-       end) do
+        Enum.any?(sensitive_terms, &MapSet.member?(words, &1)) or
+          Enum.any?(
+            sensitive_phrases,
+            &String.contains?(" " <> normalized <> " ", " " <> &1 <> " ")
+          )
+      end)
+
+    if sensitive? do
       raise ArgumentError, "elicitation forms must not request sensitive information"
     end
 

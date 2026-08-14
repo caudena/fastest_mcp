@@ -48,7 +48,7 @@ defmodule FastestMCP.ClientSessionRecoveryTest do
             "jsonrpc" => "2.0",
             "id" => id,
             "result" => %{
-              "protocolVersion" => FastestMCP.Protocol.current_version(),
+              "protocolVersion" => "2025-11-25",
               "capabilities" => %{"tools" => %{}},
               "serverInfo" => %{
                 "name" => "recovery-server-#{initialize_count}",
@@ -70,13 +70,19 @@ defmodule FastestMCP.ClientSessionRecoveryTest do
           send_resp(conn, 202, "")
 
         %{"method" => "tools/list", "id" => id} ->
+          list_count =
+            Agent.get_and_update(state, fn current ->
+              count = Map.get(current, :tool_list_count, 0) + 1
+              {count, Map.put(current, :tool_list_count, count)}
+            end)
+
           response = %{
             "jsonrpc" => "2.0",
             "id" => id,
             "result" => %{
               "tools" => [
                 %{
-                  "name" => "charge_card",
+                  "name" => "charge_card_#{list_count}",
                   "inputSchema" => %{
                     "type" => "object",
                     "properties" => %{"amount" => %{"type" => "number"}},
@@ -91,14 +97,30 @@ defmodule FastestMCP.ClientSessionRecoveryTest do
           |> put_resp_content_type("application/json")
           |> send_resp(200, JSON.encode!(response))
 
-        %{"method" => "tools/call"} ->
+        %{"method" => "tools/call", "id" => id} ->
           Agent.update(state, fn current ->
             current
             |> Map.update(:tool_call_count, 1, &(&1 + 1))
             |> Map.update(:tool_call_sessions, [session_id], &[session_id | &1])
           end)
 
-          send_resp(conn, 404, "session not found")
+          if session_id == "recovery-session-1" do
+            send_resp(conn, 404, "session not found")
+          else
+            conn
+            |> put_resp_content_type("application/json")
+            |> send_resp(
+              200,
+              JSON.encode!(%{
+                "jsonrpc" => "2.0",
+                "id" => id,
+                "result" => %{
+                  "content" => [%{"type" => "text", "text" => ~s({"charged":true})}],
+                  "structuredContent" => %{"charged" => true}
+                }
+              })
+            )
+          end
 
         %{"method" => "ping", "id" => id} ->
           Agent.update(state, fn current ->
@@ -213,7 +235,7 @@ defmodule FastestMCP.ClientSessionRecoveryTest do
 
     error =
       assert_raise Error, fn ->
-        Client.call_tool(client, "charge_card", %{"amount" => 10})
+        Client.call_tool(client, "charge_card_1", %{"amount" => 10})
       end
 
     assert error.code == :bad_request
@@ -228,12 +250,18 @@ defmodule FastestMCP.ClientSessionRecoveryTest do
     assert get_in(Client.initialize_result(client), ["serverInfo", "name"]) ==
              "recovery-server-2"
 
+    assert :sys.get_state(client.pid).server_identity["name"] == "recovery-server-2"
+
+    assert %{"charged" => true} =
+             Client.call_tool(client, "charge_card_2", %{"amount" => 20})
+
     assert %{} = Client.ping(client)
 
     snapshot = Agent.get(state, & &1)
     assert snapshot.initialize_count == 2
-    assert snapshot.tool_call_count == 1
-    assert snapshot.tool_call_sessions == ["recovery-session-1"]
+    assert snapshot.tool_list_count == 2
+    assert snapshot.tool_call_count == 2
+    assert snapshot.tool_call_sessions == ["recovery-session-2", "recovery-session-1"]
     assert snapshot.ping_sessions == ["recovery-session-2"]
 
     assert Enum.sort(snapshot.initialized_sessions) ==
@@ -344,6 +372,7 @@ defmodule FastestMCP.ClientSessionRecoveryTest do
         "http://127.0.0.1:#{port}/mcp",
         Keyword.merge(
           [
+            protocol_version: "2025-11-25",
             notification_handler: fn
               %{"method" => "notifications/message", "params" => %{"data" => data}} ->
                 send(parent, {:stream_message, data})

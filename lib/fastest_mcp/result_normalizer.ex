@@ -10,7 +10,6 @@ defmodule FastestMCP.ResultNormalizer do
   module indirectly through higher-level APIs rather than calling it first.
   """
 
-  alias FastestMCP.Error
   alias FastestMCP.JSONValue
   alias FastestMCP.Tools.Result, as: ToolResult
 
@@ -154,13 +153,7 @@ defmodule FastestMCP.ResultNormalizer do
   defp normalize_json_value(value), do: JSONValue.normalize(value)
 
   defp normalize_structured_content!(nil), do: nil
-  defp normalize_structured_content!(%{} = value), do: normalize_json_value(value)
-
-  defp normalize_structured_content!(_value) do
-    raise Error,
-      code: :internal_error,
-      message: "tool structuredContent must be an object"
-  end
+  defp normalize_structured_content!(value), do: normalize_json_value(value)
 
   defp normalize_binary_field(value) when is_binary(value) do
     if String.valid?(value), do: value, else: Base.encode64(value)
@@ -171,22 +164,18 @@ defmodule FastestMCP.ResultNormalizer do
   defp stringify_content(value) do
     normalized = normalize_json_value(value)
 
-    cond do
-      is_binary(normalized) ->
-        normalized
-
-      true ->
-        JSON.encode!(normalized)
+    if is_binary(normalized) do
+      normalized
+    else
+      JSON.encode!(normalized)
     end
   rescue
     _error -> inspect(normalized_fallback(value))
   end
 
   defp normalized_fallback(value) do
-    try do
-      normalize_json_value(value)
-    rescue
-      _error -> value
-    end
+    normalize_json_value(value)
+  rescue
+    _error -> value
   end
 end

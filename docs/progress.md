@@ -102,6 +102,20 @@ client =
 This is the cleanest way to watch long-running work from integration tests or
 local tooling.
 
+For one operation, pass `progress_handler:` directly to the client helper:
+
+```elixir
+FastestMCP.Client.call_tool(client, "build_report", %{},
+  progress_handler: fn params -> IO.inspect(params, label: "report progress") end
+)
+```
+
+If the call does not already provide `progress_token:`, the client creates a
+unique token and uses the existing request/task progress router. A task result
+retains that scoped handler until the task reaches a terminal state. Scoped,
+connection-wide, and generic notification handlers each receive the valid
+progress update once.
+
 ## Progress and Background Task State
 
 When progress is reported from a background task, FastestMCP stores it on the

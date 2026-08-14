@@ -25,7 +25,10 @@ defmodule FastestMCP.ClientHTTPCleanupTest do
 
   test "timed out request cancels its live HTTP request" do
     {url, server_ref} = start_hanging_server()
-    client = Client.connect!(url, auto_initialize: false)
+
+    client =
+      Client.connect!(url, auto_initialize: false, protocol_version: "2025-11-25")
+
     mark_initialized(client)
     on_exit(fn -> disconnect_if_alive(client) end)
 
@@ -46,7 +49,10 @@ defmodule FastestMCP.ClientHTTPCleanupTest do
 
   test "disconnect cancels an in-flight request and tears down promptly" do
     {url, server_ref} = start_hanging_server()
-    client = Client.connect!(url, auto_initialize: false)
+
+    client =
+      Client.connect!(url, auto_initialize: false, protocol_version: "2025-11-25")
+
     mark_initialized(client)
 
     request_task =
@@ -70,7 +76,10 @@ defmodule FastestMCP.ClientHTTPCleanupTest do
 
   test "killing a request worker cannot leak its HTTP request" do
     {url, server_ref} = start_hanging_server()
-    client = Client.connect!(url, auto_initialize: false)
+
+    client =
+      Client.connect!(url, auto_initialize: false, protocol_version: "2025-11-25")
+
     mark_initialized(client)
     on_exit(fn -> disconnect_if_alive(client) end)
 
@@ -92,7 +101,10 @@ defmodule FastestMCP.ClientHTTPCleanupTest do
 
   test "disconnect cancels the long-lived session stream promptly" do
     {url, server_ref} = start_hanging_server(:event_stream)
-    client = Client.connect!(url, auto_initialize: false)
+
+    client =
+      Client.connect!(url, auto_initialize: false, protocol_version: "2025-11-25")
+
     mark_initialized(client)
 
     assert :ok = Client.open_session_stream(client)
@@ -116,7 +128,13 @@ defmodule FastestMCP.ClientHTTPCleanupTest do
       start_supervised!({Bandit, plug: JSONRPCPlug, scheme: :http, port: 0})
 
     {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
-    client = Client.connect!("http://127.0.0.1:#{port}/mcp", auto_initialize: false)
+
+    client =
+      Client.connect!("http://127.0.0.1:#{port}/mcp",
+        auto_initialize: false,
+        protocol_version: "2025-11-25"
+      )
+
     mark_initialized(client)
     on_exit(fn -> disconnect_if_alive(client) end)
 
@@ -284,7 +302,7 @@ defmodule FastestMCP.ClientHTTPCleanupTest do
         state
         | lifecycle_state: :initialized,
           initialize_result: %{
-            "protocolVersion" => FastestMCP.Protocol.current_version(),
+            "protocolVersion" => "2025-11-25",
             "capabilities" => %{},
             "serverInfo" => %{"name" => "cleanup-test", "version" => "1.0.0"}
           },

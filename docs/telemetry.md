@@ -1,7 +1,7 @@
 # Telemetry
 
-FastestMCP emits telemetry events for core runtime activity and also creates
-OpenTelemetry spans for server-side tracing.
+FastestMCP emits telemetry events for core runtime activity and creates
+OpenTelemetry spans for both server execution and connected-client operations.
 
 That gives you two levels of observability:
 
@@ -45,7 +45,8 @@ usually enough to build metrics and dashboards.
 
 ## OpenTelemetry Spans
 
-FastestMCP also creates server spans around operations and provider delegation.
+FastestMCP creates SERVER spans around operations, INTERNAL spans around
+provider delegation, and CLIENT spans around connected-client operations.
 
 That is useful when you want traces that connect:
 
@@ -53,10 +54,23 @@ That is useful when you want traces that connect:
 - auth work
 - provider delegation
 - tool, resource, or prompt execution
+- Phoenix or application work that calls a remote MCP server
 
 FastestMCP uses W3C trace context propagation through request metadata and
 headers, so trace context can move through the runtime without custom glue in
 every handler.
+
+For connected clients, one public operation owns one CLIENT span across its
+complete lifetime, including asynchronous cancellation and timeouts. Tool-call
+MRTR continuations and task updates use bounded child spans; pagination and
+task polling annotate the aggregate operation rather than creating one span per
+page or poll. Cache hits remain visible as client spans while trace identifiers
+stay outside cache keys and cached values.
+
+Client propagation injects only `traceparent` and `tracestate` into MCP
+`params._meta`. Existing nested metadata is preserved. On the server, that MCP
+metadata takes precedence over direct request metadata and transport headers,
+so the immediate MCP client span remains the remote server span's parent.
 
 ## What FastestMCP Traces For You
 
@@ -67,11 +81,17 @@ FastestMCP already handles:
   request id, and GenAI/MCP semantic fields
 - exception recording on failed spans
 - trace context extraction and injection
+- client cache-hit, pagination, task-poll, and task-status annotations
+- generic error status for tool results carrying `isError: true`
 
 Resource URIs are recorded as attributes rather than embedded in span names, so
 high-cardinality resource values do not fragment trace dashboards. Failed spans
 also include `error.type`, and nil attributes are dropped before they reach the
 OpenTelemetry exporter.
+
+Arguments, content, structured results, arbitrary MCP metadata, Authorization
+headers, tokens, and credentials are never recorded as span attributes or
+events.
 
 Most applications do not need to call the internal tracing helper module
 directly. The runtime instrumentation is the default.

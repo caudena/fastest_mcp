@@ -15,8 +15,46 @@ helpers when you want handler code that reads like normal Elixir.
 
 Sampling lets a server ask the connected client to create a model response.
 
-The low-level API is `Context.sample/3`. The higher-level API is
-`FastestMCP.Sampling`.
+The transport differs by protocol profile. Modern `2026-07-28` operations use
+multi-round-trip requests (MRTR): the handler returns
+`FastestMCP.InputRequiredResult`, the connected client fulfills its
+`sampling/createMessage` input request, and FastestMCP retries the operation
+with the answer in `Context.input_responses/1`. For example:
+
+```elixir
+alias FastestMCP.{Context, InputRequiredResult}
+
+FastestMCP.add_tool(server, "summarize", fn _arguments, ctx ->
+  case Context.input_responses(ctx) do
+    %{"summary" => response} ->
+      %{"text" => get_in(response, ["content", "text"])}
+
+    %{} ->
+      InputRequiredResult.new(%{
+        "summary" => %{
+          "method" => "sampling/createMessage",
+          "params" => %{
+            "messages" => [
+              %{
+                "role" => "user",
+                "content" => %{"type" => "text", "text" => "Summarize this text"}
+              }
+            ],
+            "maxTokens" => 64
+          }
+        }
+      })
+  end
+end)
+```
+
+The client automatically performs this bounded retry in
+`FastestMCP.Client.call_tool/4`, `read_resource/3`, and `render_prompt/4`.
+Applications can attach an opaque `request_state:` to bind successive rounds.
+
+The legacy `2025-11-25` session bridge uses `Context.sample/3`; its ergonomic
+wrapper is `FastestMCP.Sampling`. The following direct callback examples refer
+to that profile.
 
 ### Prompt-oriented Sampling
 

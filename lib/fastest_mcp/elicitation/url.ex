@@ -242,28 +242,24 @@ defmodule FastestMCP.Elicitation.URL do
   defp normalize_allowed_host(host) when is_binary(host) and host != "" do
     normalized = String.downcase(host)
 
-    cond do
-      String.contains?(normalized, ["*", "/", "@", "?", "#"]) ->
-        {:error, :invalid_allowed_host}
-
-      true ->
-        case URI.new("https://" <> normalized) do
-          {:ok, %URI{host: ^normalized, path: nil}} -> {:ok, normalized}
-          _other -> {:error, :invalid_allowed_host}
-        end
+    if String.contains?(normalized, ["*", "/", "@", "?", "#"]) do
+      {:error, :invalid_allowed_host}
+    else
+      case URI.new("https://" <> normalized) do
+        {:ok, %URI{host: ^normalized, path: nil}} -> {:ok, normalized}
+        _other -> {:error, :invalid_allowed_host}
+      end
     end
   end
 
   defp normalize_allowed_host(_host), do: {:error, :invalid_allowed_host}
 
   defp build_url(builder, elicitation_id) when is_function(builder, 1) do
-    try do
-      {:ok, builder.(elicitation_id)}
-    rescue
-      error -> {:error, {:url_builder_failed, Exception.message(error)}}
-    catch
-      kind, reason -> {:error, {:url_builder_failed, inspect({kind, reason})}}
-    end
+    {:ok, builder.(elicitation_id)}
+  rescue
+    error -> {:error, {:url_builder_failed, Exception.message(error)}}
+  catch
+    kind, reason -> {:error, {:url_builder_failed, inspect({kind, reason})}}
   end
 
   defp build_url(url, _elicitation_id) when is_binary(url), do: {:ok, url}

@@ -5,8 +5,9 @@ defmodule FastestMCP.ProtectedResourceTest do
   import Plug.Test
 
   alias FastestMCP.Auth
-  alias FastestMCP.Auth.Result, as: AuthResult
   alias FastestMCP.Auth.ProtectedResource
+  alias FastestMCP.Auth.Result, as: AuthResult
+  alias FastestMCP.Authorization
   alias FastestMCP.Context
   alias FastestMCP.Error
   alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
@@ -230,6 +231,34 @@ defmodule FastestMCP.ProtectedResourceTest do
     assert challenge =~ ~s(resource_metadata="https://mcp.example.com/)
   end
 
+  test "a separately mounted well-known plug reads the running server configuration" do
+    server_name = unique_name("protected-phoenix-mount")
+
+    server =
+      FastestMCP.server(server_name,
+        auth: allow_auth(),
+        protected_resource: protected_resource()
+      )
+
+    assert {:ok, _pid} = FastestMCP.start_server(server)
+
+    opts =
+      WellKnownHTTP.init(
+        server_name: server_name,
+        path: "/public/mcp",
+        base_url: "https://mcp.example.com",
+        allowed_hosts: ["mcp.example.com"]
+      )
+
+    response =
+      :get
+      |> conn("https://mcp.example.com/.well-known/oauth-protected-resource/public/mcp")
+      |> WellKnownHTTP.call(opts)
+
+    assert response.status == 200
+    assert JSON.decode!(response.resp_body) == ProtectedResource.metadata(protected_resource())
+  end
+
   test "protected HTTP auth receives the exact resource and required scopes" do
     server_name = unique_name("protected-auth-input")
     test_pid = self()
@@ -350,6 +379,90 @@ defmodule FastestMCP.ProtectedResourceTest do
     assert [challenge] = get_resp_header(response, "www-authenticate")
     assert challenge =~ ~s(error="insufficient_scope")
     assert challenge =~ ~s(scope="files:read")
+  end
+
+  test "component scope denial returns 403 with exactly the missing scopes" do
+    server_name = unique_name("protected-component-scope")
+
+    protected_resource =
+      ProtectedResource.new!(
+        resource: "https://mcp.example.com/public/mcp",
+        authorization_servers: ["https://auth.example.com"],
+        scopes_supported: ["files:read", "files:admin"],
+        required_scopes: ["files:read"]
+      )
+
+    authenticator = fn input, _context ->
+      {:ok,
+       %{
+         principal: {"https://auth.example.com", "user-1"},
+         audiences: [input["expected_resource"]],
+         scopes: ["files:read"]
+       }}
+    end
+
+    server =
+      FastestMCP.server(server_name,
+        auth: authenticator,
+        protected_resource: protected_resource
+      )
+      |> FastestMCP.add_tool("admin", fn -> "secret" end,
+        auth: Authorization.require_scopes("files:admin")
+      )
+
+    assert {:ok, _pid} = FastestMCP.start_server(server)
+
+    payload =
+      ProtocolTest.modern_request(1, "tools/call", %{"name" => "admin", "arguments" => %{}})
+
+    response =
+      :post
+      |> conn("https://mcp.example.com/public/mcp", JSON.encode!(payload))
+      |> put_req_header("content-type", "application/json")
+      |> put_req_header("accept", "application/json, text/event-stream")
+      |> put_req_header("authorization", "Bearer verified-token")
+      |> put_req_header("mcp-protocol-version", "2026-07-28")
+      |> put_req_header("mcp-method", "tools/call")
+      |> put_req_header("mcp-name", "admin")
+      |> then(protected_app(server_name))
+
+    assert response.status == 403
+    assert [challenge] = get_resp_header(response, "www-authenticate")
+    assert challenge =~ ~s(error="insufficient_scope")
+    assert challenge =~ ~s(scope="files:admin")
+
+    assert get_in(JSON.decode!(response.resp_body), ["error", "data", "fastestmcp", "code"]) ==
+             "forbidden"
+  end
+
+  test "opaque component denial returns 403 without a scope challenge" do
+    server_name = unique_name("protected-component-opaque")
+
+    server =
+      FastestMCP.server(server_name,
+        auth: allow_auth(),
+        protected_resource: protected_resource()
+      )
+      |> FastestMCP.add_tool("private", fn -> "secret" end, auth: fn _context -> false end)
+
+    assert {:ok, _pid} = FastestMCP.start_server(server)
+
+    payload =
+      ProtocolTest.modern_request(1, "tools/call", %{"name" => "private", "arguments" => %{}})
+
+    response =
+      :post
+      |> conn("https://mcp.example.com/public/mcp", JSON.encode!(payload))
+      |> put_req_header("content-type", "application/json")
+      |> put_req_header("accept", "application/json, text/event-stream")
+      |> put_req_header("authorization", "Bearer verified-token")
+      |> put_req_header("mcp-protocol-version", "2026-07-28")
+      |> put_req_header("mcp-method", "tools/call")
+      |> put_req_header("mcp-name", "private")
+      |> then(protected_app(server_name))
+
+    assert response.status == 403
+    assert get_resp_header(response, "www-authenticate") == []
   end
 
   test "protected HTTP rejects query tokens before invoking the authenticator" do

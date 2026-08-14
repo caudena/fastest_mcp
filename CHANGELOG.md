@@ -1,5 +1,105 @@
 # Changelog
 
+## Unreleased
+
+### MCP `2026-07-28` and compatibility
+
+- add MCP `2026-07-28` as the preferred modern profile while retaining full
+  `2025-11-25` server and connected-client support at the same endpoint
+- add `protocol_version: :auto | "2026-07-28" | "2025-11-25"` to the
+  connected client; `:auto` probes modern discovery first and downgrades only
+  on explicit legacy evidence
+- expose newest-first supported-version and protocol-profile helpers, and
+  include the official `2026-07-28` schema
+
+### Extensions
+
+- add the stable MCP Apps v1.0.0 metadata/resource boundary without
+  implementing a browser Host, iframe renderer, sandbox, or `postMessage`
+  bridge
+- add the experimental `io.modelcontextprotocol/tasks` v2 wire for modern
+  connections, including MRTR input and server-directed work, while keeping
+  the distinct legacy Tasks v1 surface and including the draft extension
+  schema
+- add the draft OAuth Client Credentials and stable Enterprise-Managed
+  Authorization connected-client grants through explicit host callbacks;
+  FastestMCP remains a resource server/client toolkit, not an authorization
+  server or identity provider
+- add ordered modern active server extensions with negotiated request methods,
+  parameter schemas, namespaced lifespans, and tool-call interceptors while
+  keeping passive extension capability data separate
+
+### Runtime state
+
+- add application sessions on the existing session-state backend, including
+  authenticated per-principal buckets, opaque explicit handles, termination,
+  and an opt-in anonymous bearer mode
+- add bounded request-scoped tool search with pinned list entries, deterministic
+  ranking across tool and top-level public parameter metadata, provider
+  pagination, model-visible policy enforcement, and a synthetic call path that
+  revalidates the selected tool at execution time
+
+### Authorization and resource safety
+
+- carry verified OAuth scopes, audiences, authentication state, arguments, and
+  resource-template captures through component authorization; scope checks now
+  use verified token scopes while capability checks remain a separate explicit
+  helper
+- return `401` for missing or invalid authentication and a `403`
+  `insufficient_scope` challenge with the exact missing scopes for verified
+  tokens, while keeping opaque authorization denials generic
+- screen decoded resource-template parameters for traversal, absolute paths,
+  and null bytes by default after transforms and canonical rematching; rejected
+  values remain indistinguishable from an unknown resource on the wire
+
+### Connected client
+
+- add OTP-supervised clients with `start_link/1`, explicit child specs, standard
+  process naming, readiness checks, restart-safe pid pinning, and supervised
+  ownership of request, callback, stream, and recovery workers
+- add `call_tool_result/4` and `%FastestMCP.Client.ToolResult{}` as a stable,
+  protocol-faithful terminal result while preserving the existing
+  `call_tool/4` compatibility projection
+- add connected-client OpenTelemetry spans and W3C propagation across HTTP,
+  stdio, in-process calls, MRTR, Tasks, asynchronous lifecycles, pagination,
+  cache hits, recovery, and cancellation without recording payloads or secrets
+- make modern tool calls transparently drive server-created tasks while adding
+  `call_tool_task/4` for explicit handles, a separate 60-second task deadline,
+  adaptive polling, notification wakeups, and bounded MRTR interaction rounds
+- add an opt-in bounded response cache for positive-TTL modern discovery,
+  component-list, and resource-read results, with per-call use, refresh, and
+  bypass controls plus authentication, roots, recovery, and notification
+  invalidation
+- add bounded `list_all_tools/2`, `list_all_prompts/2`,
+  `list_all_resources/2`, and `list_all_resource_templates/2` helpers backed by
+  one shared cursor-safe paginator
+- add request-scoped `progress_handler:` callbacks with automatic progress
+  tokens and task-lifetime routing through the existing progress subsystem
+- add `Client.connect({:in_process, server_name}, opts)` through a supervised
+  connected transport that preserves JSON-RPC, authentication, lifecycle,
+  callback, progress, cancellation, task, and subscription behavior without
+  bypassing the shared server engine
+
+### Providers
+
+- add a request-scoped HTTP and stdio proxy provider that mirrors or pins the
+  protocol version, preserves modern results and MRTR continuations, forwards
+  progress, and bounds upstream catalog pagination
+- keep remote tasks, subscriptions, shared client pools, and credential
+  forwarding out of the proxy default; HTTP authorization forwarding requires
+  an exact trusted-origin allowlist; reject Proxy and bounded ToolSearch on the
+  same server because opaque upstream cursors cannot provide a global
+  synthetic-name collision proof within a bounded scan
+
+### Verification and release gates
+
+- update the official conformance runner to
+  `@modelcontextprotocol/conformance@0.2.0-alpha.11`, run both frozen core
+  requirement sets, and invoke supported Tasks and authorization-extension
+  scenarios explicitly
+- check that packaged schema and license files are present, and run the packaged
+  consumer against both protocol revisions over HTTP and stdio
+
 ## 0.2.0 - 2026-08-12
 
 This is a breaking protocol and lifecycle release. Applications upgrading from
@@ -21,7 +121,7 @@ This is a breaking protocol and lifecycle release. Applications upgrading from
   application/json` and advertise both `application/json` and
   `text/event-stream` in `Accept`
 - return `202 Accepted` with no response body for JSON-RPC notifications
-- pin the official server conformance runner to
+- run the official server conformance runner at
   `@modelcontextprotocol/conformance@0.1.16` as a release gate without
   expected-failure allowances
 
@@ -91,13 +191,11 @@ This is a breaking protocol and lifecycle release. Applications upgrading from
 - add JSV `0.22.x` as the sole new runtime dependency and make
   `FastestMCP.Schema` the compile-once validation boundary for Draft 2020-12
   and Draft 7; validation is non-coercing, bounded, and redacted
-- vendor the immutable MCP `2025-11-25` schema from source commit
-  `38c84e9f93ad191d9eb26d92b945d17bd0efcaf3` with a checked SHA-256, and cover
+- include the official MCP `2025-11-25` schema and cover
   the FastestMCP schema boundary with focused dialect, resolver, and limit tests
-- keep those vendored bytes unchanged while applying a versioned compiled-view
-  erratum for `NumberSchema.minimum`, `maximum`, and `default`: authoritative
-  `schema.ts` and the elicitation specification define numbers, while the
-  tagged generated JSON artifact emitted integers
+- apply a versioned compiled-view erratum for `NumberSchema.minimum`, `maximum`,
+  and `default`: the TypeScript definitions and elicitation specification define
+  numbers, while the published JSON schema emitted integers
 - fail remote JSON Schema references closed by default; applications may opt in
   to an explicit resolver or the allowlisted HTTPS resolver with verified TLS,
   redirect refusal, and timeout/body limits

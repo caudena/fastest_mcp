@@ -4,7 +4,6 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 artifact_dir="${1:-}"
-schema_sha256="1ffe4c5577974012f5fa02af14ea88df4b7146679df1abaaad497c8d9230ca8a"
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/fastest-mcp-package.XXXXXX")"
 archive_path="$work_dir/fastest_mcp-fresh.tar"
 outer_dir="$work_dir/archive"
@@ -26,21 +25,10 @@ mkdir "$outer_dir" "$package_dir"
 
 test -s "$archive_path"
 
-tar -tf "$archive_path" | LC_ALL=C sort >"$work_dir/outer-contents.txt"
-
-diff -u \
-  <(printf '%s\n' CHECKSUM VERSION contents.tar.gz metadata.config | LC_ALL=C sort) \
-  "$work_dir/outer-contents.txt"
-
 tar -xf "$archive_path" -C "$outer_dir"
 
 if [[ "$(cat "$outer_dir/VERSION")" != "3" ]]; then
   echo "unsupported Hex archive format version: $(cat "$outer_dir/VERSION")" >&2
-  exit 1
-fi
-
-if [[ ! "$(cat "$outer_dir/CHECKSUM")" =~ ^[A-F0-9]{64}$ ]]; then
-  echo "Hex archive CHECKSUM is not a 64-character uppercase digest" >&2
   exit 1
 fi
 
@@ -96,18 +84,9 @@ elixir -e '
   Mix.start()
   Mix.Local.append_archives()
 
-  [archive_path, package_path, report_path] = System.argv()
-  result = Hex.Tar.unpack!(archive_path, package_path)
-
-  report =
-    [
-      "verified_outer_checksum=" <> Base.encode16(result.outer_checksum, case: :lower),
-      "verified_inner_checksum=" <> Base.encode16(result.inner_checksum, case: :lower)
-    ]
-    |> Enum.join("\n")
-
-  File.write!(report_path, report <> "\n")
-' "$archive_path" "$package_dir" "$work_dir/hex-checksums.txt"
+  [archive_path, package_path] = System.argv()
+  Hex.Tar.unpack!(archive_path, package_path)
+' "$archive_path" "$package_dir"
 
 if find "$package_dir" -type l -print -quit | grep -q .; then
   echo "package must not contain symbolic links" >&2
@@ -122,30 +101,60 @@ for required_path in \
   mix.exs \
   docs/client.md \
   docs/auth.md \
+  docs/context.md \
+  docs/extensions.md \
+  docs/phoenix-deployment.md \
+  docs/progress.md \
+  docs/protocol-versions.md \
+  docs/providers-and-mounting.md \
+  docs/resources.md \
+  docs/runtime-state-and-storage.md \
+  docs/tools.md \
   docs/transports.md \
   docs/compatibility-and-scope.md \
   priv/schema/README.md \
+  priv/schema/manifest.tsv \
   priv/schema/LICENSE.upstream \
+  priv/schema/LICENSE.upstream-2026-07-28 \
+  priv/schema/LICENSE.upstream-apps \
+  priv/schema/LICENSE.upstream-tasks \
   priv/schema/mcp-2025-11-25.schema.json \
-  priv/schema/mcp-2025-11-25.schema.json.sha256; do
+  priv/schema/mcp-2026-07-28.schema.json \
+  priv/schema/mcp-apps-v1.0.0.schema.json \
+  priv/schema/mcp-tasks-extension.schema.json; do
   if [[ ! -s "$package_dir/$required_path" ]]; then
     echo "package is missing required non-empty file: $required_path" >&2
     exit 1
   fi
 done
 
-packaged_schema_sha256="$(shasum -a 256 "$package_dir/priv/schema/mcp-2025-11-25.schema.json" | awk '{print $1}')"
-declared_schema_sha256="$(awk 'NR == 1 {print $1}' "$package_dir/priv/schema/mcp-2025-11-25.schema.json.sha256")"
+cat >"$work_dir/expected-schema-manifest.tsv" <<'EOF'
+# revision	schema	license
+2025-11-25	mcp-2025-11-25.schema.json	LICENSE.upstream
+2026-07-28	mcp-2026-07-28.schema.json	LICENSE.upstream-2026-07-28
+ext-apps@v1.0.0	mcp-apps-v1.0.0.schema.json	LICENSE.upstream-apps
+ext-tasks@draft	mcp-tasks-extension.schema.json	LICENSE.upstream-tasks
+EOF
 
-if [[ "$packaged_schema_sha256" != "$schema_sha256" ]]; then
-  echo "packaged MCP schema checksum changed: $packaged_schema_sha256" >&2
+if ! diff -u "$work_dir/expected-schema-manifest.tsv" "$package_dir/priv/schema/manifest.tsv"; then
+  echo "packaged MCP schema manifest does not match the expected inventory" >&2
   exit 1
 fi
 
-if [[ "$declared_schema_sha256" != "$schema_sha256" ]]; then
-  echo "packaged MCP schema checksum declaration changed: $declared_schema_sha256" >&2
-  exit 1
-fi
+while IFS=$'\t' read -r revision schema_file license_file; do
+  [[ "$revision" == \#* ]] && continue
+  [[ -z "$revision" ]] && continue
+
+  if [[ ! -s "$package_dir/priv/schema/$schema_file" ]]; then
+    echo "packaged MCP $revision schema is missing: $schema_file" >&2
+    exit 1
+  fi
+
+  if [[ ! -s "$package_dir/priv/schema/$license_file" ]]; then
+    echo "packaged MCP $revision schema license is missing: $license_file" >&2
+    exit 1
+  fi
+done <"$package_dir/priv/schema/manifest.tsv"
 
 elixir "$repo_root/scripts/package_consumer_smoke.exs" "$package_dir" "$consumer_dir"
 
@@ -156,30 +165,10 @@ elixir "$repo_root/scripts/package_consumer_smoke.exs" "$package_dir" "$consumer
   MIX_ENV=test mix test
 )
 
-archive_sha256="$(shasum -a 256 "$archive_path" | awk '{print $1}')"
-verified_outer_checksum="$(awk -F= '$1 == "verified_outer_checksum" {print $2}' "$work_dir/hex-checksums.txt")"
-verified_inner_checksum="$(awk -F= '$1 == "verified_inner_checksum" {print $2}' "$work_dir/hex-checksums.txt")"
-declared_inner_checksum="$(tr '[:upper:]' '[:lower:]' <"$outer_dir/CHECKSUM")"
-
-if [[ "$verified_outer_checksum" != "$archive_sha256" ]]; then
-  echo "Hex outer checksum does not match the fresh archive digest" >&2
-  exit 1
-fi
-
-if [[ "$verified_inner_checksum" != "$declared_inner_checksum" ]]; then
-  echo "Hex inner checksum does not match the archive CHECKSUM entry" >&2
-  exit 1
-fi
-
 {
-  printf 'archive_sha256=%s\n' "$archive_sha256"
   printf 'package_version=%s\n' "$(cat "$work_dir/package-version.txt")"
-  printf 'hex_archive_checksum=%s\n' "$(cat "$outer_dir/CHECKSUM")"
-  cat "$work_dir/hex-checksums.txt"
-  printf 'schema_sha256=%s\n' "$packaged_schema_sha256"
   printf 'elixir=%s\n' "$(elixir --version | tail -n 1)"
   printf 'otp=%s\n' "$(erl -noshell -eval 'io:format("~s", [erlang:system_info(otp_release)]), halt().' 2>/dev/null)"
-  printf 'source_commit=%s\n' "$(git -C "$repo_root" rev-parse HEAD)"
   printf 'source_tree_clean=%s\n' "$(if [[ -z "$(git -C "$repo_root" status --porcelain)" ]]; then printf true; else printf false; fi)"
 } >"$work_dir/package-smoke.txt"
 

@@ -82,25 +82,29 @@ defmodule FastestMCP do
   over result envelopes.
   """
 
-  alias FastestMCP.BackgroundTask
-  alias FastestMCP.BackgroundTaskStore
   alias FastestMCP.Auth
   alias FastestMCP.Auth.Result, as: AuthResult
+  alias FastestMCP.BackgroundTask
+  alias FastestMCP.BackgroundTaskStore
   alias FastestMCP.ComponentManager
   alias FastestMCP.ComponentVisibility
   alias FastestMCP.Context
   alias FastestMCP.Error
   alias FastestMCP.OperationPipeline
+  alias FastestMCP.Protocol
   alias FastestMCP.Provider
   alias FastestMCP.Providers.OpenAPI
-  alias FastestMCP.Protocol
   alias FastestMCP.Registry
   alias FastestMCP.Sampling
   alias FastestMCP.Server
-  alias FastestMCP.TaskNotificationSupervisor
-  alias FastestMCP.TaskOwner
   alias FastestMCP.ServerRuntime
   alias FastestMCP.Session
+  alias FastestMCP.TaskNotificationSupervisor
+  alias FastestMCP.TaskOwner
+  alias FastestMCP.Transport.HTTPApp
+  alias FastestMCP.Transport.Stdio
+  alias FastestMCP.Transport.StreamableHTTP
+  alias FastestMCP.Transport.WellKnownHTTP
 
   @doc "Builds a new server definition."
   defdelegate server(name, opts \\ []), to: Server, as: :new
@@ -118,6 +122,8 @@ defmodule FastestMCP do
   defdelegate add_dependency(server, name, resolver), to: Server
   @doc "Adds middleware to the current definition."
   defdelegate add_middleware(server, middleware), to: Server
+  @doc "Enables bounded model-visible tool search on the server."
+  defdelegate enable_tool_search(server, opts \\ []), to: Server
   @doc "Adds a transform to the current definition."
   defdelegate add_transform(server, transform), to: Server
   @doc "Adds a provider to the current definition."
@@ -143,6 +149,9 @@ defmodule FastestMCP do
 
   @doc "Returns the current MCP protocol version."
   def current_protocol_version, do: Protocol.current_version()
+
+  @doc "Returns supported MCP protocol versions in preference order, newest first."
+  def supported_protocol_versions, do: Protocol.supported_versions()
 
   @doc "Fetches the live component manager for a running server."
   def component_manager(server_name) do
@@ -309,23 +318,23 @@ defmodule FastestMCP do
 
   @doc "Builds the main HTTP app for a running server."
   def http_app(server_name, opts \\ []) do
-    init_opts = FastestMCP.Transport.HTTPApp.init(Keyword.put(opts, :server_name, server_name))
-    fn conn -> FastestMCP.Transport.HTTPApp.call(conn, init_opts) end
+    init_opts = HTTPApp.init(Keyword.put(opts, :server_name, server_name))
+    fn conn -> HTTPApp.call(conn, init_opts) end
   end
 
   @doc "Returns a child spec for the streamable HTTP transport."
   def streamable_http_child_spec(server_name, opts \\ []) do
-    FastestMCP.Transport.StreamableHTTP.child_spec(Keyword.put(opts, :server_name, server_name))
+    StreamableHTTP.child_spec(Keyword.put(opts, :server_name, server_name))
   end
 
   @doc "Returns a child spec for the well-known HTTP transport."
   def well_known_http_child_spec(server_name, opts \\ []) do
-    FastestMCP.Transport.WellKnownHTTP.child_spec(Keyword.put(opts, :server_name, server_name))
+    WellKnownHTTP.child_spec(Keyword.put(opts, :server_name, server_name))
   end
 
   @doc "Dispatches one stdio request against a running server."
   def stdio_dispatch(server_name, request, opts \\ []) do
-    FastestMCP.Transport.Stdio.dispatch(server_name, request, opts)
+    Stdio.dispatch(server_name, request, opts)
   end
 
   @doc "Fetches background-task state."
@@ -433,6 +442,27 @@ defmodule FastestMCP do
 
       {:error, reason} ->
         raise task_storage_error(:cancel, reason)
+    end
+  end
+
+  @doc "Applies responses to outstanding input requests for a background task."
+  def update_task(server_name, task_id, input_responses, opts \\ [])
+      when is_map(input_responses) do
+    task_store = fetch_task_store!(server_name)
+    opts = normalize_task_access_opts(server_name, opts)
+
+    case BackgroundTaskStore.update(task_store, task_id, input_responses, opts) do
+      {:ok, task} ->
+        task
+
+      {:error, %Error{} = error} ->
+        raise error
+
+      {:error, :not_found} ->
+        raise invalid_task_id_error(task_id)
+
+      {:error, reason} ->
+        raise task_storage_error(:update, reason)
     end
   end
 

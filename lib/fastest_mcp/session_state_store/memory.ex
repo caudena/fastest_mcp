@@ -73,10 +73,8 @@ defmodule FastestMCP.SessionStateStore.Memory do
 
   def handle_call({:delete, session_id, key}, _from, state) do
     sessions =
-      update_in(state.sessions, fn sessions ->
-        update_session_map(sessions, session_id, fn session ->
-          Map.delete(session, key)
-        end)
+      update_session_map(state.sessions, session_id, fn session ->
+        Map.delete(session, key)
       end)
 
     {:reply, :ok, %{state | sessions: sessions}}

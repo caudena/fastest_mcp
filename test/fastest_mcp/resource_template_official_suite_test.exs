@@ -43,14 +43,12 @@ defmodule FastestMCP.ResourceTemplateOfficialSuiteTest do
   end
 
   defp compile_and_expand(template, variables) do
-    try do
-      {matcher, _variables, _query_variables} = ResourceTemplate.compile_matcher!(template)
-      {:ok, ResourceTemplate.expand_compiled(matcher, variables)}
-    rescue
-      error -> {:error, error}
-    catch
-      kind, reason -> {:error, {kind, reason}}
-    end
+    {matcher, _variables, _query_variables} = ResourceTemplate.compile_matcher!(template)
+    {:ok, ResourceTemplate.expand_compiled(matcher, variables)}
+  rescue
+    error -> {:error, error}
+  catch
+    kind, reason -> {:error, {kind, reason}}
   end
 
   defp load_fixture(name) do

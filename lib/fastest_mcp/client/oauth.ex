@@ -1,11 +1,13 @@
 defmodule FastestMCP.Client.OAuth do
   @moduledoc """
-  MCP 2025-11-25 OAuth coordinator for Streamable HTTP clients.
+  MCP OAuth coordinator for HTTP clients.
 
   The coordinator implements protected-resource and authorization-server
-  discovery, PKCE S256, resource indicators, explicit client registration
-  modes, refresh-token rotation, and scope step-up. Browser interaction remains
-  behind `FastestMCP.Client.OAuth.AuthorizationHandler`.
+  discovery, RFC 9207 issuer validation, PKCE S256, resource indicators,
+  explicit client registration modes, refresh-token rotation, scope step-up,
+  and the official client-credentials and enterprise-managed grant profiles.
+  Browser interaction remains behind
+  `FastestMCP.Client.OAuth.AuthorizationHandler`.
 
   Start one coordinator per connected client. The default token store is
   process-local and non-durable:
@@ -24,6 +26,8 @@ defmodule FastestMCP.Client.OAuth do
   use GenServer
 
   alias FastestMCP.Client.OAuth.AuthorizationHandler
+  alias FastestMCP.Client.OAuth.ClientAssertionProvider
+  alias FastestMCP.Client.OAuth.EnterpriseManagedProvider
   alias FastestMCP.Client.OAuth.Error
   alias FastestMCP.Client.OAuth.TokenStore.Memory
   alias FastestMCP.HTTP
@@ -32,19 +36,39 @@ defmodule FastestMCP.Client.OAuth do
   @default_timeout_ms 5_000
   @default_max_body_bytes 1_048_576
   @refresh_skew_ms 30_000
+  @jwt_bearer_grant "urn:ietf:params:oauth:grant-type:jwt-bearer"
+  @token_exchange_grant "urn:ietf:params:oauth:grant-type:token-exchange"
+  @jwt_client_assertion_type "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+  @id_jag_token_type "urn:ietf:params:oauth:token-type:id-jag"
+  @id_jag_grant_profile "urn:ietf:params:oauth:grant-profile:id-jag"
 
   @type registration ::
           {:pre_registered, keyword() | map()}
           | {:client_metadata_document, String.t()}
           | {:dynamic, keyword() | map()}
 
+  @type assertion_provider ::
+          module() | (ClientAssertionProvider.Request.t() -> ClientAssertionProvider.response())
+
+  @type enterprise_provider ::
+          module()
+          | (EnterpriseManagedProvider.Request.t() -> EnterpriseManagedProvider.response())
+
+  @type grant ::
+          :authorization_code
+          | {:authorization_code, keyword() | map()}
+          | {:client_credentials, keyword() | map()}
+          | {:enterprise_managed, keyword() | map()}
+
   @type option ::
           {:redirect_uri, String.t()}
+          | {:grant, grant()}
           | {:registration, registration()}
           | {:authorization_handler, module() | (AuthorizationHandler.Request.t() -> term())}
           | {:token_store, {module(), term()}}
           | {:authorization_server, String.t()}
           | {:scopes, [String.t()]}
+          | {:application_type, String.t()}
           | {:requester, (atom(), String.t(), keyword() -> term())}
           | {:timeout_ms, pos_integer()}
           | {:max_body_bytes, pos_integer()}
@@ -87,14 +111,20 @@ defmodule FastestMCP.Client.OAuth do
 
   @impl true
   def init(opts) do
-    with {:ok, config} <- normalize_config(opts),
+    credential_listener = Keyword.get(opts, :credential_listener)
+
+    with :ok <- validate_credential_listener(credential_listener),
+         {:ok, config} <- normalize_config(Keyword.delete(opts, :credential_listener)),
          {:ok, token_store, owns_store?} <- initialize_token_store(config.token_store) do
       {:ok,
        %{
          config: config,
+         credential_listener: credential_listener,
          token_store: token_store,
          owns_store?: owns_store?,
-         resources: %{}
+         resources: %{},
+         registrations: %{},
+         credential_bindings: %{}
        }}
     else
       {:error, %Error{} = error} -> {:stop, error}
@@ -111,37 +141,65 @@ defmodule FastestMCP.Client.OAuth do
 
   @impl true
   def handle_call({:authorization_header, raw_resource}, _from, state) do
-    with {:ok, resource} <- canonical_resource(raw_resource) do
-      case Map.get(state.resources, resource) do
-        nil ->
-          {:reply, :none, state}
+    case canonical_resource(raw_resource) do
+      {:ok, resource} ->
+        previous_credential = stored_access_credential(state, resource)
 
-        context ->
-          case stored_token(state, context) do
+        result =
+          case Map.get(state.resources, resource) do
             nil ->
               {:reply, :none, state}
 
-            token ->
-              cond do
-                token_current?(token) ->
-                  {:reply, {:ok, bearer_header(token)}, state}
+            context ->
+              case stored_token(state, context) do
+                nil ->
+                  {:reply, :none, state}
 
-                is_binary(token["refresh_token"]) ->
-                  case refresh_token(state, context, token) do
-                    {:ok, refreshed, next_state} ->
-                      {:reply, {:ok, bearer_header(refreshed)}, next_state}
+                token ->
+                  cond do
+                    token_current?(token) ->
+                      {:reply, {:ok, bearer_header(token)}, state}
 
-                    {:error, %Error{} = error, next_state} ->
-                      {:reply, {:error, error}, next_state}
+                    is_binary(token["refresh_token"]) ->
+                      case refresh_token(state, context, token) do
+                        {:ok, refreshed, next_state} ->
+                          {:reply, {:ok, bearer_header(refreshed)}, next_state}
+
+                        {:error, %Error{} = error, next_state} ->
+                          {:reply, {:error, error}, next_state}
+                      end
+
+                    reacquirable_grant?(context.grant) ->
+                      next_state = delete_stored_token(state, context)
+
+                      challenge = %{
+                        resource_metadata: nil,
+                        scopes: token["scope"] || [],
+                        error: nil
+                      }
+
+                      case perform_authorization(
+                             next_state,
+                             resource,
+                             challenge,
+                             scopes: token["scope"] || []
+                           ) do
+                        {:ok, reacquired, final_state} ->
+                          {:reply, {:ok, bearer_header(reacquired)}, final_state}
+
+                        {:error, %Error{} = error, final_state} ->
+                          {:reply, {:error, error}, final_state}
+                      end
+
+                    true ->
+                      next_state = delete_stored_token(state, context)
+                      {:reply, :none, next_state}
                   end
-
-                true ->
-                  next_state = delete_stored_token(state, context)
-                  {:reply, :none, next_state}
               end
           end
-      end
-    else
+
+        notify_credential_change(result, previous_credential, resource)
+
       {:error, reason} ->
         {:reply, {:error, oauth_error(:configuration, reason)}, state}
     end
@@ -154,10 +212,11 @@ defmodule FastestMCP.Client.OAuth do
          {:ok, challenge} <- parse_bearer_challenge(headers) do
       context = Map.get(state.resources, resource)
       token = context && stored_token(state, context)
+      previous_credential = token && token["access_token"]
 
-      cond do
-        attempt == 1 and challenge.error != "insufficient_scope" and
-          is_map(token) and is_binary(token["refresh_token"]) ->
+      result =
+        if attempt == 1 and challenge.error != "insufficient_scope" and
+             is_map(token) and is_binary(token["refresh_token"]) do
           case refresh_token(state, context, token) do
             {:ok, refreshed, next_state} ->
               {:reply, {:ok, bearer_header(refreshed)}, next_state}
@@ -165,10 +224,11 @@ defmodule FastestMCP.Client.OAuth do
             {:error, _refresh_error, next_state} ->
               authorize_and_reply(next_state, resource, challenge, opts)
           end
-
-        true ->
+        else
           authorize_and_reply(state, resource, challenge, opts)
-      end
+        end
+
+      notify_credential_change(result, previous_credential, resource)
     else
       {:error, reason} ->
         {:reply, {:error, oauth_error(:protected_resource_discovery, reason)}, state}
@@ -176,24 +236,31 @@ defmodule FastestMCP.Client.OAuth do
   end
 
   def handle_call({:authorize, raw_resource, opts}, _from, state) do
-    with {:ok, resource} <- canonical_resource(raw_resource) do
-      challenge = %{
-        resource_metadata: Keyword.get(opts, :resource_metadata),
-        scopes: normalize_scopes(Keyword.get(opts, :scopes, [])),
-        error: nil
-      }
+    case canonical_resource(raw_resource) do
+      {:ok, resource} ->
+        previous_credential = stored_access_credential(state, resource)
 
-      authorize_and_reply(state, resource, challenge, opts)
-    else
+        challenge = %{
+          resource_metadata: Keyword.get(opts, :resource_metadata),
+          scopes: normalize_scopes(Keyword.get(opts, :scopes, [])),
+          error: nil
+        }
+
+        state
+        |> authorize_and_reply(resource, challenge, opts)
+        |> notify_credential_change(previous_credential, resource)
+
       {:error, reason} ->
         {:reply, {:error, oauth_error(:configuration, reason)}, state}
     end
   end
 
   def handle_call({:clear, raw_resource}, _from, state) do
-    next_state =
-      case canonical_resource(raw_resource) do
-        {:ok, resource} ->
+    case canonical_resource(raw_resource) do
+      {:ok, resource} ->
+        previous_credential = stored_access_credential(state, resource)
+
+        next_state =
           case Map.pop(state.resources, resource) do
             {nil, resources} ->
               %{state | resources: resources}
@@ -204,11 +271,12 @@ defmodule FastestMCP.Client.OAuth do
               |> Map.put(:resources, resources)
           end
 
-        {:error, _reason} ->
-          state
-      end
+        {:reply, :ok, next_state}
+        |> notify_credential_change(previous_credential, resource)
 
-    {:reply, :ok, next_state}
+      {:error, _reason} ->
+        {:reply, :ok, state}
+    end
   end
 
   defp authorize_and_reply(state, resource, challenge, opts) do
@@ -218,53 +286,270 @@ defmodule FastestMCP.Client.OAuth do
     end
   end
 
+  defp notify_credential_change(
+         {:reply, _response, next_state} = reply,
+         previous_credential,
+         resource
+       ) do
+    current_credential = stored_access_credential(next_state, resource)
+
+    if previous_credential != current_credential and is_pid(next_state.credential_listener) do
+      send(next_state.credential_listener, :oauth_credentials_refreshed)
+    end
+
+    reply
+  end
+
+  defp stored_access_credential(state, resource) do
+    with %{} = context <- Map.get(state.resources, resource),
+         %{} = token <- stored_token(state, context),
+         access_token when is_binary(access_token) <- token["access_token"] do
+      access_token
+    else
+      _other -> nil
+    end
+  end
+
   defp perform_authorization(state, resource, challenge, opts) do
     with {:ok, protected_resource} <- discover_protected_resource(state, resource, challenge),
          {:ok, authorization_server} <-
            select_authorization_server(protected_resource, state.config.authorization_server),
-         {:ok, server_metadata} <- discover_authorization_server(state, authorization_server),
-         {:ok, client} <- resolve_client_registration(state, server_metadata),
-         {:ok, verifier, authorization_request} <-
-           build_authorization_request(
-             state,
-             resource,
-             protected_resource,
-             server_metadata,
-             client,
-             challenge,
-             opts
-           ),
-         {:ok, code} <- authorize_with_host(state, authorization_request),
-         {:ok, token} <-
-           exchange_code(
-             state,
-             server_metadata,
-             client,
-             resource,
-             code,
-             verifier,
-             authorization_request.scopes
-           ) do
-      context = %{
-        resource: resource,
-        protected_resource: protected_resource,
-        authorization_server: authorization_server,
-        server_metadata: server_metadata,
-        client: client,
-        token_key: {resource, authorization_server, client.client_id}
-      }
-
-      next_state =
-        state
-        |> put_stored_token(context, token)
-        |> put_in([:resources, resource], context)
-
-      {:ok, token, next_state}
+         {:ok, server_metadata} <- discover_authorization_server(state, authorization_server) do
+      perform_grant(
+        state,
+        resource,
+        protected_resource,
+        server_metadata,
+        challenge,
+        opts
+      )
     else
       {:error, %Error{} = error} -> {:error, error, state}
       {:error, stage, reason} -> {:error, oauth_error(stage, reason), state}
       {:error, reason} -> {:error, oauth_error(:authorization, reason), state}
     end
+  end
+
+  defp perform_grant(
+         state,
+         resource,
+         protected_resource,
+         server_metadata,
+         challenge,
+         opts
+       ) do
+    case state.config.grant.type do
+      :authorization_code ->
+        perform_authorization_code(
+          state,
+          resource,
+          protected_resource,
+          server_metadata,
+          challenge,
+          opts
+        )
+
+      :client_credentials ->
+        perform_client_credentials(
+          state,
+          resource,
+          protected_resource,
+          server_metadata,
+          challenge,
+          opts
+        )
+
+      :enterprise_managed ->
+        perform_enterprise_managed(
+          state,
+          resource,
+          protected_resource,
+          server_metadata,
+          challenge,
+          opts
+        )
+    end
+  end
+
+  defp perform_authorization_code(
+         state,
+         resource,
+         protected_resource,
+         server_metadata,
+         challenge,
+         opts
+       ) do
+    case resolve_client_registration(state, server_metadata) do
+      {:ok, client, registered_state} ->
+        with {:ok, verifier, authorization_request} <-
+               build_authorization_request(
+                 registered_state,
+                 resource,
+                 protected_resource,
+                 server_metadata,
+                 client,
+                 challenge,
+                 opts
+               ),
+             {:ok, code} <- authorize_with_host(registered_state, authorization_request),
+             {:ok, token} <-
+               exchange_code(
+                 registered_state,
+                 server_metadata,
+                 client,
+                 resource,
+                 code,
+                 verifier,
+                 authorization_request.scopes
+               ) do
+          store_grant_token(
+            registered_state,
+            resource,
+            protected_resource,
+            server_metadata,
+            client,
+            authorization_request.scopes,
+            token
+          )
+        else
+          {:error, stage, reason} -> {:error, oauth_error(stage, reason), registered_state}
+        end
+
+      {:error, stage, reason} ->
+        {:error, oauth_error(stage, reason), state}
+    end
+  end
+
+  defp perform_client_credentials(
+         state,
+         resource,
+         protected_resource,
+         server_metadata,
+         challenge,
+         opts
+       ) do
+    case resolve_client_registration(state, server_metadata) do
+      {:ok, client, registered_state} ->
+        scopes =
+          authorization_scopes(
+            registered_state,
+            resource,
+            protected_resource,
+            challenge.scopes,
+            Keyword.get(opts, :scopes, [])
+          )
+
+        case exchange_client_credentials(
+               registered_state,
+               server_metadata,
+               client,
+               resource,
+               scopes
+             ) do
+          {:ok, token} ->
+            store_grant_token(
+              registered_state,
+              resource,
+              protected_resource,
+              server_metadata,
+              client,
+              scopes,
+              Map.put(token, "refresh_token", nil)
+            )
+
+          {:error, stage, reason} ->
+            {:error, oauth_error(stage, reason), registered_state}
+        end
+
+      {:error, stage, reason} ->
+        {:error, oauth_error(stage, reason), state}
+    end
+  end
+
+  defp perform_enterprise_managed(
+         state,
+         resource,
+         protected_resource,
+         server_metadata,
+         challenge,
+         opts
+       ) do
+    case resolve_client_registration(state, server_metadata) do
+      {:ok, client, registered_state} ->
+        scopes =
+          authorization_scopes(
+            registered_state,
+            resource,
+            protected_resource,
+            challenge.scopes,
+            Keyword.get(opts, :scopes, [])
+          )
+
+        case exchange_enterprise_identity(
+               registered_state,
+               server_metadata,
+               client,
+               resource,
+               scopes
+             ) do
+          {:ok, token} ->
+            store_grant_token(
+              registered_state,
+              resource,
+              protected_resource,
+              server_metadata,
+              client,
+              scopes,
+              Map.put(token, "refresh_token", nil)
+            )
+
+          {:error, stage, reason} ->
+            {:error, oauth_error(stage, reason), registered_state}
+        end
+
+      {:error, stage, reason} ->
+        {:error, oauth_error(stage, reason), state}
+    end
+  end
+
+  defp store_grant_token(
+         state,
+         resource,
+         protected_resource,
+         server_metadata,
+         client,
+         scopes,
+         token
+       ) do
+    issuer = server_metadata["issuer"]
+    grant = state.config.grant.type
+
+    context = %{
+      resource: resource,
+      protected_resource: protected_resource,
+      authorization_server: issuer,
+      server_metadata: server_metadata,
+      client: client,
+      grant: grant,
+      scopes: scopes,
+      token_key: token_key(resource, issuer, client.client_id, grant)
+    }
+
+    state =
+      case Map.get(state.resources, resource) do
+        %{token_key: previous_key} = previous when previous_key != context.token_key ->
+          delete_stored_token(state, previous)
+
+        _other ->
+          state
+      end
+
+    next_state =
+      state
+      |> put_stored_token(context, token)
+      |> put_in([:resources, resource], context)
+
+    {:ok, token, next_state}
   end
 
   defp discover_protected_resource(state, resource, challenge) do
@@ -330,9 +615,9 @@ defmodule FastestMCP.Client.OAuth do
     do: {:ok, hd(servers)}
 
   defp select_authorization_server(%{"authorization_servers" => servers}, selected) do
-    with {:ok, canonical} <- canonical_https_url(selected),
-         true <- canonical in servers do
-      {:ok, canonical}
+    with {:ok, selected} <- validate_exact_https_url(selected),
+         true <- selected in servers do
+      {:ok, selected}
     else
       false -> {:error, :authorization_server_not_advertised}
       {:error, reason} -> {:error, reason}
@@ -362,7 +647,7 @@ defmodule FastestMCP.Client.OAuth do
     |> Enum.reduce_while({:error, :metadata_not_found}, fn candidate, _last_error ->
       case fetch_json_document(state, candidate, :authorization_server_discovery, :https) do
         {:ok, document} ->
-          case validate_authorization_server_metadata(document, issuer) do
+          case validate_authorization_server_metadata(document, issuer, state.config.grant) do
             {:ok, validated} -> {:halt, {:ok, validated}}
             {:error, reason} -> {:halt, {:error, :authorization_server_discovery, reason}}
           end
@@ -382,34 +667,94 @@ defmodule FastestMCP.Client.OAuth do
     end
   end
 
-  defp validate_authorization_server_metadata(document, expected_issuer)
+  defp validate_authorization_server_metadata(document, expected_issuer, grant)
        when is_map(document) do
-    with issuer when is_binary(issuer) <- document["issuer"],
-         {:ok, issuer} <- canonical_https_url(issuer),
+    recorded_issuer = document["issuer"]
+
+    with issuer when is_binary(issuer) <- recorded_issuer,
+         {:ok, issuer} <- validate_exact_https_url(issuer),
          true <- issuer == expected_issuer,
-         {:ok, authorization_endpoint} <-
-           canonical_https_url(document["authorization_endpoint"]),
-         {:ok, token_endpoint} <- canonical_https_url(document["token_endpoint"]),
-         methods when is_list(methods) <- document["code_challenge_methods_supported"],
-         true <- "S256" in methods,
-         :ok <- validate_optional_https_endpoint(document, "registration_endpoint") do
+         {:ok, token_endpoint} <- validate_preserved_https_url(document["token_endpoint"]),
+         :ok <- validate_optional_https_endpoint(document, "registration_endpoint"),
+         :ok <-
+           validate_optional_boolean(document, "authorization_response_iss_parameter_supported"),
+         {:ok, grant_metadata} <- validate_grant_metadata(document, grant) do
       {:ok,
        document
        |> Map.put("issuer", issuer)
-       |> Map.put("authorization_endpoint", authorization_endpoint)
-       |> Map.put("token_endpoint", token_endpoint)}
+       |> Map.put("recorded_issuer", issuer)
+       |> Map.put("token_endpoint", token_endpoint)
+       |> Map.merge(grant_metadata)}
     else
-      false -> {:error, :issuer_or_pkce_mismatch}
+      false -> {:error, :issuer_mismatch}
+      nil -> {:error, :authorization_server_metadata_incomplete}
+      {:error, reason} -> {:error, reason}
+      _other -> {:error, :authorization_server_metadata_incomplete}
+    end
+  end
+
+  defp validate_grant_metadata(document, %{type: :authorization_code}) do
+    with {:ok, authorization_endpoint} <-
+           validate_preserved_https_url(document["authorization_endpoint"]),
+         methods when is_list(methods) <- document["code_challenge_methods_supported"],
+         true <- "S256" in methods do
+      {:ok, %{"authorization_endpoint" => authorization_endpoint}}
+    else
+      false -> {:error, :pkce_s256_required}
       nil -> {:error, :authorization_server_metadata_incomplete}
       {:error, reason} -> {:error, reason}
       _other -> {:error, :pkce_s256_required}
     end
   end
 
+  defp validate_grant_metadata(document, %{type: :client_credentials, client: client}) do
+    methods = document["token_endpoint_auth_methods_supported"]
+
+    cond do
+      not is_list(methods) ->
+        {:error, :token_endpoint_auth_methods_required}
+
+      client.token_endpoint_auth_method not in methods ->
+        {:error, :token_endpoint_auth_method_not_supported}
+
+      client.token_endpoint_auth_method == "private_key_jwt" and
+          not valid_string_list?(document["token_endpoint_auth_signing_alg_values_supported"]) ->
+        {:error, :token_endpoint_auth_signing_algorithms_required}
+
+      true ->
+        {:ok, %{}}
+    end
+  end
+
+  defp validate_grant_metadata(document, %{type: :enterprise_managed}) do
+    case document["authorization_grant_profiles_supported"] do
+      nil ->
+        {:ok, %{}}
+
+      profiles when is_list(profiles) ->
+        cond do
+          @id_jag_grant_profile not in profiles ->
+            {:error, :enterprise_managed_grant_not_supported}
+
+          @jwt_bearer_grant not in List.wrap(document["grant_types_supported"]) ->
+            {:error, :enterprise_managed_grant_metadata_inconsistent}
+
+          true ->
+            {:ok, %{}}
+        end
+
+      _other ->
+        {:error, :invalid_authorization_server_metadata}
+    end
+  end
+
   defp resolve_client_registration(state, server_metadata) do
     case state.config.registration do
       {:pre_registered, client} ->
-        validate_registered_client(client)
+        with {:ok, client} <- validate_registered_client(client),
+             {:ok, next_state} <- bind_pre_registered_client(state, client, server_metadata) do
+          {:ok, client, next_state}
+        end
 
       {:client_metadata_document, client_id} ->
         with true <- server_metadata["client_id_metadata_document_supported"] == true,
@@ -418,15 +763,31 @@ defmodule FastestMCP.Client.OAuth do
            %{
              client_id: client_id,
              client_secret: nil,
-             token_endpoint_auth_method: "none"
-           }}
+             token_endpoint_auth_method: "none",
+             assertion_provider: nil,
+             issuer: nil
+           }, state}
         else
           false -> {:error, :client_registration, :client_metadata_document_unsupported}
           {:error, reason} -> {:error, :client_registration, reason}
         end
 
       {:dynamic, metadata} ->
-        dynamically_register_client(state, server_metadata, metadata)
+        key = {server_metadata["issuer"], metadata}
+
+        case Map.get(state.registrations, key) do
+          nil ->
+            case dynamically_register_client(state, server_metadata, metadata) do
+              {:ok, client} ->
+                {:ok, client, put_in(state, [:registrations, key], client)}
+
+              {:error, stage, reason} ->
+                {:error, stage, reason}
+            end
+
+          client ->
+            {:ok, client, state}
+        end
     end
   end
 
@@ -441,8 +802,10 @@ defmodule FastestMCP.Client.OAuth do
           |> Map.put_new("grant_types", ["authorization_code", "refresh_token"])
           |> Map.put_new("response_types", ["code"])
           |> Map.put_new("token_endpoint_auth_method", "none")
+          |> Map.put_new("application_type", state.config.application_type)
 
-        with {:ok, status, _headers, body} <-
+        with :ok <- validate_application_type(payload["application_type"]),
+             {:ok, status, _headers, body} <-
                oauth_request(state, :post, endpoint, json: payload),
              :ok <- ensure_success_status(status),
              {:ok, document} <- decode_json_object(body),
@@ -472,29 +835,84 @@ defmodule FastestMCP.Client.OAuth do
     client_id = client["client_id"]
     method = client["token_endpoint_auth_method"] || "none"
     secret = client["client_secret"]
+    assertion_provider = client["assertion_provider"]
 
     cond do
       not is_binary(client_id) or client_id == "" ->
         {:error, :client_registration, :client_id_required}
 
-      method not in ["none", "client_secret_basic", "client_secret_post"] ->
+      method not in ["none", "client_secret_basic", "client_secret_post", "private_key_jwt"] ->
         {:error, :client_registration, :unsupported_token_endpoint_auth_method}
 
-      method != "none" and (not is_binary(secret) or secret == "") ->
+      method in ["client_secret_basic", "client_secret_post"] and
+          (not is_binary(secret) or secret == "") ->
         {:error, :client_registration, :client_secret_required}
 
+      method == "private_key_jwt" and not valid_assertion_provider?(assertion_provider) ->
+        {:error, :client_registration, :client_assertion_provider_required}
+
       true ->
-        {:ok,
-         %{
-           client_id: client_id,
-           client_secret: secret,
-           token_endpoint_auth_method: method
-         }}
+        case normalize_client_issuer(client["issuer"]) do
+          {:ok, issuer} ->
+            {:ok,
+             %{
+               client_id: client_id,
+               client_secret: secret,
+               token_endpoint_auth_method: method,
+               assertion_provider: assertion_provider,
+               issuer: issuer
+             }}
+
+          {:error, reason} ->
+            {:error, :client_registration, reason}
+        end
     end
   end
 
   defp validate_registered_client(_client),
     do: {:error, :client_registration, :invalid_client_registration}
+
+  defp bind_pre_registered_client(state, client, server_metadata) do
+    issuer = server_metadata["issuer"]
+    binding_key = {:pre_registered, client.client_id}
+
+    cond do
+      is_binary(client.issuer) and client.issuer != issuer ->
+        {:error, :client_registration, :authorization_server_binding_mismatch}
+
+      Map.get(state.credential_bindings, binding_key) in [nil, issuer] ->
+        {:ok, put_in(state, [:credential_bindings, binding_key], issuer)}
+
+      true ->
+        {:error, :client_registration, :authorization_server_binding_mismatch}
+    end
+  end
+
+  defp normalize_client_issuer(nil), do: {:ok, nil}
+  defp normalize_client_issuer(issuer), do: validate_exact_https_url(issuer)
+
+  defp valid_assertion_provider?(provider) when is_function(provider, 1), do: true
+
+  defp valid_assertion_provider?(module) when is_atom(module) do
+    Code.ensure_loaded?(module) and function_exported?(module, :assertion, 1)
+  end
+
+  defp valid_assertion_provider?(_provider), do: false
+
+  defp valid_enterprise_provider?(provider) when is_function(provider, 1), do: true
+
+  defp valid_enterprise_provider?(module) when is_atom(module) do
+    Code.ensure_loaded?(module) and function_exported?(module, :identity_assertion, 1)
+  end
+
+  defp valid_enterprise_provider?(_provider), do: false
+
+  defp validate_application_type(type) when type in ["native", "web"], do: :ok
+  defp validate_application_type(_type), do: {:error, :invalid_application_type}
+
+  defp redirect_application_type(redirect_uri) do
+    if localhost?(URI.parse(redirect_uri).host), do: "native", else: "web"
+  end
 
   defp build_authorization_request(
          state,
@@ -538,7 +956,9 @@ defmodule FastestMCP.Client.OAuth do
        redirect_uri: state.config.redirect_uri,
        resource: resource,
        scopes: scopes,
-       state: state_token
+       state: state_token,
+       issuer: server_metadata["recorded_issuer"] || server_metadata["issuer"],
+       issuer_required?: server_metadata["authorization_response_iss_parameter_supported"] == true
      }}
   end
 
@@ -590,8 +1010,9 @@ defmodule FastestMCP.Client.OAuth do
          {:ok, actual} <- parse_redirect_uri(redirect),
          true <- same_redirect_endpoint?(expected, actual),
          query <- URI.decode_query(actual.query || ""),
-         :ok <- reject_authorization_error(query),
+         :ok <- validate_authorization_issuer(query["iss"], request),
          true <- secure_compare(query["state"], request.state),
+         :ok <- reject_authorization_error(query),
          code when is_binary(code) and code != "" <- query["code"] do
       {:ok, code}
     else
@@ -614,8 +1035,9 @@ defmodule FastestMCP.Client.OAuth do
          {:ok, expected} <- parse_redirect_uri(request.redirect_uri),
          {:ok, actual} <- parse_redirect_uri(redirect_uri),
          :ok <- validate_redirect_endpoint(expected, actual),
-         :ok <- reject_authorization_error(response),
+         :ok <- validate_authorization_issuer(response["iss"], request),
          :ok <- validate_authorization_state(response["state"], request.state),
+         :ok <- reject_authorization_error(response),
          {:ok, code} <-
            fetch_authorization_value(response, "code", :authorization_code_required) do
       {:ok, code}
@@ -647,8 +1069,23 @@ defmodule FastestMCP.Client.OAuth do
     if secure_compare(actual, expected), do: :ok, else: {:error, :state_mismatch}
   end
 
+  defp validate_authorization_issuer(nil, %{issuer_required?: true}),
+    do: {:error, :authorization_issuer_required}
+
+  defp validate_authorization_issuer(nil, _request), do: :ok
+
+  defp validate_authorization_issuer(actual, %{issuer: expected})
+       when is_binary(actual) and is_binary(expected) do
+    if actual == expected,
+      do: :ok,
+      else: {:error, :authorization_issuer_mismatch}
+  end
+
+  defp validate_authorization_issuer(_actual, _request),
+    do: {:error, :authorization_issuer_mismatch}
+
   defp exchange_code(state, metadata, client, resource, code, verifier, scopes) do
-    form =
+    base_form =
       [
         {"grant_type", "authorization_code"},
         {"code", code},
@@ -657,11 +1094,16 @@ defmodule FastestMCP.Client.OAuth do
         {"code_verifier", verifier},
         {"resource", resource}
       ]
-      |> apply_client_auth_form(client)
 
-    headers = client_auth_headers(client)
-
-    with {:ok, status, _headers, body} <-
+    with {:ok, form, headers} <-
+           prepare_token_request(
+             state,
+             metadata,
+             client,
+             base_form,
+             "authorization_code"
+           ),
+         {:ok, status, _headers, body} <-
            oauth_request(state, :post, metadata["token_endpoint"], form: form, headers: headers),
          :ok <- ensure_success_status(status),
          {:ok, token} <- decode_token_response(body, scopes, nil) do
@@ -672,10 +1114,172 @@ defmodule FastestMCP.Client.OAuth do
     end
   end
 
+  defp exchange_client_credentials(state, metadata, client, resource, scopes) do
+    base_form =
+      [{"grant_type", "client_credentials"}, {"resource", resource}]
+      |> maybe_append_scope(scopes)
+
+    with {:ok, form, headers} <-
+           prepare_token_request(
+             state,
+             metadata,
+             client,
+             base_form,
+             "client_credentials"
+           ),
+         {:ok, status, _headers, body} <-
+           oauth_request(state, :post, metadata["token_endpoint"], form: form, headers: headers),
+         :ok <- ensure_success_status(status),
+         {:ok, token} <- decode_token_response(body, scopes, nil) do
+      {:ok, token}
+    else
+      {:error, {:http_status, status}} -> {:error, :token_exchange, {:http_status, status}}
+      {:error, reason} -> {:error, :token_exchange, sanitize_reason(reason)}
+    end
+  end
+
+  defp exchange_enterprise_identity(state, metadata, client, resource, scopes) do
+    with {:ok, assertion} <- enterprise_identity_assertion(state, metadata, resource, scopes),
+         {:ok, id_jag} <-
+           exchange_identity_assertion(state, metadata, assertion, resource, scopes),
+         {:ok, token} <-
+           exchange_id_jag(state, metadata, client, resource, scopes, id_jag) do
+      {:ok, token}
+    else
+      {:error, stage, reason} -> {:error, stage, reason}
+    end
+  end
+
+  defp enterprise_identity_assertion(state, metadata, resource, scopes) do
+    request = %EnterpriseManagedProvider.Request{
+      resource: resource,
+      authorization_server: metadata["issuer"],
+      scopes: scopes
+    }
+
+    response =
+      case state.config.grant.provider do
+        provider when is_function(provider, 1) -> provider.(request)
+        module when is_atom(module) -> module.identity_assertion(request)
+      end
+
+    case response do
+      {:ok, assertion} -> normalize_enterprise_assertion(assertion)
+      {:error, _reason} -> {:error, :authorization, :enterprise_identity_unavailable}
+      _other -> {:error, :authorization, :invalid_enterprise_identity_response}
+    end
+  rescue
+    _error -> {:error, :authorization, :enterprise_identity_provider_failed}
+  catch
+    _kind, _reason -> {:error, :authorization, :enterprise_identity_provider_failed}
+  end
+
+  defp normalize_enterprise_assertion(%EnterpriseManagedProvider.Assertion{} = assertion),
+    do: assertion |> Map.from_struct() |> normalize_enterprise_assertion()
+
+  defp normalize_enterprise_assertion(assertion) when is_map(assertion) do
+    assertion = stringify_keys(assertion)
+    headers = assertion["headers"] || []
+    form = assertion["form"] || []
+
+    with {:ok, token_endpoint} <- validate_preserved_https_url(assertion["token_endpoint"]),
+         subject_token when is_binary(subject_token) and subject_token != "" <-
+           assertion["subject_token"],
+         subject_token_type when is_binary(subject_token_type) and subject_token_type != "" <-
+           assertion["subject_token_type"],
+         :ok <- validate_header_pairs(headers),
+         :ok <- validate_form_pairs(form),
+         :ok <- validate_enterprise_form_fields(form) do
+      {:ok,
+       %{
+         token_endpoint: token_endpoint,
+         subject_token: subject_token,
+         subject_token_type: subject_token_type,
+         headers: headers,
+         form: form
+       }}
+    else
+      {:error, stage, reason} -> {:error, stage, reason}
+      {:error, reason} -> {:error, :authorization, reason}
+      _other -> {:error, :authorization, :invalid_enterprise_identity_response}
+    end
+  end
+
+  defp normalize_enterprise_assertion(_assertion),
+    do: {:error, :authorization, :invalid_enterprise_identity_response}
+
+  defp exchange_identity_assertion(state, metadata, assertion, resource, scopes) do
+    form =
+      [
+        {"grant_type", @token_exchange_grant},
+        {"requested_token_type", @id_jag_token_type},
+        {"audience", metadata["recorded_issuer"] || metadata["issuer"]},
+        {"resource", resource},
+        {"subject_token", assertion.subject_token},
+        {"subject_token_type", assertion.subject_token_type}
+      ]
+      |> maybe_append_scope(scopes)
+      |> Kernel.++(assertion.form)
+
+    with {:ok, status, _headers, body} <-
+           oauth_request(
+             state,
+             :post,
+             assertion.token_endpoint,
+             form: form,
+             headers: assertion.headers
+           ),
+         :ok <- ensure_success_status(status),
+         {:ok, id_jag} <- decode_id_jag_response(body) do
+      {:ok, id_jag}
+    else
+      {:error, {:http_status, status}} -> {:error, :token_exchange, {:http_status, status}}
+      {:error, reason} -> {:error, :token_exchange, sanitize_reason(reason)}
+    end
+  end
+
+  defp exchange_id_jag(state, metadata, client, resource, scopes, id_jag) do
+    base_form = [
+      {"grant_type", @jwt_bearer_grant},
+      {"assertion", id_jag},
+      {"client_id", client.client_id},
+      {"resource", resource}
+    ]
+
+    with {:ok, form, headers} <-
+           prepare_token_request(
+             state,
+             metadata,
+             client,
+             base_form,
+             @jwt_bearer_grant
+           ),
+         {:ok, status, _headers, body} <-
+           oauth_request(state, :post, metadata["token_endpoint"], form: form, headers: headers),
+         :ok <- ensure_success_status(status),
+         {:ok, token} <- decode_token_response(body, scopes, nil) do
+      {:ok, token}
+    else
+      {:error, {:http_status, status}} -> {:error, :token_exchange, {:http_status, status}}
+      {:error, reason} -> {:error, :token_exchange, sanitize_reason(reason)}
+    end
+  end
+
+  defp decode_id_jag_response(body) do
+    with {:ok, document} <- decode_json_object(body),
+         true <- document["issued_token_type"] == @id_jag_token_type,
+         token when is_binary(token) and token != "" <- document["access_token"] do
+      {:ok, token}
+    else
+      false -> {:error, :invalid_identity_assertion_token_type}
+      _other -> {:error, :invalid_identity_assertion_response}
+    end
+  end
+
   defp refresh_token(state, context, old_token) do
     client = context.client
 
-    form =
+    base_form =
       [
         {"grant_type", "refresh_token"},
         {"refresh_token", old_token["refresh_token"]},
@@ -683,16 +1287,23 @@ defmodule FastestMCP.Client.OAuth do
         {"resource", context.resource}
       ]
       |> maybe_append_scope(old_token["scope"] || [])
-      |> apply_client_auth_form(client)
 
     result =
-      with {:ok, status, _headers, body} <-
+      with {:ok, form, headers} <-
+             prepare_token_request(
+               state,
+               context.server_metadata,
+               client,
+               base_form,
+               "refresh_token"
+             ),
+           {:ok, status, _headers, body} <-
              oauth_request(
                state,
                :post,
                context.server_metadata["token_endpoint"],
                form: form,
-               headers: client_auth_headers(client)
+               headers: headers
              ),
            :ok <- ensure_success_status(status),
            {:ok, token} <-
@@ -780,13 +1391,12 @@ defmodule FastestMCP.Client.OAuth do
   end
 
   defp normalize_config(opts) do
-    with {:ok, redirect_uri} <- validate_redirect_uri(Keyword.get(opts, :redirect_uri)),
-         {:ok, registration} <- normalize_registration(Keyword.get(opts, :registration)),
-         {:ok, authorization_handler} <-
-           validate_authorization_handler(Keyword.get(opts, :authorization_handler)),
+    with {:ok, grant_config} <- normalize_grant(Keyword.get(opts, :grant), opts),
          {:ok, authorization_server} <-
            validate_optional_authorization_server(Keyword.get(opts, :authorization_server)),
          {:ok, scopes} <- validate_scope_list(Keyword.get(opts, :scopes, [])),
+         {:ok, application_type} <-
+           normalize_application_type(Map.get(grant_config, :application_type), grant_config),
          {:ok, timeout_ms} <-
            positive_integer(Keyword.get(opts, :timeout_ms, @default_timeout_ms)),
          {:ok, max_body_bytes} <-
@@ -794,11 +1404,13 @@ defmodule FastestMCP.Client.OAuth do
          :ok <- validate_requester(Keyword.get(opts, :requester)) do
       {:ok,
        %{
-         redirect_uri: redirect_uri,
-         registration: registration,
-         authorization_handler: authorization_handler,
+         grant: grant_config.grant,
+         redirect_uri: grant_config.redirect_uri,
+         registration: grant_config.registration,
+         authorization_handler: grant_config.authorization_handler,
          authorization_server: authorization_server,
          scopes: scopes,
+         application_type: application_type,
          requester: Keyword.get(opts, :requester),
          token_store: Keyword.get(opts, :token_store),
          timeout_ms: timeout_ms,
@@ -806,6 +1418,121 @@ defmodule FastestMCP.Client.OAuth do
        }}
     else
       {:error, reason} -> {:error, oauth_error(:configuration, reason)}
+    end
+  end
+
+  defp normalize_grant(nil, opts), do: normalize_authorization_code_grant(%{}, opts)
+
+  defp normalize_grant(:authorization_code, opts),
+    do: normalize_authorization_code_grant(%{}, opts)
+
+  defp normalize_grant({:authorization_code, grant_opts}, opts)
+       when is_list(grant_opts) or is_map(grant_opts),
+       do: normalize_authorization_code_grant(Map.new(grant_opts), opts)
+
+  defp normalize_grant({:client_credentials, grant_opts}, _opts)
+       when is_list(grant_opts) or is_map(grant_opts) do
+    client =
+      grant_opts
+      |> Map.new()
+      |> stringify_keys()
+      |> normalize_client_auth_method()
+
+    case validate_registered_client(client) do
+      {:ok, %{token_endpoint_auth_method: method} = client}
+      when method in ["client_secret_basic", "private_key_jwt"] ->
+        {:ok,
+         %{
+           grant: %{type: :client_credentials, client: client},
+           redirect_uri: nil,
+           registration: {:pre_registered, client},
+           authorization_handler: nil
+         }}
+
+      {:ok, _client} ->
+        {:error, :client_credentials_auth_method_required}
+
+      {:error, :client_registration, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp normalize_grant({:enterprise_managed, grant_opts}, opts)
+       when is_list(grant_opts) or is_map(grant_opts) do
+    grant_opts = Map.new(grant_opts)
+    registration = config_value(grant_opts, :registration, opts)
+    provider = config_value(grant_opts, :provider, opts)
+
+    with {:ok, registration} <- normalize_registration(registration),
+         :ok <- validate_enterprise_registration(registration),
+         :ok <- validate_enterprise_provider(provider) do
+      {:ok,
+       %{
+         grant: %{type: :enterprise_managed, provider: provider},
+         redirect_uri: nil,
+         registration: registration,
+         authorization_handler: nil
+       }}
+    else
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp normalize_grant(_grant, _opts), do: {:error, :invalid_oauth_grant}
+
+  defp validate_enterprise_registration({:dynamic, _metadata}),
+    do: {:error, :dynamic_registration_not_supported_for_enterprise_managed}
+
+  defp validate_enterprise_registration(_registration), do: :ok
+
+  defp validate_enterprise_provider(provider) do
+    if valid_enterprise_provider?(provider),
+      do: :ok,
+      else: {:error, :enterprise_identity_provider_required}
+  end
+
+  defp normalize_authorization_code_grant(grant_opts, opts) do
+    with {:ok, redirect_uri} <-
+           validate_redirect_uri(config_value(grant_opts, :redirect_uri, opts)),
+         {:ok, registration} <-
+           normalize_registration(config_value(grant_opts, :registration, opts)),
+         {:ok, authorization_handler} <-
+           validate_authorization_handler(config_value(grant_opts, :authorization_handler, opts)) do
+      {:ok,
+       %{
+         grant: %{type: :authorization_code},
+         redirect_uri: redirect_uri,
+         registration: registration,
+         authorization_handler: authorization_handler,
+         application_type: config_value(grant_opts, :application_type, opts)
+       }}
+    end
+  end
+
+  defp normalize_application_type(nil, %{redirect_uri: redirect_uri})
+       when is_binary(redirect_uri),
+       do: {:ok, redirect_application_type(redirect_uri)}
+
+  defp normalize_application_type(nil, _grant_config), do: {:ok, nil}
+
+  defp normalize_application_type(type, %{grant: %{type: :authorization_code}})
+       when type in ["native", "web"],
+       do: {:ok, type}
+
+  defp normalize_application_type(_type, _grant_config), do: {:error, :invalid_application_type}
+
+  defp config_value(map, key, fallback_opts) do
+    Map.get(map, key) || Map.get(map, to_string(key)) || Keyword.get(fallback_opts, key)
+  end
+
+  defp normalize_client_auth_method(client) do
+    case client["token_endpoint_auth_method"] do
+      method when is_atom(method) ->
+        Map.put(client, "token_endpoint_auth_method", Atom.to_string(method))
+
+      _other ->
+        client
     end
   end
 
@@ -833,7 +1560,7 @@ defmodule FastestMCP.Client.OAuth do
   defp validate_authorization_handler(_handler), do: {:error, :authorization_handler_required}
 
   defp validate_optional_authorization_server(nil), do: {:ok, nil}
-  defp validate_optional_authorization_server(url), do: canonical_https_url(url)
+  defp validate_optional_authorization_server(url), do: validate_exact_https_url(url)
 
   defp validate_requester(nil), do: :ok
   defp validate_requester(requester) when is_function(requester, 3), do: :ok
@@ -884,6 +1611,18 @@ defmodule FastestMCP.Client.OAuth do
 
   defp token_current?(_token), do: false
 
+  # Keep the established authorization-code store key stable for existing
+  # custom stores. Extension grants need a discriminator because the same
+  # client and resource can legitimately hold user and workload credentials.
+  defp token_key(resource, issuer, client_id, :authorization_code),
+    do: {resource, issuer, client_id}
+
+  defp token_key(resource, issuer, client_id, grant),
+    do: {resource, issuer, client_id, grant}
+
+  defp reacquirable_grant?(grant),
+    do: grant in [:client_credentials, :enterprise_managed]
+
   defp bearer_header(%{"access_token" => token}), do: "Bearer " <> token
 
   defp protected_resource_candidates(resource) do
@@ -919,10 +1658,10 @@ defmodule FastestMCP.Client.OAuth do
   defp normalize_issuer_path(path), do: String.trim_trailing(path, "/")
 
   defp validate_client_metadata_url(url) do
-    with {:ok, canonical} <- canonical_https_url(url),
-         %URI{path: path} <- URI.parse(canonical),
+    with {:ok, exact} <- validate_preserved_https_url(url),
+         %URI{path: path} <- URI.parse(exact),
          true <- is_binary(path) and path not in ["", "/"] do
-      {:ok, canonical}
+      {:ok, exact}
     else
       false -> {:error, :client_metadata_path_required}
       {:error, reason} -> {:error, reason}
@@ -992,6 +1731,27 @@ defmodule FastestMCP.Client.OAuth do
 
   defp canonical_https_url(_url), do: {:error, :invalid_url}
 
+  defp validate_preserved_https_url(url) when is_binary(url) do
+    case canonical_https_url(url) do
+      {:ok, _canonical} -> {:ok, url}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp validate_preserved_https_url(_url), do: {:error, :invalid_url}
+
+  defp validate_exact_https_url(url) when is_binary(url) do
+    with {:ok, _canonical} <- canonical_https_url(url),
+         %URI{query: nil} <- URI.parse(url) do
+      {:ok, url}
+    else
+      %URI{} -> {:error, :issuer_query_forbidden}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp validate_exact_https_url(_url), do: {:error, :invalid_url}
+
   defp canonical_https_or_loopback_url(url) when is_binary(url) do
     uri = URI.parse(url)
     scheme = if is_binary(uri.scheme), do: String.downcase(uri.scheme)
@@ -1055,8 +1815,8 @@ defmodule FastestMCP.Client.OAuth do
 
   defp validate_https_urls(urls) do
     Enum.reduce_while(urls, {:ok, []}, fn url, {:ok, acc} ->
-      case canonical_https_url(url) do
-        {:ok, canonical} -> {:cont, {:ok, acc ++ [canonical]}}
+      case validate_exact_https_url(url) do
+        {:ok, exact} -> {:cont, {:ok, acc ++ [exact]}}
         {:error, reason} -> {:halt, {:error, reason}}
       end
     end)
@@ -1068,13 +1828,20 @@ defmodule FastestMCP.Client.OAuth do
         :ok
 
       value when is_binary(value) ->
-        case canonical_https_url(value) do
+        case validate_preserved_https_url(value) do
           {:ok, _canonical} -> :ok
           {:error, reason} -> {:error, reason}
         end
 
       _other ->
         {:error, :invalid_endpoint}
+    end
+  end
+
+  defp validate_optional_boolean(document, key) do
+    case document[key] do
+      value when value in [nil, true, false] -> :ok
+      _other -> {:error, :invalid_authorization_server_metadata}
     end
   end
 
@@ -1173,19 +1940,121 @@ defmodule FastestMCP.Client.OAuth do
 
   defp secure_compare(_left, _right), do: false
 
-  defp apply_client_auth_form(form, %{token_endpoint_auth_method: "client_secret_post"} = client) do
-    form ++ [{"client_secret", client.client_secret}]
+  defp prepare_token_request(
+         _state,
+         _metadata,
+         %{token_endpoint_auth_method: "none"},
+         form,
+         _grant_type
+       ) do
+    {:ok, form, []}
   end
 
-  defp apply_client_auth_form(form, _client), do: form
-
-  defp client_auth_headers(%{token_endpoint_auth_method: "client_secret_basic"} = client) do
+  defp prepare_token_request(
+         _state,
+         _metadata,
+         %{token_endpoint_auth_method: "client_secret_basic"} = client,
+         form,
+         _grant_type
+       ) do
     username = URI.encode_www_form(client.client_id)
     password = URI.encode_www_form(client.client_secret)
-    [{"authorization", "Basic " <> Base.encode64(username <> ":" <> password)}]
+
+    {:ok, form, [{"authorization", "Basic " <> Base.encode64(username <> ":" <> password)}]}
   end
 
-  defp client_auth_headers(_client), do: []
+  defp prepare_token_request(
+         _state,
+         _metadata,
+         %{token_endpoint_auth_method: "client_secret_post"} = client,
+         form,
+         _grant_type
+       ) do
+    {:ok, form ++ [{"client_secret", client.client_secret}], []}
+  end
+
+  defp prepare_token_request(
+         _state,
+         metadata,
+         %{token_endpoint_auth_method: "private_key_jwt"} = client,
+         form,
+         grant_type
+       ) do
+    request = %ClientAssertionProvider.Request{
+      client_id: client.client_id,
+      token_endpoint: metadata["token_endpoint"],
+      authorization_server: metadata["issuer"],
+      signing_algorithms:
+        normalize_scopes(metadata["token_endpoint_auth_signing_alg_values_supported"] || []),
+      grant_type: grant_type
+    }
+
+    response =
+      case client.assertion_provider do
+        provider when is_function(provider, 1) -> provider.(request)
+        module when is_atom(module) -> module.assertion(request)
+      end
+
+    case response do
+      {:ok, assertion} when is_binary(assertion) and assertion != "" ->
+        {:ok,
+         form ++
+           [
+             {"client_assertion_type", @jwt_client_assertion_type},
+             {"client_assertion", assertion}
+           ], []}
+
+      _other ->
+        {:error, :client_assertion_failed}
+    end
+  rescue
+    _error -> {:error, :client_assertion_failed}
+  catch
+    _kind, _reason -> {:error, :client_assertion_failed}
+  end
+
+  defp validate_header_pairs(pairs) when is_list(pairs) do
+    if Enum.all?(pairs, fn
+         {key, value} -> is_binary(key) and key != "" and is_binary(value)
+         _other -> false
+       end),
+       do: :ok,
+       else: {:error, :invalid_enterprise_request_headers}
+  end
+
+  defp validate_header_pairs(_pairs), do: {:error, :invalid_enterprise_request_headers}
+
+  defp validate_form_pairs(pairs) when is_list(pairs) do
+    if Enum.all?(pairs, fn
+         {key, value} -> is_binary(key) and key != "" and is_binary(value)
+         _other -> false
+       end),
+       do: :ok,
+       else: {:error, :invalid_enterprise_request_form}
+  end
+
+  defp validate_form_pairs(_pairs), do: {:error, :invalid_enterprise_request_form}
+
+  defp validate_enterprise_form_fields(form) do
+    reserved = [
+      "grant_type",
+      "requested_token_type",
+      "audience",
+      "resource",
+      "scope",
+      "subject_token",
+      "subject_token_type"
+    ]
+
+    if Enum.any?(form, fn {key, _value} -> key in reserved end),
+      do: {:error, :enterprise_request_field_override},
+      else: :ok
+  end
+
+  defp valid_string_list?(values) when is_list(values),
+    do: values != [] and Enum.all?(values, &(is_binary(&1) and &1 != ""))
+
+  defp valid_string_list?(_values), do: false
 
   defp normalize_expiry(nil), do: {:ok, nil}
 
@@ -1214,6 +2083,10 @@ defmodule FastestMCP.Client.OAuth do
 
   defp positive_integer(value) when is_integer(value) and value > 0, do: {:ok, value}
   defp positive_integer(_value), do: {:error, :positive_integer_required}
+
+  defp validate_credential_listener(nil), do: :ok
+  defp validate_credential_listener(pid) when is_pid(pid), do: :ok
+  defp validate_credential_listener(_listener), do: {:error, :invalid_credential_listener}
 
   defp ensure_success_status(status) when status in 200..299, do: :ok
   defp ensure_success_status(status), do: {:error, {:http_status, status}}

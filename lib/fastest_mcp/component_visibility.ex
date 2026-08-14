@@ -5,9 +5,8 @@ defmodule FastestMCP.ComponentVisibility do
   alias FastestMCP.Context
   alias FastestMCP.Error
   alias FastestMCP.EventBus
+  alias FastestMCP.Registry
   alias FastestMCP.ServerRuntime
-
-  @table :fastest_mcp_component_visibility
 
   @component_family_map %{
     tool: :tools,
@@ -22,33 +21,24 @@ defmodule FastestMCP.ComponentVisibility do
   def reset(server_name) do
     server_name = normalize_server_name(server_name)
     ensure_runtime!(server_name)
-    ensure_table!()
 
-    case :ets.lookup(@table, server_name) do
-      [] ->
+    case Registry.reset_component_visibility_rules(server_name) do
+      :unchanged ->
         :ok
 
-      _existing ->
-        :ets.delete(@table, server_name)
+      :changed ->
         broadcast_change(server_name, [:tools, :resources, :prompts])
         :ok
     end
   end
 
   def delete(server_name) do
-    ensure_table!()
-    :ets.delete(@table, normalize_server_name(server_name))
-    :ok
+    Registry.delete_component_visibility_rules(normalize_server_name(server_name))
   end
 
   def server_rules(server_name) do
     server_name = normalize_server_name(server_name)
-    ensure_table!()
-
-    case :ets.lookup(@table, server_name) do
-      [{^server_name, rules}] when is_list(rules) -> rules
-      _other -> []
-    end
+    Registry.component_visibility_rules(server_name)
   end
 
   def session_rules(%Context{} = context) do
@@ -108,12 +98,7 @@ defmodule FastestMCP.ComponentVisibility do
   defp update_server_rules(server_name, action, opts) do
     server_name = normalize_server_name(server_name)
     ensure_runtime!(server_name)
-    ensure_table!()
-
-    next_rules =
-      server_rules(server_name) ++ normalize_rules(action, opts)
-
-    :ets.insert(@table, {server_name, next_rules})
+    :ok = Registry.append_component_visibility_rules(server_name, normalize_rules(action, opts))
     broadcast_change(server_name, component_families(opts))
     :ok
   end
@@ -157,9 +142,7 @@ defmodule FastestMCP.ComponentVisibility do
   end
 
   defp visibility_rule_matches?(rule, component) do
-    if not has_visibility_criteria?(rule) do
-      false
-    else
+    if has_visibility_criteria?(rule) do
       identifier = Component.identifier(component)
       key = Component.key(component)
       version = Component.version(component) && to_string(Component.version(component))
@@ -171,6 +154,8 @@ defmodule FastestMCP.ComponentVisibility do
         matches_version_selector?(rule.version, version) and
         matches_component_selector?(rule.components, component_type) and
         matches_tag_selector?(rule.tags, tags)
+    else
+      false
     end
   end
 
@@ -352,26 +337,6 @@ defmodule FastestMCP.ComponentVisibility do
         %{count: length(families)},
         %{families: families}
       )
-    end
-  end
-
-  defp ensure_table! do
-    case :ets.whereis(@table) do
-      :undefined ->
-        try do
-          :ets.new(@table, [
-            :named_table,
-            :public,
-            :set,
-            {:read_concurrency, true},
-            {:write_concurrency, true}
-          ])
-        rescue
-          ArgumentError -> @table
-        end
-
-      _table ->
-        @table
     end
   end
 end

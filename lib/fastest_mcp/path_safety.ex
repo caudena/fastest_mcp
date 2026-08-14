@@ -15,7 +15,7 @@ defmodule FastestMCP.PathSafety do
     |> to_string()
     |> Path.expand()
     |> path_segments()
-    |> resolve_segments("/", MapSet.new(), 0)
+    |> resolve_segments("/", %{}, 0)
   end
 
   @doc "Resolves an existing path, raising `File.Error` on failure."
@@ -72,7 +72,7 @@ defmodule FastestMCP.PathSafety do
   defp resolve_symlink(candidate, rest, seen, count) do
     resolution_state = {candidate, rest}
 
-    if MapSet.member?(seen, resolution_state) do
+    if Map.has_key?(seen, resolution_state) do
       {:error, :eloop}
     else
       with {:ok, target} <- File.read_link(candidate) do
@@ -84,7 +84,7 @@ defmodule FastestMCP.PathSafety do
         resolve_segments(
           path_segments(target) ++ rest,
           "/",
-          MapSet.put(seen, resolution_state),
+          Map.put(seen, resolution_state, true),
           count + 1
         )
       end

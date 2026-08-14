@@ -38,10 +38,10 @@ defmodule FastestMCP.ServerRuntime do
   alias FastestMCP.Server
   alias FastestMCP.SessionNotificationSupervisor
   alias FastestMCP.SessionStateStore.Memory, as: SessionStateStoreMemory
+  alias FastestMCP.SessionSupervisor
   alias FastestMCP.TaskBackend.Memory, as: MemoryTaskBackend
   alias FastestMCP.TaskNotificationSupervisor
   alias FastestMCP.TTLStore
-  alias FastestMCP.SessionSupervisor
 
   @doc "Starts the runtime or application process owned by this module."
   def start(%Server{} = server, opts \\ []) do
@@ -55,7 +55,6 @@ defmodule FastestMCP.ServerRuntime do
         case FastestMCP.ServerSupervisor.stop_server(owner_pid) do
           :ok -> :ok
           {:error, :not_found} -> Supervisor.stop(owner_pid, :shutdown)
-          other -> other
         end
 
       {:error, :not_found} ->
@@ -63,7 +62,6 @@ defmodule FastestMCP.ServerRuntime do
           case FastestMCP.ServerSupervisor.stop_server(pid) do
             :ok -> :ok
             {:error, :not_found} -> GenServer.stop(pid, :shutdown)
-            other -> other
           end
         end
     end
@@ -84,6 +82,7 @@ defmodule FastestMCP.ServerRuntime do
       server: runtime.server,
       dependencies: runtime.server.dependencies,
       task_store: Map.get(runtime, :task_store),
+      session_state_store: Map.get(runtime, :session_state_store),
       session_supervisor: runtime.session_supervisor,
       terminated_session_store: Map.get(runtime, :terminated_session_store),
       event_bus: runtime.event_bus,
@@ -235,7 +234,9 @@ defmodule FastestMCP.ServerRuntime do
   end
 
   defp start_lifespans(state) do
-    case safe_start(fn -> Lifespan.run_all(state.server, state.server.lifespans) end) do
+    case safe_start(fn ->
+           Lifespan.run_all(state.server, Server.runtime_lifespans(state.server))
+         end) do
       {:ok, {:ok, context, cleanups}} ->
         {:ok,
          state
@@ -517,37 +518,18 @@ defmodule FastestMCP.ServerRuntime do
         |> maybe_put_opt(:negotiated_protocol_version, context.negotiated_protocol_version)
         |> maybe_put_opt(:client_capabilities, context.client_capabilities)
         |> maybe_put_opt(:request_metadata, context.request_metadata)
-        |> maybe_put_opt(:auth_input, inherited_auth_input(context))
+        |> maybe_put_opt(:transport_authorization, context.transport_authorization)
+        |> maybe_put_opt(:auth_input, %{})
         |> maybe_put_opt(:principal, context.principal)
+        |> maybe_put_opt(:authenticated, context.authenticated)
         |> maybe_put_opt(:auth, context.auth)
         |> maybe_put_opt(:capabilities, context.capabilities)
+        |> maybe_put_opt(:verified_audiences, context.verified_audiences)
+        |> maybe_put_opt(:verified_scopes, context.verified_scopes)
+        |> maybe_put_opt(:transport_authenticated, context.authenticated)
 
       _other ->
         opts
-    end
-  end
-
-  defp inherited_auth_input(%Context{} = context) do
-    request_metadata = Map.new(context.request_metadata)
-    access_token = Context.access_token(context)
-
-    headers =
-      request_metadata
-      |> Map.get(:headers, Map.get(request_metadata, "headers", %{}))
-      |> Map.new()
-
-    has_authorization? =
-      Map.has_key?(headers, "authorization") or
-        Map.has_key?(headers, :authorization) or
-        Map.has_key?(request_metadata, "authorization") or
-        Map.has_key?(request_metadata, :authorization)
-
-    if access_token && not has_authorization? do
-      request_metadata
-      |> Map.put("headers", Map.put(headers, "authorization", "Bearer " <> access_token))
-      |> Map.put_new("authorization", "Bearer " <> access_token)
-    else
-      request_metadata
     end
   end
 
@@ -764,7 +746,7 @@ defmodule FastestMCP.ServerRuntime do
   defp materialize_server_runtime(%Server{} = server) do
     case materialize_provider_runtimes(server.providers) do
       {:ok, providers} ->
-        case materialize_middleware_runtimes(server.middleware) do
+        case materialize_middleware_runtimes(Server.runtime_middleware(server)) do
           {:ok, middleware} ->
             {:ok, %{server | middleware: middleware, providers: providers}}
 

@@ -43,10 +43,11 @@ defmodule FastestMCP.Resources.HTTP do
           request
 
         body ->
-          {String.to_charlist(resource.url), resource.headers, ~c"application/octet-stream", body}
+          {String.to_charlist(resource.url), resource.headers, ~c"application/octet-stream",
+           IO.iodata_to_binary(body)}
       end
 
-    http_options = [body_format: :binary]
+    http_options = []
 
     case :httpc.request(resource.method, request, http_options, body_format: :binary) do
       {:ok, {{_version, status, _reason}, headers, body}} when status in 200..299 ->

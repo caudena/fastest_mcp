@@ -1,7 +1,8 @@
 # Transports
 
-FastestMCP 0.2 targets MCP `2025-11-25` over streamable HTTP and stdio.
-Both transports accept JSON-RPC 2.0 only and feed the same operation pipeline.
+FastestMCP supports MCP `2026-07-28` and `2025-11-25` over streamable HTTP and
+stdio. Both transports accept JSON-RPC 2.0 only and feed the same operation
+pipeline, but the modern and legacy lifecycle envelopes stay distinct.
 
 ## Streamable HTTP
 
@@ -9,8 +10,8 @@ The configured MCP endpoint is `/mcp` by default. It is the only built-in HTTP
 route:
 
 - `POST /mcp` carries exactly one JSON-RPC request, notification, or response
-- `GET /mcp` opens the session event stream
-- `DELETE /mcp` terminates the session
+- `GET /mcp` opens the legacy session event stream
+- `DELETE /mcp` terminates a legacy session
 
 Every POST must use JSON media (`application/json`; parameters and casing are
 accepted). Its `Accept` header must allow both `application/json` and
@@ -27,7 +28,23 @@ There are no built-in `/health`, `/mcp/tools`, `/mcp/resources/read`, or other
 method-specific routes. Add application health endpoints or custom routes in
 the surrounding Plug/Phoenix router, outside the MCP endpoint.
 
-### Session lifecycle
+### Modern request lifecycle (`2026-07-28`)
+
+The client starts with `server/discover`. Every request carries protocol
+version, client information, and client capabilities in standard request
+metadata. There is no initialize notification, `MCP-Session-Id`, or session
+termination request. Standard `Mcp-Method`, `Mcp-Name`, and declared
+`Mcp-Param-*` HTTP headers mirror routing fields and are validated against the
+JSON-RPC body.
+
+Modern HTTP is POST-only: GET, DELETE, session replay, `Last-Event-ID`, and
+detached request work are not part of this profile. A POST can remain open as
+SSE for callbacks, progress/log notifications, or `subscriptions/listen`.
+Closing that response stream cancels its request worker; reconnecting a modern
+listener creates a fresh `subscriptions/listen` request rather than replaying
+an old stream.
+
+### Legacy session lifecycle (`2025-11-25`)
 
 An HTTP client follows this sequence:
 
@@ -39,15 +56,15 @@ An HTTP client follows this sequence:
 
 Requests before `notifications/initialized`, client-chosen session ids,
 unsupported subsequent `MCP-Protocol-Version` headers, and unknown or
-terminated sessions are rejected. An initialize request that proposes another
-version receives a successful result selecting `2025-11-25`. The connected
-`FastestMCP.Client` performs this lifecycle automatically.
+terminated sessions are rejected. The connected `FastestMCP.Client` performs
+this lifecycle automatically when explicitly selected or after an
+evidence-based `:auto` fallback.
 
 Sessions provide protocol identity, task ownership, subscriptions, and server
 notifications. `GET /mcp` uses event-stream framing inside streamable HTTP; it
 is not the removed standalone SSE transport.
 
-Streamed POST dispatch runs beneath the server runtime's `Task.Supervisor` and
+Legacy streamed POST dispatch runs beneath the server runtime's `Task.Supervisor` and
 has a configurable `stream_request_timeout_ms:` (60 seconds by default). A
 network disconnect does not imply MCP cancellation: detached work continues
 under supervision. `notifications/cancelled` stops cancellable ordinary work;
@@ -56,7 +73,7 @@ never cancelled.
 
 ### Request-local handler state
 
-FastestMCP no longer exposes a zero-session HTTP mode. The former
+For the legacy profile, FastestMCP no longer exposes a zero-session HTTP mode. The former
 `stateless_http:` and `stateless:` options fail at startup because they cannot
 represent initialize ordering, callback correlation, or session ownership.
 
@@ -81,7 +98,7 @@ Request-scoped state:
 Use the default `state_scope: :session` when handler values should persist
 between requests in the same MCP session.
 
-### Bidirectional streams and replay
+### Legacy bidirectional streams and replay (`2025-11-25`)
 
 Server-originated roots, sampling, elicitation, ping, task, progress, logging,
 and cancellation messages all pass through the session coordinator. A POST may
@@ -105,7 +122,7 @@ store is process-local. A host that requires replay across process or node
 failure owns durable persistence and routing of a resumed session to that
 store.
 
-The connected client accepts only JSON and SSE response media, retains SSE
+On the legacy profile, the connected client accepts only JSON and SSE response media, retains SSE
 `id` and `retry` fields, resumes either a POST-originated or GET-originated
 stream with GET plus `Last-Event-ID`, clamps retry delays, and suppresses
 duplicate delivery. It stops retrying after the session is closed. A network
@@ -219,13 +236,24 @@ The transport owns that server until stdin closes. `serve/4` also accepts the
 name of an already-running server for embedding, but output emitted before the
 transport takes control is necessarily the host launcher's responsibility.
 Each line is one JSON-RPC 2.0 message; batches and native non-JSON-RPC maps are rejected.
-Each stdio connection has one runtime-owned session and must complete
-`initialize` followed by `notifications/initialized` before other requests.
+On `2025-11-25`, each stdio connection has one runtime-owned session and must
+complete `initialize` followed by `notifications/initialized` before other
+requests. On `2026-07-28`, stdio is sessionless: requests carry their own
+protocol/client metadata and multiple request ids may be active concurrently.
 A concurrent reader continues accepting callback responses and notifications
 while supervised handlers run, and one serialized writer owns stdout. This
-gives stdio the same roots, sampling, elicitation, peer-task, progress, logging,
-ping, and cancellation behavior as HTTP. Application logs and child-process
-diagnostics stay on stderr.
+gives stdio the version-appropriate callback, progress, subscription, task,
+and cancellation behavior as HTTP. Legacy roots, logging-level control, ping,
+and session notifications remain on the legacy connection. Application logs
+and child-process diagnostics stay on stderr.
+
+The connected client restarts an unexpectedly exited child only after a
+`2026-07-28` stdio connection reached ready state. Restart is bounded to three
+attempts by default. Ordinary in-flight requests fail and are not replayed;
+active `subscriptions/listen` handles are reissued with fresh ids. Configure
+`stdio_restart: true | false | [max_attempts:, retry_ms:, max_retry_ms:]` on
+`Client.connect/2`. A legacy child exit or explicit disconnect remains
+terminal.
 
 The transport gives handler and callback workers an stderr-backed group leader
 so ordinary `IO.puts/1`, Logger output, startup messages, and malformed-input

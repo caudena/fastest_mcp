@@ -4,9 +4,9 @@ defmodule FastestMCP.MixProject do
   def project do
     [
       app: :fastest_mcp,
-      version: "0.2.0",
+      version: "0.3.0",
       description:
-        "BEAM-native MCP toolkit for supervised Elixir servers, clients, auth, and transports",
+        "Production-grade Model Context Protocol (MCP) SDK for Elixir and Phoenix. Complete server and client support for MCP 2026-07-28 and 2025-11-25, with OAuth authentication, MCP Apps, Tasks, Streamable HTTP, stdio, strict validation, observability, and a FastMCP-inspired DSL.",
       source_url: "https://github.com/caudena/fastest_mcp",
       homepage_url: "https://github.com/caudena/fastest_mcp",
       elixir: "~> 1.19",
@@ -65,6 +65,8 @@ defmodule FastestMCP.MixProject do
         "docs/context.md",
         "docs/dependency-injection.md",
         "docs/lifespan.md",
+        "docs/protocol-versions.md",
+        "docs/extensions.md",
         "docs/transports.md",
         "docs/client.md",
         "docs/sampling-and-interaction.md",
@@ -74,6 +76,7 @@ defmodule FastestMCP.MixProject do
         "docs/telemetry.md",
         "docs/component-manager.md",
         "docs/auth.md",
+        "docs/phoenix-deployment.md",
         "docs/middleware.md",
         "docs/background-tasks.md",
         "docs/providers-and-mounting.md",
@@ -88,7 +91,10 @@ defmodule FastestMCP.MixProject do
         "Start Here": ["README.md", "CHANGELOG.md", "docs/onboarding.md"],
         Explanation: [
           "docs/why-fastest-mcp.md",
-          "docs/compatibility-and-scope.md"
+          "docs/compatibility-and-scope.md",
+          "docs/protocol-versions.md",
+          "docs/extensions.md",
+          "docs/phoenix-deployment.md"
         ],
         Features: [
           "docs/components.md",
@@ -142,6 +148,9 @@ defmodule FastestMCP.MixProject do
         FastestMCP.ServerModule,
         FastestMCP.Server,
         FastestMCP.Context,
+        FastestMCP.ApplicationSession,
+        FastestMCP.Apps,
+        FastestMCP.InputRequiredResult,
         FastestMCP.RequestContext,
         FastestMCP.BackgroundTask,
         FastestMCP.PeerTask,
@@ -153,15 +162,23 @@ defmodule FastestMCP.MixProject do
         FastestMCP.Client.OAuth,
         FastestMCP.Client.OAuth.AuthorizationHandler,
         FastestMCP.Client.OAuth.AuthorizationHandler.Request,
+        FastestMCP.Client.OAuth.ClientAssertionProvider,
+        FastestMCP.Client.OAuth.ClientAssertionProvider.Request,
+        FastestMCP.Client.OAuth.EnterpriseManagedProvider,
+        FastestMCP.Client.OAuth.EnterpriseManagedProvider.Request,
+        FastestMCP.Client.OAuth.EnterpriseManagedProvider.Assertion,
         FastestMCP.Client.OAuth.Error,
         FastestMCP.Client.OAuth.TokenStore,
         FastestMCP.Client.OAuth.TokenStore.Memory,
         FastestMCP.Client.ProtocolError,
         FastestMCP.Client.Request,
         FastestMCP.Client.Task,
+        FastestMCP.Client.ToolResult,
         FastestMCP.Client.URLElicitation,
         FastestMCP.Protocol,
+        FastestMCP.Protocol.Extensions,
         FastestMCP.Transport.HTTPApp,
+        FastestMCP.Transport.WellKnownHTTP,
         FastestMCP.Transport.StreamableHTTP,
         FastestMCP.Transport.Stdio
       ],
@@ -170,12 +187,21 @@ defmodule FastestMCP.MixProject do
         FastestMCP.Auth.ProtectedResource,
         FastestMCP.Auth.Result,
         FastestMCP.Auth.StaticToken,
+        FastestMCP.Authorization,
+        FastestMCP.Authorization.Check,
+        FastestMCP.Authorization.Context,
         FastestMCP.ComponentManager,
         FastestMCP.Error,
         FastestMCP.Interact,
         FastestMCP.Middleware,
+        FastestMCP.Middleware.ToolSearch,
         FastestMCP.Operation,
         FastestMCP.Provider,
+        FastestMCP.Providers.ApplicationSessions,
+        FastestMCP.Providers.Proxy,
+        FastestMCP.ResourceSecurity,
+        FastestMCP.ServerExtension,
+        FastestMCP.ServerExtension.Method,
         FastestMCP.Sampling,
         FastestMCP.Schema,
         FastestMCP.Schema.Compiled,
@@ -217,7 +243,9 @@ defmodule FastestMCP.MixProject do
       ],
       licenses: ["Apache-2.0"],
       links: %{
-        "GitHub" => "https://github.com/caudena/fastest_mcp"
+        "Documentation" => "https://hexdocs.pm/fastest_mcp",
+        "GitHub" => "https://github.com/caudena/fastest_mcp",
+        "Changelog" => "https://github.com/caudena/fastest_mcp/blob/master/CHANGELOG.md"
       }
     ]
   end

@@ -9,11 +9,11 @@ defmodule FastestMCP.Transport.HTTPApp do
 
   alias FastestMCP.Auth.ProtectedResource
   alias FastestMCP.Error
-  alias FastestMCP.Transport.StreamableHTTP
-  alias FastestMCP.Transport.HTTPCommon
-  alias FastestMCP.Transport.WellKnownHTTP
   alias FastestMCP.Provider
   alias FastestMCP.ServerRuntime
+  alias FastestMCP.Transport.HTTPCommon
+  alias FastestMCP.Transport.StreamableHTTP
+  alias FastestMCP.Transport.WellKnownHTTP
 
   @type middleware ::
           (Plug.Conn.t(), (Plug.Conn.t() -> Plug.Conn.t()) -> Plug.Conn.t())

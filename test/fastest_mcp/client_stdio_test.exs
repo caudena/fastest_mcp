@@ -32,8 +32,12 @@ defmodule FastestMCP.ClientStdioTest do
     assert Client.protocol_version(client) == Protocol.current_version()
     assert %{items: tools, next_cursor: nil} = Client.list_tools(client)
     assert Enum.sort(Enum.map(tools, & &1["name"])) == ["child_env", "echo"]
-    assert %{"message" => "hi"} = Client.call_tool(client, "echo", %{"message" => "hi"})
-    assert %{"value" => "from-client"} = Client.call_tool(client, "child_env", %{})
+
+    assert %{"structuredContent" => %{"message" => "hi"}} =
+             Client.call_tool(client, "echo", %{"message" => "hi"})
+
+    assert %{"structuredContent" => %{"value" => "from-client"}} =
+             Client.call_tool(client, "child_env", %{})
   end
 
   test "connected client authenticates protected stdio servers" do
@@ -59,7 +63,8 @@ defmodule FastestMCP.ClientStdioTest do
       if Client.connected?(client), do: Client.disconnect(client)
     end)
 
-    assert %{"sub" => "local-client"} = Client.call_tool(client, "whoami", %{})
+    assert %{"structuredContent" => %{"sub" => "local-client"}} =
+             Client.call_tool(client, "whoami", %{})
   end
 
   test "stdio authentication metadata is omitted unless the legacy option is explicit" do
@@ -68,6 +73,7 @@ defmodule FastestMCP.ClientStdioTest do
     client =
       Client.connect!(
         {:stdio, elixir, auth_metadata_probe_stdio_server_args()},
+        protocol_version: "2025-11-25",
         access_token: "must-not-be-written-to-json-rpc"
       )
 
@@ -92,7 +98,10 @@ defmodule FastestMCP.ClientStdioTest do
                 code: :bad_request,
                 details: %{max_in_flight: 2, supported: 1, transport: :stdio}
               }} =
-               Client.connect({:stdio, elixir, stdio_server_args(server_name)}, max_in_flight: 2)
+               Client.connect({:stdio, elixir, stdio_server_args(server_name)},
+                 protocol_version: "2025-11-25",
+                 max_in_flight: 2
+               )
     after
       Process.flag(:trap_exit, previous)
     end
@@ -125,7 +134,20 @@ defmodule FastestMCP.ClientStdioTest do
     assert error.code == :timeout
 
     assert Client.connected?(client)
-    assert %{"message" => "hi"} = Client.call_tool(client, "echo", %{"message" => "hi"})
+
+    assert %{"structuredContent" => %{"message" => "hi"}} =
+             Client.call_tool(client, "echo", %{"message" => "hi"})
+  end
+
+  test "automatic stdio negotiation falls back on the same live process after a non-modern error" do
+    elixir = System.find_executable("elixir") || flunk("elixir executable not found on PATH")
+
+    client = Client.connect!({:stdio, elixir, legacy_fallback_stdio_server_args()})
+    on_exit(fn -> if Client.connected?(client), do: Client.disconnect(client) end)
+
+    assert Client.protocol_version(client) == "2025-11-25"
+    assert get_in(Client.initialize_result(client), ["serverInfo", "name"]) == "same-process"
+    assert %{items: [%{"name" => "fallback-ok"}]} = Client.list_tools(client)
   end
 
   test "stdio client routes notifications without consuming the matching response" do
@@ -135,6 +157,7 @@ defmodule FastestMCP.ClientStdioTest do
     client =
       Client.connect!(
         {:stdio, elixir, interleaved_stdio_server_args()},
+        protocol_version: "2025-11-25",
         notification_handler: fn message -> send(test_pid, {:stdio_notification, message}) end
       )
 
@@ -157,6 +180,268 @@ defmodule FastestMCP.ClientStdioTest do
                     }}
   end
 
+  test "modern stdio demultiplexes concurrent responses while a subscription remains open" do
+    server_name =
+      "client-stdio-modern-demux-" <>
+        Integer.to_string(System.unique_integer([:positive]))
+
+    elixir = System.find_executable("elixir") || flunk("elixir executable not found on PATH")
+    test_pid = self()
+
+    client =
+      Client.connect!(
+        {:stdio, elixir, modern_concurrent_stdio_server_args(server_name)},
+        protocol_version: "2026-07-28",
+        max_in_flight: 4,
+        notification_handler: fn message -> send(test_pid, {:global_notification, message}) end
+      )
+
+    on_exit(fn ->
+      if Client.connected?(client), do: Client.disconnect(client)
+    end)
+
+    listener =
+      Client.listen(
+        client,
+        %{"resourceSubscriptions" => ["status://modern"]},
+        on_notification: fn message -> send(test_pid, {:subscription_notification, message}) end
+      )
+
+    assert_receive {:subscription_notification,
+                    %{
+                      "method" => "notifications/subscriptions/acknowledged",
+                      "params" => %{
+                        "_meta" => %{
+                          "io.modelcontextprotocol/subscriptionId" => subscription_id
+                        }
+                      }
+                    }},
+                   2_000
+
+    assert subscription_id == listener.request_id
+
+    slow =
+      Client.request_async(client, "tools/call", %{
+        "name" => "slow",
+        "arguments" => %{}
+      })
+
+    fast =
+      Client.request_async(client, "tools/call", %{
+        "name" => "fast",
+        "arguments" => %{}
+      })
+
+    assert %{"structuredContent" => %{"name" => "fast"}} = Client.await(fast, 2_000)
+    assert %{"structuredContent" => %{"name" => "slow"}} = Client.await(slow, 2_000)
+
+    cancelled =
+      Client.request_async(client, "tools/call", %{
+        "name" => "slow",
+        "arguments" => %{}
+      })
+
+    cancelled_id = cancelled.request_id
+    assert :ok = Client.cancel(cancelled, "ordinary request cancellation")
+
+    refute_receive {:global_notification,
+                    %{
+                      "method" => "notifications/cancelled",
+                      "params" => %{"requestId" => ^cancelled_id}
+                    }},
+                   300
+
+    assert %{items: tools} = Client.list_tools(client)
+    assert Enum.any?(tools, &(&1["name"] == "fast"))
+
+    assert_receive {:subscription_notification,
+                    %{
+                      "method" => "notifications/resources/updated",
+                      "params" => %{
+                        "uri" => "status://modern",
+                        "_meta" => %{
+                          "io.modelcontextprotocol/subscriptionId" => ^subscription_id
+                        }
+                      }
+                    }},
+                   2_000
+
+    assert_receive {:global_notification,
+                    %{
+                      "method" => "notifications/resources/updated",
+                      "params" => %{
+                        "uri" => "status://modern",
+                        "_meta" => %{
+                          "io.modelcontextprotocol/subscriptionId" => ^subscription_id
+                        }
+                      }
+                    }},
+                   2_000
+
+    assert :ok = Client.cancel(listener, "test complete")
+
+    assert %{"structuredContent" => %{"name" => "fast"}} =
+             client
+             |> Client.request_async("tools/call", %{
+               "name" => "fast",
+               "arguments" => %{}
+             })
+             |> Client.await(2_000)
+
+    refute_receive {:subscription_notification,
+                    %{
+                      "method" => "notifications/resources/updated",
+                      "params" => %{"uri" => "status://modern"}
+                    }},
+                   100
+
+    refute_receive {:global_notification,
+                    %{
+                      "method" => "notifications/resources/updated",
+                      "params" => %{"uri" => "status://modern"}
+                    }},
+                   100
+
+    assert %{items: tools} = Client.list_tools(client)
+    assert Enum.map(tools, & &1["name"]) == ["fast", "slow"]
+    assert Client.connected?(client)
+  end
+
+  test "modern stdio restarts an exited child and re-establishes subscriptions" do
+    server_name =
+      "client-stdio-modern-restart-" <>
+        Integer.to_string(System.unique_integer([:positive]))
+
+    elixir = System.find_executable("elixir") || flunk("elixir executable not found on PATH")
+    test_pid = self()
+
+    client =
+      Client.connect!(
+        {:stdio, elixir, restartable_modern_stdio_server_args(server_name)},
+        protocol_version: "2026-07-28",
+        stdio_restart: [max_attempts: 3, retry_ms: 10, max_retry_ms: 50]
+      )
+
+    on_exit(fn -> if Client.connected?(client), do: Client.disconnect(client) end)
+
+    assert %{"structuredContent" => %{"name" => "fast"}} =
+             Client.call_tool(client, "fast", %{})
+
+    catalog_generation = :sys.get_state(client.pid).tool_catalog.generation
+
+    listener =
+      Client.listen(
+        client,
+        %{"resourceSubscriptions" => ["status://restart"]},
+        on_notification: fn message -> send(test_pid, {:restart_notification, message}) end
+      )
+
+    assert_receive {:restart_notification,
+                    %{
+                      "method" => "notifications/subscriptions/acknowledged",
+                      "params" => %{
+                        "_meta" => %{
+                          "io.modelcontextprotocol/subscriptionId" => first_subscription_id
+                        }
+                      }
+                    }},
+                   2_000
+
+    crash =
+      Client.request_async(client, "tools/call", %{
+        "name" => "crash",
+        "arguments" => %{}
+      })
+
+    assert_raise Error, fn -> Client.await(crash, 3_000) end
+
+    assert_receive {:restart_notification,
+                    %{
+                      "method" => "notifications/subscriptions/acknowledged",
+                      "params" => %{
+                        "_meta" => %{
+                          "io.modelcontextprotocol/subscriptionId" => second_subscription_id
+                        }
+                      }
+                    }},
+                   5_000
+
+    refute second_subscription_id == first_subscription_id
+    assert first_subscription_id == listener.request_id
+
+    restarted_state = :sys.get_state(client.pid)
+    assert restarted_state.tool_catalog.generation > catalog_generation
+    refute restarted_state.tool_catalog_ready?
+
+    assert %{"structuredContent" => %{"name" => "fast"}} =
+             Client.call_tool(client, "fast", %{})
+
+    assert_receive {:restart_notification,
+                    %{
+                      "method" => "notifications/resources/updated",
+                      "params" => %{
+                        "uri" => "status://restart",
+                        "_meta" => %{
+                          "io.modelcontextprotocol/subscriptionId" => ^second_subscription_id
+                        }
+                      }
+                    }},
+                   2_000
+
+    assert Client.connected?(client)
+    assert :ok = Client.cancel(listener, "test complete")
+  end
+
+  test "modern stdio stops cleanly after bounded restart attempts are exhausted" do
+    server_name =
+      "client-stdio-modern-restart-exhaustion-" <>
+        Integer.to_string(System.unique_integer([:positive]))
+
+    marker =
+      Path.join(
+        System.tmp_dir!(),
+        "fastest-mcp-stdio-restart-#{System.unique_integer([:positive])}"
+      )
+
+    elixir = System.find_executable("elixir") || flunk("elixir executable not found on PATH")
+    test_pid = self()
+
+    client =
+      Client.connect!(
+        {:stdio, elixir, exhausting_modern_stdio_server_args(server_name, marker)},
+        protocol_version: "2026-07-28",
+        stdio_restart: [max_attempts: 2, retry_ms: 10, max_retry_ms: 20]
+      )
+
+    client_ref = Process.monitor(client.pid)
+
+    on_exit(fn ->
+      File.rm(marker)
+      if Client.connected?(client), do: Client.disconnect(client)
+    end)
+
+    listener =
+      Client.listen(client, %{"resourceSubscriptions" => ["status://restart"]},
+        on_notification: fn message -> send(test_pid, {:exhaustion_notification, message}) end
+      )
+
+    assert_receive {:exhaustion_notification,
+                    %{"method" => "notifications/subscriptions/acknowledged"}},
+                   2_000
+
+    crash =
+      Client.request_async(client, "tools/call", %{
+        "name" => "crash",
+        "arguments" => %{}
+      })
+
+    assert_raise Error, fn -> Client.await(crash, 3_000) end
+    assert_raise Error, fn -> Client.await(listener, 5_000) end
+
+    assert_receive {:DOWN, ^client_ref, :process, _pid, :normal}, 5_000
+    refute Client.connected?(client)
+  end
+
   test "task progress retains token ownership, stays monotonic, and cleans up at terminal" do
     elixir = System.find_executable("elixir") || flunk("elixir executable not found on PATH")
     test_pid = self()
@@ -164,6 +449,7 @@ defmodule FastestMCP.ClientStdioTest do
     client =
       Client.connect!(
         {:stdio, elixir, task_progress_stdio_server_args()},
+        protocol_version: "2025-11-25",
         progress_handler: fn params -> send(test_pid, {:task_progress, params}) end
       )
 
@@ -261,6 +547,152 @@ defmodule FastestMCP.ClientStdioTest do
     Enum.flat_map(code_paths, fn path -> ["-pa", path] end) ++ ["-e", code]
   end
 
+  defp legacy_fallback_stdio_server_args do
+    code_paths =
+      Mix.Project.build_path()
+      |> Path.join("lib/*/ebin")
+      |> Path.wildcard()
+
+    code = ~S'''
+    write = fn message -> IO.puts(JSON.encode!(message)) end
+
+    loop = fn loop ->
+      case IO.read(:stdio, :line) do
+        :eof ->
+          :ok
+
+        line ->
+          request = JSON.decode!(line)
+
+          case request["method"] do
+            "server/discover" ->
+              write.(%{
+                "jsonrpc" => "2.0",
+                "id" => request["id"],
+                "error" => %{"code" => -32042, "message" => "legacy-only process"}
+              })
+
+            "initialize" ->
+              write.(%{
+                "jsonrpc" => "2.0",
+                "id" => request["id"],
+                "result" => %{
+                  "protocolVersion" => "2025-11-25",
+                  "capabilities" => %{"tools" => %{}},
+                  "serverInfo" => %{"name" => "same-process", "version" => "1.0.0"}
+                }
+              })
+
+            "notifications/initialized" ->
+              :ok
+
+            "tools/list" ->
+              write.(%{
+                "jsonrpc" => "2.0",
+                "id" => request["id"],
+                "result" => %{
+                  "tools" => [
+                    %{"name" => "fallback-ok", "inputSchema" => %{"type" => "object"}}
+                  ]
+                }
+              })
+          end
+
+          loop.(loop)
+      end
+    end
+
+    loop.(loop)
+    '''
+
+    Enum.flat_map(code_paths, fn path -> ["-pa", path] end) ++ ["-e", code]
+  end
+
+  defp modern_concurrent_stdio_server_args(server_name) do
+    code_paths =
+      Mix.Project.build_path()
+      |> Path.join("lib/*/ebin")
+      |> Path.wildcard()
+
+    code = """
+    Application.put_env(:opentelemetry, :span_processor, :simple)
+    Application.put_env(:opentelemetry, :traces_exporter, :none)
+    Application.put_env(:opentelemetry, :create_application_tracers, false)
+    Application.ensure_all_started(:fastest_mcp)
+
+    server =
+      FastestMCP.server(#{inspect(server_name)})
+      |> FastestMCP.add_tool("fast", fn _arguments, ctx ->
+        FastestMCP.Context.notify_resource_updated(ctx, "status://modern")
+        %{"name" => "fast"}
+      end)
+      |> FastestMCP.add_tool("slow", fn _arguments, _ctx ->
+        Process.sleep(150)
+        %{"name" => "slow"}
+      end)
+      |> FastestMCP.add_resource("status://modern", fn _arguments, _ctx -> %{ok: true} end)
+
+    FastestMCP.Transport.Stdio.serve(server)
+    """
+
+    Enum.flat_map(code_paths, fn path -> ["-pa", path] end) ++ ["-e", code]
+  end
+
+  defp restartable_modern_stdio_server_args(server_name) do
+    code_paths =
+      Mix.Project.build_path()
+      |> Path.join("lib/*/ebin")
+      |> Path.wildcard()
+
+    code = """
+    Application.put_env(:opentelemetry, :span_processor, :simple)
+    Application.put_env(:opentelemetry, :traces_exporter, :none)
+    Application.put_env(:opentelemetry, :create_application_tracers, false)
+    Application.ensure_all_started(:fastest_mcp)
+
+    server =
+      FastestMCP.server(#{inspect(server_name)})
+      |> FastestMCP.add_tool("crash", fn _arguments, _ctx -> System.halt(17) end)
+      |> FastestMCP.add_tool("fast", fn _arguments, ctx ->
+        FastestMCP.Context.notify_resource_updated(ctx, "status://restart")
+        %{"name" => "fast"}
+      end)
+      |> FastestMCP.add_resource("status://restart", fn _arguments, _ctx -> %{ok: true} end)
+
+    FastestMCP.Transport.Stdio.serve(server)
+    """
+
+    Enum.flat_map(code_paths, fn path -> ["-pa", path] end) ++ ["-e", code]
+  end
+
+  defp exhausting_modern_stdio_server_args(server_name, marker) do
+    code_paths =
+      Mix.Project.build_path()
+      |> Path.join("lib/*/ebin")
+      |> Path.wildcard()
+
+    code = """
+    if File.exists?(#{inspect(marker)}), do: System.halt(19)
+
+    Application.put_env(:opentelemetry, :span_processor, :simple)
+    Application.put_env(:opentelemetry, :traces_exporter, :none)
+    Application.put_env(:opentelemetry, :create_application_tracers, false)
+    Application.ensure_all_started(:fastest_mcp)
+
+    server =
+      FastestMCP.server(#{inspect(server_name)})
+      |> FastestMCP.add_tool("crash", fn _arguments, _ctx ->
+        File.write!(#{inspect(marker)}, "crashed")
+        System.halt(17)
+      end)
+      |> FastestMCP.add_resource("status://restart", fn _arguments, _ctx -> %{ok: true} end)
+
+    FastestMCP.Transport.Stdio.serve(server)
+    """
+
+    Enum.flat_map(code_paths, fn path -> ["-pa", path] end) ++ ["-e", code]
+  end
+
   defp protected_stdio_server_args(server_name) do
     code_paths =
       Mix.Project.build_path()
@@ -322,7 +754,7 @@ defmodule FastestMCP.ClientStdioTest do
                 "jsonrpc" => "2.0",
                 "id" => request["id"],
                 "result" => %{
-                  "protocolVersion" => FastestMCP.Protocol.current_version(),
+                  "protocolVersion" => "2025-11-25",
                   "capabilities" => %{"tools" => %{}},
                   "serverInfo" => %{"name" => "interleaved", "version" => "1.0.0"}
                 }
@@ -383,7 +815,7 @@ defmodule FastestMCP.ClientStdioTest do
               "jsonrpc" => "2.0",
               "id" => request["id"],
               "result" => %{
-                "protocolVersion" => FastestMCP.Protocol.current_version(),
+                "protocolVersion" => "2025-11-25",
                 "capabilities" => %{},
                 "serverInfo" => %{
                   "name" => if(auth, do: "injected-wire", else: "clean-wire"),
@@ -438,7 +870,7 @@ defmodule FastestMCP.ClientStdioTest do
                 "jsonrpc" => "2.0",
                 "id" => request["id"],
                 "result" => %{
-                  "protocolVersion" => FastestMCP.Protocol.current_version(),
+                  "protocolVersion" => "2025-11-25",
                   "capabilities" => %{
                     "tools" => %{},
                     "tasks" => %{"requests" => %{"tools" => %{"call" => %{}}}}
