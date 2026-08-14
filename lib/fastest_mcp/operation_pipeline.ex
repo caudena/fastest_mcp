@@ -33,6 +33,7 @@ defmodule FastestMCP.OperationPipeline do
   alias FastestMCP.Middleware
   alias FastestMCP.Operation
   alias FastestMCP.Protocol.Duration
+  alias FastestMCP.Protocol.Extensions
   alias FastestMCP.Pagination
   alias FastestMCP.Provider
   alias FastestMCP.Protocol
@@ -40,6 +41,7 @@ defmodule FastestMCP.OperationPipeline do
   alias FastestMCP.ServerRuntime
   alias FastestMCP.TaskConfig
   alias FastestMCP.TaskMeta
+  alias FastestMCP.TaskOwner
   alias FastestMCP.Telemetry
 
   @resolved_component_key {__MODULE__, :resolved_component}
@@ -58,6 +60,32 @@ defmodule FastestMCP.OperationPipeline do
       end,
       authenticate?: false
     )
+  end
+
+  @doc "Discovers capabilities for a stateless MCP 2026 connection."
+  def discover(server_name, params \\ %{}, opts \\ []) do
+    run(
+      server_name,
+      :server,
+      "server/discover",
+      nil,
+      normalize_arguments(params),
+      opts,
+      fn server, operation ->
+        %{}
+        |> Map.put("supportedVersions", Protocol.supported_versions())
+        |> Map.put("capabilities", server_capabilities(server, operation, :modern))
+        |> maybe_put("instructions", metadata_value(server.metadata, :instructions))
+      end
+    )
+  end
+
+  @doc false
+  def server_info(server_name) do
+    server_name
+    |> fetch_runtime!()
+    |> Map.fetch!(:server)
+    |> server_info_for()
   end
 
   @doc "Runs a ping request."
@@ -134,6 +162,40 @@ defmodule FastestMCP.OperationPipeline do
     }
   end
 
+  @doc false
+  def subscription_profile(server_name, requested_resource_uris, opts \\ [])
+      when is_list(requested_resource_uris) and is_list(opts) do
+    run(
+      server_name,
+      :server,
+      "subscriptions/listen",
+      nil,
+      %{},
+      opts,
+      fn server, operation ->
+        discovery_operation = %{operation | method: "server/discover"}
+
+        resource_uris =
+          Enum.filter(requested_resource_uris, fn uri ->
+            resource_operation = %{
+              operation
+              | component_type: :resource,
+                method: "resources/read",
+                target: uri
+            }
+
+            accessible_resource?(server, uri, resource_operation)
+          end)
+
+        %{
+          capabilities: server_capabilities(server, discovery_operation, :modern),
+          resource_uris: resource_uris,
+          owner_fingerprint: TaskOwner.from_context(operation.context)
+        }
+      end
+    )
+  end
+
   @doc "Resolves completion values for a prompt argument or resource-template parameter."
   def complete(server_name, ref, argument, opts \\ []) do
     ref = normalize_completion_ref(ref, Keyword.get(opts, :wire, false))
@@ -189,6 +251,23 @@ defmodule FastestMCP.OperationPipeline do
   @doc false
   def read_resource_with_component(server_name, uri, opts \\ []) do
     invoke_with_component(server_name, :resource, "resources/read", to_string(uri), %{}, opts)
+  end
+
+  @doc false
+  def visible_resource_descriptor(server_name, uri, opts \\ []) do
+    with_visible_snapshot(
+      server_name,
+      :resource,
+      "resources/read",
+      to_string(uri),
+      opts,
+      fn server, operation ->
+        case resolve_resource_target(server, to_string(uri), operation) do
+          {_kind, component, _captures} -> component
+          nil -> nil
+        end
+      end
+    )
   end
 
   @doc "Renders a prompt with the given arguments."
@@ -248,10 +327,16 @@ defmodule FastestMCP.OperationPipeline do
             })
 
           nil ->
+            modern? = operation.context.negotiated_protocol_version == "2026-07-28"
+
             raise Error,
               code: :not_found,
               message: "unknown resource #{inspect(target)}",
-              details: %{jsonrpc_code: -32_002}
+              details:
+                %{
+                  jsonrpc_code: if(modern?, do: -32_602, else: -32_002)
+                }
+                |> maybe_put(:uri, if(modern?, do: target))
         end
     end)
   end
@@ -270,6 +355,7 @@ defmodule FastestMCP.OperationPipeline do
         if component do
           operation = %{operation | component: component}
           Telemetry.annotate_span(operation)
+          run_before_component_execute!(opts, component, operation)
           execute_component(component, operation)
         else
           raise Error,
@@ -278,6 +364,13 @@ defmodule FastestMCP.OperationPipeline do
         end
       end
     )
+  end
+
+  defp run_before_component_execute!(opts, component, operation) do
+    case Keyword.get(opts, :before_component_execute) do
+      callback when is_function(callback, 2) -> callback.(component, operation)
+      nil -> :ok
+    end
   end
 
   defp run(server_name, component_type, method, target, arguments, opts, executor, run_opts \\ []) do
@@ -396,9 +489,13 @@ defmodule FastestMCP.OperationPipeline do
   end
 
   defp with_visible_snapshot(server_name, component_type, method, opts, fun) do
+    with_visible_snapshot(server_name, component_type, method, nil, opts, fun)
+  end
+
+  defp with_visible_snapshot(server_name, component_type, method, target, opts, fun) do
     runtime = fetch_runtime!(server_name)
     context = build_context!(server_name, runtime, opts)
-    operation = build_operation(runtime, component_type, method, nil, %{}, context, opts)
+    operation = build_operation(runtime, component_type, method, target, %{}, context, opts)
 
     Context.with_request(context, fn ->
       operation =
@@ -851,8 +948,8 @@ defmodule FastestMCP.OperationPipeline do
 
     %{}
     |> maybe_put("protocolVersion", protocol_version(server))
-    |> maybe_put("serverInfo", server_info(server))
-    |> maybe_put("capabilities", server_capabilities(server, operation))
+    |> maybe_put("serverInfo", server_info_for(server))
+    |> maybe_put("capabilities", server_capabilities(server, operation, :legacy))
     |> maybe_put("instructions", metadata_value(server.metadata, :instructions))
   end
 
@@ -874,9 +971,9 @@ defmodule FastestMCP.OperationPipeline do
     end
   end
 
-  defp protocol_version(_server), do: Protocol.current_version()
+  defp protocol_version(_server), do: "2025-11-25"
 
-  defp server_info(server) do
+  defp server_info_for(server) do
     %{}
     |> maybe_put("name", server.name)
     |> maybe_put("version", server_version(server))
@@ -898,7 +995,7 @@ defmodule FastestMCP.OperationPipeline do
     end
   end
 
-  defp server_capabilities(server, operation) do
+  defp server_capabilities(server, operation, profile) do
     visible_tools = visible_components(server, :tool, operation)
     visible_resources = visible_components(server, :resource, operation)
     visible_templates = visible_components(server, :resource_template, operation)
@@ -911,7 +1008,7 @@ defmodule FastestMCP.OperationPipeline do
       "resources",
       capability_if_visible(
         visible_resources ++ visible_templates,
-        resource_capabilities(operation)
+        resource_capabilities(operation, profile)
       )
     )
     |> maybe_put(
@@ -922,7 +1019,11 @@ defmodule FastestMCP.OperationPipeline do
       "completions",
       completion_capability(visible_prompts, visible_templates)
     )
-    |> maybe_put("tasks", task_capabilities(operation, visible_tools))
+    |> maybe_put("tasks", if(profile == :legacy, do: task_capabilities(operation, visible_tools)))
+    |> maybe_put(
+      "extensions",
+      configured_extensions(server, profile)
+    )
     |> maybe_put("experimental", configured_experimental_capabilities(server))
   end
 
@@ -937,12 +1038,16 @@ defmodule FastestMCP.OperationPipeline do
     end
   end
 
-  defp resource_capabilities(operation) do
+  defp resource_capabilities(operation, :legacy) do
     if callback_transport?(operation) do
       %{"subscribe" => true, "listChanged" => true}
     else
       %{}
     end
+  end
+
+  defp resource_capabilities(operation, :modern) do
+    if callback_transport?(operation), do: %{"listChanged" => true}, else: %{}
   end
 
   defp logging_capability(operation) do
@@ -982,6 +1087,11 @@ defmodule FastestMCP.OperationPipeline do
     end
   end
 
+  defp configured_extensions(%{extensions: extensions}, profile) do
+    extensions = Extensions.for_profile(extensions, profile)
+    if map_size(extensions) > 0, do: extensions
+  end
+
   defp callback_transport?(operation) do
     operation.transport in [:streamable_http, :stdio] and
       jsonrpc_connection?(operation.context)
@@ -989,6 +1099,13 @@ defmodule FastestMCP.OperationPipeline do
 
   defp task_transport?(%{transport: :in_process}), do: true
   defp task_transport?(operation), do: callback_transport?(operation)
+
+  defp jsonrpc_connection?(%Context{
+         negotiated_protocol_version: "2026-07-28",
+         request_metadata: metadata
+       }) do
+    is_map(Map.get(metadata, :jsonrpc_envelope, Map.get(metadata, "jsonrpc_envelope")))
+  end
 
   defp jsonrpc_connection?(%Context{session_id: session_id, request_metadata: metadata}) do
     is_binary(session_id) and session_id != "" and
@@ -1237,6 +1354,21 @@ defmodule FastestMCP.OperationPipeline do
     end
   end
 
+  defp accessible_resource?(server, uri, operation) do
+    case resolve_resource_target(server, uri, operation) do
+      {:exact, _component, _captures} -> true
+      {:template, _component, _captures} -> true
+      nil -> false
+    end
+  rescue
+    error in Error ->
+      if error.code in [:disabled, :not_visible, :filtered, :forbidden, :not_found] do
+        false
+      else
+        reraise error, __STACKTRACE__
+      end
+  end
+
   defp matching_local_templates(server, uri, operation) do
     server.name
     |> Registry.list_components(:resource_template)
@@ -1296,7 +1428,8 @@ defmodule FastestMCP.OperationPipeline do
   defp negotiated_component_visible?(%FastestMCP.Components.Tool{} = tool, operation) do
     task_config = Map.get(tool, :task, TaskConfig.new(false))
 
-    task_config.mode != :required or
+    operation.context.negotiated_protocol_version == "2026-07-28" or
+      task_config.mode != :required or
       operation.transport == :in_process or
       Protocol.capability?(
         operation.context.server_capabilities,

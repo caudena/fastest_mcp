@@ -415,9 +415,10 @@ Several higher-level features are just context operations:
 
 Sampling lets the server ask the connected client model to generate content.
 Form elicitation asks for schema-validated structured input, while URL
-elicitation coordinates an identity-bound out-of-band interaction. Roots let a
-server request the client's canonical `file://` boundaries. All of these use
-the same session coordinator over streamable HTTP and stdio.
+elicitation coordinates an identity-bound out-of-band interaction. On the
+legacy profile these peer operations use the session coordinator over HTTP or
+stdio. Modern handlers return `InputRequiredResult` and the client performs
+the corresponding MRTR interaction without a session.
 
 `Context.sample/3`, `Context.elicit/4`, and `Context.elicit_url/4` return an
 immediate result by default. With `task: true`, sampling and elicitation return
@@ -434,9 +435,9 @@ See:
 - [Sampling and Interaction](sampling-and-interaction.md)
 - [Background Tasks](background-tasks.md)
 
-## Client Roots and Peer Ping
+## Legacy Client Roots and Peer Ping
 
-`Context.list_roots/2` requests the connected client's current filesystem
+On `2025-11-25`, `Context.list_roots/2` requests the connected client's current filesystem
 roots after verifying the negotiated `roots` capability. Successful results
 are parsed into `%FastestMCP.Root{}` values and cached on the exact session:
 
@@ -457,6 +458,11 @@ the server's local filesystem.
 `Context.ping_peer/2` sends an outbound MCP ping through the same session path
 and returns `:ok` only for the standard empty-object result.
 
+Core `2026-07-28` has no independent roots callback or ping method. Modern
+tools, prompts, and resource reads request roots through an
+`InputRequiredResult`; the connected client reuses its configured roots
+handler during that MRTR round.
+
 When the client negotiated `tasks.list`, `Context.list_peer_tasks/2` returns
 `%{items: tasks, next_cursor: cursor}` for tasks owned by that peer. Continue
 with the opaque `cursor:` only; a `page_size:` option is ignored and never sent
@@ -471,8 +477,8 @@ FastestMCP exposes nested resource and prompt helpers directly on the context:
 - `Context.list_prompts/1`
 - `Context.render_prompt/3`
 
-Those helpers preserve the current session, auth, request metadata, and task
-context when one component needs to call another surface inside the same
+Those helpers preserve the current auth, request metadata, task context, and
+legacy session when one component needs to call another surface inside the same
 server.
 
 Example:
@@ -518,7 +524,7 @@ Context also owns session-local visibility rules:
 - `Context.disable_components/2`
 - `Context.reset_visibility/1`
 
-These rules let one session reveal or hide tools, resources, resource
+These rules let one legacy session reveal or hide tools, resources, resource
 templates, and prompts without mutating the global registry for every client.
 
 Selectors support:
@@ -538,10 +544,10 @@ Visibility changes can produce session-specific:
 
 when the visible set actually changes for that session.
 
-## Direct Notifications
+## Legacy Direct Notifications
 
-`Context.send_notification/3` lets a handler send a raw MCP notification over
-the active client session stream:
+`Context.send_notification/3` lets a legacy handler send a raw MCP notification
+over the active client session stream:
 
 ```elixir
 alias FastestMCP.Context

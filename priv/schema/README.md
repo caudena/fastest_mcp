@@ -1,25 +1,25 @@
-# Vendored MCP protocol schema
+# Bundled MCP protocol schemas
 
-`mcp-2025-11-25.schema.json` is vendored without modification from the
-official Model Context Protocol repository:
+FastestMCP includes the official schemas for both supported core revisions:
 
-- revision: `2025-11-25`
-- source commit: `38c84e9f93ad191d9eb26d92b945d17bd0efcaf3`
-- source path: `schema/2025-11-25/schema.json`
-- SHA-256: `1ffe4c5577974012f5fa02af14ea88df4b7146679df1abaaad497c8d9230ca8a`
-- upstream license: MIT; see `LICENSE.upstream`
+- MCP `2026-07-28`; see `LICENSE.upstream-2026-07-28`
+- MCP `2025-11-25`; see `LICENSE.upstream`
 
-Update the file, checksum, and source commit together. Never regenerate it
-from a moving branch.
+Extension schemas are included separately because extensions are versioned
+independently from the core protocol:
 
-`FastestMCP.Schema` verifies this checksum before compiling tagged protocol
-definitions through JSV `0.21.2`. Focused tests exercise FastestMCP's dialect,
-resolver, caching, and resource-limit contract; general JSON Schema conformance
-is delegated to JSV. See `docs/schema-validation.md` for the supported boundary.
+- draft `io.modelcontextprotocol/tasks`; see `LICENSE.upstream-tasks`
+- MCP Apps v1.0.0, `io.modelcontextprotocol/ui`; see
+  `LICENSE.upstream-apps`
 
-The generated artifact types `NumberSchema.minimum`, `maximum`, and `default`
-as integers even though authoritative `schema.ts` at the same commit and the
-tagged elicitation specification define them as numbers. The vendored bytes are
-not edited: `FastestMCP.Schema` applies an explicitly versioned correction only
-to its compiled protocol view, with tests for the source checksum and corrected
-definitions.
+The package includes these schemas and their upstream license notices.
+`FastestMCP.Schema` compiles the protocol definitions through JSV. Focused
+tests exercise FastestMCP's dialect, resolver, caching, and resource-limit
+contract; general JSON Schema conformance is delegated to JSV. See
+`docs/schema-validation.md` for the supported boundary.
+
+The published 2025-11-25 schema types `NumberSchema.minimum`, `maximum`, and
+`default` as integers even though the corresponding TypeScript definitions and
+elicitation specification define them as numbers. The bundled artifact is not
+edited: `FastestMCP.Schema` applies an explicitly versioned correction only to
+its compiled protocol view, with tests for the corrected definitions.

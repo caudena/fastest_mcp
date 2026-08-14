@@ -12,6 +12,7 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
 
   alias FastestMCP.Error
   alias FastestMCP.MIME
+  alias FastestMCP.Protocol.HTTPHeaders
   alias FastestMCP.Transport.HTTPCommon
   alias FastestMCP.Transport.JSONRPC
   alias FastestMCP.Transport.Request
@@ -41,18 +42,30 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
         end
 
       :get ->
-        if Keyword.get(opts, :enable_get_streaming, true) do
-          with :ok <- require_event_stream_accept(conn) do
-            {:ok, build_get_request(conn, request_opts)}
-          end
-        else
+        if modern_protocol_header?(conn) do
           {:response, 405,
-           %{error: %{code: :method_not_allowed, message: "GET streaming is disabled"}},
-           [{"allow", "POST, DELETE"}]}
+           %{error: %{code: :method_not_allowed, message: "MCP 2026 HTTP is POST-only"}},
+           [{"allow", "POST"}]}
+        else
+          if Keyword.get(opts, :enable_get_streaming, true) do
+            with :ok <- require_event_stream_accept(conn) do
+              {:ok, build_get_request(conn, request_opts)}
+            end
+          else
+            {:response, 405,
+             %{error: %{code: :method_not_allowed, message: "GET streaming is disabled"}},
+             [{"allow", "POST, DELETE"}]}
+          end
         end
 
       :delete ->
-        {:ok, build_delete_request(conn, request_opts)}
+        if modern_protocol_header?(conn) do
+          {:response, 405,
+           %{error: %{code: :method_not_allowed, message: "MCP 2026 HTTP is POST-only"}},
+           [{"allow", "POST"}]}
+        else
+          {:ok, build_delete_request(conn, request_opts)}
+        end
 
       {:response, status, payload} ->
         {:response, status, payload}
@@ -89,20 +102,30 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
   end
 
   defp build_jsonrpc_message(conn, {:request, method, params, request_id}, opts) do
-    with :ok <- validate_session_header(method, conn, opts),
-         {:ok, {task_request, task_ttl_ms}} <- JSONRPC.task_metadata(params) do
-      {:ok,
-       build_request(
-         conn,
-         method,
-         params,
-         Keyword.merge(opts,
-           protocol: :jsonrpc,
-           request_id: request_id,
-           task_request: task_request,
-           task_ttl_ms: task_ttl_ms
-         )
-       )}
+    result =
+      with :ok <- validate_session_header(method, conn, opts),
+           :ok <- validate_modern_headers(conn, method, params),
+           {:ok, {task_request, task_ttl_ms}} <- JSONRPC.task_metadata(params) do
+        {:ok,
+         build_request(
+           conn,
+           method,
+           params,
+           Keyword.merge(opts,
+             protocol: :jsonrpc,
+             request_id: request_id,
+             task_request: task_request,
+             task_ttl_ms: task_ttl_ms
+           )
+         )}
+      end
+
+    case result do
+      {:error, %Error{} = error} ->
+        {:error, annotate_request_error(error, request_id)}
+
+      other ->
+        other
     end
   end
 
@@ -117,17 +140,25 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
   end
 
   defp build_request(conn, method, payload, opts) do
-    headers = request_headers(conn)
+    headers = conn |> request_headers() |> normalize_mcp_routing_headers()
     provided_session_id = headers["mcp-session-id"]
 
+    body_protocol_version =
+      get_in(payload, ["_meta", "io.modelcontextprotocol/protocolVersion"])
+
     session_id =
-      if method == "initialize", do: generate_session_id(), else: provided_session_id
+      cond do
+        body_protocol_version == "2026-07-28" -> nil
+        method == "initialize" -> generate_session_id()
+        true -> provided_session_id
+      end
 
     %Request{
       method: method,
       transport: :streamable_http,
       session_id: session_id,
       request_id: Keyword.fetch!(opts, :request_id),
+      protocol_version: body_protocol_version || headers["mcp-protocol-version"],
       protocol: Keyword.fetch!(opts, :protocol),
       task_request: Keyword.get(opts, :task_request, false),
       task_ttl_ms: Keyword.get(opts, :task_ttl_ms),
@@ -146,7 +177,8 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
           jsonrpc_notification:
             Keyword.fetch!(opts, :protocol) == :jsonrpc and
               is_nil(Keyword.fetch!(opts, :request_id)),
-          progress_token: get_in(payload, ["_meta", "progressToken"])
+          progress_token: get_in(payload, ["_meta", "progressToken"]),
+          log_level: get_in(payload, ["_meta", "io.modelcontextprotocol/logLevel"])
         }
         |> put_request_context(opts),
       auth_input: HTTPCommon.auth_input(conn, opts)
@@ -261,6 +293,112 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
     end
   end
 
+  defp validate_modern_headers(conn, method, params) do
+    headers = conn |> request_headers() |> normalize_mcp_routing_headers()
+    version = get_in(params, ["_meta", "io.modelcontextprotocol/protocolVersion"])
+    header_version = headers["mcp-protocol-version"]
+
+    if is_nil(version) and header_version != "2026-07-28" do
+      :ok
+    else
+      expected_name = modern_request_name(method, params)
+
+      name_header_valid? =
+        is_nil(expected_name) or
+          HTTPHeaders.compare_value(expected_name, headers["mcp-name"], "string") == :ok
+
+      with :ok <- validate_unique_modern_headers(conn) do
+        cond do
+          is_nil(version) ->
+            header_mismatch(
+              "params._meta.io.modelcontextprotocol/protocolVersion",
+              header_version,
+              nil
+            )
+
+          header_version != version ->
+            header_mismatch("MCP-Protocol-Version", version, header_version)
+
+          headers["mcp-method"] != method ->
+            header_mismatch("Mcp-Method", method, headers["mcp-method"])
+
+          not name_header_valid? ->
+            header_mismatch("Mcp-Name", expected_name, headers["mcp-name"])
+
+          headers["mcp-session-id"] not in [nil, ""] ->
+            header_mismatch("Mcp-Session-Id", nil, headers["mcp-session-id"])
+
+          true ->
+            :ok
+        end
+      end
+    end
+  end
+
+  defp validate_unique_modern_headers(conn) do
+    duplicates =
+      conn.req_headers
+      |> Enum.filter(fn {name, _value} -> modern_singleton_header?(name) end)
+      |> Enum.group_by(fn {name, _value} -> String.downcase(name) end, fn {_name, value} ->
+        value
+      end)
+      |> Enum.find(fn {_name, values} -> length(values) > 1 end)
+
+    case duplicates do
+      nil ->
+        :ok
+
+      {name, values} ->
+        header_mismatch(name, "a single header value", values)
+    end
+  end
+
+  defp modern_singleton_header?(name) when is_binary(name) do
+    name = String.downcase(name)
+
+    name in ["mcp-protocol-version", "mcp-method", "mcp-name", "mcp-session-id"] or
+      String.starts_with?(name, "mcp-param-")
+  end
+
+  defp modern_request_name("tools/call", params), do: Map.get(params, "name")
+  defp modern_request_name("resources/read", params), do: Map.get(params, "uri")
+  defp modern_request_name("prompts/get", params), do: Map.get(params, "name")
+
+  defp modern_request_name(method, params)
+       when method in ["tasks/get", "tasks/update", "tasks/cancel"],
+       do: Map.get(params, "taskId")
+
+  defp modern_request_name(_method, _params), do: nil
+
+  defp header_mismatch(header, expected, actual) do
+    {:error,
+     %Error{
+       code: :header_mismatch,
+       message: "#{header} does not match the JSON-RPC request",
+       details: %{
+         jsonrpc_code: -32_020,
+         header: header,
+         expected: expected,
+         actual: actual
+       }
+     }}
+  end
+
+  defp normalize_mcp_routing_headers(headers) do
+    Enum.reduce(
+      ["mcp-protocol-version", "mcp-method", "mcp-name", "mcp-session-id"],
+      headers,
+      fn name, normalized ->
+        case Map.get(normalized, name) do
+          value when is_binary(value) -> Map.put(normalized, name, trim_http_ows(value))
+          _other -> normalized
+        end
+      end
+    )
+  end
+
+  defp trim_http_ows(value), do: String.replace(value, ~r/^[\x20\x09]+|[\x20\x09]+$/, "")
+
   defp request_context_opts(conn, opts, base_path) do
     http_context = HTTPCommon.http_context(conn, %{}, Keyword.put(opts, :path, base_path))
 
@@ -311,6 +449,16 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
   defp parsed_body_params(_conn), do: :unavailable
 
   defp request_headers(conn), do: Map.new(conn.req_headers)
+
+  defp annotate_request_error(%Error{} = error, request_id) do
+    jsonrpc_id =
+      if is_binary(request_id) or is_integer(request_id), do: request_id, else: :unavailable
+
+    %{error | jsonrpc_id: jsonrpc_id, jsonrpc_notification: is_nil(request_id)}
+  end
+
+  defp modern_protocol_header?(conn),
+    do: Map.get(request_headers(conn), "mcp-protocol-version") == "2026-07-28"
 
   defp normalize_base_path(path),
     do: "/" <> String.trim(String.trim_leading(to_string(path), "/"), "/")

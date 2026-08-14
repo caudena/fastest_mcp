@@ -161,12 +161,12 @@ explicit request for the unauthorized version is rejected.
 
 ## HTTP Behavior
 
-When a server configures auth, FastestMCP authenticates every inbound HTTP
-initialize, request, notification, client response, POST stream, GET stream,
-and DELETE before dispatch. The successful initialize identity is bound to the
-session; a different principal cannot reuse the session id. Component
-authorization still runs in the operation pipeline after transport
-authentication.
+When a server configures auth, FastestMCP authenticates every applicable
+inbound HTTP request, notification, client response, and control operation
+before dispatch. A legacy initialize identity is bound to its session; a
+different principal cannot reuse that session id. Modern requests are
+stateless authentication boundaries. Component authorization still runs in
+the operation pipeline after transport authentication.
 
 Without protected-resource configuration, HTTP auth failures use a plain
 bearer challenge:
@@ -193,8 +193,12 @@ server =
   )
 ```
 
-The public HTTP app serves the path-derived metadata document on the same
-resource origin. For the example above it is:
+The path-derived metadata document must be served on the same resource origin.
+For a standalone FastestMCP listener the HTTP app serves it directly. A Phoenix
+application that forwards only `/mcp` must separately mount
+`FastestMCP.Transport.WellKnownHTTP` outside its authenticated pipeline, as
+shown in [Phoenix Deployment](phoenix-deployment.md). For the example above the
+public URL is:
 
 ```text
 https://mcp.example.com/.well-known/oauth-protected-resource/mcp
@@ -244,9 +248,25 @@ verified audience and scope evidence returned by that boundary. Configure
 `FastestMCP.Auth.ProtectedResource` only together with an authenticator;
 protected-resource HTTP fails closed when no authenticator exists.
 
-The connected-client OAuth flow and its host-owned browser/token-store
-boundaries are documented in [Client](client.md). They do not turn FastestMCP
-into an authorization server.
+## Connected-Client Extension Grants
+
+The connected client also supports the draft OAuth Client Credentials and
+stable Enterprise-Managed Authorization extensions. They stay under the
+existing `oauth:` option as tagged `grant:` values. Client Credentials accepts
+a host secret or an arity-one `private_key_jwt` assertion provider.
+Enterprise-Managed Authorization accepts an arity-one host identity provider
+and explicit pre-registration or Client ID Metadata Document registration.
+Selecting either tagged grant is the explicit opt-in and automatically
+declares its matching extension capability on every modern MCP request.
+
+These grants change how a client obtains a bearer token. They do not add token,
+login, IdP, or authorization routes to a FastestMCP server. Exact shapes and
+maturity labels are documented in [Protocol Extensions](extensions.md).
+
+The connected-client OAuth flow and its host-owned browser, signing,
+enterprise identity, and token-store boundaries are documented in
+[Client](client.md). The Phoenix resource-server deployment boundary is in
+[Phoenix Deployment](phoenix-deployment.md).
 
 ## Why This Shape
 

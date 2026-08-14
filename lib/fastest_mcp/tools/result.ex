@@ -32,29 +32,38 @@ defmodule FastestMCP.Tools.Result do
   ```
   """
 
-  defstruct content: nil, structured_content: nil, meta: nil, is_error: nil
+  defstruct content: nil,
+            structured_content: nil,
+            structured_content_present?: false,
+            meta: nil,
+            is_error: nil
 
   @type t :: %__MODULE__{
           content: any(),
-          structured_content: map() | nil,
+          structured_content: any(),
+          structured_content_present?: boolean(),
           meta: map() | nil,
           is_error: boolean() | nil
         }
 
   @doc "Builds a normalized tool result."
   def new(content \\ nil, opts \\ []) do
+    structured_content_present? =
+      Keyword.has_key?(opts, :structured_content) or Keyword.has_key?(opts, :structuredContent)
+
     structured_content =
       opts
       |> Keyword.get_lazy(:structured_content, fn -> Keyword.get(opts, :structuredContent) end)
-      |> normalize_optional_structured_content()
+      |> normalize_structured_content()
 
-    if is_nil(content) and is_nil(structured_content) do
+    if is_nil(content) and not structured_content_present? do
       raise ArgumentError, "tool result requires content or structured_content"
     end
 
     %__MODULE__{
       content: if(is_nil(content), do: structured_content, else: content),
       structured_content: structured_content,
+      structured_content_present?: structured_content_present?,
       meta: normalize_optional_map(Keyword.get(opts, :meta)),
       is_error: normalize_optional_boolean(Keyword.get(opts, :is_error))
     }
@@ -64,30 +73,39 @@ defmodule FastestMCP.Tools.Result do
   def from(%__MODULE__{} = result), do: result
 
   def from(%{} = value) do
+    structured_content_keys = [
+      :structured_content,
+      "structured_content",
+      :structuredContent,
+      "structuredContent"
+    ]
+
+    structured_content_key = Enum.find(structured_content_keys, &Map.has_key?(value, &1))
+
+    structured_content_opts =
+      if structured_content_key do
+        [structured_content: Map.get(value, structured_content_key)]
+      else
+        []
+      end
+
     new(
       Map.get(value, :content, Map.get(value, "content")),
-      structured_content:
-        Map.get(
-          value,
-          :structured_content,
-          Map.get(
-            value,
-            "structured_content",
-            Map.get(value, :structuredContent, Map.get(value, "structuredContent"))
-          )
-        ),
-      meta:
-        Map.get(
-          value,
-          :_meta,
-          Map.get(value, "_meta", Map.get(value, :meta, Map.get(value, "meta")))
-        ),
-      is_error:
-        Map.get(
-          value,
-          :is_error,
-          Map.get(value, "is_error", Map.get(value, :isError, Map.get(value, "isError")))
-        )
+      structured_content_opts ++
+        [
+          meta:
+            Map.get(
+              value,
+              :_meta,
+              Map.get(value, "_meta", Map.get(value, :meta, Map.get(value, "meta")))
+            ),
+          is_error:
+            Map.get(
+              value,
+              :is_error,
+              Map.get(value, "is_error", Map.get(value, :isError, Map.get(value, "isError")))
+            )
+        ]
     )
   end
 
@@ -97,7 +115,7 @@ defmodule FastestMCP.Tools.Result do
   def to_map(%__MODULE__{} = result) do
     %{}
     |> Map.put(:content, result.content)
-    |> maybe_put(:structuredContent, result.structured_content)
+    |> maybe_put_structured_content(result)
     |> maybe_put(:meta, result.meta)
     |> maybe_put(:isError, result.is_error)
   end
@@ -109,13 +127,8 @@ defmodule FastestMCP.Tools.Result do
     raise ArgumentError, "tool result meta must be a map, got #{inspect(other)}"
   end
 
-  defp normalize_optional_structured_content(nil), do: nil
-  defp normalize_optional_structured_content(value) when is_map(value), do: value
-
-  defp normalize_optional_structured_content(other) do
-    raise ArgumentError,
-          "tool result structured_content must be a map, got #{inspect(other)}"
-  end
+  defp normalize_structured_content(nil), do: nil
+  defp normalize_structured_content(value), do: FastestMCP.JSONValue.normalize(value)
 
   defp normalize_optional_boolean(nil), do: nil
   defp normalize_optional_boolean(value) when is_boolean(value), do: value
@@ -126,4 +139,9 @@ defmodule FastestMCP.Tools.Result do
 
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)
+
+  defp maybe_put_structured_content(map, %{structured_content_present?: true} = result),
+    do: Map.put(map, :structuredContent, result.structured_content)
+
+  defp maybe_put_structured_content(map, _result), do: map
 end

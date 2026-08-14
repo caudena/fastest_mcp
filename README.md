@@ -4,8 +4,12 @@ FastestMCP is a BEAM-native MCP toolkit for Elixir.
 
 It includes MCP tools, resources, prompts, middleware, auth, providers,
 background tasks, and streamable HTTP. FastestMCP is built as an OTP system
-with supervised runtime trees, explicit request, session, and task lifetimes,
+with supervised runtime trees, explicit request, task, and legacy-session lifetimes,
 and module-first server startup that fits normal Elixir applications.
+
+It supports MCP `2026-07-28` and `2025-11-25` over streamable HTTP and stdio.
+Clients prefer `2026-07-28` and fall back only when a peer provides credible
+legacy evidence.
 
 ## Installation
 
@@ -27,14 +31,15 @@ mix deps.get
 
 ### Upgrading from 0.1.x
 
-FastestMCP 0.2.0 has one protocol boundary: MCP `2025-11-25` over JSON-RPC
-2.0. Streamable HTTP accepts one message per POST at `/mcp`; legacy
+FastestMCP 0.2.0 established the legacy MCP `2025-11-25` boundary over
+JSON-RPC 2.0. Current releases retain that profile alongside `2026-07-28`.
+Streamable HTTP accepts one message per POST at `/mcp`; legacy
 method-specific routes and JSON-RPC batches are gone. HTTP clients must use
-the server-issued session id and complete the initialize lifecycle. Zero-session
-HTTP and the `stateless_http:`/`stateless:` options are gone. Use
+the server-issued session id and complete the initialize lifecycle. Legacy
+zero-session HTTP and the `stateless_http:`/`stateless:` options are gone. Use
 `state_scope: :request` when handler state must reset for each operation; the
-MCP session, negotiated capabilities, subscriptions, and task ownership remain
-available.
+legacy MCP session, negotiated capabilities, subscriptions, and task ownership
+remain available. MCP `2026-07-28` is separately sessionless by design.
 
 Remote task augmentation is standard `tools/call` only. Local Elixir prompt and
 resource tasks remain available, as does local `FastestMCP.send_task_input/5`,
@@ -42,7 +47,7 @@ but the remote prompt/resource task extensions and wire `tasks/sendInput` method
 were removed. Tool schemas are now strict JSON Schema values with object roots,
 and values are never coerced. The old `dereference_schemas:` path is removed;
 remote references require an explicit `schema_options:` resolver. See the
-[0.2.0 changelog](CHANGELOG.md#020---unreleased) and
+[0.2.0 changelog](CHANGELOG.md#020---2026-08-12) and
 [transport migration notes](docs/transports.md#migrating-from-01) for the full
 checklist.
 
@@ -99,6 +104,9 @@ client call, lives in [docs/onboarding.md](docs/onboarding.md).
 - [Telemetry](docs/telemetry.md)
 - [Dynamic Component Manager](docs/component-manager.md)
 - [Auth](docs/auth.md)
+- [Protocol Versions](docs/protocol-versions.md)
+- [Protocol Extensions](docs/extensions.md)
+- [Phoenix Deployment](docs/phoenix-deployment.md)
 - [Middleware](docs/middleware.md)
 - [Background Tasks](docs/background-tasks.md)
 - [Providers and Mounting](docs/providers-and-mounting.md)
@@ -116,9 +124,10 @@ FastestMCP keeps the public surface deliberately curated.
 - `FastestMCP`: top-level server, transport, runtime, and task helpers
 - `FastestMCP.ServerModule`: preferred module-owned startup wrapper
 - `FastestMCP.Server`: low-level server definition for dynamic cases
-- `FastestMCP.Context`: explicit request, session, auth, and task context
+- `FastestMCP.Context`: explicit request, auth, task, and legacy-session context
 - `FastestMCP.RequestContext`: stable request snapshot derived from context
 - `FastestMCP.Client`: connected MCP client for streamable HTTP and stdio
+- `FastestMCP.Apps`: MCP Apps resource and metadata helpers
 - `FastestMCP.Auth`: auth contract and shared authenticator wrapper
 - `FastestMCP.Auth.Result`: normalized authenticator result
 - `FastestMCP.Auth.StaticToken`: hermetic bearer-token authenticator
@@ -159,8 +168,8 @@ FastestMCP currently ships:
 - module-owned and dynamic server definitions
 - tools, resources, resource templates, and prompts
 - middleware, providers, auth, and transport-independent execution
-- explicit `%FastestMCP.Context{}` access to request, session, task, auth, and
-  HTTP state
+- explicit `%FastestMCP.Context{}` access to request, task, auth, HTTP, and
+  version-appropriate legacy session state
 - `FastestMCP.Context.current!/0`, `request_context/1`, and `client_id/1` for
   narrow convenience helpers where needed
 - standard prompt/resource wire completion plus Elixir-native tool and
@@ -171,16 +180,22 @@ FastestMCP currently ships:
 - per-server runtime isolation, bounded concurrency, overload control, and task
   supervision
 - streamable HTTP and stdio transports
-- MCP `2025-11-25` as the sole protocol version
+- MCP `2026-07-28` and `2025-11-25`, with latest-first client negotiation
+- MCP Apps server/resource metadata and connected-client preservation, with
+  Host/View rendering and sandboxing left to the consuming host
+- modern Tasks, OAuth Client Credentials, and Enterprise-Managed Authorization
+  extensions, while retaining the legacy Tasks wire for `2025-11-25`
 - one JSON-RPC message per request at the configured `/mcp` endpoint
 - a Plug-first HTTP embedding surface for Bandit, Phoenix, or custom Plug apps
 - a connected client for streamable HTTP and stdio
 - client-side sampling, elicitation, logging, and progress callbacks
-- server-originated roots, sampling, form and URL elicitation, ping, logging,
-  progress, cancellation, and requester-side peer tasks over HTTP and stdio
+- version-appropriate roots, sampling, form and URL elicitation, logging,
+  progress, cancellation, and requester-side peer tasks over HTTP and stdio;
+  ping remains legacy-only
 - identity-bound URL elicitation completion and RFC 9728 protected-resource
   discovery for configured HTTP servers
-- bounded SSE replay using `Last-Event-ID`
+- bounded legacy SSE replay using `Last-Event-ID`; modern SSE streams are fresh
+  request lifetimes
 - Draft 2020-12 and Draft 7 JSON Schema validation through JSV, with opt-in
   allowlisted HTTPS reference resolution
 - runtime component mutation through `FastestMCP.ComponentManager`
@@ -191,7 +206,7 @@ The main deferred items remain:
 - CLI tooling
 - cluster-aware runtime behavior
 - publishing automation after the first manual release path is proven
-- custom app or UI layer
+- browser/native Apps Host and View runtime
 
 Standalone SSE, legacy method-specific HTTP routes, and JSON-RPC batches are
 intentionally unsupported. HTTP means streamable HTTP at `/mcp` only.
@@ -214,4 +229,4 @@ It is not the right choice yet if you need:
 - standalone SSE transport compatibility
 - CLI tooling
 - distributed multi-node runtime behavior out of the box
-- a custom app or UI layer
+- a browser/native Apps Host and View runtime

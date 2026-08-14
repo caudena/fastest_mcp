@@ -62,7 +62,7 @@ defmodule FastestMCP.PackageConsumerSmoke do
       alias FastestMCP.Client
       alias FastestMCP.Protocol
 
-      test "the unpacked package serves and consumes MCP over live HTTP" do
+      test "the unpacked package serves and consumes both MCP revisions over live HTTP" do
         server_name = unique_server_name("http")
 
         assert {:ok, _pid} = FastestMCP.start_server(server(server_name))
@@ -80,23 +80,33 @@ defmodule FastestMCP.PackageConsumerSmoke do
 
         {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
 
-        client =
-          Client.connect!("http://127.0.0.1:#{port}/mcp",
-            client_info: %{"name" => "package-http-smoke", "version" => "1.0.0"}
-          )
+        for preference <- [:auto | Protocol.supported_versions()] do
+          expected = if preference == :auto, do: Protocol.current_version(), else: preference
 
-        on_exit(fn ->
-          if Client.connected?(client), do: Client.disconnect(client)
-        end)
+          client =
+            Client.connect!("http://127.0.0.1:#{port}/mcp",
+              protocol_version: preference,
+              client_info: %{"name" => "package-http-smoke", "version" => "1.0.0"}
+            )
 
-        assert Client.protocol_version(client) == Protocol.current_version()
-        assert %{items: [%{"name" => "echo"}], next_cursor: nil} = Client.list_tools(client)
-        assert %{"transport" => "http"} =
-                 Client.call_tool(client, "echo", %{"transport" => "http"})
+          try do
+            assert Client.protocol_version(client) == expected
+            assert %{items: [%{"name" => "echo"}], next_cursor: nil} = Client.list_tools(client)
+            result =
+              Client.call_tool(client, "echo", %{
+                "transport" => "http",
+                "revision" => expected
+              })
+
+            assert %{"transport" => "http", "revision" => ^expected} =
+                     result["structuredContent"] || result
+          after
+            if Client.connected?(client), do: Client.disconnect(client)
+          end
+        end
       end
 
-      test "the unpacked package serves and consumes MCP over a real stdio subprocess" do
-        server_name = unique_server_name("stdio")
+      test "the unpacked package serves and consumes both MCP revisions over stdio" do
         elixir = System.find_executable("elixir") || flunk("elixir executable not found")
 
         code_paths =
@@ -104,32 +114,44 @@ defmodule FastestMCP.PackageConsumerSmoke do
           |> Path.join("lib/*/ebin")
           |> Path.wildcard()
 
-        child_code = """
-        Application.ensure_all_started(:fastest_mcp)
+        for preference <- [:auto | Protocol.supported_versions()] do
+          expected = if preference == :auto, do: Protocol.current_version(), else: preference
+          server_name = unique_server_name("stdio")
 
-        server =
-          FastestMCP.server(#{inspect(server_name)})
-          |> FastestMCP.add_tool("echo", fn arguments, _context -> arguments end)
+          child_code = """
+          Application.ensure_all_started(:fastest_mcp)
 
-        FastestMCP.Transport.Stdio.serve(server)
-        """
+          server =
+            FastestMCP.server(#{inspect(server_name)})
+            |> FastestMCP.add_tool("echo", fn arguments, _context -> arguments end)
 
-        child_args =
-          Enum.flat_map(code_paths, fn path -> ["-pa", path] end) ++ ["-e", child_code]
+          FastestMCP.Transport.Stdio.serve(server)
+          """
 
-        client =
-          Client.connect!({:stdio, elixir, child_args},
-            client_info: %{"name" => "package-stdio-smoke", "version" => "1.0.0"}
-          )
+          child_args =
+            Enum.flat_map(code_paths, fn path -> ["-pa", path] end) ++ ["-e", child_code]
 
-        on_exit(fn ->
-          if Client.connected?(client), do: Client.disconnect(client)
-        end)
+          client =
+            Client.connect!({:stdio, elixir, child_args},
+              protocol_version: preference,
+              client_info: %{"name" => "package-stdio-smoke", "version" => "1.0.0"}
+            )
 
-        assert Client.protocol_version(client) == Protocol.current_version()
-        assert %{items: [%{"name" => "echo"}], next_cursor: nil} = Client.list_tools(client)
-        assert %{"transport" => "stdio"} =
-                 Client.call_tool(client, "echo", %{"transport" => "stdio"})
+          try do
+            assert Client.protocol_version(client) == expected
+            assert %{items: [%{"name" => "echo"}], next_cursor: nil} = Client.list_tools(client)
+            result =
+              Client.call_tool(client, "echo", %{
+                "transport" => "stdio",
+                "revision" => expected
+              })
+
+            assert %{"transport" => "stdio", "revision" => ^expected} =
+                     result["structuredContent"] || result
+          after
+            if Client.connected?(client), do: Client.disconnect(client)
+          end
+        end
       end
 
       defp server(server_name) do

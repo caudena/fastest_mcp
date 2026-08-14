@@ -96,14 +96,13 @@ jobs:
 
       - name: Verify pinned conformance runner
         working-directory: test/conformance
-        run: test "$(npx --no-install conformance --version)" = "0.1.16"
+        run: test "$(npx --no-install conformance --version)" = "0.2.0-alpha.11"
 
-      - name: Prove runner adapter boundary and run all server conformance scenarios
+      - name: Run frozen core requirements and selected server extensions
         env:
           MCP_CONFORMANCE_OUTPUT_DIR: ${{ runner.temp }}/conformance-server
         run: >-
           mix test
-          test/fastest_mcp/conformance_protocol_shim_test.exs
           test/fastest_mcp/conformance_test.exs
           --include conformance --exclude external_auth
 
@@ -143,14 +142,13 @@ jobs:
 
       - name: Verify pinned conformance runner
         working-directory: test/conformance
-        run: test "$(npx --no-install conformance --version)" = "0.1.16"
+        run: test "$(npx --no-install conformance --version)" = "0.2.0-alpha.11"
 
-      - name: Prove runner adapter boundary and run all client conformance scenarios
+      - name: Run frozen core requirements and selected client extensions
         env:
           MCP_CONFORMANCE_OUTPUT_DIR: ${{ runner.temp }}/conformance-client
         run: >-
           mix test
-          test/fastest_mcp/conformance_client_protocol_proxy_test.exs
           test/fastest_mcp/conformance_client_test.exs
           --include conformance --exclude external_auth
 

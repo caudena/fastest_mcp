@@ -1,8 +1,11 @@
-defmodule FastestMCP.TestSupport.ConformanceClientProtocolProxy do
+defmodule FastestMCP.TestSupport.PinnedConformanceSSEProxy do
   @moduledoc false
 
+  # conformance 0.2.0-alpha.11's frozen 2025 sse-retry fixture replies to
+  # initialize with 2025-03-26 even when the selected requirements revision is
+  # 2025-11-25. Keep this repair confined to that one test scenario.
   @runner_protocol_fragment ~s("protocolVersion":"2025-03-26")
-  @current_protocol_fragment ~s("protocolVersion":"2025-11-25")
+  @required_protocol_fragment ~s("protocolVersion":"2025-11-25")
   @initialize_method_fragment ~s("method":"initialize")
   @jsonrpc_method_fragment ~s("method":)
   @max_initialize_response_bytes 65_536
@@ -12,10 +15,8 @@ defmodule FastestMCP.TestSupport.ConformanceClientProtocolProxy do
 
     unless uri.scheme == "http" and loopback?(uri.host) do
       raise ArgumentError,
-            "conformance client protocol proxy requires a loopback HTTP URL, got: #{inspect(upstream_url)}"
+            "the pinned conformance proxy requires a loopback HTTP URL, got: #{inspect(upstream_url)}"
     end
-
-    upstream_port = uri.port || 80
 
     {:ok, listener} =
       :gen_tcp.listen(0, [
@@ -27,26 +28,14 @@ defmodule FastestMCP.TestSupport.ConformanceClientProtocolProxy do
       ])
 
     {:ok, {_address, proxy_port}} = :inet.sockname(listener)
+    acceptor = spawn(fn -> accept_loop(listener, uri.host, uri.port || 80) end)
 
-    acceptor =
-      spawn(fn ->
-        accept_loop(listener, uri.host, upstream_port)
-      end)
-
-    %{
-      listener: listener,
-      acceptor: acceptor,
-      url: proxy_url(uri, proxy_port)
-    }
+    %{listener: listener, acceptor: acceptor, url: proxy_url(uri, proxy_port)}
   end
 
   def stop(%{listener: listener, acceptor: acceptor}) do
     :gen_tcp.close(listener)
-
-    if Process.alive?(acceptor) do
-      Process.exit(acceptor, :shutdown)
-    end
-
+    if Process.alive?(acceptor), do: Process.exit(acceptor, :shutdown)
     :ok
   end
 
@@ -62,14 +51,14 @@ defmodule FastestMCP.TestSupport.ConformanceClientProtocolProxy do
 
     cond do
       :binary.match(combined, @runner_protocol_fragment) != :nomatch ->
-        {
-          String.replace(combined, @runner_protocol_fragment, @current_protocol_fragment,
+        rewritten =
+          String.replace(combined, @runner_protocol_fragment, @required_protocol_fragment,
             global: false
-          ),
-          :passthrough
-        }
+          )
 
-      :binary.match(combined, @current_protocol_fragment) != :nomatch ->
+        {rewritten, :passthrough}
+
+      :binary.match(combined, @required_protocol_fragment) != :nomatch ->
         {combined, :passthrough}
 
       byte_size(combined) >= @max_initialize_response_bytes ->
@@ -130,13 +119,14 @@ defmodule FastestMCP.TestSupport.ConformanceClientProtocolProxy do
       end)
 
     case :gen_tcp.controlling_process(downstream, bridge) do
-      :ok ->
-        send(bridge, {:accepted, downstream})
-
-      {:error, _reason} ->
-        :gen_tcp.close(downstream)
-        Process.exit(bridge, :kill)
+      :ok -> send(bridge, {:accepted, downstream})
+      {:error, _reason} -> close_bridge(downstream, bridge)
     end
+  end
+
+  defp close_bridge(downstream, bridge) do
+    :gen_tcp.close(downstream)
+    Process.exit(bridge, :kill)
   end
 
   defp bridge(downstream, upstream_host, upstream_port) do
@@ -149,7 +139,6 @@ defmodule FastestMCP.TestSupport.ConformanceClientProtocolProxy do
       {:ok, upstream} ->
         :ok = :inet.setopts(downstream, active: :once)
         :ok = :inet.setopts(upstream, active: :once)
-
         relay(downstream, upstream, {:awaiting_request, ""})
 
       {:error, _reason} ->
@@ -162,13 +151,11 @@ defmodule FastestMCP.TestSupport.ConformanceClientProtocolProxy do
       {:tcp, ^downstream, data} ->
         rewrite_state = classify_request(rewrite_state, data)
 
-        case :gen_tcp.send(upstream, data) do
-          :ok ->
-            :ok = :inet.setopts(downstream, active: :once)
-            relay(downstream, upstream, rewrite_state)
-
-          {:error, _reason} ->
-            close_pair(downstream, upstream)
+        with :ok <- :gen_tcp.send(upstream, data),
+             :ok <- :inet.setopts(downstream, active: :once) do
+          relay(downstream, upstream, rewrite_state)
+        else
+          {:error, _reason} -> close_pair(downstream, upstream)
         end
 
       {:tcp, ^upstream, data} ->
@@ -199,7 +186,7 @@ defmodule FastestMCP.TestSupport.ConformanceClientProtocolProxy do
   defp flush_pending(downstream, {:awaiting_initialize, buffer}),
     do: send_if_present(downstream, buffer)
 
-  defp flush_pending(_downstream, :passthrough), do: :ok
+  defp flush_pending(_downstream, _state), do: :ok
 
   defp close_pair(downstream, upstream) do
     :gen_tcp.close(downstream)

@@ -205,7 +205,7 @@ defmodule FastestMCP.TestSupport.PrimedSSEPlug do
           "jsonrpc" => "2.0",
           "id" => request["id"],
           "result" => %{
-            "protocolVersion" => FastestMCP.Protocol.current_version(),
+            "protocolVersion" => "2025-11-25",
             "capabilities" => %{"tools" => %{}},
             "serverInfo" => %{"name" => "primed-sse", "version" => "1.0.0"}
           }
@@ -282,7 +282,12 @@ defmodule FastestMCP.SSEClientCleanupTest do
       )
 
     {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
-    client = Client.connect!("http://127.0.0.1:#{port}/mcp", timeout_ms: 5_000)
+
+    client =
+      Client.connect!("http://127.0.0.1:#{port}/mcp",
+        protocol_version: "2025-11-25",
+        timeout_ms: 5_000
+      )
 
     on_exit(fn ->
       if Client.connected?(client), do: Client.disconnect(client)
@@ -293,6 +298,7 @@ defmodule FastestMCP.SSEClientCleanupTest do
 
     bounded_client =
       Client.connect!("http://127.0.0.1:#{port}/mcp",
+        protocol_version: "2025-11-25",
         timeout_ms: 5_000,
         max_sse_event_bytes: 512
       )
@@ -322,7 +328,9 @@ defmodule FastestMCP.SSEClientCleanupTest do
       )
 
     {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
-    client = Client.connect!("http://127.0.0.1:#{port}/mcp")
+
+    client =
+      Client.connect!("http://127.0.0.1:#{port}/mcp", protocol_version: "2025-11-25")
 
     on_exit(fn ->
       if Client.connected?(client), do: Client.disconnect(client)

@@ -40,10 +40,9 @@ compiled =
 ```
 
 `Schema.compile/2` and `validate/2` return explicit tuples;
-`Schema.compile!/2` raises `FastestMCP.Schema.Error`. Compiled values are opaque
-and carry a canonical SHA-256 schema digest. Runtime component schemas are
-cached by that digest: an unchanged provider transform reuses the validator,
-while a transform that changes the schema produces a new digest and validator.
+`Schema.compile!/2` raises `FastestMCP.Schema.Error`. Compiled values are opaque.
+Runtime component schemas are cached so an unchanged provider transform reuses
+the validator, while a transform that changes the schema produces a new one.
 
 Violations contain bounded instance paths, schema paths, keywords, and
 messages. They never echo the submitted value, which avoids returning tool
@@ -51,11 +50,13 @@ arguments, elicitation content, or other secrets in validation errors.
 
 ## MCP Tool Schemas
 
-MCP requires tool `inputSchema` and `outputSchema` to have object roots.
-FastestMCP enforces that rule when local, mounted, provider, transformed, or
-dynamically injected tools are built. A tool with `output_schema:` must return
-object `structuredContent` that validates against the same compiled schema
-before serialization.
+MCP requires tool `inputSchema` to have an object root because tool arguments
+are objects. FastestMCP enforces that rule for local, mounted, provider,
+transformed, and dynamically injected tools. Under `2025-11-25`,
+`outputSchema` and `structuredContent` are also object-rooted. Under
+`2026-07-28`, `outputSchema` may describe any JSON value and the returned
+`structuredContent` must validate against that same compiled schema before
+serialization.
 
 ```elixir
 FastestMCP.add_tool(server, "lookup", &MyApp.lookup/2,
@@ -135,27 +136,23 @@ These are explicit options, not environment-driven behavior. A limit or
 deadline failure returns a bounded schema error instead of continuing with an
 incomplete validator.
 
-## Provenance
+## Implementation Boundary
 
-JSV `0.21.2` is the direct runtime dependency used for schema compilation and
+JSV `0.22.x` is the direct runtime dependency used for schema compilation and
 validation. Texture handles RFC 6570 templates, while Mint provides incremental
 HTTP streaming for connected clients.
-The immutable MCP protocol schema is vendored at
-`priv/schema/mcp-2025-11-25.schema.json` from MCP tag `2025-11-25`, source
-commit `38c84e9f93ad191d9eb26d92b945d17bd0efcaf3`, with SHA-256
-`1ffe4c5577974012f5fa02af14ea88df4b7146679df1abaaad497c8d9230ca8a`.
-See `priv/schema/README.md` and the upstream MIT license beside the schema.
+FastestMCP includes the official schemas for MCP `2026-07-28`, MCP
+`2025-11-25`, the draft Tasks extension, and MCP Apps v1.0.0. Upstream license
+notices are packaged beside those schemas.
 
-The vendored bytes and checksum stay exact. Their generated `NumberSchema`
-declares `minimum`, `maximum`, and `default` as integers, and generated
-`ElicitResult.content` likewise excludes non-integer numbers. The authoritative
-`schema.ts` at the same commit and the tagged elicitation text define all four
-positions as numbers. `FastestMCP.Schema` therefore applies one explicit
-semantic overlay, version 2, only to its compiled protocol view. The source
-artifact remains unchanged and tests pin both the original checksum and the
-corrected compiled definitions.
+The published 2025 schema's `NumberSchema` declares `minimum`, `maximum`, and
+`default` as integers, and generated `ElicitResult.content` likewise excludes
+non-integer numbers. The corresponding TypeScript definitions and elicitation
+specification define all four positions as numbers. `FastestMCP.Schema`
+therefore applies a version-specific correction only to its compiled protocol
+view. Tests cover the corrected compiled definitions.
 
-General JSON Schema dialect conformance is delegated to the pinned JSV
+General JSON Schema dialect conformance is delegated to the JSV
 dependency. Focused FastestMCP tests cover the observable library boundary:
 dialect selection, non-coercion, local and explicit remote references, resolver
 security, resource limits, deadlines, and bounded redacted diagnostics.

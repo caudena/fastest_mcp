@@ -598,8 +598,21 @@ Read failures still surface as normal `FastestMCP.Error` values:
 
 ## Subscriptions and Update Notifications
 
-FastestMCP supports session-scoped resource subscriptions through the MCP
-transport surface. A subscription targets one concrete resource URI:
+On `2026-07-28`, resource updates are selected through the long-lived
+`subscriptions/listen` request:
+
+```elixir
+listener =
+  FastestMCP.Client.listen(
+    client,
+    %{"resourceSubscriptions" => ["config://release"]},
+    on_notification: &MyApp.MCPNotifications.handle/1
+  )
+```
+
+Cancel `listener` with `FastestMCP.Client.Request.cancel/2` when it is no
+longer needed. On `2025-11-25`, subscriptions are session-scoped and target
+one concrete resource URI:
 
 ```elixir
 client = FastestMCP.Client.connect!("http://127.0.0.1:4100/mcp", session_stream: true)
@@ -608,8 +621,9 @@ client = FastestMCP.Client.connect!("http://127.0.0.1:4100/mcp", session_stream:
 ```
 
 Resource templates remain available for discovery and reads, but their
-template strings are not subscription targets. Subscribe separately to each
-expanded concrete URI whose updates the client needs.
+template strings are not subscription targets in either profile. Select or
+subscribe separately to each expanded concrete URI whose updates the client
+needs.
 
 When the server knows that resource changed, emit an update:
 
@@ -629,10 +643,14 @@ end)
 Current behavior:
 
 - subscriptions are exact concrete resource URIs
-- `notifications/resources/updated` is delivered only to subscribed,
+- modern update notifications carry the matching
+  `io.modelcontextprotocol/subscriptionId` and remain scoped to the open
+  listener
+- legacy `notifications/resources/updated` is delivered only to subscribed,
   initialized sessions with an attached HTTP or stdio output sink
-- `notifications/resources/list_changed` is emitted when the visible set of
-  resources or resource templates changes for a session
+- legacy `notifications/resources/list_changed` is emitted when the visible
+  set changes for a session; modern listeners receive it only when their
+  acknowledged filter includes resource-list changes
 - bidirectional stdio receives the same negotiated resource notifications as
   Streamable HTTP
 
@@ -690,9 +708,8 @@ Reverse routing keeps the existing handler map interface and decodes captures
 deterministically as strings, ordered lists, or maps.
 
 The repository runs the official `uri-templates/uritemplate-test` positive and
-negative fixtures, pinned at commit
-`4171dac22aa67fc710b3f6df308a50bd08552986`, together with reverse-routing
-fixtures for fragment, prefix, exploded, and ambiguous templates.
+negative fixtures together with reverse-routing fixtures for fragment, prefix,
+exploded, and ambiguous templates.
 
 Resource update notifications require an active session event stream.
 

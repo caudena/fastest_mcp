@@ -127,7 +127,9 @@ defmodule FastestMCP.CompletionTest do
       )
 
     {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
-    client = Client.connect!("http://127.0.0.1:#{port}/mcp")
+
+    client =
+      Client.connect!("http://127.0.0.1:#{port}/mcp", protocol_version: "2025-11-25")
 
     on_exit(fn ->
       if Client.connected?(client), do: Client.disconnect(client)

@@ -58,7 +58,10 @@ defmodule FastestMCP.Client do
 
   use GenServer
 
+  require Logger
+
   alias FastestMCP.BackgroundTask
+  alias FastestMCP.Apps
   alias FastestMCP.Client.CallbackContext
   alias FastestMCP.Client.OAuth
   alias FastestMCP.Client.OAuth.Error, as: OAuthError
@@ -75,7 +78,9 @@ defmodule FastestMCP.Client do
   alias FastestMCP.MIME
   alias FastestMCP.Client.Task, as: RemoteTask
   alias FastestMCP.Protocol
+  alias FastestMCP.Protocol.Extensions
   alias FastestMCP.Protocol.Duration
+  alias FastestMCP.Protocol.HTTPHeaders
   alias FastestMCP.Protocol.Progress, as: ProtocolProgress
   alias FastestMCP.Protocol.Sampling, as: SamplingProtocol
   alias FastestMCP.Root
@@ -91,9 +96,14 @@ defmodule FastestMCP.Client do
   @default_init_timeout_ms 10_000
   @default_http_max_in_flight 10
   @default_stdio_max_in_flight 1
+  @default_modern_stdio_max_in_flight 10
+  @default_max_mrtr_rounds 8
   @default_sse_retry_ms 1_000
   @default_sse_max_retry_ms 30_000
   @default_sse_max_reconnect_attempts 3
+  @default_stdio_restart_retry_ms 1_000
+  @default_stdio_restart_max_retry_ms 30_000
+  @default_stdio_restart_max_attempts 3
   @default_max_auth_attempts 3
   @default_max_callback_request_ids 100_000
   @max_tool_catalog_pages 256
@@ -105,19 +115,19 @@ defmodule FastestMCP.Client do
 
   @doc "Connects a client to the given transport target."
   def connect(target, opts \\ []) do
-    with :ok <- reject_configurable_protocol_versions(opts),
+    with :ok <- validate_protocol_options(opts),
          {:ok, transport} <- normalize_transport(target, opts),
          {:ok, pid} <- GenServer.start_link(__MODULE__, {transport, opts}) do
       client = %__MODULE__{pid: pid}
 
       if Keyword.get(opts, :auto_initialize, true) do
         try do
-          _ =
-            initialize(client, %{},
-              timeout_ms: Keyword.get(opts, :init_timeout_ms, @default_init_timeout_ms)
-            )
+          _ = negotiate_ready(client, opts)
 
-          if Keyword.get(opts, :session_stream, false), do: open_session_stream(client)
+          if Keyword.get(opts, :session_stream, false) and
+               protocol_version(client) == "2025-11-25",
+             do: open_session_stream(client)
+
           {:ok, client}
         rescue
           error in [Error, ProtocolError] ->
@@ -154,16 +164,17 @@ defmodule FastestMCP.Client do
   @doc "Returns the last initialize result cached by the client."
   def initialize_result(%__MODULE__{pid: pid}), do: GenServer.call(pid, :initialize_result)
 
+  @doc "Returns the last modern server discovery result cached by the client."
+  def discovery_result(%__MODULE__{pid: pid}), do: GenServer.call(pid, :discovery_result)
+
   @doc false
   def lifecycle_state(%__MODULE__{pid: pid}), do: GenServer.call(pid, :lifecycle_state)
 
   @doc "Returns the negotiated protocol version."
-  def protocol_version(%__MODULE__{} = client),
-    do: get_in(initialize_result(client), ["protocolVersion"])
+  def protocol_version(%__MODULE__{pid: pid}), do: GenServer.call(pid, :protocol_version)
 
   @doc "Returns the negotiated server capabilities."
-  def capabilities(%__MODULE__{} = client),
-    do: get_in(initialize_result(client), ["capabilities"]) || %{}
+  def capabilities(%__MODULE__{pid: pid}), do: GenServer.call(pid, :capabilities)
 
   @doc "Returns whether the client session stream is currently open."
   def session_stream_open?(%__MODULE__{pid: pid}), do: GenServer.call(pid, :session_stream_open?)
@@ -266,6 +277,55 @@ defmodule FastestMCP.Client do
     end
   end
 
+  @doc "Runs modern stateless server discovery and selects MCP 2026 for this connection."
+  def discover(%__MODULE__{} = client, opts \\ []) do
+    case GenServer.call(client.pid, :begin_discover) do
+      :ok -> :ok
+      {:error, %Error{} = error} -> raise error
+    end
+
+    result = discover_with_version_retry(client, opts, 1)
+
+    case GenServer.call(client.pid, {:finish_discover, result}) do
+      :ok -> result
+      {:error, %Error{} = error} -> raise error
+    end
+  end
+
+  defp discover_with_version_retry(client, opts, retries_left) do
+    request(client, "server/discover", %{}, :identity, opts)
+  rescue
+    error in Error ->
+      if retries_left > 0 and retryable_unsupported_version?(error) do
+        discover_with_version_retry(client, opts, retries_left - 1)
+      else
+        reraise error, __STACKTRACE__
+      end
+  end
+
+  defp retryable_unsupported_version?(%Error{
+         code: :unsupported_protocol_version,
+         details: details
+       })
+       when is_map(details) do
+    supported = Map.get(details, :supported, Map.get(details, "supported", []))
+    "2026-07-28" in List.wrap(supported)
+  end
+
+  defp retryable_unsupported_version?(_error), do: false
+
+  @doc "Starts a modern subscription/listen request and returns its request handle."
+  def listen(%__MODULE__{} = client, filter \\ %{}, opts \\ []) do
+    params = %{"notifications" => Map.new(filter)}
+
+    request_async(
+      client,
+      "subscriptions/listen",
+      params,
+      Keyword.put(opts, :timeout_ms, :infinity)
+    )
+  end
+
   @doc "Runs a ping request."
   def ping(%__MODULE__{} = client, opts \\ []) do
     request(client, "ping", %{}, :identity, opts)
@@ -295,7 +355,7 @@ defmodule FastestMCP.Client do
     case GenServer.call(
            pid,
            {:request_async, method, params, :identity, opts, self()},
-           min(timeout_ms, @default_timeout_ms) + 1_000
+           call_timeout(timeout_ms)
          ) do
       {:ok, ref, request_id, task_augmented} ->
         %ClientRequest{
@@ -402,22 +462,44 @@ defmodule FastestMCP.Client do
     descriptor = tool_descriptor!(client, name, opts[:version], deadline)
 
     validate_tool_arguments!(descriptor, arguments)
-    validate_tool_task_mode!(client, descriptor, task_requested?(opts))
+
+    modern_protocol? = protocol_version(client) == "2026-07-28"
+
+    validate_tool_task_mode!(
+      client,
+      descriptor,
+      task_requested?(opts),
+      modern_protocol?
+    )
 
     params =
       %{
         "name" => name,
         "arguments" => arguments
       }
-      |> maybe_put_task(opts)
+      |> maybe_put_task(opts, modern_protocol?)
       |> maybe_put_transport_version(opts[:version])
       |> maybe_put_request_meta(opts)
 
-    request_opts = Keyword.put(opts, :timeout_ms, remaining_timeout!(deadline, "tools/call"))
-    result = request(client, "tools/call", params, :identity, request_opts)
+    request_opts =
+      opts
+      |> Keyword.put(:timeout_ms, remaining_timeout!(deadline, "tools/call"))
+      |> Keyword.put(
+        :http_parameter_headers,
+        http_parameter_headers!(client, descriptor, arguments)
+      )
+
+    result = request_with_mrtr(client, "tools/call", params, request_opts)
 
     case result do
       %{"task" => task} ->
+        track_task(client, task,
+          kind: :tool,
+          target: name,
+          output_validator: descriptor.output_validator
+        )
+
+      %{"resultType" => "task", "taskId" => _task_id} = task ->
         track_task(client, task,
           kind: :tool,
           target: name,
@@ -453,7 +535,9 @@ defmodule FastestMCP.Client do
       |> maybe_put_transport_version(opts[:version])
       |> maybe_put_request_meta(opts)
 
-    request(client, "resources/read", params, :resource_read, opts)
+    client
+    |> request_with_mrtr("resources/read", params, opts)
+    |> then(&normalize_response(:resource_read, &1))
   end
 
   @doc "Subscribes the current session to updates for one concrete resource URI."
@@ -492,7 +576,9 @@ defmodule FastestMCP.Client do
       }
       |> maybe_put_request_meta(opts)
 
-    request(client, "prompts/get", params, :prompt, opts)
+    client
+    |> request_with_mrtr("prompts/get", params, opts)
+    |> then(&normalize_response(:prompt, &1))
   end
 
   @doc "Fetches background-task state."
@@ -512,6 +598,14 @@ defmodule FastestMCP.Client do
 
   @doc "Returns the normalized result for a background task."
   def task_result(%__MODULE__{} = client, task_id, opts \\ []) do
+    if protocol_version(client) == "2026-07-28" do
+      modern_task_result(client, task_id, opts)
+    else
+      legacy_task_result(client, task_id, opts)
+    end
+  end
+
+  defp legacy_task_result(client, task_id, opts) do
     result =
       request(
         client,
@@ -522,6 +616,37 @@ defmodule FastestMCP.Client do
       )
 
     validate_remote_task_payload!(client, task_id, result)
+  end
+
+  defp modern_task_result(client, task_id, opts) do
+    task = wait_for_task(client, task_id, opts)
+
+    case task["status"] do
+      "completed" ->
+        validate_remote_task_payload!(client, task_id, Map.fetch!(task, "result"))
+
+      "failed" ->
+        raise remote_task_error(task_id, task["error"])
+
+      "cancelled" ->
+        raise Error, code: :cancelled, message: "background task was cancelled"
+    end
+  end
+
+  @doc "Supplies responses to a remote task's outstanding input requests."
+  def update_task(%__MODULE__{} = client, task_id, input_responses, opts \\ [])
+      when is_map(input_responses) do
+    request(
+      client,
+      "tasks/update",
+      %{
+        "taskId" => to_string(task_id),
+        "inputResponses" => Map.new(input_responses)
+      }
+      |> maybe_put_request_meta(opts),
+      :identity,
+      opts
+    )
   end
 
   @doc "Lists background tasks."
@@ -544,17 +669,23 @@ defmodule FastestMCP.Client do
 
   @doc "Cancels a background task."
   def cancel_task(%__MODULE__{} = client, task_id, opts \\ []) do
-    task =
+    modern? = protocol_version(client) == "2026-07-28"
+
+    result =
       request(
         client,
         "tasks/cancel",
         %{"taskId" => to_string(task_id)} |> maybe_put_request_meta(opts),
-        :task,
+        if(modern?, do: :identity, else: :task),
         opts
       )
 
-    :ok = cache_task_status(client, task_id, task)
-    task
+    if modern? do
+      result
+    else
+      :ok = cache_task_status(client, task_id, result)
+      result
+    end
   end
 
   @doc "Builds or refreshes a remote task handle tracked by this client."
@@ -616,9 +747,14 @@ defmodule FastestMCP.Client do
 
   @doc "Cancels a remote task and updates the local cache."
   def cancel_remote_task(%__MODULE__{} = client, task_id, opts \\ []) do
-    task = cancel_task(client, task_id, opts)
-    :ok = cache_task_status(client, task_id, task)
-    task
+    result = cancel_task(client, task_id, opts)
+
+    if result["resultType"] == "complete" do
+      result
+    else
+      :ok = cache_task_status(client, task_id, result)
+      result
+    end
   end
 
   @doc "Registers a callback for remote task status changes."
@@ -630,14 +766,29 @@ defmodule FastestMCP.Client do
   @impl true
   @doc "Initializes the state used by this module before it starts processing work."
   def init({transport, opts}) do
-    with :ok <- reject_configurable_protocol_versions(opts),
+    with :ok <- validate_protocol_options(opts),
          {:ok, roots} <- normalize_client_roots(Keyword.get(opts, :roots)) do
+      protocol_preference =
+        normalize_protocol_preference!(Keyword.get(opts, :protocol_version, :auto))
+
       state =
         %{
           client_pid: self(),
           transport: transport,
           session_id: transport.session_id,
           initialize_result: nil,
+          discovery_result: nil,
+          protocol_preference: protocol_preference,
+          selected_protocol_version: nil,
+          extensions:
+            opts
+            |> Keyword.get(:extensions)
+            |> Extensions.declare_oauth_grant(Keyword.get(opts, :oauth)),
+          max_mrtr_rounds:
+            normalize_positive_integer!(
+              Keyword.get(opts, :max_mrtr_rounds, @default_max_mrtr_rounds),
+              :max_mrtr_rounds
+            ),
           advertised_client_capabilities: nil,
           lifecycle_state: :new,
           initialization_owner_ref: nil,
@@ -656,6 +807,11 @@ defmodule FastestMCP.Client do
           callback_result_waiters: %{},
           pending_stdio_buffer: "",
           pending_stdio_ref: nil,
+          pending_stdio_refs: %{},
+          stdio_restart: normalize_stdio_restart!(Keyword.get(opts, :stdio_restart, true)),
+          stdio_restart_attempt: 0,
+          stdio_restart_timer_ref: nil,
+          stdio_restart_token: nil,
           sampling_handler: Keyword.get(opts, :sampling_handler),
           sampling_tools: normalize_sampling_tools(Keyword.get(opts, :sampling_tools, [])),
           sampling_context: Keyword.get(opts, :sampling_context),
@@ -693,7 +849,7 @@ defmodule FastestMCP.Client do
           timeout_ms: Keyword.get(opts, :timeout_ms, @default_timeout_ms),
           max_in_flight:
             Keyword.get_lazy(opts, :max_in_flight, fn ->
-              default_max_in_flight(transport.type)
+              default_max_in_flight(transport.type, protocol_preference)
             end)
         }
 
@@ -728,12 +884,51 @@ defmodule FastestMCP.Client do
     do: {:reply, state.initialize_result, state}
 
   def handle_call(:initialize_result, _from, state), do: {:reply, nil, state}
+  def handle_call(:discovery_result, _from, state), do: {:reply, state.discovery_result, state}
+
+  def handle_call(:protocol_version, _from, state),
+    do: {:reply, state.selected_protocol_version, state}
+
+  def handle_call(:transport_type, _from, state), do: {:reply, state.transport.type, state}
+
+  def handle_call(:capabilities, _from, state) do
+    result = state.discovery_result || state.initialize_result || %{}
+    {:reply, Map.get(result, "capabilities", %{}), state}
+  end
+
+  def handle_call(:mrtr_snapshot, _from, state) do
+    snapshot =
+      Map.take(state, [
+        :roots,
+        :roots_supported?,
+        :sampling_handler,
+        :sampling_tools,
+        :sampling_context,
+        :elicitation_handler,
+        :url_elicitation_handler,
+        :schema_options
+      ])
+
+    {:reply, snapshot, state}
+  end
+
   def handle_call(:lifecycle_state, _from, state), do: {:reply, state.lifecycle_state, state}
 
   def handle_call(:begin_initialize, {owner, _tag}, %{lifecycle_state: :new} = state) do
-    owner_ref = Process.monitor(owner)
+    if state.protocol_preference == "2026-07-28" do
+      {:reply,
+       {:error,
+        %Error{
+          code: :invalid_request,
+          message:
+            "initialize is a legacy-only API and cannot be used with protocol_version: \"2026-07-28\""
+        }}, state}
+    else
+      owner_ref = Process.monitor(owner)
 
-    {:reply, :ok, %{state | lifecycle_state: :initializing, initialization_owner_ref: owner_ref}}
+      {:reply, :ok,
+       %{state | lifecycle_state: :initializing, initialization_owner_ref: owner_ref}}
+    end
   end
 
   def handle_call(:begin_initialize, _from, state) do
@@ -746,10 +941,56 @@ defmodule FastestMCP.Client do
       }}, state}
   end
 
+  def handle_call(:begin_discover, _from, state) do
+    if state.protocol_preference == "2025-11-25" do
+      {:reply,
+       {:error,
+        %Error{
+          code: :invalid_request,
+          message:
+            "server/discover is a modern-only API and cannot be used with protocol_version: \"2025-11-25\""
+        }}, state}
+    else
+      {:reply, :ok, state}
+    end
+  end
+
   def handle_call(:finish_initialize, _from, %{lifecycle_state: :initializing} = state) do
     demonitor_initialization_owner(state.initialization_owner_ref)
 
-    {:reply, :ok, %{state | lifecycle_state: :initialized, initialization_owner_ref: nil}}
+    {:reply, :ok,
+     %{
+       state
+       | lifecycle_state: :initialized,
+         initialization_owner_ref: nil,
+         selected_protocol_version: "2025-11-25"
+     }}
+  end
+
+  def handle_call({:finish_discover, %{} = result}, _from, state) do
+    supported = Map.get(result, "supportedVersions", [])
+
+    if "2026-07-28" in supported do
+      demonitor_initialization_owner(state.initialization_owner_ref)
+
+      {:reply, :ok,
+       %{
+         state
+         | lifecycle_state: :initialized,
+           discovery_result: result,
+           selected_protocol_version: "2026-07-28",
+           session_id: nil,
+           initialization_owner_ref: nil
+       }}
+    else
+      {:reply,
+       {:error,
+        %Error{
+          code: :unsupported_protocol_version,
+          message: "server discovery did not advertise MCP 2026-07-28",
+          details: %{supported: supported, requested: "2026-07-28", jsonrpc_code: -32_022}
+        }}, state}
+    end
   end
 
   def handle_call(:finish_initialize, _from, state) do
@@ -924,8 +1165,12 @@ defmodule FastestMCP.Client do
     {:reply, {entry[:origin_method], entry[:output_validator]}, state}
   end
 
-  def handle_call(:ensure_tool_catalog, _from, %{tool_catalog_ready?: true} = state) do
-    {:reply, {:ready, state.tool_catalog}, state}
+  def handle_call(:ensure_tool_catalog, from, %{tool_catalog_ready?: true} = state) do
+    if ToolCatalog.fresh?(state.tool_catalog) do
+      {:reply, {:ready, state.tool_catalog}, state}
+    else
+      handle_call(:ensure_tool_catalog, from, %{state | tool_catalog_ready?: false})
+    end
   end
 
   def handle_call(:ensure_tool_catalog, {loader, _tag}, %{tool_catalog_load: nil} = state) do
@@ -1239,6 +1484,23 @@ defmodule FastestMCP.Client do
     end
   end
 
+  def handle_info(
+        {:http_request_complete, ref,
+         {:modern_subscription_terminated, %Error{} = error, retry_delay}},
+        state
+      ) do
+    case Map.get(state.in_flight, ref) do
+      %{
+        method: "subscriptions/listen",
+        protocol_version: "2026-07-28"
+      } = entry ->
+        {:noreply, schedule_modern_subscription_reconnect(state, ref, entry, error, retry_delay)}
+
+      _stale_or_cancelled_request ->
+        {:noreply, state}
+    end
+  end
+
   def handle_info({:session_recovery_complete, generation, result}, state) do
     {:noreply, finish_session_recovery(state, generation, result)}
   end
@@ -1256,26 +1518,23 @@ defmodule FastestMCP.Client do
   end
 
   def handle_info({:http_request_complete, ref, result}, state) do
-    case Map.pop(state.in_flight, ref) do
-      {nil, _in_flight} ->
+    {:noreply, complete_http_request(state, ref, result)}
+  end
+
+  def handle_info({:reconnect_modern_subscription, ref, reconnect_token}, state) do
+    case Map.get(state.in_flight, ref) do
+      %{
+        method: "subscriptions/listen",
+        protocol_version: "2026-07-28",
+        reconnect_token: ^reconnect_token,
+        worker_pid: nil,
+        worker_ref: nil,
+        request_ref: nil
+      } = entry ->
+        {:noreply, reopen_modern_subscription(state, ref, entry)}
+
+      _stale_active_or_cancelled_request ->
         {:noreply, state}
-
-      {%{timer_ref: timer_ref, worker_ref: worker_ref, normalizer: normalizer} = entry, in_flight} ->
-        cancel_timer(timer_ref)
-        cancel_http_request(get_in(state.in_flight, [ref, :request_ref]))
-        if worker_ref, do: Process.demonitor(worker_ref, [:flush])
-        {reply, state} = apply_http_response_metadata(result, state, entry)
-        state = retain_task_progress(state, entry, reply)
-        reply_request_entry(entry, reply)
-
-        {:noreply,
-         %{
-           state
-           | in_flight: in_flight,
-             worker_refs: drop_worker_ref(state.worker_refs, worker_ref),
-             request_owner_refs: drop_owner_ref(state.request_owner_refs, entry.owner_ref),
-             initialize_result: initialize_result_for(normalizer, reply, state.initialize_result)
-         }}
     end
   end
 
@@ -1290,6 +1549,7 @@ defmodule FastestMCP.Client do
         worker_ref = Map.get(entry, :worker_ref)
 
         maybe_send_outbound_cancellation(state, entry, "request timed out")
+        cancel_timer(Map.get(entry, :reconnect_timer_ref))
         cancel_http_request(Map.get(entry, :request_ref))
         if is_pid(worker_pid), do: Process.exit(worker_pid, :kill)
         if worker_ref, do: Process.demonitor(worker_ref, [:flush])
@@ -1310,7 +1570,9 @@ defmodule FastestMCP.Client do
            | in_flight: in_flight,
              worker_refs: drop_worker_ref(state.worker_refs, worker_ref),
              request_owner_refs: drop_owner_ref(state.request_owner_refs, entry.owner_ref),
-             pending_stdio_ref: nil
+             pending_stdio_ref:
+               if(state.pending_stdio_ref == ref, do: nil, else: state.pending_stdio_ref),
+             pending_stdio_refs: Map.delete(state.pending_stdio_refs, entry.request_id)
          }}
     end
   end
@@ -1462,7 +1724,7 @@ defmodule FastestMCP.Client do
           end
 
         {:notification, message} ->
-          {:noreply, dispatch_notification(message, state)}
+          {:noreply, route_server_notification(message, state)}
 
         {:error, %Error{} = error, message} ->
           if is_map(message) and not is_nil(message["id"]) and is_binary(message["method"]) do
@@ -1485,7 +1747,7 @@ defmodule FastestMCP.Client do
   end
 
   def handle_info({:server_notification, message}, state) do
-    {:noreply, dispatch_notification(message, state)}
+    {:noreply, route_server_notification(message, state)}
   end
 
   def handle_info({:task_wait_timeout, task_id, waiter_ref}, state) do
@@ -1546,19 +1808,72 @@ defmodule FastestMCP.Client do
         details: %{status: status}
       }
 
-    Enum.each(state.in_flight, fn {_ref, %{timer_ref: timer_ref} = entry} ->
-      cancel_timer(timer_ref)
-      reply_request_entry(entry, {:error, error})
-    end)
-
-    {:stop, :normal, %{state | in_flight: %{}}}
+    if restartable_modern_stdio?(state) do
+      {:noreply, begin_stdio_restart(state, error)}
+    else
+      {:stop, :normal, fail_stdio_requests(state, error)}
+    end
   end
 
+  def handle_info({:restart_stdio_transport, token}, %{stdio_restart_token: token} = state) do
+    case open_stdio_port(state.transport) do
+      {:ok, port} ->
+        state =
+          state
+          |> put_in([:transport, :port], port)
+          |> Map.put(:stdio_restart_timer_ref, nil)
+          |> Map.put(:stdio_restart_token, nil)
+          |> reopen_modern_stdio_subscriptions()
+
+        {:noreply, state}
+
+      {:error, reason} ->
+        error = %Error{
+          code: :internal_error,
+          message: "failed to restart stdio client transport",
+          details: %{reason: inspect(reason), attempt: state.stdio_restart_attempt}
+        }
+
+        case schedule_stdio_restart(state, error) do
+          {:ok, next_state} -> {:noreply, next_state}
+          {:error, next_state} -> {:stop, :normal, next_state}
+        end
+    end
+  end
+
+  def handle_info({:restart_stdio_transport, _stale_token}, state), do: {:noreply, state}
+
   def handle_info(_message, state), do: {:noreply, state}
+
+  defp complete_http_request(state, ref, result) do
+    case Map.pop(state.in_flight, ref) do
+      {nil, _in_flight} ->
+        state
+
+      {%{timer_ref: timer_ref, worker_ref: worker_ref, normalizer: normalizer} = entry, in_flight} ->
+        cancel_timer(timer_ref)
+        cancel_timer(Map.get(entry, :reconnect_timer_ref))
+        cancel_http_request(get_in(state.in_flight, [ref, :request_ref]))
+        if worker_ref, do: Process.demonitor(worker_ref, [:flush])
+        {reply, state} = apply_http_response_metadata(result, state, entry)
+        state = retain_task_progress(state, entry, reply)
+        reply_request_entry(entry, reply)
+
+        %{
+          state
+          | in_flight: in_flight,
+            worker_refs: drop_worker_ref(state.worker_refs, worker_ref),
+            request_owner_refs: drop_owner_ref(state.request_owner_refs, entry.owner_ref),
+            initialize_result: initialize_result_for(normalizer, reply, state.initialize_result)
+        }
+    end
+  end
 
   @impl true
   @doc "Cleans up module state on shutdown."
   def terminate(_reason, state) do
+    cancel_timer(state.stdio_restart_timer_ref)
+
     if session_stream = state.session_stream do
       cancel_http_request(session_stream.request_ref)
       if is_pid(session_stream.pid), do: Process.exit(session_stream.pid, :kill)
@@ -1571,6 +1886,7 @@ defmodule FastestMCP.Client do
       if is_pid(entry[:worker_pid]), do: Process.exit(entry.worker_pid, :kill)
       if entry[:worker_ref], do: Process.demonitor(entry.worker_ref, [:flush])
       cancel_timer(entry[:timer_ref])
+      cancel_timer(entry[:reconnect_timer_ref])
     end)
 
     if is_pid(state.callback_supervisor) and Process.alive?(state.callback_supervisor) do
@@ -1638,6 +1954,151 @@ defmodule FastestMCP.Client do
     end
   end
 
+  defp request_with_mrtr(client, method, params, opts) do
+    max_rounds = Keyword.get(opts, :max_mrtr_rounds, @default_max_mrtr_rounds)
+    do_request_with_mrtr(client, method, params, opts, 0, max_rounds)
+  end
+
+  defp do_request_with_mrtr(client, method, params, opts, round, max_rounds) do
+    result = request(client, method, params, :identity, opts)
+
+    case result do
+      %{"resultType" => "input_required"} when round < max_rounds ->
+        input_requests = Map.get(result, "inputRequests", %{})
+
+        responses =
+          if map_size(input_requests) == 0,
+            do: nil,
+            else: fulfill_input_requests(client, input_requests)
+
+        retry_params = latest_mrtr_retry_params(params, result, responses)
+
+        do_request_with_mrtr(client, method, retry_params, opts, round + 1, max_rounds)
+
+      %{"resultType" => "input_required"} ->
+        raise Error,
+          code: :overloaded,
+          message: "#{method} exceeded max_mrtr_rounds",
+          details: %{max_mrtr_rounds: max_rounds}
+
+      _complete ->
+        result
+    end
+  end
+
+  defp latest_mrtr_retry_params(params, result, responses) do
+    params = Map.drop(params, ["inputResponses", "requestState"])
+
+    params =
+      if is_map(responses) and map_size(responses) > 0,
+        do: Map.put(params, "inputResponses", responses),
+        else: params
+
+    if Map.has_key?(result, "requestState") do
+      Map.put(params, "requestState", Map.fetch!(result, "requestState"))
+    else
+      params
+    end
+  end
+
+  defp fulfill_input_requests(%__MODULE__{} = client, input_requests) do
+    snapshot = GenServer.call(client.pid, :mrtr_snapshot)
+
+    Map.new(input_requests, fn {key, request} ->
+      {key, fulfill_input_request!(client, key, request, snapshot)}
+    end)
+  end
+
+  defp fulfill_input_request!(_client, _key, %{"method" => "roots/list"}, snapshot) do
+    unless snapshot.roots_supported? do
+      raise Error,
+        code: :missing_required_client_capability,
+        message: "roots input is unsupported"
+    end
+
+    %{"resultType" => "complete", "roots" => Enum.map(snapshot.roots, &Root.to_wire/1)}
+  end
+
+  defp fulfill_input_request!(
+         client,
+         key,
+         %{"method" => "sampling/createMessage", "params" => params},
+         snapshot
+       ) do
+    context = mrtr_callback_context(client, key, "sampling/createMessage", params, snapshot)
+
+    with handler when not is_nil(handler) <- snapshot.sampling_handler,
+         {:ok, validators} <- validate_sampling_request_capabilities(params, snapshot),
+         {:ok, result} <- sampling_response(handler, params, context, validators) do
+      Map.put_new(result, "resultType", "complete")
+    else
+      nil ->
+        raise Error, code: :missing_required_client_capability, message: "sampling is unsupported"
+
+      {:error, %Error{} = error} ->
+        raise error
+    end
+  end
+
+  defp fulfill_input_request!(
+         client,
+         key,
+         %{"method" => "elicitation/create", "params" => params},
+         snapshot
+       ) do
+    context = mrtr_callback_context(client, key, "elicitation/create", params, snapshot)
+
+    result =
+      case Map.get(params, "mode", "form") do
+        "url" when not is_nil(snapshot.url_elicitation_handler) ->
+          url_elicitation_response(snapshot.url_elicitation_handler, params, context)
+
+        "url" ->
+          {:error,
+           %Error{
+             code: :missing_required_client_capability,
+             message: "URL elicitation is unsupported"
+           }}
+
+        _form when not is_nil(snapshot.elicitation_handler) ->
+          with :ok <- validate_elicitation_request_schema(params, snapshot.schema_options) do
+            elicitation_response(snapshot.elicitation_handler, params, context)
+          end
+
+        _form ->
+          {:error,
+           %Error{
+             code: :missing_required_client_capability,
+             message: "elicitation is unsupported"
+           }}
+      end
+
+    case result do
+      {:ok, response} -> Map.put_new(response, "resultType", "complete")
+      {:error, %Error{} = error} -> raise error
+    end
+  end
+
+  defp fulfill_input_request!(_client, _key, request, _snapshot) do
+    raise Error,
+      code: :invalid_request,
+      message: "unsupported MRTR input request #{inspect(Map.get(request, "method"))}"
+  end
+
+  defp mrtr_callback_context(client, key, method, params, snapshot) do
+    %CallbackContext{
+      client: client,
+      request_id: key,
+      method: method,
+      direction: :server_to_client,
+      progress_token: get_in(params, ["_meta", "progressToken"]),
+      sampling_tools: snapshot.sampling_tools,
+      sampling_context: snapshot.sampling_context,
+      cancellation_ref: :atomics.new(1, []),
+      cancelled?: false
+    }
+  end
+
   defp fail_initialize(%__MODULE__{pid: pid}, reason) do
     if Process.alive?(pid) do
       GenServer.call(pid, {:fail_initialize, reason})
@@ -1647,6 +2108,64 @@ defmodule FastestMCP.Client do
   catch
     :exit, _reason -> :ok
   end
+
+  defp negotiate_ready(%__MODULE__{} = client, opts) do
+    timeout_opts = [timeout_ms: Keyword.get(opts, :init_timeout_ms, @default_init_timeout_ms)]
+
+    case Keyword.get(opts, :protocol_version, :auto) do
+      "2025-11-25" ->
+        initialize(client, %{}, timeout_opts)
+
+      "2026-07-28" ->
+        discover(client, timeout_opts)
+
+      :auto ->
+        try do
+          discover(client, timeout_opts)
+        rescue
+          error in [Error, ProtocolError] ->
+            if legacy_fallback_evidence?(error, client_transport_type(client)) do
+              initialize(client, %{}, timeout_opts)
+            else
+              reraise error, __STACKTRACE__
+            end
+        end
+    end
+  end
+
+  defp legacy_fallback_evidence?(%ProtocolError{method: "server/discover"}, :stdio), do: true
+
+  defp legacy_fallback_evidence?(%ProtocolError{}, :streamable_http), do: false
+
+  defp legacy_fallback_evidence?(%Error{} = error, :stdio) do
+    not recognized_modern_discovery_error?(error)
+  end
+
+  defp legacy_fallback_evidence?(%Error{} = error, :streamable_http) do
+    details = if is_map(error.details), do: error.details, else: %{}
+    status = Map.get(details, :status, Map.get(details, "status"))
+    jsonrpc_code = Map.get(details, :jsonrpc_code, Map.get(details, "jsonrpc_code"))
+
+    not recognized_modern_discovery_error?(error) and
+      (jsonrpc_code == -32_601 or
+         (status == 400 and (is_nil(jsonrpc_code) or is_integer(jsonrpc_code))) or
+         (status in [404, 405] and is_nil(jsonrpc_code)))
+  end
+
+  defp legacy_fallback_evidence?(_error, _transport), do: false
+
+  defp recognized_modern_discovery_error?(%Error{code: code, details: details}) do
+    details = if is_map(details), do: details, else: %{}
+    jsonrpc_code = Map.get(details, :jsonrpc_code, Map.get(details, "jsonrpc_code"))
+
+    code in [
+      :header_mismatch,
+      :missing_required_client_capability,
+      :unsupported_protocol_version
+    ] or jsonrpc_code in [-32_020, -32_021, -32_022]
+  end
+
+  defp client_transport_type(%__MODULE__{pid: pid}), do: GenServer.call(pid, :transport_type)
 
   defp notification(%__MODULE__{pid: pid}, method, params, opts) do
     timeout_ms = Keyword.get(opts, :timeout_ms, @default_timeout_ms)
@@ -1662,6 +2181,14 @@ defmodule FastestMCP.Client do
          "initialize",
          :initialize
        ),
+       do: :ok
+
+  defp validate_outbound_request_lifecycle(
+         %{lifecycle_state: state},
+         "server/discover",
+         _normalizer
+       )
+       when state in [:new, :initialized],
        do: :ok
 
   defp validate_outbound_request_lifecycle(
@@ -1806,6 +2333,18 @@ defmodule FastestMCP.Client do
   end
 
   defp maybe_open_stdio_port(%{transport: %{type: :stdio} = transport} = state) do
+    case open_stdio_port(transport) do
+      {:ok, port} ->
+        put_in(state, [:transport, :port], port)
+
+      {:error, reason} ->
+        raise ArgumentError, "failed to open stdio transport: #{inspect(reason)}"
+    end
+  end
+
+  defp maybe_open_stdio_port(state), do: state
+
+  defp open_stdio_port(transport) do
     port_options =
       [
         :binary,
@@ -1816,19 +2355,208 @@ defmodule FastestMCP.Client do
       ]
       |> maybe_put_port_env(transport.env)
 
-    port =
-      Port.open(
-        {:spawn_executable, transport.command},
-        port_options
-      )
-
-    put_in(state, [:transport, :port], port)
+    {:ok, Port.open({:spawn_executable, transport.command}, port_options)}
+  rescue
+    error -> {:error, error}
+  catch
+    kind, reason -> {:error, {kind, reason}}
   end
-
-  defp maybe_open_stdio_port(state), do: state
 
   defp maybe_put_port_env(options, []), do: options
   defp maybe_put_port_env(options, env), do: options ++ [{:env, env}]
+
+  defp restartable_modern_stdio?(state) do
+    state.lifecycle_state == :initialized and
+      state.selected_protocol_version == "2026-07-28" and
+      state.stdio_restart.max_attempts > state.stdio_restart_attempt
+  end
+
+  defp begin_stdio_restart(state, error) do
+    state
+    |> detach_stdio_requests_for_restart(error)
+    |> schedule_stdio_restart(error)
+    |> case do
+      {:ok, next_state} -> next_state
+      {:error, next_state} -> next_state
+    end
+  end
+
+  defp schedule_stdio_restart(state, error) do
+    cancel_timer(state.stdio_restart_timer_ref)
+
+    if state.stdio_restart_attempt < state.stdio_restart.max_attempts do
+      attempt = state.stdio_restart_attempt + 1
+      retry_ms = stdio_restart_delay(state.stdio_restart, attempt)
+      token = make_ref()
+
+      timer_ref =
+        Process.send_after(self(), {:restart_stdio_transport, token}, retry_ms)
+
+      {:ok,
+       %{
+         state
+         | stdio_restart_attempt: attempt,
+           stdio_restart_timer_ref: timer_ref,
+           stdio_restart_token: token
+       }}
+    else
+      terminal_error = %{
+        error
+        | details:
+            Map.merge(error.details || %{}, %{
+              restart_attempts: state.stdio_restart_attempt,
+              restart_exhausted: true
+            })
+      }
+
+      {:error, fail_stdio_requests(state, terminal_error)}
+    end
+  end
+
+  defp stdio_restart_delay(%{retry_ms: retry_ms, max_retry_ms: max_retry_ms}, attempt) do
+    multiplier = Integer.pow(2, max(attempt - 1, 0))
+    min(retry_ms * multiplier, max_retry_ms)
+  end
+
+  defp detach_stdio_requests_for_restart(state, error) do
+    {subscriptions, ordinary_requests} =
+      Enum.split_with(state.in_flight, fn {_ref, entry} ->
+        entry.method == "subscriptions/listen" and
+          entry.protocol_version == "2026-07-28"
+      end)
+
+    Enum.each(ordinary_requests, fn {_ref, entry} ->
+      cancel_timer(entry.timer_ref)
+      cancel_timer(Map.get(entry, :reconnect_timer_ref))
+      reply_request_entry(entry, {:error, error})
+      if entry.owner_ref, do: Process.demonitor(entry.owner_ref, [:flush])
+    end)
+
+    subscriptions =
+      Map.new(subscriptions, fn {ref, entry} ->
+        {ref,
+         entry
+         |> Map.put(:request_id, nil)
+         |> Map.put(:subscription_acknowledged?, false)
+         |> Map.put(:acknowledged_subscription_filter, nil)}
+      end)
+
+    subscription_owner_refs =
+      subscriptions
+      |> Map.values()
+      |> Enum.map(& &1.owner_ref)
+      |> MapSet.new()
+
+    request_owner_refs =
+      Map.filter(state.request_owner_refs, fn {owner_ref, _ref} ->
+        MapSet.member?(subscription_owner_refs, owner_ref)
+      end)
+
+    %{
+      state
+      | transport: Map.put(state.transport, :port, nil),
+        in_flight: subscriptions,
+        worker_refs: %{},
+        request_owner_refs: request_owner_refs,
+        pending_stdio_buffer: "",
+        pending_stdio_ref: nil,
+        pending_stdio_refs: %{},
+        stdio_restart_timer_ref: nil,
+        stdio_restart_token: nil
+    }
+  end
+
+  defp reopen_modern_stdio_subscriptions(state) do
+    Enum.reduce(Map.keys(state.in_flight), state, fn ref, next_state ->
+      case Map.get(next_state.in_flight, ref) do
+        %{method: "subscriptions/listen", protocol_version: "2026-07-28"} = entry ->
+          reopen_modern_stdio_subscription(next_state, ref, entry)
+
+        _other ->
+          next_state
+      end
+    end)
+  end
+
+  defp reopen_modern_stdio_subscription(state, ref, entry) do
+    request_id = Integer.to_string(state.next_request_id)
+    opts = Map.fetch!(entry, :request_opts)
+    params = Map.fetch!(entry, :request_params)
+
+    case safe_build_request("subscriptions/listen", params, request_id, state, opts) do
+      {:ok, request} ->
+        case safe_stdio_command(state.transport.port, request) do
+          :ok ->
+            entry =
+              entry
+              |> Map.put(:request_id, request_id)
+              |> Map.put(:subscription_acknowledged?, false)
+              |> Map.put(:acknowledged_subscription_filter, nil)
+
+            state
+            |> Map.put(:next_request_id, state.next_request_id + 1)
+            |> put_in([:in_flight, ref], entry)
+            |> put_in([:pending_stdio_refs, request_id], ref)
+
+          {:error, %Error{}} ->
+            # The child may exit between Port.open/2 and the first command.
+            # Keep the listener detached so the next bounded restart attempt
+            # can re-establish it instead of failing the public handle early.
+            state
+        end
+
+      {:error, %Error{} = error} ->
+        fail_reopened_stdio_subscription(state, ref, entry, error)
+    end
+  end
+
+  defp fail_reopened_stdio_subscription(state, ref, entry, error) do
+    cancel_timer(entry.timer_ref)
+    reply_request_entry(entry, {:error, error})
+
+    %{
+      state
+      | in_flight: Map.delete(state.in_flight, ref),
+        request_owner_refs: drop_owner_ref(state.request_owner_refs, entry.owner_ref)
+    }
+  end
+
+  defp fail_stdio_requests(state, error) do
+    Enum.each(state.in_flight, fn {_ref, entry} ->
+      cancel_timer(entry.timer_ref)
+      cancel_timer(Map.get(entry, :reconnect_timer_ref))
+      reply_request_entry(entry, {:error, error})
+      if entry.owner_ref, do: Process.demonitor(entry.owner_ref, [:flush])
+    end)
+
+    %{
+      state
+      | transport: Map.put(state.transport, :port, nil),
+        in_flight: %{},
+        worker_refs: %{},
+        request_owner_refs: %{},
+        pending_stdio_buffer: "",
+        pending_stdio_ref: nil,
+        pending_stdio_refs: %{},
+        stdio_restart_timer_ref: nil,
+        stdio_restart_token: nil
+    }
+  end
+
+  defp safe_stdio_command(port, message) when is_port(port) do
+    if Port.info(port) && Port.command(port, JSON.encode!(message) <> "\n") do
+      :ok
+    else
+      {:error, %Error{code: :internal_error, message: "stdio client transport is closed"}}
+    end
+  rescue
+    ArgumentError ->
+      {:error, %Error{code: :internal_error, message: "stdio client transport is closed"}}
+  end
+
+  defp safe_stdio_command(_port, _message) do
+    {:error, %Error{code: :internal_error, message: "stdio client transport is restarting"}}
+  end
 
   defp maybe_start_oauth(state, nil), do: {:ok, state}
 
@@ -1924,6 +2652,47 @@ defmodule FastestMCP.Client do
       message: "sse_reconnect must be a keyword list, true, or false"
   end
 
+  defp normalize_stdio_restart!(false) do
+    %{max_attempts: 0, retry_ms: 0, max_retry_ms: 0}
+  end
+
+  defp normalize_stdio_restart!(true), do: normalize_stdio_restart!([])
+
+  defp normalize_stdio_restart!(opts) when is_list(opts) do
+    max_attempts =
+      normalize_non_negative_integer!(
+        Keyword.get(opts, :max_attempts, @default_stdio_restart_max_attempts),
+        :max_attempts
+      )
+
+    retry_ms =
+      normalize_non_negative_integer!(
+        Keyword.get(opts, :retry_ms, @default_stdio_restart_retry_ms),
+        :retry_ms
+      )
+
+    max_retry_ms =
+      normalize_non_negative_integer!(
+        Keyword.get(opts, :max_retry_ms, @default_stdio_restart_max_retry_ms),
+        :max_retry_ms
+      )
+
+    if retry_ms > max_retry_ms or max_retry_ms > 60_000 do
+      raise Error,
+        code: :invalid_params,
+        message: "invalid stdio restart retry bounds",
+        details: %{retry_ms: retry_ms, max_retry_ms: max_retry_ms}
+    end
+
+    %{max_attempts: max_attempts, retry_ms: retry_ms, max_retry_ms: max_retry_ms}
+  end
+
+  defp normalize_stdio_restart!(_opts) do
+    raise Error,
+      code: :invalid_params,
+      message: "stdio_restart must be a keyword list, true, or false"
+  end
+
   defp normalize_non_negative_integer!(value, option) do
     case normalize_non_negative_integer(value, option) do
       {:ok, normalized} -> normalized
@@ -1944,20 +2713,53 @@ defmodule FastestMCP.Client do
      }}
   end
 
-  defp validate_transport_options(%{transport: %{type: :stdio}, max_in_flight: 1}), do: :ok
+  defp normalize_positive_integer!(value, _option) when is_integer(value) and value > 0,
+    do: value
+
+  defp normalize_positive_integer!(value, option) do
+    raise ArgumentError, "#{option} must be a positive integer, got #{inspect(value)}"
+  end
+
+  defp request_timer(_ref, :infinity), do: nil
+
+  defp request_timer(ref, timeout_ms),
+    do: Process.send_after(self(), {:request_timeout, ref}, timeout_ms)
+
+  defp call_timeout(:infinity), do: :infinity
+  defp call_timeout(timeout_ms), do: min(timeout_ms, @default_timeout_ms) + 1_000
+
+  defp validate_transport_options(%{
+         transport: %{type: :stdio},
+         protocol_preference: "2025-11-25",
+         max_in_flight: max
+       })
+       when max != 1 do
+    {:error,
+     %Error{
+       code: :bad_request,
+       message: "legacy stdio max_in_flight must be 1",
+       details: %{transport: :stdio, max_in_flight: max, supported: 1}
+     }}
+  end
+
+  defp validate_transport_options(%{transport: %{type: :stdio}, max_in_flight: max})
+       when max == :infinity or (is_integer(max) and max > 0),
+       do: :ok
+
   defp validate_transport_options(%{transport: %{type: :streamable_http}}), do: :ok
 
   defp validate_transport_options(%{transport: %{type: :stdio}, max_in_flight: max_in_flight}) do
     {:error,
      %Error{
        code: :bad_request,
-       message: "stdio clients only support max_in_flight: 1",
-       details: %{transport: :stdio, max_in_flight: max_in_flight, supported: 1}
+       message: "stdio max_in_flight must be a positive integer or :infinity",
+       details: %{transport: :stdio, max_in_flight: max_in_flight}
      }}
   end
 
-  defp default_max_in_flight(:stdio), do: @default_stdio_max_in_flight
-  defp default_max_in_flight(:streamable_http), do: @default_http_max_in_flight
+  defp default_max_in_flight(:stdio, "2025-11-25"), do: @default_stdio_max_in_flight
+  defp default_max_in_flight(:stdio, _preference), do: @default_modern_stdio_max_in_flight
+  defp default_max_in_flight(:streamable_http, _preference), do: @default_http_max_in_flight
 
   defp session_stream_alive?(%{session_stream: %{pid: pid}}) when is_pid(pid),
     do: Process.alive?(pid)
@@ -2001,18 +2803,28 @@ defmodule FastestMCP.Client do
 
   defp start_outbound_request(state, method, params, normalizer, opts, reply_to) do
     timeout_ms = Keyword.get(opts, :timeout_ms, state.timeout_ms)
+    protocol_version = selected_request_protocol_version(state, method)
+    opts = Keyword.put(opts, :protocol_version, protocol_version)
 
     lifecycle_validation =
       validate_outbound_request_lifecycle(state, method, normalizer)
 
     normalizer =
       if method == "initialize",
-        do: {:initialize, Protocol.current_version()},
+        do: {:initialize, "2025-11-25"},
         else: normalizer
 
     cond do
       match?({:error, %Error{}}, lifecycle_validation) ->
         {:error, elem(lifecycle_validation, 1), state}
+
+      stdio_transport_restarting?(state) ->
+        {:error,
+         %Error{
+           code: :internal_error,
+           message: "stdio client transport is restarting",
+           details: %{attempt: state.stdio_restart_attempt}
+         }, state}
 
       saturated?(state) ->
         {:error,
@@ -2064,10 +2876,18 @@ defmodule FastestMCP.Client do
               task_augmented: task_augmented,
               progress_token: progress_token,
               last_progress: nil,
-              progress_total: nil
+              progress_total: nil,
+              protocol_version: protocol_version,
+              notification_handler: Keyword.get(opts, :on_notification),
+              request_params: params,
+              request_opts: opts,
+              subscription_acknowledged?: false,
+              subscription_reconnect_attempt: 0,
+              reconnect_timer_ref: nil,
+              reconnect_token: nil
             }
 
-            timer_ref = Process.send_after(self(), {:request_timeout, ref}, timeout_ms)
+            timer_ref = request_timer(ref, timeout_ms)
             entry = Map.put(entry, :timer_ref, timer_ref)
 
             next_state =
@@ -2079,40 +2899,32 @@ defmodule FastestMCP.Client do
 
             case state.transport.type do
               :stdio ->
-                true = Port.command(state.transport.port, JSON.encode!(request) <> "\n")
+                case safe_stdio_command(state.transport.port, request) do
+                  :ok ->
+                    {:ok, ref, request_id, task_augmented,
+                     %{
+                       next_state
+                       | pending_stdio_ref: ref,
+                         pending_stdio_refs:
+                           Map.put(next_state.pending_stdio_refs, request_id, ref)
+                     }}
 
-                {:ok, ref, request_id, task_augmented, %{next_state | pending_stdio_ref: ref}}
+                  {:error, %Error{} = error} ->
+                    Process.demonitor(owner_ref, [:flush])
+                    {:error, error, state}
+                end
 
               :streamable_http ->
-                parent = self()
-
-                {pid, worker_ref} =
-                  spawn_monitor(fn ->
-                    request_started = fn request_ref ->
-                      send(parent, {:http_request_started, ref, self(), request_ref})
-                    end
-
-                    result =
-                      run_http_request(
-                        request,
-                        method,
-                        normalizer,
-                        timeout_ms,
-                        state,
-                        opts,
-                        request_started
-                      )
-
-                    send(parent, {:http_request_complete, ref, result})
-                  end)
-
-                next_state =
-                  next_state
-                  |> put_in([:in_flight, ref, :worker_pid], pid)
-                  |> put_in([:in_flight, ref, :worker_ref], worker_ref)
-                  |> put_in([:worker_refs, worker_ref], ref)
-
-                {:ok, ref, request_id, task_augmented, next_state}
+                {:ok, ref, request_id, task_augmented,
+                 start_http_request_worker(
+                   next_state,
+                   ref,
+                   request,
+                   method,
+                   normalizer,
+                   timeout_ms,
+                   opts
+                 )}
             end
 
           {:error, exception} ->
@@ -2120,6 +2932,11 @@ defmodule FastestMCP.Client do
         end
     end
   end
+
+  defp stdio_transport_restarting?(%{transport: %{type: :stdio, port: port}}),
+    do: not is_port(port) or Port.info(port) == nil
+
+  defp stdio_transport_restarting?(_state), do: false
 
   defp request_owner({:sync, {pid, _tag}}), do: pid
   defp request_owner({:async, pid}), do: pid
@@ -2130,12 +2947,151 @@ defmodule FastestMCP.Client do
 
   defp maybe_store_advertised_client_capabilities(state, _request, _method), do: state
 
+  defp start_http_request_worker(
+         state,
+         ref,
+         request,
+         method,
+         normalizer,
+         timeout_ms,
+         opts
+       ) do
+    parent = self()
+
+    {pid, worker_ref} =
+      spawn_monitor(fn ->
+        request_started = fn request_ref ->
+          send(parent, {:http_request_started, ref, self(), request_ref})
+        end
+
+        result =
+          run_http_request(
+            request,
+            method,
+            normalizer,
+            timeout_ms,
+            state,
+            opts,
+            request_started
+          )
+
+        send(parent, {:http_request_complete, ref, result})
+      end)
+
+    state
+    |> put_in([:in_flight, ref, :worker_pid], pid)
+    |> put_in([:in_flight, ref, :worker_ref], worker_ref)
+    |> put_in([:worker_refs, worker_ref], ref)
+  end
+
+  defp schedule_modern_subscription_reconnect(state, ref, entry, error, retry_delay) do
+    cancel_http_request(entry.request_ref)
+    cancel_timer(Map.get(entry, :reconnect_timer_ref))
+    if entry.worker_ref, do: Process.demonitor(entry.worker_ref, [:flush])
+
+    attempt = Map.get(entry, :subscription_reconnect_attempt, 0)
+
+    detached_entry =
+      entry
+      |> Map.put(:worker_pid, nil)
+      |> Map.put(:worker_ref, nil)
+      |> Map.put(:request_ref, nil)
+      |> Map.put(:subscription_acknowledged?, false)
+      |> Map.put(:reconnect_timer_ref, nil)
+      |> Map.put(:reconnect_token, nil)
+
+    state =
+      state
+      |> Map.put(:worker_refs, drop_worker_ref(state.worker_refs, entry.worker_ref))
+      |> put_in([:in_flight, ref], detached_entry)
+
+    if attempt < state.sse_reconnect.max_attempts and is_integer(retry_delay) do
+      reconnect_token = make_ref()
+
+      reconnect_timer_ref =
+        Process.send_after(
+          self(),
+          {:reconnect_modern_subscription, ref, reconnect_token},
+          retry_delay
+        )
+
+      state
+      |> put_in([:in_flight, ref, :subscription_reconnect_attempt], attempt + 1)
+      |> put_in([:in_flight, ref, :reconnect_timer_ref], reconnect_timer_ref)
+      |> put_in([:in_flight, ref, :reconnect_token], reconnect_token)
+    else
+      terminal_error = %{
+        error
+        | details:
+            Map.merge(error.details || %{}, %{
+              reconnect_attempts: attempt,
+              reconnect_exhausted: attempt >= state.sse_reconnect.max_attempts
+            })
+      }
+
+      complete_http_request(state, ref, {:error, terminal_error})
+    end
+  end
+
+  defp reopen_modern_subscription(state, ref, entry) do
+    request_id = Integer.to_string(state.next_request_id)
+    opts = Map.fetch!(entry, :request_opts)
+    params = Map.fetch!(entry, :request_params)
+
+    cancel_timer(Map.get(entry, :reconnect_timer_ref))
+
+    entry =
+      entry
+      |> Map.put(:request_id, request_id)
+      |> Map.put(:reconnect_timer_ref, nil)
+      |> Map.put(:reconnect_token, nil)
+
+    state =
+      state
+      |> Map.put(:next_request_id, state.next_request_id + 1)
+      |> put_in([:in_flight, ref], entry)
+
+    case safe_build_request("subscriptions/listen", params, request_id, state, opts) do
+      {:ok, request} ->
+        start_http_request_worker(
+          state,
+          ref,
+          request,
+          "subscriptions/listen",
+          entry.normalizer,
+          entry.timeout_ms,
+          opts
+        )
+
+      {:error, %Error{} = error} ->
+        complete_http_request(state, ref, {:error, error})
+    end
+  end
+
   defp task_augmented_params?(%{"task" => %{}}), do: true
+
+  defp task_augmented_params?(%{
+         "_meta" => %{"io.modelcontextprotocol/protocolVersion" => "2026-07-28"}
+       }),
+       do: true
+
   defp task_augmented_params?(_params), do: false
 
   defp server_supports_method?(state, method) do
-    capabilities = get_in(state.initialize_result || %{}, ["capabilities"]) || %{}
-    Protocol.server_supports_method?(capabilities, method)
+    if method in ["initialize", "server/discover"] do
+      true
+    else
+      capabilities =
+        Map.get(state.discovery_result || state.initialize_result || %{}, "capabilities", %{})
+
+      if state.selected_protocol_version == "2026-07-28" and
+           method in ["tasks/get", "tasks/update", "tasks/cancel"] do
+        Extensions.enabled?(capabilities, Extensions.tasks()) and
+          Extensions.enabled?(state.extensions, Extensions.tasks())
+      else
+        Protocol.server_supports_method?(capabilities, method)
+      end
+    end
   end
 
   defp duplicate_progress_token?(_state, nil), do: false
@@ -2150,7 +3106,10 @@ defmodule FastestMCP.Client do
   defp safe_build_request(method, params, request_id, state, opts) do
     request = build_request(method, params, request_id, state, opts)
 
-    case Schema.validate_protocol(:client_to_server, :request, method, request) do
+    protocol_version =
+      Keyword.get(opts, :protocol_version, selected_request_protocol_version(state, method))
+
+    case Schema.validate_protocol(protocol_version, :client_to_server, :request, method, request) do
       {:ok, ^request} ->
         {:ok, request}
 
@@ -2200,6 +3159,7 @@ defmodule FastestMCP.Client do
 
   defp locally_cancel_outbound_request(state, ref, entry) do
     cancel_timer(entry.timer_ref)
+    cancel_timer(Map.get(entry, :reconnect_timer_ref))
     cancel_http_request(entry.request_ref)
     if is_pid(entry.worker_pid), do: Process.exit(entry.worker_pid, :kill)
     if entry.worker_ref, do: Process.demonitor(entry.worker_ref, [:flush])
@@ -2219,12 +3179,21 @@ defmodule FastestMCP.Client do
         worker_refs: drop_worker_ref(state.worker_refs, entry.worker_ref),
         request_owner_refs: drop_owner_ref(state.request_owner_refs, entry.owner_ref),
         pending_stdio_ref:
-          if(state.pending_stdio_ref == ref, do: nil, else: state.pending_stdio_ref)
+          if(state.pending_stdio_ref == ref, do: nil, else: state.pending_stdio_ref),
+        pending_stdio_refs: Map.delete(state.pending_stdio_refs, entry.request_id)
     }
   end
 
   defp maybe_send_outbound_cancellation(_state, %{method: "initialize"}, _reason), do: :ok
   defp maybe_send_outbound_cancellation(_state, %{task_augmented: true}, _reason), do: :ok
+
+  defp maybe_send_outbound_cancellation(
+         %{transport: %{type: :stdio, port: port}},
+         _entry,
+         _reason
+       )
+       when not is_port(port),
+       do: :ok
 
   defp maybe_send_outbound_cancellation(state, entry, reason) do
     params =
@@ -2236,6 +3205,10 @@ defmodule FastestMCP.Client do
     case state.transport.type do
       :stdio ->
         send_client_notification(state, "notifications/cancelled", params, opts)
+
+      :streamable_http when state.selected_protocol_version == "2026-07-28" ->
+        # Modern HTTP cancellation is closing the request-scoped response.
+        :ok
 
       :streamable_http ->
         spawn(fn ->
@@ -2352,8 +3325,8 @@ defmodule FastestMCP.Client do
   end
 
   defp load_tool_catalog(client, generation, schema_options, deadline) do
-    tools = fetch_all_tools!(client, nil, MapSet.new(), [], 0, 0, deadline)
-    {:ok, ToolCatalog.build(tools, generation, schema_options)}
+    {tools, ttl_ms} = fetch_all_tools!(client, nil, MapSet.new(), [], nil, 0, 0, deadline)
+    {:ok, ToolCatalog.build(tools, generation, schema_options, ttl_ms)}
   rescue
     exception -> {:error, exception}
   end
@@ -2363,18 +3336,20 @@ defmodule FastestMCP.Client do
          nil,
          _seen_cursors,
          pages,
+         ttl_ms,
          page_count,
          _item_count,
          _deadline
        )
        when page_count > 0,
-       do: pages |> Enum.reverse() |> List.flatten()
+       do: {pages |> Enum.reverse() |> List.flatten(), ttl_ms || 0}
 
   defp fetch_all_tools!(
          client,
          cursor,
          seen_cursors,
          pages,
+         ttl_ms,
          page_count,
          item_count,
          deadline
@@ -2390,6 +3365,7 @@ defmodule FastestMCP.Client do
     opts = if is_nil(cursor), do: opts, else: Keyword.put(opts, :cursor, cursor)
     page = list_tools(client, opts)
     next_count = item_count + length(page.items)
+    ttl_ms = min_ttl(ttl_ms, Map.get(page, :ttl_ms, 0))
 
     if next_count > @max_tool_catalog_items do
       raise Error,
@@ -2402,7 +3378,7 @@ defmodule FastestMCP.Client do
 
     cond do
       is_nil(next_cursor) ->
-        [page.items | pages] |> Enum.reverse() |> List.flatten()
+        {[page.items | pages] |> Enum.reverse() |> List.flatten(), ttl_ms}
 
       MapSet.member?(seen_cursors, next_cursor) ->
         raise Error,
@@ -2416,12 +3392,16 @@ defmodule FastestMCP.Client do
           next_cursor,
           MapSet.put(seen_cursors, next_cursor),
           [page.items | pages],
+          ttl_ms,
           page_count + 1,
           next_count,
           deadline
         )
     end
   end
+
+  defp min_ttl(nil, ttl_ms), do: ttl_ms
+  defp min_ttl(ttl_ms, other), do: min(ttl_ms, other)
 
   defp validate_tool_arguments!(descriptor, arguments) do
     case Schema.validate(descriptor.input_validator, arguments) do
@@ -2436,13 +3416,37 @@ defmodule FastestMCP.Client do
     end
   end
 
-  defp validate_tool_task_mode!(client, descriptor, task_augmented?) do
+  defp http_parameter_headers!(client, descriptor, arguments) do
+    if client_transport_type(client) == :streamable_http do
+      encode_http_parameter_headers!(descriptor, arguments)
+    else
+      %{}
+    end
+  end
+
+  defp encode_http_parameter_headers!(descriptor, arguments) do
+    case HTTPHeaders.encode(descriptor.http_headers, arguments) do
+      {:ok, headers} ->
+        headers
+
+      {:error, reason} ->
+        raise Error,
+          code: :invalid_params,
+          message: "tool arguments cannot be represented in the declared HTTP headers",
+          details: %{tool: descriptor.name, reason: reason}
+    end
+  end
+
+  defp validate_tool_task_mode!(client, descriptor, task_augmented?, modern_protocol?) do
     capabilities = capabilities(client)
 
     task_capability? =
       Protocol.capability?(capabilities, ["tasks", "requests", "tools", "call"])
 
     cond do
+      modern_protocol? ->
+        :ok
+
       task_augmented? and not task_capability? ->
         raise Error,
           code: :bad_request,
@@ -2761,8 +3765,11 @@ defmodule FastestMCP.Client do
 
   defp task_poll_interval_ms(task) do
     task
-    |> then(&(&1["pollInterval"] || &1[:pollInterval] || 500))
-    |> Duration.positive_milliseconds!("task pollInterval")
+    |> then(
+      &(&1["pollIntervalMs"] || &1[:pollIntervalMs] || &1["pollInterval"] ||
+          &1[:pollInterval] || 500)
+    )
+    |> Duration.positive_milliseconds!("task polling interval")
   end
 
   defp task_id_from_status(%{} = params) do
@@ -2787,7 +3794,13 @@ defmodule FastestMCP.Client do
       {method, output_validator} when is_binary(method) ->
         envelope = %{"jsonrpc" => "2.0", "id" => "task-result", "result" => result}
 
-        case Schema.validate_protocol(:server_to_client, :response, method, envelope) do
+        case Schema.validate_protocol(
+               "2025-11-25",
+               :server_to_client,
+               :response,
+               method,
+               envelope
+             ) do
           {:ok, ^envelope} ->
             if method == "tools/call" do
               validate_tool_output_validator!(output_validator, "task:#{task_id}", result)
@@ -2819,12 +3832,16 @@ defmodule FastestMCP.Client do
         "initialize" ->
           params
           |> Map.drop([:protocolVersion, "protocolVersion"])
-          |> Map.put("protocolVersion", Protocol.current_version())
+          |> Map.put("protocolVersion", "2025-11-25")
           |> Map.put_new("clientInfo", state.client_info)
           |> Map.put("capabilities", initialize_capabilities(state, params))
 
         _other ->
-          params
+          if modern_request?(state, method) do
+            put_modern_request_meta(params, state)
+          else
+            params
+          end
       end
 
     case state.transport.type do
@@ -2860,6 +3877,12 @@ defmodule FastestMCP.Client do
       |> maybe_put("sampling", sampling_capability(state))
       |> maybe_put("elicitation", elicitation_capability(state))
       |> maybe_put("tasks", initialize_task_capabilities(state))
+      |> maybe_put(
+        "extensions",
+        state.extensions
+        |> Extensions.for_profile(:legacy)
+        |> non_empty_map()
+      )
 
     validate_declared_capabilities!(base, auto)
     deep_merge_maps(base, auto)
@@ -2931,6 +3954,49 @@ defmodule FastestMCP.Client do
       message: "initialize capabilities must be an object"
   end
 
+  defp modern_request?(_state, "initialize"), do: false
+
+  defp modern_request?(state, _method) do
+    state.selected_protocol_version == "2026-07-28" or
+      (is_nil(state.selected_protocol_version) and
+         state.protocol_preference in [:auto, "2026-07-28"])
+  end
+
+  defp selected_request_protocol_version(_state, "initialize"), do: "2025-11-25"
+
+  defp selected_request_protocol_version(state, method) do
+    if modern_request?(state, method),
+      do: "2026-07-28",
+      else: state.selected_protocol_version || "2025-11-25"
+  end
+
+  defp put_modern_request_meta(params, state) do
+    capabilities = modern_client_capabilities(state)
+
+    meta =
+      params
+      |> Map.get("_meta", %{})
+      |> Map.new()
+      |> Map.put("io.modelcontextprotocol/protocolVersion", "2026-07-28")
+      |> Map.put("io.modelcontextprotocol/clientCapabilities", capabilities)
+      |> Map.put("io.modelcontextprotocol/clientInfo", state.client_info)
+
+    Map.put(params, "_meta", meta)
+  end
+
+  defp modern_client_capabilities(state) do
+    %{}
+    |> maybe_put("roots", if(state.roots_supported?, do: %{}))
+    |> maybe_put("sampling", sampling_capability(state))
+    |> maybe_put("elicitation", elicitation_capability(state))
+    |> maybe_put(
+      "extensions",
+      state.extensions
+      |> Extensions.for_profile(:modern)
+      |> non_empty_map()
+    )
+  end
+
   defp capability_subset?(_provided, nil), do: false
 
   defp capability_subset?(%{} = provided, %{} = _actual) when map_size(provided) == 0,
@@ -2983,6 +4049,9 @@ defmodule FastestMCP.Client do
           with {:ok, normalized_result} <- normalize_response_result(normalizer, result) do
             {:ok, normalized_result, headers}
           end
+
+        {:modern_subscription_terminated, %Error{} = error, retry_delay} ->
+          {:modern_subscription_terminated, error, retry_delay}
 
         {:http_error, status, headers, _body, %Error{} = error} ->
           cond do
@@ -3048,7 +4117,11 @@ defmodule FastestMCP.Client do
 
   defp perform_http_session_recovery(recovery_request_id, timeout_ms, state, opts) do
     recovery_state = %{state | session_id: nil, initialize_result: nil}
-    recovery_opts = Keyword.delete(opts, :request_started)
+
+    recovery_opts =
+      opts
+      |> Keyword.delete(:request_started)
+      |> Keyword.put(:protocol_version, "2025-11-25")
 
     with {:ok, initialize_request} <-
            safe_build_request(
@@ -3062,7 +4135,7 @@ defmodule FastestMCP.Client do
            run_http_request(
              initialize_request,
              "initialize",
-             {:initialize, Protocol.current_version()},
+             {:initialize, "2025-11-25"},
              timeout_ms,
              recovery_state,
              recovery_opts,
@@ -3384,24 +4457,32 @@ defmodule FastestMCP.Client do
     opts =
       opts
       |> Keyword.put(:task_augmented, task_augmented_params?(request["params"]))
-      |> Keyword.put_new(:sse_deadline_ms, System.monotonic_time(:millisecond) + timeout_ms)
+      |> maybe_put_sse_deadline(timeout_ms)
 
-    with {:ok, request_ref} <- start_stream_http_request(request, timeout_ms, state, opts) do
-      try do
-        receive_stream_events(
-          request_ref,
-          request["id"],
-          method,
-          timeout_ms,
-          {:pending, decoder},
-          nil,
-          state,
-          opts
-        )
-      after
-        _ = HTTP.cancel_request(request_ref)
-        flush_http_messages(request_ref)
-      end
+    case start_stream_http_request(request, timeout_ms, state, opts) do
+      {:ok, request_ref} ->
+        try do
+          receive_stream_events(
+            request_ref,
+            request["id"],
+            method,
+            timeout_ms,
+            {:pending, decoder},
+            nil,
+            state,
+            opts
+          )
+        after
+          _ = HTTP.cancel_request(request_ref)
+          flush_http_messages(request_ref)
+        end
+
+      {:error, %Error{} = error} ->
+        if modern_subscription_stream?(method, opts) do
+          {:modern_subscription_terminated, error, sse_retry_delay(decoder, state.sse_reconnect)}
+        else
+          {:error, error}
+        end
     end
   end
 
@@ -3492,7 +4573,8 @@ defmodule FastestMCP.Client do
                  body,
                  original_id,
                  method,
-                 Keyword.get(opts, :task_augmented, false)
+                 Keyword.get(opts, :task_augmented, false),
+                 Keyword.fetch!(opts, :protocol_version)
                ) do
           {:ok, result, normalize_httpc_headers(response_headers)}
         end
@@ -3586,7 +4668,8 @@ defmodule FastestMCP.Client do
            body,
            original_id,
            method,
-           Keyword.get(opts, :task_augmented, false)
+           Keyword.get(opts, :task_augmented, false),
+           Keyword.fetch!(opts, :protocol_version)
          ) do
       {:ok, result} -> {:ok, result, normalize_httpc_headers(headers)}
       {:error, error} when is_exception(error) -> {:error, error}
@@ -3621,7 +4704,7 @@ defmodule FastestMCP.Client do
   end
 
   defp resume_or_fail_streamed_response(
-         {:sse, decoder},
+         {mode, decoder},
          _headers,
          original_id,
          method,
@@ -3629,46 +4712,53 @@ defmodule FastestMCP.Client do
          state,
          opts,
          fallback_error
-       ) do
-    reconnect_attempt = Keyword.get(opts, :sse_reconnect_attempt, 0)
-    last_event_id = SSEDecoder.last_event_id(decoder)
+       )
+       when mode in [:pending, :sse] do
     retry_delay = sse_retry_delay(decoder, state.sse_reconnect)
-    remaining = stream_timeout_remaining(opts, timeout_ms)
 
-    if reconnect_attempt < state.sse_reconnect.max_attempts and
-         is_binary(last_event_id) and last_event_id != "" and
-         is_integer(retry_delay) and retry_delay <= remaining do
-      Process.sleep(retry_delay)
-
-      next_opts = Keyword.put(opts, :sse_reconnect_attempt, reconnect_attempt + 1)
-
-      with {:ok, request_ref} <- start_resume_stream_http_request(state, next_opts, last_event_id) do
-        try do
-          receive_stream_events(
-            request_ref,
-            original_id,
-            method,
-            timeout_ms,
-            {:sse, SSEDecoder.resume(decoder)},
-            nil,
-            state,
-            next_opts
-          )
-        after
-          _ = HTTP.cancel_request(request_ref)
-          flush_http_messages(request_ref)
-        end
-      end
+    if modern_subscription_stream?(method, opts) do
+      {:modern_subscription_terminated, fallback_error, retry_delay}
     else
-      if is_integer(retry_delay) and retry_delay > remaining do
-        {:error,
-         %Error{
-           code: :timeout,
-           message: "#{method} timed out before the server retry delay elapsed",
-           details: %{timeout_ms: timeout_ms, retry_ms: retry_delay}
-         }}
+      reconnect_attempt = Keyword.get(opts, :sse_reconnect_attempt, 0)
+      last_event_id = SSEDecoder.last_event_id(decoder)
+      remaining = stream_timeout_remaining(opts, timeout_ms)
+
+      if reconnect_attempt < state.sse_reconnect.max_attempts and
+           is_binary(last_event_id) and last_event_id != "" and
+           is_integer(retry_delay) and retry_delay <= remaining do
+        Process.sleep(retry_delay)
+
+        next_opts = Keyword.put(opts, :sse_reconnect_attempt, reconnect_attempt + 1)
+
+        with {:ok, request_ref} <-
+               start_resume_stream_http_request(state, next_opts, last_event_id) do
+          try do
+            receive_stream_events(
+              request_ref,
+              original_id,
+              method,
+              timeout_ms,
+              {:sse, SSEDecoder.resume(decoder)},
+              nil,
+              state,
+              next_opts
+            )
+          after
+            _ = HTTP.cancel_request(request_ref)
+            flush_http_messages(request_ref)
+          end
+        end
       else
-        {:error, fallback_error}
+        if is_integer(retry_delay) and retry_delay > remaining do
+          {:error,
+           %Error{
+             code: :timeout,
+             message: "#{method} timed out before the server retry delay elapsed",
+             details: %{timeout_ms: timeout_ms, retry_ms: retry_delay}
+           }}
+        else
+          {:error, fallback_error}
+        end
       end
     end
   end
@@ -3684,6 +4774,11 @@ defmodule FastestMCP.Client do
          fallback_error
        ),
        do: {:error, fallback_error}
+
+  defp modern_subscription_stream?("subscriptions/listen", opts),
+    do: Keyword.get(opts, :protocol_version) == "2026-07-28"
+
+  defp modern_subscription_stream?(_method, _opts), do: false
 
   defp sse_retry_delay(decoder, reconnect) do
     case SSEDecoder.retry_ms(decoder) do
@@ -3708,6 +4803,12 @@ defmodule FastestMCP.Client do
       _other ->
         fallback
     end
+  end
+
+  defp maybe_put_sse_deadline(opts, :infinity), do: opts
+
+  defp maybe_put_sse_deadline(opts, timeout_ms) when is_integer(timeout_ms) do
+    Keyword.put_new(opts, :sse_deadline_ms, System.monotonic_time(:millisecond) + timeout_ms)
   end
 
   defp start_resume_stream_http_request(state, opts, last_event_id) do
@@ -3742,14 +4843,20 @@ defmodule FastestMCP.Client do
   defp handle_stream_events([], _original_id, _method, _state, _opts), do: :continue
 
   defp handle_stream_events([event | rest], original_id, method, state, opts) do
-    case JSONRPC.decode(event, direction: :server_to_client) do
+    protocol_version = Keyword.fetch!(opts, :protocol_version)
+
+    case JSONRPC.decode(event,
+           direction: :server_to_client,
+           protocol_version: protocol_version
+         ) do
       {:ok, {:response, response_id, response}} ->
         decode_jsonrpc_response(
           response_id,
           response,
           original_id,
           method,
-          Keyword.get(opts, :task_augmented, false)
+          Keyword.get(opts, :task_augmented, false),
+          protocol_version
         )
 
       {:ok, {:request, _method, _params, nil}} ->
@@ -3757,9 +4864,17 @@ defmodule FastestMCP.Client do
         handle_stream_events(rest, original_id, method, state, opts)
 
       {:ok, {:request, _method, _params, _request_id}} ->
-        case handle_server_request(event, state, opts) do
-          {:ok, next_state} -> handle_stream_events(rest, original_id, method, next_state, opts)
-          {:error, %Error{} = error} -> {:error, error}
+        if protocol_version == "2026-07-28" do
+          {:error,
+           %Error{
+             code: :invalid_request,
+             message: "modern MCP responses must not contain an independent server request"
+           }}
+        else
+          case handle_server_request(event, state, opts) do
+            {:ok, next_state} -> handle_stream_events(rest, original_id, method, next_state, opts)
+            {:error, %Error{} = error} -> {:error, error}
+          end
         end
 
       {:error, %Error{} = error} ->
@@ -4108,7 +5223,13 @@ defmodule FastestMCP.Client do
 
     {kind, schema_method} = schema_selector
 
-    case Schema.validate_protocol(:client_to_server, kind, schema_method, payload) do
+    case Schema.validate_protocol(
+           "2025-11-25",
+           :client_to_server,
+           kind,
+           schema_method,
+           payload
+         ) do
       {:ok, ^payload} ->
         :ok
 
@@ -4177,6 +5298,8 @@ defmodule FastestMCP.Client do
   end
 
   defp do_post_client_response(state, payload, opts) do
+    opts = Keyword.put(opts, :request, payload)
+
     result =
       HTTP.request(:post, state.transport.base_url,
         json: payload,
@@ -4816,7 +5939,13 @@ defmodule FastestMCP.Client do
   defp validate_callback_result!(method, result) do
     envelope = %{"jsonrpc" => "2.0", "id" => "callback-result", "result" => result}
 
-    case Schema.validate_protocol(:client_to_server, :response, method, envelope) do
+    case Schema.validate_protocol(
+           "2025-11-25",
+           :client_to_server,
+           :response,
+           method,
+           envelope
+         ) do
       {:ok, ^envelope} ->
         :ok
 
@@ -5114,11 +6243,125 @@ defmodule FastestMCP.Client do
 
   defp dispatch_notification_on_owner(message, state) do
     if self() == state.client_pid do
-      dispatch_notification(message, state)
+      route_server_notification(message, state)
     else
       send(state.client_pid, {:server_notification, message})
       state
     end
+  end
+
+  defp route_server_notification(message, state) do
+    subscription_id =
+      get_in(message, ["params", "_meta", "io.modelcontextprotocol/subscriptionId"])
+
+    if is_binary(subscription_id) or is_integer(subscription_id) do
+      case find_outbound_request_by_id(state, subscription_id) do
+        {ref, %{method: "subscriptions/listen", protocol_version: "2026-07-28"} = entry} ->
+          route_modern_subscription_notification(state, ref, entry, message)
+
+        _unknown_or_non_subscription_request ->
+          record_subscription_protocol_error(:unknown_subscription_id, subscription_id)
+          state
+      end
+    else
+      dispatch_notification(message, state)
+    end
+  end
+
+  defp route_modern_subscription_notification(
+         state,
+         ref,
+         %{subscription_acknowledged?: false} = entry,
+         %{
+           "method" => "notifications/subscriptions/acknowledged",
+           "params" => %{"notifications" => accepted}
+         } = message
+       ) do
+    requested = get_in(entry, [:request_params, "notifications"]) || %{}
+
+    case FastestMCP.Protocol.Subscriptions.acknowledged_subset(requested, accepted) do
+      {:ok, accepted} ->
+        compiled_filter = FastestMCP.Protocol.Subscriptions.compile_filter(accepted)
+        maybe_invoke_notification_handler(entry.notification_handler, message)
+
+        state
+        |> put_in([:in_flight, ref, :subscription_acknowledged?], true)
+        |> put_in([:in_flight, ref, :acknowledged_subscription_filter], compiled_filter)
+        |> put_in([:in_flight, ref, :subscription_reconnect_attempt], 0)
+        |> then(&dispatch_notification(message, &1))
+
+      {:error, reason} ->
+        reject_modern_subscription_notification(state, ref, entry, reason)
+    end
+  end
+
+  defp route_modern_subscription_notification(
+         state,
+         ref,
+         %{subscription_acknowledged?: false} = entry,
+         _message
+       ) do
+    reject_modern_subscription_notification(
+      state,
+      ref,
+      entry,
+      "subscription notification arrived before acknowledgement"
+    )
+  end
+
+  defp route_modern_subscription_notification(
+         state,
+         ref,
+         %{subscription_acknowledged?: true} = entry,
+         %{"method" => "notifications/subscriptions/acknowledged"}
+       ) do
+    reject_modern_subscription_notification(
+      state,
+      ref,
+      entry,
+      "subscription acknowledgement was sent more than once"
+    )
+  end
+
+  defp route_modern_subscription_notification(state, ref, entry, message) do
+    if FastestMCP.Protocol.Subscriptions.notification_allowed?(
+         Map.fetch!(entry, :acknowledged_subscription_filter),
+         message
+       ) do
+      maybe_invoke_notification_handler(entry.notification_handler, message)
+      dispatch_notification(message, state)
+    else
+      reject_modern_subscription_notification(
+        state,
+        ref,
+        entry,
+        "subscription notification is outside the acknowledged filter"
+      )
+    end
+  end
+
+  defp reject_modern_subscription_notification(state, ref, entry, reason) do
+    error = %Error{
+      code: :invalid_request,
+      message: "invalid subscriptions/listen stream",
+      details: %{reason: reason}
+    }
+
+    record_subscription_protocol_error(:invalid_stream, entry.request_id)
+    _ = maybe_send_outbound_cancellation(state, entry, reason)
+
+    case state.transport.type do
+      :streamable_http -> complete_http_request(state, ref, {:error, error})
+      :stdio -> finish_stdio_request(state, ref, {:error, error})
+    end
+  end
+
+  defp record_subscription_protocol_error(reason, subscription_id) do
+    :telemetry.execute(
+      [:fastest_mcp, :client, :subscription, :protocol_error],
+      %{count: 1},
+      %{reason: reason, subscription_id: subscription_id}
+    )
   end
 
   defp dispatch_notification(
@@ -5134,7 +6377,15 @@ defmodule FastestMCP.Client do
          %{"method" => "notifications/cancelled", "params" => params},
          state
        ) do
-    cancel_inbound_callback(state, Map.get(params, "requestId"))
+    request_id = Map.get(params, "requestId")
+
+    case find_outbound_request_by_id(state, request_id) do
+      {ref, entry} when entry.method == "subscriptions/listen" ->
+        complete_cancelled_subscription(state, ref, entry)
+
+      _other ->
+        cancel_inbound_callback(state, request_id)
+    end
   end
 
   defp dispatch_notification(
@@ -5184,9 +6435,10 @@ defmodule FastestMCP.Client do
   end
 
   defp dispatch_notification(
-         %{"method" => "notifications/tasks/status", "params" => params} = message,
+         %{"method" => method, "params" => params} = message,
          state
-       ) do
+       )
+       when method in ["notifications/tasks/status", "notifications/tasks"] do
     state = update_task_status(state, task_id_from_status(params), params)
 
     maybe_invoke_notification_handler(state.notification_handler, message)
@@ -5201,6 +6453,35 @@ defmodule FastestMCP.Client do
   defp dispatch_notification(message, state) do
     maybe_invoke_notification_handler(state.notification_handler, message)
     state
+  end
+
+  defp find_outbound_request_by_id(state, request_id) do
+    Enum.find(state.in_flight, fn {_ref, entry} -> entry.request_id == request_id end)
+  end
+
+  defp complete_cancelled_subscription(state, ref, entry) do
+    cancel_timer(entry.timer_ref)
+    cancel_timer(Map.get(entry, :reconnect_timer_ref))
+    cancel_http_request(Map.get(entry, :request_ref))
+    if is_pid(entry[:worker_pid]), do: Process.exit(entry.worker_pid, :kill)
+    if entry[:worker_ref], do: Process.demonitor(entry.worker_ref, [:flush])
+
+    reply_request_entry(
+      entry,
+      {:ok,
+       %{
+         "resultType" => "complete",
+         "_meta" => %{"io.modelcontextprotocol/subscriptionId" => entry.request_id}
+       }}
+    )
+
+    %{
+      state
+      | in_flight: Map.delete(state.in_flight, ref),
+        worker_refs: drop_worker_ref(state.worker_refs, entry[:worker_ref]),
+        request_owner_refs: drop_owner_ref(state.request_owner_refs, entry.owner_ref),
+        pending_stdio_refs: Map.delete(state.pending_stdio_refs, entry.request_id)
+    }
   end
 
   defp dispatch_progress_notification(state, target, owner, params, progress, total) do
@@ -5281,10 +6562,17 @@ defmodule FastestMCP.Client do
     end
   end
 
-  defp decode_jsonrpc_response(body, expected_id, method, task_augmented) when is_binary(body) do
+  defp decode_jsonrpc_response(body, expected_id, method, task_augmented, protocol_version)
+       when is_binary(body) do
     case JSON.decode(body) do
       {:ok, payload} ->
-        decode_jsonrpc_response_payload(payload, expected_id, method, task_augmented)
+        decode_jsonrpc_response_payload(
+          payload,
+          expected_id,
+          method,
+          task_augmented,
+          protocol_version
+        )
 
       {:error, reason} ->
         {:error,
@@ -5292,10 +6580,26 @@ defmodule FastestMCP.Client do
     end
   end
 
-  defp decode_jsonrpc_response_payload(payload, expected_id, method, task_augmented) do
-    case JSONRPC.decode(payload, direction: :server_to_client) do
+  defp decode_jsonrpc_response_payload(
+         payload,
+         expected_id,
+         method,
+         task_augmented,
+         protocol_version
+       ) do
+    case JSONRPC.decode(payload,
+           direction: :server_to_client,
+           protocol_version: protocol_version
+         ) do
       {:ok, {:response, response_id, response}} ->
-        decode_jsonrpc_response(response_id, response, expected_id, method, task_augmented)
+        decode_jsonrpc_response(
+          response_id,
+          response,
+          expected_id,
+          method,
+          task_augmented,
+          protocol_version
+        )
 
       {:ok, {:request, _method, _params, _request_id}} ->
         {:error,
@@ -5310,9 +6614,17 @@ defmodule FastestMCP.Client do
     end
   end
 
-  defp decode_jsonrpc_response(response_id, response, expected_id, method, task_augmented) do
+  defp decode_jsonrpc_response(
+         response_id,
+         response,
+         expected_id,
+         method,
+         task_augmented,
+         protocol_version
+       ) do
     with :ok <- validate_jsonrpc_response_id(response_id, expected_id),
-         :ok <- validate_server_method_response(response, method, task_augmented) do
+         :ok <-
+           validate_server_method_response(response, method, task_augmented, protocol_version) do
       case response do
         %{"result" => result} -> {:ok, result}
         %{"error" => error} -> {:error, jsonrpc_error(error)}
@@ -5320,16 +6632,61 @@ defmodule FastestMCP.Client do
     end
   end
 
-  defp validate_server_method_response(response, method, task_augmented) do
+  defp validate_server_method_response(response, method, task_augmented, protocol_version) do
+    if Map.has_key?(response, "error") do
+      validate_server_error_response(response, method, protocol_version)
+    else
+      validate_server_result_response(response, method, task_augmented, protocol_version)
+    end
+  end
+
+  defp validate_server_error_response(response, method, protocol_version) do
+    case Schema.validate_protocol(
+           protocol_version,
+           :server_to_client,
+           :error_response,
+           response
+         ) do
+      {:ok, ^response} ->
+        :ok
+
+      {:error, %FastestMCP.Schema.Error{} = error} ->
+        {:error,
+         ProtocolError.new(
+           method,
+           :server_to_client,
+           :error_response,
+           error.violations,
+           response["id"]
+         )}
+
+      {:error, %Error{} = error} ->
+        {:error, error}
+    end
+  end
+
+  defp validate_server_result_response(response, method, task_augmented, protocol_version) do
+    task_response? =
+      if protocol_version == "2026-07-28" do
+        match?(%{"resultType" => "task"}, response["result"])
+      else
+        task_augmented
+      end
+
     kind =
-      if task_augmented and Map.has_key?(response, "result") and
-           Schema.protocol_supported?(:server_to_client, :task_response, method) do
+      if task_response? and Map.has_key?(response, "result") and
+           Schema.protocol_supported?(
+             protocol_version,
+             :server_to_client,
+             :task_response,
+             method
+           ) do
         :task_response
       else
         :response
       end
 
-    case Schema.validate_protocol(:server_to_client, kind, method, response) do
+    case Schema.validate_protocol(protocol_version, :server_to_client, kind, method, response) do
       {:ok, ^response} ->
         :ok
 
@@ -5363,6 +6720,14 @@ defmodule FastestMCP.Client do
     data = Map.get(error, "data", %{})
     fastestmcp = if is_map(data), do: Map.get(data, "fastestmcp", %{}), else: %{}
 
+    details =
+      fastestmcp
+      |> Map.get("details", data)
+      |> case do
+        %{} = details -> Map.put_new(details, :jsonrpc_code, Map.get(error, "code"))
+        other -> %{data: other, jsonrpc_code: Map.get(error, "code")}
+      end
+
     %Error{
       code:
         JSONRPC.decode_error_code(
@@ -5370,7 +6735,7 @@ defmodule FastestMCP.Client do
           Map.get(error, "code")
         ),
       message: to_string(message),
-      details: Map.get(fastestmcp, "details", data)
+      details: details
     }
   end
 
@@ -5551,6 +6916,8 @@ defmodule FastestMCP.Client do
   end
 
   defp start_stream_http_request(request, timeout_ms, state, opts) do
+    opts = Keyword.put(opts, :request, request)
+
     headers =
       transport_headers(
         [
@@ -5698,7 +7065,10 @@ defmodule FastestMCP.Client do
   end
 
   defp classify_stream_message(message) do
-    case JSONRPC.decode(message, direction: :server_to_client) do
+    case JSONRPC.decode(message,
+           direction: :server_to_client,
+           protocol_version: "2025-11-25"
+         ) do
       {:ok, {:request, _method, _params, nil}} -> {:notification, message}
       {:ok, {:request, _method, _params, _id}} -> {:server_request, message}
       {:ok, {:response, _id, _response}} -> :ignore
@@ -5728,22 +7098,40 @@ defmodule FastestMCP.Client do
   defp handle_stdio_line(state, line) do
     case JSON.decode(line) do
       {:ok, payload} ->
-        handle_decoded_stdio_message(state, payload)
+        state
+        |> reset_stdio_restart_attempt()
+        |> handle_decoded_stdio_message(payload)
 
       {:error, error} ->
         fail_pending_stdio_request(state, json_decode_error_message(error), %{line: line})
     end
   end
 
+  defp reset_stdio_restart_attempt(%{stdio_restart_attempt: attempt} = state)
+       when attempt > 0 do
+    %{state | stdio_restart_attempt: 0}
+  end
+
+  defp reset_stdio_restart_attempt(state), do: state
+
   defp handle_decoded_stdio_message(state, payload) do
-    case JSONRPC.decode(payload, direction: :server_to_client) do
+    protocol_version = state.selected_protocol_version || "2025-11-25"
+
+    case JSONRPC.decode(payload,
+           direction: :server_to_client,
+           protocol_version: protocol_version
+         ) do
       {:ok, {:request, _method, _params, nil}} ->
-        dispatch_notification(payload, state)
+        route_server_notification(payload, state)
 
       {:ok, {:request, _method, _params, _id}} ->
-        case process_server_request(payload, expire_callback_tasks(state), []) do
-          {:ok, next_state} -> next_state
-          {:error, _error} -> state
+        if protocol_version == "2026-07-28" do
+          state
+        else
+          case process_server_request(payload, expire_callback_tasks(state), []) do
+            {:ok, next_state} -> next_state
+            {:error, _error} -> state
+          end
         end
 
       {:ok, {:response, id, response}} ->
@@ -5754,18 +7142,26 @@ defmodule FastestMCP.Client do
     end
   end
 
-  defp complete_stdio_response(%{pending_stdio_ref: nil} = state, _id, _result), do: state
+  defp complete_stdio_response(state, id, response) do
+    ref =
+      Map.get(state.pending_stdio_refs, to_string(id)) || Map.get(state.pending_stdio_refs, id)
 
-  defp complete_stdio_response(%{pending_stdio_ref: ref} = state, id, response) do
     case Map.get(state.in_flight, ref) do
       %{
         request_id: ^id,
         normalizer: normalizer,
         method: method,
-        task_augmented: task_augmented
+        task_augmented: task_augmented,
+        protocol_version: protocol_version
       } ->
         normalized_result =
-          normalize_stdio_method_response(response, method, task_augmented, normalizer)
+          normalize_stdio_method_response(
+            response,
+            method,
+            task_augmented,
+            normalizer,
+            protocol_version
+          )
 
         finish_stdio_request(state, ref, normalized_result)
 
@@ -5776,8 +7172,15 @@ defmodule FastestMCP.Client do
     end
   end
 
-  defp normalize_stdio_method_response(response, method, task_augmented, normalizer) do
-    with :ok <- validate_server_method_response(response, method, task_augmented) do
+  defp normalize_stdio_method_response(
+         response,
+         method,
+         task_augmented,
+         normalizer,
+         protocol_version
+       ) do
+    with :ok <-
+           validate_server_method_response(response, method, task_augmented, protocol_version) do
       case response do
         %{"result" => value} -> normalize_response_result(normalizer, value)
         %{"error" => error} -> {:error, jsonrpc_error(error)}
@@ -5785,21 +7188,15 @@ defmodule FastestMCP.Client do
     end
   end
 
-  defp fail_pending_stdio_request(%{pending_stdio_ref: nil} = state, _message, _details),
-    do: state
-
-  defp fail_pending_stdio_request(%{pending_stdio_ref: ref} = state, message, details) do
-    finish_stdio_request(
-      state,
-      ref,
-      {:error, %Error{code: :internal_error, message: message, details: details}}
-    )
-  end
+  # Malformed or uncorrelated input cannot safely be assigned to one of several
+  # concurrent stdio requests. Keep every correlated request alive; a caller's
+  # own timeout remains its failure boundary.
+  defp fail_pending_stdio_request(state, _message, _details), do: state
 
   defp finish_stdio_request(state, ref, result) do
     case Map.pop(state.in_flight, ref) do
       {nil, _in_flight} ->
-        %{state | pending_stdio_ref: nil}
+        state
 
       {%{timer_ref: timer_ref, normalizer: normalizer} = entry, in_flight} ->
         cancel_timer(timer_ref)
@@ -5809,6 +7206,7 @@ defmodule FastestMCP.Client do
         %{
           state
           | pending_stdio_ref: nil,
+            pending_stdio_refs: Map.delete(state.pending_stdio_refs, entry.request_id),
             in_flight: in_flight,
             request_owner_refs: drop_owner_ref(state.request_owner_refs, entry.owner_ref),
             initialize_result: initialize_result_for(normalizer, result, state.initialize_result)
@@ -5851,19 +7249,26 @@ defmodule FastestMCP.Client do
   defp normalize_response(:completion, %{"completion" => completion}), do: completion
 
   defp normalize_response(:tools, %{"tools" => tools} = page) do
-    %{items: tools, next_cursor: page["nextCursor"]}
+    tools =
+      if page["resultType"] == "complete" do
+        Enum.filter(tools, &valid_http_header_tool?/1)
+      else
+        tools
+      end
+
+    page_response(tools, page)
   end
 
   defp normalize_response(:resources, %{"resources" => resources} = page) do
-    %{items: resources, next_cursor: page["nextCursor"]}
+    page_response(resources, page)
   end
 
   defp normalize_response(:resource_templates, %{"resourceTemplates" => templates} = page) do
-    %{items: templates, next_cursor: page["nextCursor"]}
+    page_response(templates, page)
   end
 
   defp normalize_response(:prompts, %{"prompts" => prompts} = page) do
-    %{items: prompts, next_cursor: page["nextCursor"]}
+    page_response(prompts, page)
   end
 
   defp normalize_response(:prompt, result), do: result
@@ -5876,6 +7281,7 @@ defmodule FastestMCP.Client do
   defp normalize_response(:task_result, result), do: result
 
   defp normalize_response(:tool_call, %{"task" => _task} = result), do: result
+  defp normalize_response(:tool_call, %{"resultType" => "task"} = result), do: result
   defp normalize_response(:tool_call, %{"isError" => true} = result), do: result
 
   defp normalize_response(:tool_call, %{"structuredContent" => structured} = result)
@@ -5898,6 +7304,16 @@ defmodule FastestMCP.Client do
   defp normalize_response(:tool_call, result), do: result
 
   defp normalize_response(:resource_read, %{"contents" => [content]} = result) do
+    if Apps.mime_type?(content["mimeType"]) do
+      result
+    else
+      normalize_plain_resource_result(result, content)
+    end
+  end
+
+  defp normalize_response(_normalizer, result), do: result
+
+  defp normalize_plain_resource_result(result, content) do
     if is_nil(result["_meta"]) and is_nil(content["_meta"]) do
       cond do
         is_binary(content["text"]) -> decode_json_if_possible(content["text"])
@@ -5909,7 +7325,27 @@ defmodule FastestMCP.Client do
     end
   end
 
-  defp normalize_response(_normalizer, result), do: result
+  defp page_response(items, page) do
+    %{items: items, next_cursor: page["nextCursor"]}
+    |> maybe_put(:ttl_ms, page["ttlMs"])
+    |> maybe_put(:cache_scope, page["cacheScope"])
+  end
+
+  defp valid_http_header_tool?(%{"inputSchema" => input_schema, "name" => name}) do
+    case HTTPHeaders.annotations(input_schema) do
+      {:ok, _annotations} ->
+        true
+
+      {:error, reason} ->
+        Logger.warning(
+          "ignoring MCP tool #{inspect(name)} with invalid x-mcp-header annotations: #{inspect(reason)}"
+        )
+
+        false
+    end
+  end
+
+  defp valid_http_header_tool?(_tool), do: true
 
   defp tool_result_mirrors_structured_content?(
          [%{"type" => "text", "text" => text}],
@@ -5951,14 +7387,28 @@ defmodule FastestMCP.Client do
   end
 
   defp send_client_notification(state, method, params, opts) do
+    params =
+      if state.selected_protocol_version == "2026-07-28" do
+        put_modern_request_meta(params, state)
+      else
+        params
+      end
+
     message = build_notification(method, params)
 
-    case Schema.validate_protocol(:client_to_server, :notification, method, message) do
+    protocol_version = state.selected_protocol_version || "2025-11-25"
+
+    case Schema.validate_protocol(
+           protocol_version,
+           :client_to_server,
+           :notification,
+           method,
+           message
+         ) do
       {:ok, ^message} ->
         case state.transport.type do
           :stdio ->
-            true = Port.command(state.transport.port, JSON.encode!(message) <> "\n")
-            :ok
+            safe_stdio_command(state.transport.port, message)
 
           :streamable_http ->
             send_http_notification(message, state, opts)
@@ -5978,6 +7428,8 @@ defmodule FastestMCP.Client do
   end
 
   defp send_http_notification(message, state, opts) do
+    opts = Keyword.put(opts, :request, message)
+
     case HTTP.request(:post, state.transport.base_url,
            json: message,
            headers:
@@ -6028,7 +7480,8 @@ defmodule FastestMCP.Client do
   defp decode_http_error(body, status, fallback_message) do
     case JSON.decode(body) do
       {:ok, %{"jsonrpc" => "2.0", "error" => %{} = error}} ->
-        jsonrpc_error(error)
+        decoded = jsonrpc_error(error)
+        %{decoded | details: Map.put(decoded.details, :status, status)}
 
       _other ->
         %Error{
@@ -6141,7 +7594,9 @@ defmodule FastestMCP.Client do
 
   defp task_requested?(opts), do: Keyword.get(opts, :task) not in [nil, false]
 
-  defp maybe_put_task(params, opts) do
+  defp maybe_put_task(params, _opts, true), do: params
+
+  defp maybe_put_task(params, opts, false) do
     case Keyword.get(opts, :task) do
       nil ->
         params
@@ -6161,6 +7616,19 @@ defmodule FastestMCP.Client do
   end
 
   defp put_task_request(params, task), do: Map.put(params, "task", task)
+
+  defp remote_task_error(task_id, %{} = error) do
+    decoded = jsonrpc_error(Map.put_new(error, "message", "background task failed"))
+    %{decoded | details: Map.put(Map.new(decoded.details), :task_id, task_id)}
+  end
+
+  defp remote_task_error(task_id, _error) do
+    %Error{
+      code: :internal_error,
+      message: "background task failed",
+      details: %{task_id: task_id}
+    }
+  end
 
   defp maybe_put_request_meta(params, opts) do
     existing_meta =
@@ -6234,18 +7702,32 @@ defmodule FastestMCP.Client do
      }}
   end
 
-  defp reject_configurable_protocol_versions(opts) do
-    if Keyword.has_key?(opts, :supported_protocol_versions) do
-      {:error,
-       %Error{
-         code: :invalid_params,
-         message:
-           "supported_protocol_versions is not configurable; this client supports only #{Protocol.current_version()}"
-       }}
-    else
-      :ok
+  defp validate_protocol_options(opts) do
+    cond do
+      Keyword.has_key?(opts, :supported_protocol_versions) ->
+        {:error,
+         %Error{
+           code: :invalid_params,
+           message:
+             "supported_protocol_versions is not configurable; use protocol_version: :auto or an exact supported version"
+         }}
+
+      Keyword.get(opts, :protocol_version, :auto) not in [:auto | Protocol.supported_versions()] ->
+        {:error,
+         %Error{
+           code: :invalid_params,
+           message:
+             "protocol_version must be :auto or one of #{inspect(Protocol.supported_versions())}"
+         }}
+
+      true ->
+        :ok
     end
   end
+
+  defp normalize_protocol_preference!(value)
+       when value == :auto or value in ["2026-07-28", "2025-11-25"],
+       do: value
 
   defp normalize_log_level!(level) when is_atom(level),
     do: normalize_log_level!(Atom.to_string(level))
@@ -6462,13 +7944,28 @@ defmodule FastestMCP.Client do
   end
 
   defp transport_headers(default_headers, state, opts) do
-    default_headers
-    |> normalize_header_map()
-    |> merge_header_maps(request_auth_input(state, opts) |> Map.get("headers", %{}))
-    |> maybe_put_oauth_authorization(state)
-    |> maybe_put("mcp-session-id", state.session_id)
-    |> maybe_put("mcp-protocol-version", negotiated_protocol_version(state))
-    |> Enum.into([])
+    headers =
+      default_headers
+      |> normalize_header_map()
+      |> merge_header_maps(request_auth_input(state, opts) |> Map.get("headers", %{}))
+      |> maybe_put_oauth_authorization(state)
+      |> maybe_put("mcp-session-id", state.session_id)
+      |> maybe_put("mcp-protocol-version", request_protocol_version(state, opts))
+
+    headers =
+      case Keyword.get(opts, :request) do
+        %{"method" => method, "params" => params} ->
+          headers
+          |> maybe_put("mcp-method", method)
+          |> maybe_put_encoded_name("mcp-name", request_header_name(method, params))
+
+        _other ->
+          headers
+      end
+
+    headers = Map.merge(headers, Keyword.get(opts, :http_parameter_headers, %{}))
+
+    Enum.into(headers, [])
   end
 
   defp maybe_put_oauth_authorization(headers, %{oauth: %{pid: pid, resource: resource}}) do
@@ -6495,10 +7992,41 @@ defmodule FastestMCP.Client do
     }
   end
 
-  defp negotiated_protocol_version(%{initialize_result: %{"protocolVersion" => version}}),
+  defp negotiated_protocol_version(state), do: state.selected_protocol_version
+
+  defp request_protocol_version(state, opts) do
+    case Keyword.get(opts, :request) do
+      %{"params" => params} ->
+        get_in(params, ["_meta", "io.modelcontextprotocol/protocolVersion"]) ||
+          negotiated_protocol_version(state) || protocol_preference_version(state)
+
+      _other ->
+        negotiated_protocol_version(state) || protocol_preference_version(state)
+    end
+  end
+
+  defp protocol_preference_version(%{protocol_preference: version}) when is_binary(version),
     do: version
 
-  defp negotiated_protocol_version(_state), do: nil
+  defp protocol_preference_version(%{lifecycle_state: :initializing}), do: "2025-11-25"
+  defp protocol_preference_version(_state), do: nil
+
+  defp request_header_name("tools/call", params), do: Map.get(params, "name")
+  defp request_header_name("resources/read", params), do: Map.get(params, "uri")
+  defp request_header_name("prompts/get", params), do: Map.get(params, "name")
+
+  defp request_header_name(method, params)
+       when method in ["tasks/get", "tasks/update", "tasks/cancel"],
+       do: Map.get(params, "taskId")
+
+  defp request_header_name(_method, _params), do: nil
+
+  defp maybe_put_encoded_name(headers, _key, nil), do: headers
+
+  defp maybe_put_encoded_name(headers, key, value) when is_binary(value) do
+    {:ok, encoded} = HTTPHeaders.encode_value(value)
+    Map.put(headers, key, encoded)
+  end
 
   defp normalize_auth_input(%{} = auth_input) do
     auth_input =

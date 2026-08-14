@@ -261,6 +261,10 @@ defmodule FastestMCP.ClientTaskTest do
 
   defp connect_client!(bandit, opts \\ []) do
     {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
-    Client.connect!("http://127.0.0.1:#{port}/mcp", opts)
+
+    Client.connect!(
+      "http://127.0.0.1:#{port}/mcp",
+      Keyword.put_new(opts, :protocol_version, "2025-11-25")
+    )
   end
 end

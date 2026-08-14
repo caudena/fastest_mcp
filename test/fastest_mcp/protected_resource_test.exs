@@ -230,6 +230,34 @@ defmodule FastestMCP.ProtectedResourceTest do
     assert challenge =~ ~s(resource_metadata="https://mcp.example.com/)
   end
 
+  test "a separately mounted well-known plug reads the running server configuration" do
+    server_name = unique_name("protected-phoenix-mount")
+
+    server =
+      FastestMCP.server(server_name,
+        auth: allow_auth(),
+        protected_resource: protected_resource()
+      )
+
+    assert {:ok, _pid} = FastestMCP.start_server(server)
+
+    opts =
+      WellKnownHTTP.init(
+        server_name: server_name,
+        path: "/public/mcp",
+        base_url: "https://mcp.example.com",
+        allowed_hosts: ["mcp.example.com"]
+      )
+
+    response =
+      :get
+      |> conn("https://mcp.example.com/.well-known/oauth-protected-resource/public/mcp")
+      |> WellKnownHTTP.call(opts)
+
+    assert response.status == 200
+    assert JSON.decode!(response.resp_body) == ProtectedResource.metadata(protected_resource())
+  end
+
   test "protected HTTP auth receives the exact resource and required scopes" do
     server_name = unique_name("protected-auth-input")
     test_pid = self()

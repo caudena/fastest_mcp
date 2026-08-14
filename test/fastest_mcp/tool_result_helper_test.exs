@@ -23,7 +23,7 @@ defmodule FastestMCP.ToolResultHelperTest do
                %{type: "text", text: "Release checklist generated"},
                %{type: "text", text: "Warnings: 0"}
              ],
-             structured_content: %{status: "ok", generated_at: ~U[2025-11-05 12:30:45Z]},
+             structured_content: %{status: "ok", generated_at: "2025-11-05T12:30:45Z"},
              meta: %{source: "helper"},
              is_error: false
            } = result
@@ -33,7 +33,7 @@ defmodule FastestMCP.ToolResultHelperTest do
                %{type: "text", text: "Release checklist generated"},
                %{type: "text", text: "Warnings: 0"}
              ],
-             structuredContent: %{status: "ok", generated_at: ~U[2025-11-05 12:30:45Z]},
+             structuredContent: %{status: "ok", generated_at: "2025-11-05T12:30:45Z"},
              meta: %{source: "helper"},
              isError: false
            } = ToolResult.to_map(result)
@@ -46,9 +46,15 @@ defmodule FastestMCP.ToolResultHelperTest do
       ToolResult.new("bad", meta: [:invalid])
     end
 
-    assert_raise ArgumentError, ~r/structured_content must be a map/, fn ->
-      ToolResult.new("bad", structured_content: ["invalid"])
-    end
+    assert %ToolResult{structured_content: ["valid", 1, true]} =
+             ToolResult.new("JSON values are supported", structured_content: ["valid", 1, true])
+
+    assert %ToolResult{structured_content: nil, structured_content_present?: true} =
+             null_result =
+             ToolResult.new("JSON null is supported", structured_content: nil)
+
+    assert %{content: "JSON null is supported", structuredContent: nil} =
+             ToolResult.to_map(null_result)
 
     assert_raise ArgumentError, ~r/is_error must be a boolean/, fn ->
       ToolResult.new("bad", is_error: :invalid)
@@ -142,7 +148,9 @@ defmodule FastestMCP.ToolResultHelperTest do
       )
 
     {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
-    client = Client.connect!("http://127.0.0.1:#{port}/mcp")
+
+    client =
+      Client.connect!("http://127.0.0.1:#{port}/mcp", protocol_version: "2025-11-25")
 
     on_exit(fn ->
       if Client.connected?(client), do: Client.disconnect(client)

@@ -25,6 +25,9 @@ defmodule FastestMCP.Transport.StdioAdapter do
              transport: :stdio,
              session_id: session_id,
              request_id: request_id,
+             protocol_version:
+               get_in(params, ["_meta", "io.modelcontextprotocol/protocolVersion"]) ||
+                 if(method == "initialize", do: Map.get(params, "protocolVersion")),
              protocol: :jsonrpc,
              task_request: task_request,
              task_ttl_ms: task_ttl_ms,
@@ -36,7 +39,8 @@ defmodule FastestMCP.Transport.StdioAdapter do
                connection_id: Keyword.get(opts, :connection_id),
                jsonrpc_request_id: request_id,
                jsonrpc_envelope: message,
-               progress_token: get_in(params, ["_meta", "progressToken"])
+               progress_token: get_in(params, ["_meta", "progressToken"]),
+               log_level: get_in(params, ["_meta", "io.modelcontextprotocol/logLevel"])
              },
              auth_input: request_auth_input(params, opts)
            }}

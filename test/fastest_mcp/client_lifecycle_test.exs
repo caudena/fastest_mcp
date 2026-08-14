@@ -23,7 +23,7 @@ defmodule FastestMCP.ClientLifecycleTest do
             "jsonrpc" => "2.0",
             "id" => id,
             "result" => %{
-              "protocolVersion" => FastestMCP.Protocol.current_version(),
+              "protocolVersion" => "2025-11-25",
               "capabilities" => %{},
               "serverInfo" => %{"name" => "lifecycle-test", "version" => "1.0.0"}
             }
@@ -83,7 +83,7 @@ defmodule FastestMCP.ClientLifecycleTest do
     assert {:ok, %{}} = Task.await(initializing_ping, 1_000)
 
     assert {:ok, %{"protocolVersion" => version}} = Task.await(initializer, 1_000)
-    assert version == FastestMCP.Protocol.current_version()
+    assert version == "2025-11-25"
     assert Client.lifecycle_state(client) == :initialized
     assert Client.initialize_result(client)["protocolVersion"] == version
 
@@ -116,7 +116,12 @@ defmodule FastestMCP.ClientLifecycleTest do
       )
 
     {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
-    client = Client.connect!("http://127.0.0.1:#{port}/mcp", auto_initialize: false)
+
+    client =
+      Client.connect!("http://127.0.0.1:#{port}/mcp",
+        auto_initialize: false,
+        protocol_version: "2025-11-25"
+      )
 
     on_exit(fn ->
       if Client.connected?(client), do: Client.disconnect(client)

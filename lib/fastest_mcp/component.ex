@@ -25,6 +25,7 @@ defmodule FastestMCP.Component do
   alias FastestMCP.InputValidator
   alias FastestMCP.JSONValue
   alias FastestMCP.Prompts.Message, as: PromptMessage
+  alias FastestMCP.Protocol.Extensions
   alias FastestMCP.Prompts.Result, as: PromptResult
   alias FastestMCP.ResultNormalizer
   alias FastestMCP.Resources.Content, as: ResourceContent
@@ -159,8 +160,38 @@ defmodule FastestMCP.Component do
   @doc "Executes a component for the given operation."
   def execute(component, operation) do
     task_config = Map.get(component, :task, TaskConfig.new(false))
+    modern? = operation.context.negotiated_protocol_version == "2026-07-28"
+
+    server_tasks? =
+      case operation.context.server do
+        %{extensions: extensions} -> Extensions.enabled?(extensions, Extensions.tasks())
+        _other -> false
+      end
+
+    client_tasks? =
+      Extensions.enabled?(operation.context.client_capabilities, Extensions.tasks())
+
+    modern_tasks? = server_tasks? and client_tasks?
 
     cond do
+      modern? and type(component) == :tool and server_tasks? and
+        task_config.mode == :required and not client_tasks? ->
+        raise Error,
+          code: :missing_required_client_capability,
+          message:
+            "#{type(component)} #{inspect(identifier(component))} requires the MCP Tasks extension",
+          details: %{
+            jsonrpc_code: -32_021,
+            requiredCapabilities: %{extensions: %{Extensions.tasks() => %{}}}
+          }
+
+      modern? and type(component) == :tool and modern_tasks? and
+          TaskConfig.supports_tasks?(task_config) ->
+        submit_background_task(%{component | timeout: nil}, operation)
+
+      modern? ->
+        execute_inline(component, operation)
+
       operation.task_request and not TaskConfig.supports_tasks?(task_config) ->
         raise Error,
           code: :method_not_found,
@@ -243,6 +274,8 @@ defmodule FastestMCP.Component do
   end
 
   @doc "Normalizes a raw handler result for the component type."
+  def normalize_result(_component, %FastestMCP.InputRequiredResult{} = result), do: result
+
   def normalize_result(%Tool{} = tool, %ToolResult{} = value) do
     normalized = value |> ToolResult.to_map() |> ResultNormalizer.normalize_tool()
     validate_tool_output!(tool, value, normalized)
@@ -258,6 +291,9 @@ defmodule FastestMCP.Component do
   def normalize_result(%Prompt{}, value), do: normalize_prompt_result(value)
 
   @doc false
+  def validate_normalized_output(_component, %FastestMCP.InputRequiredResult{} = result),
+    do: result
+
   def validate_normalized_output(%Tool{} = tool, normalized) do
     validate_tool_output!(tool, normalized, normalized)
   end
@@ -322,7 +358,7 @@ defmodule FastestMCP.Component do
     end
   end
 
-  defp structured_tool_output(%ToolResult{structured_content: nil}, _normalized),
+  defp structured_tool_output(%ToolResult{structured_content_present?: false}, _normalized),
     do: {:error, :missing_structured_content}
 
   defp structured_tool_output(%ToolResult{structured_content: structured}, _normalized),
@@ -340,15 +376,13 @@ defmodule FastestMCP.Component do
         end
 
       key ->
-        case Map.get(raw, key) do
-          nil -> {:error, :missing_structured_content}
-          structured -> {:ok, structured}
-        end
+        {:ok, Map.get(raw, key)}
     end
   end
 
-  defp structured_tool_output(_raw, normalized) when is_map(normalized), do: {:ok, normalized}
-  defp structured_tool_output(_raw, _normalized), do: {:error, :missing_structured_content}
+  defp structured_tool_output(nil, nil), do: {:ok, nil}
+  defp structured_tool_output(_raw, nil), do: {:error, :missing_structured_content}
+  defp structured_tool_output(_raw, normalized), do: {:ok, normalized}
 
   defp cached_schema(nil, _cache, _schema_options, _existing), do: nil
 

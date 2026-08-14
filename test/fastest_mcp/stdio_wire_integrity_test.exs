@@ -8,7 +8,6 @@ defmodule FastestMCP.StdioWireIntegrityTest do
     def log(_event, _config), do: :ok
   end
 
-  alias FastestMCP.Protocol
   alias FastestMCP.Registry
   alias FastestMCP.ServerRuntime
   alias FastestMCP.Transport.Stdio
@@ -40,7 +39,7 @@ defmodule FastestMCP.StdioWireIntegrityTest do
       "id" => 1,
       "method" => "initialize",
       "params" => %{
-        "protocolVersion" => Protocol.current_version(),
+        "protocolVersion" => "2025-11-25",
         "capabilities" => %{},
         "clientInfo" => %{"name" => "wire-integrity", "version" => "1.0.0"}
       }
@@ -52,7 +51,7 @@ defmodule FastestMCP.StdioWireIntegrityTest do
              "result" => %{"protocolVersion" => version}
            } = receive_envelope(port)
 
-    assert version == Protocol.current_version()
+    assert version == "2025-11-25"
 
     send_envelope(port, %{
       "jsonrpc" => "2.0",
@@ -400,7 +399,7 @@ defmodule FastestMCP.StdioWireIntegrityTest do
       "id" => 1,
       "method" => "initialize",
       "params" => %{
-        "protocolVersion" => Protocol.current_version(),
+        "protocolVersion" => "2025-11-25",
         "capabilities" => %{},
         "clientInfo" => %{"name" => "cleanup-lease", "version" => "1.0.0"}
       }

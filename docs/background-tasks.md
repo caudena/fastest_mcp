@@ -1,8 +1,8 @@
 # Tasks
 
-FastestMCP implements the MCP task protocol from SEP-1686 for long-running
-operations and keeps the execution model OTP-native: the server runtime owns
-task state, workers, progress, and interaction flow.
+FastestMCP implements both supported MCP task eras for long-running operations
+and keeps the execution model OTP-native: the server runtime owns task state,
+workers, progress, and interaction flow.
 
 Use tasks when an operation:
 
@@ -11,15 +11,19 @@ Use tasks when an operation:
 - may require elicitation or sampling before it can finish
 - is worth polling, listing, cancelling, or resuming by `taskId`
 
-## What Is Standard vs Extended
+## Three Separate Task Surfaces
 
-MCP `2025-11-25` standardizes task augmentation for `tools/call` together with:
+MCP `2026-07-28` uses the experimental
+`io.modelcontextprotocol/tasks` extension (Tasks v2). A server advertises and a
+client negotiates the extension explicitly. The server directs task creation;
+the wire methods are `tasks/get`, `tasks/update`, and `tasks/cancel`. Terminal
+results are inlined on `tasks/get`, and durations use `ttlMs` and
+`pollIntervalMs`. Multi-round-trip input is delivered with `tasks/update`.
 
-- `tasks/get`
-- `tasks/list`
-- `tasks/result`
-- `tasks/cancel`
-- `notifications/tasks/status`
+MCP `2025-11-25` retains experimental core Tasks v1. It augments
+`tools/call` and uses `tasks/get`, `tasks/list`, `tasks/result`,
+`tasks/cancel`, and `notifications/tasks/status`. Its envelopes and duration
+field names are intentionally not translated into Tasks v2.
 
 These receiver-side `%FastestMCP.BackgroundTask{}` values are work owned by the
 FastestMCP server. They are distinct from `%FastestMCP.PeerTask{}` values
@@ -28,15 +32,12 @@ the connected client. Peer-task handles are scoped to the originating server
 session and expose `fetch/2`, `wait/2`, `result/2`, `cancel/2`, and
 `on_status_change/2` through `FastestMCP.PeerTask`.
 
-FastestMCP supports that wire contract without prompt/resource task extensions
-or `tasks/sendInput`. The standard MCP path for interactive remote work is
-`tasks/result`; it can block, relay elicitation or sampling over the connected
-session, and resume when the client replies.
-
-The local Elixir API is intentionally broader. In-process callers can create
+The local Elixir API is the third surface and is intentionally broader.
+In-process callers can create
 tool, prompt, resource, and resource-template tasks and can answer local
 interaction waiters with `FastestMCP.send_task_input/5`. Those are runtime APIs,
-not additional MCP wire methods.
+not additional MCP wire methods. Choose behavior from the negotiated protocol
+profile; do not mix method sets or fields between eras.
 
 ## Enabling Task Execution
 
@@ -80,10 +81,10 @@ Task modes:
 
 `task: true` is shorthand for `task: [mode: :optional]`.
 
-For tools, the transport serializer advertises this as the standard direct
-`execution.taskSupport` field. Task execution data is not placed in a
-FastestMCP metadata extension, and prompt/resource task settings are never
-advertised remotely.
+For legacy tools, the transport serializer advertises the Tasks v1 execution
+support field. For modern tools, task support is effective only when the Tasks
+extension is negotiated. Prompt/resource task settings are local and are never
+advertised as extra remote methods.
 
 Enable tasks across the whole server with `tasks: true`. Over MCP, only tools
 can be task-augmented; the prompt and resource settings below apply to local
@@ -215,6 +216,15 @@ The task object also carries the server-suggested poll interval configured by
 Background tasks can move into `input_required`, wait for user input, and then
 resume inside the same supervision tree.
 
+On the modern profile, a handler can return
+`FastestMCP.InputRequiredResult` before task creation, or a running Tasks v2
+operation can expose `inputRequests`. The client echoes synchronous MRTR
+answers on the retried operation and sends task answers through
+`tasks/update`. Request state belongs to MRTR; it is not copied onto the Tasks
+v2 envelope.
+
+The following callback-style flow describes legacy Tasks v1:
+
 ```elixir
 alias FastestMCP.Elicitation.Accepted
 
@@ -232,7 +242,7 @@ server =
   )
 ```
 
-For connected clients, the standard flow is:
+For connected legacy clients, the flow is:
 
 1. call the task-capable operation
 2. wait on `tasks/result`
@@ -259,10 +269,18 @@ This calls the supervised task runtime directly. It does not expose or send a
 ## Task Result Semantics
 
 Every task envelope is validated before it crosses the wire. That includes
-`CreateTaskResult`, `tasks/get`, `tasks/list`, `tasks/cancel`, status
-notifications, and the final `tasks/result`. The final result is validated both
-as a Tasks payload and as the result type of the original augmented method, so
-a completed `tools/call` task cannot return a method-invalid payload.
+the version-appropriate `CreateTaskResult`, access methods, status
+notifications, and final component result.
+
+Tasks v2 returns a flat create envelope, inlines terminal `result` or `error`
+on `tasks/get`, and removes `tasks/list` and `tasks/result`. A tool execution
+result with `isError: true` is still a completed task; `failed` is reserved for
+a protocol-level error. Cancel and update return an empty complete
+acknowledgement.
+
+For legacy Tasks v1, the final result is validated both as a Tasks payload and
+as the result type of the original augmented method, so a completed
+`tools/call` task cannot return a method-invalid payload.
 
 Terminal task outcomes are mapped deliberately:
 
@@ -302,19 +320,16 @@ inconsistent totals, and late or unknown updates are rejected or isolated.
 
 ## Session and Auth Scoping
 
-Task ownership is bound to the session and, when auth context exists, to the
-authenticated client identity for that session.
+Task ownership is bound to the authenticated identity when auth exists. Legacy
+Tasks additionally bind ownership to the MCP session; modern Tasks carry no
+legacy session identifier.
 
-That means:
-
-- `tasks/get`
-- `tasks/list`
-- `tasks/result`
-- `tasks/cancel`
-
-only operate on tasks visible to the current session and auth fingerprint.
-Wrong session, wrong auth context, expired tasks, and nonexistent task ids all
-resolve to the same invalid-task response shape.
+Legacy `tasks/get`, `tasks/list`, `tasks/result`, and `tasks/cancel` operate
+only on tasks visible to the current session and auth fingerprint. Modern
+`tasks/get`, `tasks/update`, and `tasks/cancel` use the current authenticated
+request identity without a session id. Wrong legacy session, wrong auth
+context, expired tasks, and nonexistent task ids resolve to the same
+invalid-task response shape.
 
 Local `FastestMCP.send_task_input/5` applies the same task ownership checks but
 does not cross the MCP transport.
@@ -331,7 +346,8 @@ This implementation is intentionally OTP-first and single-node for now:
 - task orchestration lives in supervised Elixir processes
 - task state is stored in ETS through the configured `TaskBackend`
 - TTL expiry is enforced inside the runtime
-- session streams and subscribers stay inside the server supervision tree
+- legacy session streams and modern subscribers stay inside the server
+  supervision tree
 
 This pass does not add cross-node task routing or an external broker. The
 extension point for future distribution is the task backend, not a separate
@@ -344,8 +360,7 @@ retention policy.
 
 ## Capabilities
 
-FastestMCP advertises task capabilities as a first-class part of server
-initialization:
+On `2025-11-25`, FastestMCP advertises task capabilities during initialize:
 
 ```elixir
 %{
@@ -359,7 +374,10 @@ initialization:
 } = FastestMCP.initialize(MyApp.MCPServer)["capabilities"]
 ```
 
-`tools.call` is the only advertised remote task request surface. Passing task
+On `2026-07-28`, the server instead advertises
+`capabilities.extensions["io.modelcontextprotocol/tasks"]`; the client must
+negotiate that extension. `tools.call` is the only component execution surface
+that creates remote Tasks. Passing task
 metadata to a wire method that does not support augmentation is ignored by the
 server, as required by MCP; the connected Elixir client does not offer task
 options for those remote calls.

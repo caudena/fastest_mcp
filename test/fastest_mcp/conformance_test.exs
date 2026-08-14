@@ -1,20 +1,52 @@
-defmodule FastestMCP.ConformanceServerShimTest do
+defmodule FastestMCP.ConformanceServerTest do
   use ExUnit.Case, async: false
 
   @moduletag :conformance
-  @moduletag timeout: 180_000
+  @moduletag timeout: 600_000
 
   alias FastestMCP.TestSupport.ConformanceRunner
 
-  test "pinned official runner passes through the isolated stale-header shim" do
+  test "pinned official runner passes the frozen core requirements on both protocol eras" do
     ConformanceRunner.assert_version!()
+    %{url: url} = start_conformance_server!()
 
-    expected_scenarios = ConformanceRunner.list!(:server)
-    assert length(expected_scenarios) == 32
-    assert "server-initialize" in expected_scenarios
-    assert "server-sse-polling" in expected_scenarios
-    assert "server-sse-multiple-streams" in expected_scenarios
+    Enum.each(ConformanceRunner.requirement_versions(), fn revision ->
+      expected = ConformanceRunner.required_scenarios!(:server, revision)
+      assert expected != []
 
+      if revision == "2025-11-25" do
+        assert "server-initialize" in expected
+      else
+        assert "server-stateless" in expected
+      end
+
+      output_dir = output_dir!("server-core-#{revision}")
+      {output, status} = ConformanceRunner.run_server_requirements!(url, revision, output_dir)
+
+      assert status in if(revision == "2026-07-28", do: [0, 1], else: [0]), output
+      assert_required_evidence!(expected, output_dir, output, revision)
+    end)
+  end
+
+  test "selected Tasks extension scenarios pass explicitly on the 2026 wire" do
+    ConformanceRunner.assert_version!()
+    %{url: url} = start_conformance_server!()
+    scenarios = ConformanceRunner.tasks_extension_scenarios()
+    output_dir = output_dir!("server-extension-tasks-2026-07-28")
+
+    {output, status} =
+      ConformanceRunner.run_server_scenarios!(url, "2026-07-28", scenarios, output_dir)
+
+    assert status in [0, 1], output
+    assert_tasks_evidence!(scenarios, output_dir, output)
+
+    # alpha.11's tasks-status-notifications fixture always emits SKIPPED while
+    # upstream migrates it to subscriptions/listen. Native coverage owns that
+    # release gate; the runner scenario is intentionally not claimed here.
+    refute ConformanceRunner.tasks_native_replacement() in scenarios
+  end
+
+  defp start_conformance_server! do
     server_name = "conformance-" <> Integer.to_string(System.unique_integer([:positive]))
     server = FastestMCP.TestSupport.ConformanceFixture.build_server(server_name)
 
@@ -25,58 +57,91 @@ defmodule FastestMCP.ConformanceServerShimTest do
       start_supervised!(
         {Bandit,
          plug:
-           {FastestMCP.TestSupport.ConformanceProtocolShim,
-            server_name: server_name, allowed_hosts: :localhost},
+           {FastestMCP.Transport.HTTPApp,
+            server_name: server_name, path: "/mcp", allowed_hosts: :localhost},
          scheme: :http,
          port: 0}
       )
 
     {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
-    url = "http://127.0.0.1:#{port}/mcp"
-
-    output_dir = tmp_dir!()
-
-    {output, status} =
-      Task.async(fn -> ConformanceRunner.run_server!(url, output_dir) end)
-      |> Task.await(150_000)
-
-    assert status == 0, output
-    assert output =~ "=== SUMMARY ==="
-    assert output =~ "0 failed"
-    refute output =~ "Skipping scenario"
-
-    coverage = ConformanceRunner.coverage(:server, output_dir)
-
-    assert length(coverage.check_files) == length(expected_scenarios),
-           "expected one checks.json for every pinned server scenario\n#{output}"
-
-    refute coverage.checks == []
-    refute Enum.any?(coverage.checks, &(&1["status"] not in ["SUCCESS", "INFO"])), output
-
-    assert coverage.executed == MapSet.new(expected_scenarios),
-           "not every pinned server scenario produced checks\n#{output}"
+    %{url: "http://127.0.0.1:#{port}/mcp"}
   end
 
-  defp tmp_dir! do
-    case System.get_env("MCP_CONFORMANCE_OUTPUT_DIR") do
-      nil ->
-        path =
-          Path.join(
-            System.tmp_dir!(),
-            "fastest-mcp-conformance-shim-#{System.unique_integer([:positive])}"
-          )
+  defp assert_required_evidence!(expected, output_dir, output, revision) do
+    coverage = ConformanceRunner.coverage(expected, output_dir)
 
-        File.mkdir_p!(path)
-        on_exit(fn -> File.rm_rf!(path) end)
-        path
+    assert coverage.executed == MapSet.new(expected),
+           "not every required scenario produced checks\n#{output}"
 
-      configured_path ->
-        prepare_persistent_output_dir!(configured_path)
+    refute coverage.scored_checks == []
+
+    failures = Enum.filter(coverage.scored_checks, &(&1["status"] == "FAILURE"))
+
+    if revision == "2026-07-28" do
+      assert length(failures) == 2,
+             "the pinned request-metadata precedence defect changed; update or remove its exception\n#{output}"
+
+      assert Enum.all?(
+               failures,
+               &ConformanceRunner.pinned_modern_request_meta_precedence_defect?/1
+             ),
+             output
+    else
+      assert failures == [], output
     end
+
+    refute Enum.any?(coverage.scored_checks, fn check ->
+             check["status"] not in ["SUCCESS", "INFO", "FAILURE"] or
+               (check["status"] == "FAILURE" and revision != "2026-07-28") or
+               (check["status"] == "FAILURE" and
+                  not ConformanceRunner.pinned_modern_request_meta_precedence_defect?(check))
+           end),
+           output
   end
 
-  defp prepare_persistent_output_dir!(configured_path) do
-    path = Path.expand(configured_path)
+  defp assert_tasks_evidence!(expected, output_dir, output) do
+    coverage = ConformanceRunner.coverage(expected, output_dir)
+
+    assert coverage.executed == MapSet.new(expected),
+           "not every selected Tasks scenario produced checks\n#{output}"
+
+    refute coverage.scored_checks == []
+
+    failures = Enum.filter(coverage.scored_checks, &(&1["status"] == "FAILURE"))
+    refute failures == [], "the pinned alpha runner defect disappeared; remove its exception"
+
+    assert Enum.all?(failures, &ConformanceRunner.pinned_tasks_wire_schema_defect?/1),
+           output
+
+    refute Enum.any?(coverage.scored_checks, fn check ->
+             check["status"] not in ["SUCCESS", "INFO", "FAILURE"] or
+               (check["status"] == "FAILURE" and
+                  not ConformanceRunner.pinned_tasks_wire_schema_defect?(check))
+           end),
+           output
+  end
+
+  defp output_dir!(lane) do
+    base =
+      case System.get_env("MCP_CONFORMANCE_OUTPUT_DIR") do
+        nil ->
+          path =
+            Path.join(
+              System.tmp_dir!(),
+              "fastest-mcp-conformance-#{System.unique_integer([:positive])}"
+            )
+
+          File.mkdir_p!(path)
+          on_exit(fn -> File.rm_rf!(path) end)
+          path
+
+        configured_path ->
+          path = Path.expand(configured_path)
+          File.mkdir_p!(path)
+          path
+      end
+
+    path = Path.join(base, lane)
     File.mkdir_p!(path)
 
     case File.ls!(path) do

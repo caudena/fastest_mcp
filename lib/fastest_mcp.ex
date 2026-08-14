@@ -144,6 +144,9 @@ defmodule FastestMCP do
   @doc "Returns the current MCP protocol version."
   def current_protocol_version, do: Protocol.current_version()
 
+  @doc "Returns supported MCP protocol versions in preference order, newest first."
+  def supported_protocol_versions, do: Protocol.supported_versions()
+
   @doc "Fetches the live component manager for a running server."
   def component_manager(server_name) do
     case ComponentManager.fetch(server_name) do
@@ -433,6 +436,27 @@ defmodule FastestMCP do
 
       {:error, reason} ->
         raise task_storage_error(:cancel, reason)
+    end
+  end
+
+  @doc "Applies responses to outstanding input requests for a background task."
+  def update_task(server_name, task_id, input_responses, opts \\ [])
+      when is_map(input_responses) do
+    task_store = fetch_task_store!(server_name)
+    opts = normalize_task_access_opts(server_name, opts)
+
+    case BackgroundTaskStore.update(task_store, task_id, input_responses, opts) do
+      {:ok, task} ->
+        task
+
+      {:error, %Error{} = error} ->
+        raise error
+
+      {:error, :not_found} ->
+        raise invalid_task_id_error(task_id)
+
+      {:error, reason} ->
+        raise task_storage_error(:update, reason)
     end
   end
 

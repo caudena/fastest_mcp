@@ -86,6 +86,8 @@ defmodule FastestMCP.Context do
   alias FastestMCP.OperationPipeline
   alias FastestMCP.PeerTask
   alias FastestMCP.Protocol
+  alias FastestMCP.Protocol.Progress, as: ProgressProtocol
+  alias FastestMCP.Protocol.Redactor
   alias FastestMCP.Protocol.Sampling, as: SamplingProtocol
   alias FastestMCP.RequestContext
   alias FastestMCP.SamplingTool
@@ -130,6 +132,7 @@ defmodule FastestMCP.Context do
     :transport,
     :state_scope,
     :negotiated_protocol_version,
+    :request_state,
     :event_bus,
     :task_store,
     :principal,
@@ -142,6 +145,7 @@ defmodule FastestMCP.Context do
     lifespan_context: %{},
     dependencies: %{},
     request_metadata: %{},
+    input_responses: %{},
     task_metadata: %{}
   ]
 
@@ -153,6 +157,7 @@ defmodule FastestMCP.Context do
           transport: atom(),
           state_scope: :request | :session,
           negotiated_protocol_version: String.t() | nil,
+          request_state: String.t() | nil,
           event_bus: pid() | atom(),
           task_store: pid() | atom() | nil,
           principal: any(),
@@ -165,6 +170,7 @@ defmodule FastestMCP.Context do
           lifespan_context: map(),
           dependencies: map(),
           request_metadata: map(),
+          input_responses: map(),
           task_metadata: map()
         }
 
@@ -188,9 +194,11 @@ defmodule FastestMCP.Context do
     client_capabilities = normalize_map(Keyword.get(opts, :client_capabilities, %{}))
     server_capabilities = normalize_map(Keyword.get(opts, :server_capabilities, %{}))
     negotiated_protocol_version = Keyword.get(opts, :negotiated_protocol_version)
+    request_state = Keyword.get(opts, :request_state)
     lifespan_context = Map.new(Keyword.get(opts, :lifespan_context, %{}))
     dependencies = normalize_dependencies(Keyword.get(opts, :dependencies, %{}))
     task_metadata = Map.new(Keyword.get(opts, :task_metadata, %{}))
+    input_responses = Map.new(Keyword.get(opts, :input_responses, %{}))
 
     context = %__MODULE__{
       server_name: to_string(server_name),
@@ -200,6 +208,7 @@ defmodule FastestMCP.Context do
       transport: transport,
       state_scope: state_scope,
       negotiated_protocol_version: negotiated_protocol_version,
+      request_state: request_state,
       event_bus: event_bus,
       task_store: task_store,
       principal: principal,
@@ -212,6 +221,7 @@ defmodule FastestMCP.Context do
       lifespan_context: lifespan_context,
       dependencies: dependencies,
       request_metadata: request_metadata,
+      input_responses: input_responses,
       task_metadata: task_metadata
     }
 
@@ -309,6 +319,12 @@ defmodule FastestMCP.Context do
     Process.delete({__MODULE__, context.request_id, key})
     :ok
   end
+
+  @doc "Returns the MRTR responses supplied with the current modern request."
+  def input_responses(%__MODULE__{} = context), do: context.input_responses
+
+  @doc "Returns the opaque MRTR state echoed by the client, if present."
+  def request_state(%__MODULE__{} = context), do: context.request_state
 
   @doc "Builds a new server definition."
   def server(%__MODULE__{} = context), do: context.server
@@ -467,7 +483,12 @@ defmodule FastestMCP.Context do
   def log(%__MODULE__{} = context, level, data, opts \\ []) do
     level = normalize_log_level(level)
 
-    result = Session.log(context.server_name, context.session_id, level, data, opts)
+    result =
+      if context.negotiated_protocol_version == "2026-07-28" do
+        deliver_modern_log(context, level, data, opts)
+      else
+        Session.log(context.server_name, context.session_id, level, data, opts)
+      end
 
     if result == :ok do
       emit(
@@ -483,6 +504,44 @@ defmodule FastestMCP.Context do
     end
 
     result
+  end
+
+  defp deliver_modern_log(context, level, data, opts) do
+    requested_level = request_log_level(context)
+
+    cond do
+      is_nil(requested_level) ->
+        :filtered
+
+      log_level_index(level) < log_level_index(requested_level) ->
+        :filtered
+
+      true ->
+        case request_stream_sink(context) do
+          {pid, stream_ref} when is_pid(pid) ->
+            params =
+              %{
+                "level" => level,
+                "data" => Redactor.redact(data, opts)
+              }
+              |> maybe_put_map("logger", Keyword.get(opts, :logger))
+
+            send(
+              pid,
+              {:fastest_mcp_request_stream_message, stream_ref,
+               %{
+                 "jsonrpc" => "2.0",
+                 "method" => "notifications/message",
+                 "params" => params
+               }}
+            )
+
+            :ok
+
+          _other ->
+            {:error, :request_stream_unavailable}
+        end
+    end
   end
 
   @doc "Sends a raw MCP notification to the connected client session stream."
@@ -879,42 +938,93 @@ defmodule FastestMCP.Context do
 
   @doc "Records a progress update."
   def report_progress(%__MODULE__{} = context, current, total \\ nil, message \\ nil) do
-    progress =
-      %{}
-      |> maybe_put(:current, current)
-      |> maybe_put(:total, total)
-      |> maybe_put(:message, message)
-      |> Map.put(:reported_at, System.system_time(:millisecond))
+    with {:ok, next_total} <- validate_progress_update(context, current, total) do
+      progress =
+        %{}
+        |> maybe_put(:current, current)
+        |> maybe_put(:total, total)
+        |> maybe_put(:message, message)
+        |> Map.put(:reported_at, System.system_time(:millisecond))
 
-    case {task_store(context), task_id(context)} do
-      {store, task_id} when not is_nil(store) and is_binary(task_id) and task_id != "" ->
-        BackgroundTaskStore.report_progress(store, task_id, progress)
+      stored? = store_task_progress(context, progress)
+      delivery = deliver_progress(context, current, total, message)
 
-      _other ->
-        :ok
-    end
-
-    delivery =
-      case progress_token(context) do
-        nil ->
-          {:error, :missing_progress_token}
-
-        _token ->
-          Session.report_progress(
-            context.server_name,
-            context.session_id,
-            protocol_request_id(context),
-            %{
-              "progress" => current
-            }
-            |> maybe_put_map("total", total)
-            |> maybe_put_map("message", message)
-          )
+      if modern_progress?(context) and (delivery == :ok or stored?) do
+        put_request_state(context, :progress_update, %{current: current, total: next_total})
       end
 
-    emit(context, [:task, :progress], progress, %{task_id: task_id(context)})
-    delivery
+      emit(context, [:task, :progress], progress, %{task_id: task_id(context)})
+      delivery
+    end
   end
+
+  defp validate_progress_update(%__MODULE__{} = context, current, total) do
+    if modern_progress?(context) do
+      previous = get_request_state(context, :progress_update, %{current: nil, total: nil})
+      supplied_total = if is_nil(total), do: :absent, else: {:provided, total}
+
+      ProgressProtocol.validate_update(
+        current,
+        previous.current,
+        supplied_total,
+        previous.total
+      )
+    else
+      {:ok, total}
+    end
+  end
+
+  defp store_task_progress(%__MODULE__{} = context, progress) do
+    case {task_store(context), task_id(context)} do
+      {store, task_id} when not is_nil(store) and is_binary(task_id) and task_id != "" ->
+        BackgroundTaskStore.report_progress(store, task_id, progress) == :ok
+
+      _other ->
+        false
+    end
+  end
+
+  defp deliver_progress(%__MODULE__{} = context, current, total, message) do
+    case progress_token(context) do
+      nil ->
+        {:error, :missing_progress_token}
+
+      token ->
+        params =
+          %{
+            "progressToken" => token,
+            "progress" => current
+          }
+          |> maybe_put_map("total", total)
+          |> maybe_put_map("message", message)
+
+        case request_stream_sink(context) do
+          {pid, stream_ref} when is_pid(pid) ->
+            send(
+              pid,
+              {:fastest_mcp_request_stream_message, stream_ref,
+               %{
+                 "jsonrpc" => "2.0",
+                 "method" => "notifications/progress",
+                 "params" => params
+               }}
+            )
+
+            :ok
+
+          _other ->
+            Session.report_progress(
+              context.server_name,
+              context.session_id,
+              protocol_request_id(context),
+              Map.delete(params, "progressToken")
+            )
+        end
+    end
+  end
+
+  defp modern_progress?(%__MODULE__{negotiated_protocol_version: "2026-07-28"}), do: true
+  defp modern_progress?(%__MODULE__{}), do: false
 
   @doc "Requests interactive input for a background task."
   def elicit(%__MODULE__{} = context, message, response_type, opts \\ []) do
@@ -1124,6 +1234,16 @@ defmodule FastestMCP.Context do
     request_metadata_value(context, :progress_token)
   end
 
+  defp request_stream_sink(%__MODULE__{} = context) do
+    request_metadata_value(context, :request_stream_sink)
+  end
+
+  defp request_log_level(%__MODULE__{} = context) do
+    request_metadata_value(context, :log_level)
+  end
+
+  defp log_level_index(level), do: Enum.find_index(@logging_levels, &(&1 == level)) || 0
+
   defp send_client_request(%__MODULE__{} = context, method, params, timeout_ms, opts) do
     request_opts =
       session_delivery_opts(context,
@@ -1280,7 +1400,17 @@ defmodule FastestMCP.Context do
     if Protocol.capability?(context.client_capabilities, path) do
       :ok
     else
-      raise Error, code: :method_not_found, message: message
+      if context.negotiated_protocol_version == "2026-07-28" do
+        raise Error,
+          code: :missing_required_client_capability,
+          message: message,
+          details: %{
+            jsonrpc_code: -32_021,
+            requiredCapabilities: Protocol.capabilities_map([path])
+          }
+      else
+        raise Error, code: :method_not_found, message: message
+      end
     end
   end
 
@@ -1422,6 +1552,8 @@ defmodule FastestMCP.Context do
       |> Map.delete("path")
       |> Map.delete(:query_params)
       |> Map.delete("query_params")
+      |> Map.delete(:request_stream_sink)
+      |> Map.delete("request_stream_sink")
       |> Map.new(fn {key, value} ->
         normalized_key = if is_atom(key), do: Atom.to_string(key), else: key
         {normalized_key, value}
@@ -1610,12 +1742,13 @@ defmodule FastestMCP.Context do
   end
 
   defp validate_sampling_capabilities!(context, tools, include_context) do
-    cond do
-      not sampling_base_capability?(context) ->
-        raise Error,
-          code: :method_not_found,
-          message: "connected client did not declare sampling support"
+    require_client_capability!(
+      context,
+      ["sampling"],
+      "connected client did not declare sampling support"
+    )
 
+    cond do
       not is_nil(tools) and not client_sampling_capability?(context, "tools") ->
         raise Error,
           code: :bad_request,
@@ -1630,10 +1763,6 @@ defmodule FastestMCP.Context do
       true ->
         :ok
     end
-  end
-
-  defp sampling_base_capability?(%__MODULE__{client_capabilities: capabilities}) do
-    is_map(Map.get(capabilities, "sampling", Map.get(capabilities, :sampling)))
   end
 
   defp validate_peer_task_capability!(context, opts, request_path) do

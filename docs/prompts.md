@@ -263,12 +263,13 @@ FastestMCP.render_prompt("prompt-duplicates", "welcome", %{})
 
 ## Runtime Change Notifications
 
-Prompt definitions participate in the same session-aware notification pipeline
-as tools and resources.
+Prompt definitions participate in the same version-appropriate notification
+pipeline as tools and resources.
 
-When prompts are added, removed, enabled, disabled, or hidden for one session,
-FastestMCP can emit `notifications/prompts/list_changed` to active initialized
-HTTP or stdio sessions.
+On `2025-11-25`, prompt changes can emit
+`notifications/prompts/list_changed` to active initialized HTTP or stdio
+sessions. On `2026-07-28`, the notification is routed only to long-lived
+listeners whose acknowledged filter includes prompt-list changes.
 
 The notification is only emitted when the visible prompt set actually changes
 for that session.
@@ -343,8 +344,8 @@ explicit in the prompt definition.
 
 - prompt arguments are explicit `arguments: [...]` metadata
 - there is no hidden implicit argument injection
-- session notifications exist only on transports with a live session event
-  stream
+- legacy notifications require a live session event stream; modern
+  notifications require a matching long-lived listener
 
 ## Why This Shape
 

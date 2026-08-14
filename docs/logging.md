@@ -7,7 +7,8 @@ FastestMCP exposes two distinct logging planes:
 
 Keeping those separate matters. Request logging is about observing runtime
 behavior. Handler log notifications are about sending structured messages to the
-connected client that is actively participating in the session.
+connected client that is actively participating in the current legacy session
+or modern request stream.
 
 ## Request Logging Middleware
 
@@ -39,7 +40,7 @@ Use this when you need runtime traces in application logs.
 ## Handler Log Notifications
 
 Use `FastestMCP.Context.log/4` when a handler wants to emit a protocol message
-to the current client session:
+to the current client request:
 
 ```elixir
 alias FastestMCP.Context
@@ -54,20 +55,26 @@ server =
   end)
 ```
 
-These messages are session-aware. They are useful when the client is actively
-watching the operation and wants structured log notifications alongside
-progress, sampling, or elicitation callbacks.
+These messages follow the selected protocol. They are useful when the client
+is actively watching the operation and wants structured log notifications
+alongside progress, sampling, or elicitation callbacks.
 
-Each initialized session starts at the MCP `info` threshold. A client can
-change it with `logging/setLevel`; FastestMCP applies the complete MCP/RFC 5424
-ordering from `debug` through `emergency` before enqueueing. The threshold is
-isolated to that session and disappears when the session terminates.
+On `2025-11-25`, each initialized session starts at the MCP `info` threshold.
+A client can change it with `logging/setLevel`; FastestMCP applies the complete
+MCP/RFC 5424 ordering from `debug` through `emergency` before enqueueing. The
+threshold is isolated to that legacy session and disappears when it terminates.
 
-Protocol logs are recursively filtered for configurable sensitive keys and are
-bounded to 100 messages per second per session by default. `Context.log/4`
-returns explicit lifecycle, delivery, or rate errors instead of claiming that
-an undeliverable log was sent. Set the runtime `max_logs_per_second:` option to
-change that bound and `redaction_opts:` to configure recursive key filtering.
+On `2026-07-28`, `logging/setLevel` does not exist. The client instead supplies
+`_meta["io.modelcontextprotocol/logLevel"]` on each request. Matching
+`notifications/message` events stay on that originating HTTP/stdio request;
+without the metadata, modern handler logs are filtered.
+
+Protocol logs are recursively filtered for configurable sensitive keys.
+Legacy logs are bounded to 100 messages per second per session by default;
+set `max_logs_per_second:` to change that bound. `Context.log/4` returns
+explicit filtering, lifecycle, delivery, or rate errors instead of claiming
+that an undeliverable log was sent. Use `redaction_opts:` to configure
+recursive key filtering.
 
 ## Client-side Consumption
 
@@ -81,8 +88,8 @@ client =
   )
 ```
 
-That handler receives protocol log notifications from the server while the
-session is connected.
+That handler receives legacy session logs or modern logs carried by an active
+request stream.
 
 ## Choosing The Right Plane
 
@@ -105,8 +112,9 @@ It is normal to use both:
 
 ## Logging and Background Tasks
 
-Handler log notifications can be emitted from background tasks too, as long as
-the session is still active and the client is listening.
+Legacy handler log notifications can be emitted from background tasks too, as
+long as the session is still active and the client is listening. Modern log
+delivery is request-scoped; a detached task has no request log stream.
 
 That makes them a good fit for:
 
@@ -120,8 +128,8 @@ FastestMCP keeps application logs and protocol logs separate because they solve
 different problems.
 
 Middleware logging is about server observability. `Context.log/4` is about
-session-aware MCP notifications. Mixing those responsibilities usually produces
-confusing logs and weaker client behavior.
+version-appropriate MCP notifications to the connected peer. Mixing those
+responsibilities usually produces confusing logs and weaker client behavior.
 
 ## Related Guides
 

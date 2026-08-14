@@ -7,7 +7,9 @@ defmodule FastestMCP.Client.OAuth.TokenStore do
   at rest and must not log values.
   """
 
-  @type key :: {String.t(), String.t(), String.t()}
+  @type key ::
+          {String.t(), String.t(), String.t()}
+          | {String.t(), String.t(), String.t(), :client_credentials | :enterprise_managed}
   @type token_set :: map()
 
   @callback get(term(), key()) :: token_set() | nil

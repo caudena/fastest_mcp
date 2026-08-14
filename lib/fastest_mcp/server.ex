@@ -67,6 +67,7 @@ defmodule FastestMCP.Server do
   alias FastestMCP.ComponentCompiler
   alias FastestMCP.Elicitation.URL, as: URLElicitation
   alias FastestMCP.Provider
+  alias FastestMCP.Protocol.Extensions
   alias FastestMCP.Providers.MountedServer, as: MountedServerProvider
   alias FastestMCP.TaskConfig
 
@@ -78,6 +79,7 @@ defmodule FastestMCP.Server do
     mask_error_details: false,
     on_duplicate: :error,
     metadata: %{},
+    extensions: %{},
     http_routes: [],
     tasks: %TaskConfig{},
     schema_options: [],
@@ -106,6 +108,7 @@ defmodule FastestMCP.Server do
           mask_error_details: boolean(),
           on_duplicate: :error | :warn | :ignore | :replace,
           metadata: map(),
+          extensions: map(),
           http_routes: [tuple()],
           tasks: struct(),
           schema_options: keyword(),
@@ -139,6 +142,7 @@ defmodule FastestMCP.Server do
         |> Map.new()
         |> put_experimental_capabilities(Keyword.get(opts, :experimental_capabilities))
         |> validate_experimental_capabilities!(),
+      extensions: Extensions.normalize(Keyword.get(opts, :extensions)),
       http_routes: [],
       tasks: normalize_tasks(Keyword.get(opts, :tasks, false)),
       schema_options: normalize_schema_options(Keyword.get(opts, :schema_options, [])),

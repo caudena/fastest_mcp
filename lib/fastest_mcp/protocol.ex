@@ -12,7 +12,15 @@ defmodule FastestMCP.Protocol do
   module indirectly through higher-level APIs rather than calling it first.
   """
 
-  @current_version "2025-11-25"
+  @supported_versions ["2026-07-28", "2025-11-25"]
+  @current_version hd(@supported_versions)
+  @profiles %{
+    "2026-07-28" => :modern,
+    "2025-11-25" => :legacy
+  }
+
+  @type version :: String.t()
+  @type profile :: :modern | :legacy | :unsupported
 
   @server_method_capabilities %{
     "tools/list" => ["tools"],
@@ -26,6 +34,8 @@ defmodule FastestMCP.Protocol do
     "prompts/get" => ["prompts"],
     "completion/complete" => ["completions"],
     "logging/setLevel" => ["logging"],
+    "tasks/get" => ["tasks"],
+    "tasks/update" => ["tasks"],
     "tasks/list" => ["tasks", "list"],
     "tasks/cancel" => ["tasks", "cancel"]
   }
@@ -37,8 +47,34 @@ defmodule FastestMCP.Protocol do
     "tasks/cancel" => ["tasks", "cancel"]
   }
 
-  @doc "Returns the active MCP protocol version supported by the library."
+  @doc "Returns supported MCP protocol versions in preference order, newest first."
+  @spec supported_versions() :: [version()]
+  def supported_versions, do: @supported_versions
+
+  @doc "Returns whether the exact protocol version is supported."
+  @spec supported_version?(term()) :: boolean()
+  def supported_version?(version), do: Map.has_key?(@profiles, version)
+
+  @doc "Returns the preferred MCP protocol version supported by the library."
+  @spec current_version() :: version()
   def current_version, do: @current_version
+
+  @doc "Returns the implementation profile for a protocol version."
+  @spec profile(term()) :: profile()
+  def profile(version), do: Map.get(@profiles, version, :unsupported)
+
+  @doc "Returns the implementation profile for a supported protocol version."
+  @spec profile!(term()) :: :modern | :legacy
+  def profile!(version) do
+    case profile(version) do
+      :unsupported ->
+        raise ArgumentError,
+              "unsupported MCP protocol version #{inspect(version)}; supported versions: #{Enum.join(@supported_versions, ", ")}"
+
+      profile ->
+        profile
+    end
+  end
 
   @doc "Returns the protocol version string for the given input."
   def version(metadata_or_server, default \\ @current_version)
@@ -125,7 +161,9 @@ defmodule FastestMCP.Protocol do
   def required_client_capability("elicitation/create", params) when is_map(params) do
     case Map.get(params, "mode", "form") do
       "url" -> ["elicitation", "url"]
-      _form -> ["elicitation", "form"]
+      # The 2026 elicitation specification explicitly defines an empty
+      # `elicitation` object as backwards-compatible form-mode support.
+      _form -> ["elicitation"]
     end
   end
 
@@ -140,7 +178,84 @@ defmodule FastestMCP.Protocol do
     end
   end
 
+  @doc false
+  def required_input_capability_paths(input_requests) when is_map(input_requests) do
+    input_requests
+    |> Map.values()
+    |> Enum.flat_map(&input_request_capability_paths/1)
+    |> Enum.uniq()
+  end
+
+  @doc false
+  def missing_input_capabilities(client_capabilities, input_requests)
+      when is_map(input_requests) do
+    input_requests
+    |> required_input_capability_paths()
+    |> Enum.reject(&capability?(client_capabilities, &1))
+    |> capabilities_map()
+  end
+
+  @doc false
+  def capabilities_map(paths) when is_list(paths) do
+    Enum.reduce(paths, %{}, fn path, required ->
+      deep_merge_capabilities(required, capability_path_map(path))
+    end)
+  end
+
+  defp input_request_capability_paths(request) when is_map(request) do
+    method = metadata_value(request, :method)
+    params = metadata_value(request, :params, %{})
+
+    base =
+      case required_client_capability(method, params) do
+        nil -> []
+        path -> [path]
+      end
+
+    base ++ sampling_capability_paths(method, params)
+  end
+
+  defp input_request_capability_paths(_request), do: []
+
+  defp sampling_capability_paths("sampling/createMessage", params) when is_map(params) do
+    []
+    |> maybe_add_capability_path(
+      Map.has_key?(params, "tools") or Map.has_key?(params, :tools) or
+        Map.has_key?(params, "toolChoice") or Map.has_key?(params, :toolChoice),
+      ["sampling", "tools"]
+    )
+    |> maybe_add_capability_path(
+      metadata_value(params, :includeContext) in ["thisServer", "allServers"],
+      ["sampling", "context"]
+    )
+  end
+
+  defp sampling_capability_paths(_method, _params), do: []
+
+  defp maybe_add_capability_path(paths, true, path), do: [path | paths]
+  defp maybe_add_capability_path(paths, false, _path), do: paths
+
+  defp capability_path_map(path) do
+    path
+    |> Enum.reverse()
+    |> Enum.reduce(%{}, fn segment, nested -> %{to_string(segment) => nested} end)
+  end
+
+  defp deep_merge_capabilities(left, right) do
+    Map.merge(left, right, fn _key, left_value, right_value ->
+      if is_map(left_value) and is_map(right_value) do
+        deep_merge_capabilities(left_value, right_value)
+      else
+        right_value
+      end
+    end)
+  end
+
   defp metadata_value(metadata, key) do
     Map.get(metadata, key, Map.get(metadata, Atom.to_string(key)))
+  end
+
+  defp metadata_value(metadata, key, default) do
+    Map.get(metadata, key, Map.get(metadata, Atom.to_string(key), default))
   end
 end

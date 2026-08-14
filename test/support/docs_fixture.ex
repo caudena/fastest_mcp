@@ -97,14 +97,38 @@ defmodule FastestMCP.TestSupport.DocsFixture.InteractiveServer do
   use FastestMCP.ServerModule
 
   alias FastestMCP.Context
+  alias FastestMCP.InputRequiredResult
   alias FastestMCP.Interact
   alias FastestMCP.Sampling
 
   def server(opts) do
     base_server(opts)
     |> FastestMCP.add_tool("summarize", fn _arguments, ctx ->
-      response = Sampling.run!(ctx, "Summarize this text", max_tokens: 64)
-      %{text: response.text}
+      if ctx.negotiated_protocol_version == "2026-07-28" do
+        case Context.input_responses(ctx) do
+          %{"summary" => response} ->
+            %{"text" => get_in(response, ["content", "text"])}
+
+          %{} ->
+            InputRequiredResult.new(%{
+              "summary" => %{
+                "method" => "sampling/createMessage",
+                "params" => %{
+                  "messages" => [
+                    %{
+                      "role" => "user",
+                      "content" => %{"type" => "text", "text" => "Summarize this text"}
+                    }
+                  ],
+                  "maxTokens" => 64
+                }
+              }
+            })
+        end
+      else
+        response = Sampling.run!(ctx, "Summarize this text", max_tokens: 64)
+        %{text: response.text}
+      end
     end)
     |> FastestMCP.add_tool(
       "approve_release",

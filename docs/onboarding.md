@@ -28,8 +28,19 @@ end
 `base_server/1` keeps the builder DSL intact while making the module name the
 server identity automatically.
 
-If you need to advertise protocol extension capabilities during
-initialization, pass `experimental_capabilities:` when constructing the server:
+For modern protocol extensions, pass their exact identifiers with
+`extensions:`:
+
+```elixir
+alias FastestMCP.Protocol.Extensions
+
+FastestMCP.server("capability-demo",
+  extensions: %{Extensions.tasks() => %{}}
+)
+```
+
+`experimental_capabilities:` remains the separate legacy escape hatch for
+application-specific experimental capabilities:
 
 ```elixir
 FastestMCP.server("capability-demo",
@@ -39,7 +50,7 @@ FastestMCP.server("capability-demo",
 )
 ```
 
-The map is exposed under initialize capabilities as `"experimental"`.
+That map is exposed under legacy initialize capabilities as `"experimental"`.
 
 ## 2. Start it under your supervision tree
 
@@ -91,6 +102,12 @@ forward "/mcp", FastestMCP.Transport.HTTPApp,
   allowed_hosts: ["mcp.example.com"]
 ```
 
+If the server is an OAuth protected resource, the RFC 9728 document is outside
+that forwarded path. Add a separate unauthenticated
+`FastestMCP.Transport.WellKnownHTTP` mount at the path derived from the exact
+resource URI; see [Phoenix Deployment](phoenix-deployment.md) for the complete
+router and `base_url` configuration.
+
 `allowed_hosts: :localhost` is the safe local default. Deployed listeners must
 use their concrete public host names; `allowed_hosts: :any` was removed in
 0.2.0. See [Transports](transports.md#host-and-listener-safety) before binding a
@@ -114,8 +131,10 @@ FastestMCP.Client.complete(
 )
 ```
 
-The client negotiates MCP `2025-11-25`, retains the server-issued session id,
-and sends `notifications/initialized` before normal requests.
+The client defaults to `protocol_version: :auto`: it prefers MCP `2026-07-28`
+and falls back to `2025-11-25` only when the peer provides explicit legacy
+evidence. The legacy path retains the server-issued session id and sends
+`notifications/initialized`; the modern path is request-stateless.
 
 From here, branch into the focused guides:
 
@@ -124,6 +143,9 @@ From here, branch into the focused guides:
 - [Dependency Injection](dependency-injection.md)
 - [Lifespan](lifespan.md)
 - [Transports](transports.md)
+- [Protocol Versions](protocol-versions.md)
+- [Protocol Extensions](extensions.md)
+- [Phoenix Deployment](phoenix-deployment.md)
 - [Client](client.md)
 - [Sampling and Interaction](sampling-and-interaction.md)
 - [Background Tasks](background-tasks.md)

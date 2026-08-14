@@ -121,7 +121,7 @@ defmodule FastestMCP.Middleware.ResponseLimiting do
 
   defp truncate_structured_tool_result(payload, actual_size, max_size, suffix) do
     case Map.fetch(payload, "structuredContent") do
-      {:ok, structured_content} when is_map(structured_content) ->
+      {:ok, structured_content} when not is_nil(structured_content) ->
         required_metadata =
           %{"structuredContent" => structured_content}
           |> maybe_put_metadata("isError", Map.get(payload, "isError"))

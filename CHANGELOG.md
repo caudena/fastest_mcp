@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased
+
+### MCP `2026-07-28` and compatibility
+
+- add MCP `2026-07-28` as the preferred modern profile while retaining full
+  `2025-11-25` server and connected-client support at the same endpoint
+- add `protocol_version: :auto | "2026-07-28" | "2025-11-25"` to the
+  connected client; `:auto` probes modern discovery first and downgrades only
+  on explicit legacy evidence
+- expose newest-first supported-version and protocol-profile helpers, and
+  include the official `2026-07-28` schema
+
+### Extensions
+
+- add the stable MCP Apps v1.0.0 metadata/resource boundary without
+  implementing a browser Host, iframe renderer, sandbox, or `postMessage`
+  bridge
+- add the experimental `io.modelcontextprotocol/tasks` v2 wire for modern
+  connections, including MRTR input and server-directed work, while keeping
+  the distinct legacy Tasks v1 surface and including the draft extension
+  schema
+- add the draft OAuth Client Credentials and stable Enterprise-Managed
+  Authorization connected-client grants through explicit host callbacks;
+  FastestMCP remains a resource server/client toolkit, not an authorization
+  server or identity provider
+
+### Verification and release gates
+
+- update the official conformance runner to
+  `@modelcontextprotocol/conformance@0.2.0-alpha.11`, run both frozen core
+  requirement sets, and invoke supported Tasks and authorization-extension
+  scenarios explicitly
+- check that packaged schema and license files are present, and run the packaged
+  consumer against both protocol revisions over HTTP and stdio
+
 ## 0.2.0 - 2026-08-12
 
 This is a breaking protocol and lifecycle release. Applications upgrading from
@@ -21,7 +56,7 @@ This is a breaking protocol and lifecycle release. Applications upgrading from
   application/json` and advertise both `application/json` and
   `text/event-stream` in `Accept`
 - return `202 Accepted` with no response body for JSON-RPC notifications
-- pin the official server conformance runner to
+- run the official server conformance runner at
   `@modelcontextprotocol/conformance@0.1.16` as a release gate without
   expected-failure allowances
 
@@ -91,13 +126,11 @@ This is a breaking protocol and lifecycle release. Applications upgrading from
 - add JSV `0.22.x` as the sole new runtime dependency and make
   `FastestMCP.Schema` the compile-once validation boundary for Draft 2020-12
   and Draft 7; validation is non-coercing, bounded, and redacted
-- vendor the immutable MCP `2025-11-25` schema from source commit
-  `38c84e9f93ad191d9eb26d92b945d17bd0efcaf3` with a checked SHA-256, and cover
+- include the official MCP `2025-11-25` schema and cover
   the FastestMCP schema boundary with focused dialect, resolver, and limit tests
-- keep those vendored bytes unchanged while applying a versioned compiled-view
-  erratum for `NumberSchema.minimum`, `maximum`, and `default`: authoritative
-  `schema.ts` and the elicitation specification define numbers, while the
-  tagged generated JSON artifact emitted integers
+- apply a versioned compiled-view erratum for `NumberSchema.minimum`, `maximum`,
+  and `default`: the TypeScript definitions and elicitation specification define
+  numbers, while the published JSON schema emitted integers
 - fail remote JSON Schema references closed by default; applications may opt in
   to an explicit resolver or the allowlisted HTTPS resolver with verified TLS,
   redirect refusal, and timeout/body limits

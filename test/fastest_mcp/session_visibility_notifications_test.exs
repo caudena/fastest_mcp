@@ -351,6 +351,7 @@ defmodule FastestMCP.SessionVisibilityNotificationsTest do
     client =
       Client.connect!(
         "http://127.0.0.1:#{port}/mcp",
+        protocol_version: "2025-11-25",
         session_stream: true,
         notification_handler: fn payload ->
           send(parent, {:visibility_notification, payload})

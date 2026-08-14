@@ -62,7 +62,8 @@ defmodule FastestMCP.DocsExamplesTest do
 
     assert %{items: [%{"name" => "welcome"}], next_cursor: nil} = Client.list_prompts(client)
 
-    assert 42 == Client.call_tool(client, "sum", %{"a" => 20, "b" => 22})
+    assert %{"resultType" => "complete", "structuredContent" => 42} =
+             Client.call_tool(client, "sum", %{"a" => 20, "b" => 22})
   end
 
   test "sampling, interaction, and background task examples work against the docs fixture" do
@@ -90,7 +91,10 @@ defmodule FastestMCP.DocsExamplesTest do
       if Client.connected?(client), do: Client.disconnect(client)
     end)
 
-    assert %{"text" => "short summary"} = Client.call_tool(client, "summarize", %{})
+    assert %{
+             "resultType" => "complete",
+             "structuredContent" => %{"text" => "short summary"}
+           } = Client.call_tool(client, "summarize", %{})
 
     assert_receive {:sampling_handler_called, _messages, %{"maxTokens" => 64}}, 1_000
 
@@ -127,7 +131,9 @@ defmodule FastestMCP.DocsExamplesTest do
     end)
 
     whoami = Client.call_tool(client, "whoami", %{})
-    assert "local-client" == DocsFixture.nested_fetch(whoami, [:principal, :sub])
+
+    assert "local-client" ==
+             DocsFixture.nested_fetch(whoami, [:structuredContent, :principal, :sub])
 
     server_name =
       "docs-component-manager-" <> Integer.to_string(System.unique_integer([:positive]))
@@ -318,7 +324,10 @@ defmodule FastestMCP.DocsExamplesTest do
     assert shipped_tool.input_schema["$defs"]["address"]["type"] == "object"
     assert shipped_tool.input_schema["properties"]["shipping"]["$ref"] == "#/$defs/address"
 
-    assert %{"values" => ["alpha", "beta"]} = Client.call_tool(client, "list_values", %{})
+    assert %{
+             "resultType" => "complete",
+             "structuredContent" => %{"values" => ["alpha", "beta"]}
+           } = Client.call_tool(client, "list_values", %{})
 
     :ok = FastestMCP.disable_components(server_name, tags: ["private"], components: [:tool])
 
@@ -405,8 +414,18 @@ defmodule FastestMCP.DocsExamplesTest do
     assert %{items: [%{"uriTemplate" => "users://{id}{?format}"}], next_cursor: nil} =
              Client.list_resource_templates(client)
 
-    assert %{"name" => "fastest_mcp", "version" => "0.1.0"} =
-             Client.read_resource(client, "config://release")
+    assert %{
+             "resultType" => "complete",
+             "contents" => [
+               %{
+                 "uri" => "config://release",
+                 "mimeType" => "application/json",
+                 "text" => encoded_release
+               }
+             ]
+           } = Client.read_resource(client, "config://release")
+
+    assert %{"name" => "fastest_mcp", "version" => "0.1.0"} = JSON.decode!(encoded_release)
   end
 
   test "readme and guide links resolve and no compatibility sidecar references remain" do

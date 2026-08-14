@@ -12,7 +12,6 @@ defmodule FastestMCP.Transport.StreamableHTTP do
   alias FastestMCP.Error
   alias FastestMCP.ErrorExposure
   alias FastestMCP.MIME
-  alias FastestMCP.Protocol
   alias FastestMCP.Registry
   alias FastestMCP.ServerRuntime
   alias FastestMCP.Session
@@ -24,8 +23,9 @@ defmodule FastestMCP.Transport.StreamableHTTP do
   alias FastestMCP.Transport.StreamableHTTPAdapter
   alias FastestMCP.TTLStore
 
-  @protocol_version Protocol.current_version()
+  @legacy_protocol_version "2025-11-25"
   @default_sse_retry_ms 1_000
+  @modern_request_heartbeat_ms 1_000
 
   @doc "Builds a child specification for supervising this module."
   def child_spec(opts) do
@@ -99,8 +99,14 @@ defmodule FastestMCP.Transport.StreamableHTTP do
 
       {:application_error, %FastestMCP.Transport.Request{protocol: :jsonrpc} = request,
        %Error{} = error, _auth, _http_context} ->
+        status = application_error_status(request, error)
+
         conn =
-          HTTPCommon.json(conn, 200, StreamableHTTPAdapter.encode_jsonrpc_error(request, error))
+          HTTPCommon.json(
+            conn,
+            status,
+            StreamableHTTPAdapter.encode_jsonrpc_error(request, error)
+          )
 
         terminate_session_after_delivery(server_name, request, error)
         conn
@@ -219,6 +225,37 @@ defmodule FastestMCP.Transport.StreamableHTTP do
 
   defp expose_dispatch_error(other, _runtime, _http_context), do: other
 
+  defp application_error_status(
+         %{protocol_version: "2026-07-28"},
+         %Error{code: :method_not_found}
+       ),
+       do: 404
+
+  defp application_error_status(request, %Error{code: :method_not_found}) do
+    if modern_request_attempt?(request), do: 404, else: 200
+  end
+
+  defp application_error_status(request, %Error{code: code})
+       when code in [
+              :header_mismatch,
+              :invalid_params,
+              :invalid_request,
+              :missing_required_client_capability,
+              :unsupported_protocol_version
+            ] do
+    if modern_request_attempt?(request), do: 400, else: 200
+  end
+
+  defp application_error_status(_request, _error), do: 200
+
+  defp modern_request_attempt?(%{protocol_version: "2026-07-28"}), do: true
+
+  defp modern_request_attempt?(%{payload: payload}) when is_map(payload) do
+    is_binary(get_in(payload, ["_meta", "io.modelcontextprotocol/protocolVersion"]))
+  end
+
+  defp modern_request_attempt?(_request), do: false
+
   defp authentication_error(conn, opts, error) do
     case StreamableHTTPAdapter.decode(conn, opts) do
       {:ok, %FastestMCP.Transport.Request{} = request} ->
@@ -275,6 +312,50 @@ defmodule FastestMCP.Transport.StreamableHTTP do
        ),
        do: handle_client_response(runtime, request)
 
+  defp dispatch_request(
+         conn,
+         runtime,
+         %{protocol_version: "2026-07-28", method: "subscriptions/listen"} = request,
+         _opts
+       ) do
+    case Engine.start_subscription(runtime.server.name, request,
+           owner: self(),
+           target: self()
+         ) do
+      {:ok, subscriber, _validated_request} ->
+        {:handled, stream_modern_subscription(conn, runtime, subscriber)}
+
+      {:error, %Error{} = error} ->
+        {:application_error, request, error}
+    end
+  end
+
+  defp dispatch_request(
+         conn,
+         runtime,
+         %{protocol_version: "2026-07-28"} = request,
+         opts
+       ) do
+    if modern_request_stream?(conn, request, opts) do
+      {:handled, stream_modern_request(conn, runtime, request, opts)}
+    else
+      execute_request_supervised(runtime, request, opts)
+    end
+  end
+
+  defp dispatch_request(
+         _conn,
+         runtime,
+         %{
+           payload: %{
+             "_meta" => %{"io.modelcontextprotocol/protocolVersion" => version}
+           }
+         } = request,
+         opts
+       )
+       when is_binary(version),
+       do: execute_request_supervised(runtime, request, opts)
+
   defp dispatch_request(conn, runtime, %{method: method, request_id: request_id} = request, opts)
        when method != "initialize" and not is_nil(request_id),
        do: maybe_stream_task_request(conn, runtime, request, opts)
@@ -295,7 +376,15 @@ defmodule FastestMCP.Transport.StreamableHTTP do
 
   defp validate_http_request(_runtime, %{method: "initialize"}), do: :ok
 
+  defp validate_http_request(_runtime, %{protocol_version: "2026-07-28"}), do: :ok
+
   defp validate_http_request(runtime, request) do
+    if modern_request_attempt?(request),
+      do: :ok,
+      else: validate_legacy_http_request(runtime, request)
+  end
+
+  defp validate_legacy_http_request(runtime, request) do
     with :ok <- require_session_header(request),
          :ok <- validate_protocol_header(request),
          {:ok, _pid} <- lookup_http_session(runtime, request.session_id),
@@ -315,7 +404,7 @@ defmodule FastestMCP.Transport.StreamableHTTP do
 
   defp validate_protocol_header(%{request_metadata: metadata}) do
     case Map.get(metadata, :protocol_version) do
-      @protocol_version ->
+      @legacy_protocol_version ->
         :ok
 
       nil ->
@@ -516,6 +605,243 @@ defmodule FastestMCP.Transport.StreamableHTTP do
     end
   end
 
+  defp stream_modern_subscription(conn, runtime, subscriber) do
+    conn =
+      conn
+      |> modern_sse_response()
+      |> send_chunked(200)
+
+    monitor_ref = Process.monitor(subscriber)
+
+    try do
+      modern_subscription_loop(conn, subscriber, monitor_ref)
+    after
+      Process.demonitor(monitor_ref, [:flush])
+
+      _ =
+        DynamicSupervisor.terminate_child(
+          runtime.session_notification_supervisor,
+          subscriber
+        )
+    end
+  end
+
+  defp modern_subscription_loop(conn, subscriber, monitor_ref) do
+    receive do
+      {:fastest_mcp_subscription_notification, notification} ->
+        case chunk_message(conn, notification) do
+          {:ok, conn} -> modern_subscription_loop(conn, subscriber, monitor_ref)
+          {:error, _reason} -> conn
+        end
+
+      {:DOWN, ^monitor_ref, :process, ^subscriber, _reason} ->
+        conn
+    after
+      5_000 ->
+        case chunk_raw(conn, ": keepalive\n\n") do
+          {:ok, conn} -> modern_subscription_loop(conn, subscriber, monitor_ref)
+          {:error, _reason} -> conn
+        end
+    end
+  end
+
+  defp modern_request_stream?(conn, request, opts) do
+    not json_response_mode?(opts) and accepts_event_stream?(conn) and
+      not is_nil(request.request_id) and
+      (not is_nil(Map.get(request.request_metadata, :progress_token)) or
+         not is_nil(Map.get(request.request_metadata, :log_level)))
+  end
+
+  defp stream_modern_request(conn, runtime, request, opts) do
+    conn =
+      conn
+      |> modern_sse_response()
+      |> send_chunked(200)
+
+    result_alias = :erlang.alias()
+    stream_ref = make_ref()
+    owner = self()
+
+    spawned_request = %{
+      request
+      | request_metadata:
+          Map.put(request.request_metadata, :request_stream_sink, {owner, stream_ref})
+    }
+
+    case Task.Supervisor.start_child(runtime.stream_task_supervisor, fn ->
+           result = execute_stream_worker(runtime, spawned_request, opts)
+           send(result_alias, {:modern_stream_result, stream_ref, result})
+         end) do
+      {:ok, worker} ->
+        monitor_ref = Process.monitor(worker)
+        timeout_ms = request_timeout_ms!(opts)
+        deadline = System.monotonic_time(:millisecond) + timeout_ms
+
+        try do
+          modern_request_stream_loop(
+            conn,
+            runtime,
+            request,
+            worker,
+            monitor_ref,
+            result_alias,
+            stream_ref,
+            deadline,
+            timeout_ms
+          )
+        after
+          if Process.alive?(worker) do
+            _ = Task.Supervisor.terminate_child(runtime.stream_task_supervisor, worker)
+          end
+
+          _ = :erlang.unalias(result_alias)
+          Process.demonitor(monitor_ref, [:flush])
+        end
+
+      {:error, reason} ->
+        _ = :erlang.unalias(result_alias)
+
+        error = %Error{
+          code: :overloaded,
+          message: "request worker could not be started",
+          details: %{reason: inspect(reason)}
+        }
+
+        case chunk_message(conn, StreamableHTTPAdapter.encode_jsonrpc_error(request, error)) do
+          {:ok, conn} -> conn
+          {:error, _reason} -> conn
+        end
+    end
+  end
+
+  defp modern_request_stream_loop(
+         conn,
+         runtime,
+         request,
+         worker,
+         monitor_ref,
+         result_alias,
+         stream_ref,
+         deadline,
+         timeout_ms
+       ) do
+    remaining_ms = max(deadline - System.monotonic_time(:millisecond), 0)
+    wait_ms = min(remaining_ms, @modern_request_heartbeat_ms)
+
+    receive do
+      {:fastest_mcp_request_stream_message, ^stream_ref, envelope} ->
+        case chunk_message(conn, envelope) do
+          {:ok, conn} ->
+            modern_request_stream_loop(
+              conn,
+              runtime,
+              request,
+              worker,
+              monitor_ref,
+              result_alias,
+              stream_ref,
+              deadline,
+              timeout_ms
+            )
+
+          {:error, _reason} ->
+            conn
+        end
+
+      {:modern_stream_result, ^stream_ref, {:ok, payload}} ->
+        modern_stream_terminal(
+          conn,
+          StreamableHTTPAdapter.encode_jsonrpc_success(request, payload)
+        )
+
+      {:modern_stream_result, ^stream_ref, {:error, %Error{} = error}} ->
+        modern_stream_terminal(conn, StreamableHTTPAdapter.encode_jsonrpc_error(request, error))
+
+      {:DOWN, ^monitor_ref, :process, ^worker, reason} ->
+        modern_stream_worker_down(conn, request, result_alias, stream_ref, reason)
+    after
+      wait_ms ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          _ = Task.Supervisor.terminate_child(runtime.stream_task_supervisor, worker)
+
+          modern_stream_terminal(
+            conn,
+            StreamableHTTPAdapter.encode_jsonrpc_error(
+              request,
+              %Error{
+                code: :timeout,
+                message: "request timed out",
+                details: %{timeout_ms: timeout_ms}
+              }
+            )
+          )
+        else
+          case chunk_raw(conn, ": keepalive\n\n") do
+            {:ok, conn} ->
+              modern_request_stream_loop(
+                conn,
+                runtime,
+                request,
+                worker,
+                monitor_ref,
+                result_alias,
+                stream_ref,
+                deadline,
+                timeout_ms
+              )
+
+            {:error, _reason} ->
+              conn
+          end
+        end
+    end
+  end
+
+  defp modern_sse_response(conn) do
+    conn
+    |> put_resp_header("content-type", "text/event-stream")
+    |> put_resp_header("cache-control", "no-cache")
+    |> put_resp_header("connection", "close")
+    |> put_resp_header("x-accel-buffering", "no")
+  end
+
+  defp modern_stream_worker_down(conn, request, _result_alias, stream_ref, reason)
+       when reason in [:normal, :shutdown] do
+    receive do
+      {:modern_stream_result, ^stream_ref, {:ok, payload}} ->
+        modern_stream_terminal(
+          conn,
+          StreamableHTTPAdapter.encode_jsonrpc_success(request, payload)
+        )
+
+      {:modern_stream_result, ^stream_ref, {:error, %Error{} = error}} ->
+        modern_stream_terminal(conn, StreamableHTTPAdapter.encode_jsonrpc_error(request, error))
+    after
+      0 -> conn
+    end
+  end
+
+  defp modern_stream_worker_down(conn, request, _result_alias, _stream_ref, reason) do
+    modern_stream_terminal(
+      conn,
+      StreamableHTTPAdapter.encode_jsonrpc_error(
+        request,
+        %Error{
+          code: :internal_error,
+          message: "request worker exited",
+          details: %{reason: inspect(reason)}
+        }
+      )
+    )
+  end
+
+  defp modern_stream_terminal(conn, envelope) do
+    case chunk_message(conn, envelope) do
+      {:ok, conn} -> conn
+      {:error, _reason} -> conn
+    end
+  end
+
   defp cleanup_failed_initialize(runtime, %{method: "initialize", session_id: session_id})
        when is_binary(session_id) do
     _ =
@@ -624,6 +950,25 @@ defmodule FastestMCP.Transport.StreamableHTTP do
         end
     end
   end
+
+  defp register_supervised_request(
+         _runtime,
+         %{protocol_version: "2026-07-28"},
+         _task_pid
+       ),
+       do: {:ok, false}
+
+  defp register_supervised_request(
+         _runtime,
+         %{
+           payload: %{
+             "_meta" => %{"io.modelcontextprotocol/protocolVersion" => version}
+           }
+         },
+         _task_pid
+       )
+       when is_binary(version),
+       do: {:ok, false}
 
   defp register_supervised_request(
          runtime,

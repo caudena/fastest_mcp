@@ -162,17 +162,24 @@ defmodule FastestMCP.ComponentCompiler do
   @doc false
   def normalize_tool_schema!(_kind, nil), do: nil
 
-  def normalize_tool_schema!(kind, schema) when kind in [:input, :output] do
+  def normalize_tool_schema!(:input, schema) do
     with {:ok, normalized} <- Schema.normalize(schema),
          true <- Schema.object_root?(normalized) do
       normalized
     else
       false ->
         raise ArgumentError,
-              "tool #{kind}_schema must be a JSON Schema object with type: \"object\" at the root"
+              "tool input_schema must be a JSON Schema object with type: \"object\" at the root"
 
       {:error, error} ->
         raise error
+    end
+  end
+
+  def normalize_tool_schema!(:output, schema) do
+    case Schema.normalize(schema) do
+      {:ok, normalized} -> normalized
+      {:error, error} -> raise error
     end
   end
 

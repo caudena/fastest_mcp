@@ -5,6 +5,8 @@ defmodule FastestMCP.SchemaTest do
   alias FastestMCP.Schema
   alias FastestMCP.Schema.HTTPResolver
 
+  @legacy_version "2025-11-25"
+
   @object_schema %{
     "type" => "object",
     "properties" => %{"count" => %{"type" => "integer", "minimum" => 1}},
@@ -12,17 +14,26 @@ defmodule FastestMCP.SchemaTest do
     "additionalProperties" => false
   }
 
-  test "the immutable MCP 2025-11-25 schema is vendored at its recorded checksum" do
-    path = Application.app_dir(:fastest_mcp, "priv/schema/mcp-2025-11-25.schema.json")
-    schema = File.read!(path)
+  test "vendored protocol schemas expose definitions for their selected versions" do
+    assert {:ok, legacy_initialize} =
+             Schema.compile_protocol_definition(@legacy_version, "InitializeRequest")
 
-    assert Base.encode16(:crypto.hash(:sha256, schema), case: :lower) ==
-             "1ffe4c5577974012f5fa02af14ea88df4b7146679df1abaaad497c8d9230ca8a"
+    assert legacy_initialize.source["type"] == "object"
 
-    assert %{
-             "$schema" => "https://json-schema.org/draft/2020-12/schema",
-             "$defs" => %{"InitializeRequest" => %{"type" => "object"}}
-           } = JSON.decode!(schema)
+    assert {:ok, modern_discover} =
+             Schema.compile_protocol_definition("2026-07-28", "DiscoverRequest")
+
+    assert modern_discover.source["type"] == "object"
+
+    assert {:error, legacy_error} =
+             Schema.compile_protocol_definition(@legacy_version, "DiscoverRequest")
+
+    assert legacy_error.message =~ "unknown MCP protocol schema definition"
+
+    assert {:error, modern_error} =
+             Schema.compile_protocol_definition("2026-07-28", "InitializeRequest")
+
+    assert modern_error.message =~ "unknown MCP protocol schema definition"
   end
 
   test "tagged protocol definitions are cached and selectable by direction and method" do
@@ -38,10 +49,17 @@ defmodule FastestMCP.SchemaTest do
     }
 
     assert {:ok, ^initialize} =
-             Schema.validate_protocol(:client_to_server, :request, "initialize", initialize)
+             Schema.validate_protocol(
+               @legacy_version,
+               :client_to_server,
+               :request,
+               "initialize",
+               initialize
+             )
 
     assert {:error, error} =
              Schema.validate_protocol(
+               @legacy_version,
                :client_to_server,
                :request,
                "initialize",
@@ -51,22 +69,52 @@ defmodule FastestMCP.SchemaTest do
     assert error.phase == :validation
 
     assert {:error, error} =
-             Schema.compile_protocol(:server_to_client, :request, "tools/call")
+             Schema.compile_protocol(
+               @legacy_version,
+               :server_to_client,
+               :request,
+               "tools/call"
+             )
 
     assert error.message =~ "unsupported server_to_client request method"
-    assert Schema.protocol_supported?(:client_to_server, :request, "tools/call")
-    refute Schema.protocol_supported?(:server_to_client, :request, "tools/call")
-    assert Schema.protocol_supported?(:server_to_client, :response, "tools/call")
-    assert Schema.protocol_supported?(:server_to_client, :task_response, "tools/call")
-    refute Schema.protocol_supported?(:client_to_server, :task_response, "tools/call")
+    assert Schema.protocol_supported?(@legacy_version, :client_to_server, :request, "tools/call")
 
-    assert {:ok, first} = Schema.compile_protocol_definition("ContentBlock")
-    assert {:ok, second} = Schema.compile_protocol_definition("ContentBlock")
+    refute Schema.protocol_supported?(
+             @legacy_version,
+             :server_to_client,
+             :request,
+             "tools/call"
+           )
+
+    assert Schema.protocol_supported?(
+             @legacy_version,
+             :server_to_client,
+             :response,
+             "tools/call"
+           )
+
+    assert Schema.protocol_supported?(
+             @legacy_version,
+             :server_to_client,
+             :task_response,
+             "tools/call"
+           )
+
+    refute Schema.protocol_supported?(
+             @legacy_version,
+             :client_to_server,
+             :task_response,
+             "tools/call"
+           )
+
+    assert {:ok, first} = Schema.compile_protocol_definition(@legacy_version, "ContentBlock")
+    assert {:ok, second} = Schema.compile_protocol_definition(@legacy_version, "ContentBlock")
     assert first === second
   end
 
   test "compiled elicitation schema follows authoritative number semantics" do
-    compiled = Schema.compile_protocol_definition!("ElicitRequestFormParams")
+    compiled =
+      Schema.compile_protocol_definition!(@legacy_version, "ElicitRequestFormParams")
 
     params = %{
       "message" => "Decimal bounds and default",
@@ -96,6 +144,7 @@ defmodule FastestMCP.SchemaTest do
 
     assert {:ok, ^response} =
              Schema.validate_protocol(
+               @legacy_version,
                :client_to_server,
                :response,
                "elicitation/create",
@@ -106,6 +155,7 @@ defmodule FastestMCP.SchemaTest do
 
     assert {:error, _error} =
              Schema.validate_protocol(
+               @legacy_version,
                :client_to_server,
                :response,
                "elicitation/create",
@@ -125,6 +175,7 @@ defmodule FastestMCP.SchemaTest do
 
     assert {:ok, ^result_response} =
              Schema.validate_protocol(
+               @legacy_version,
                :server_to_client,
                :response,
                "tools/call",
@@ -135,6 +186,7 @@ defmodule FastestMCP.SchemaTest do
 
     assert {:error, _error} =
              Schema.validate_protocol(
+               @legacy_version,
                :server_to_client,
                :response,
                "tools/call",
@@ -149,6 +201,7 @@ defmodule FastestMCP.SchemaTest do
 
     assert {:ok, ^error_response} =
              Schema.validate_protocol(
+               @legacy_version,
                :server_to_client,
                :response,
                "tools/call",
@@ -210,10 +263,10 @@ defmodule FastestMCP.SchemaTest do
   end
 
   test "protocol schemas assert MCP formats and corrected task number semantics" do
-    task_metadata = Schema.compile_protocol_definition!("TaskMetadata")
+    task_metadata = Schema.compile_protocol_definition!(@legacy_version, "TaskMetadata")
     assert {:ok, %{"ttl" => 1.5}} = Schema.validate(task_metadata, %{"ttl" => 1.5})
 
-    task = Schema.compile_protocol_definition!("Task")
+    task = Schema.compile_protocol_definition!(@legacy_version, "Task")
 
     valid_task = %{
       "taskId" => "task-1",
@@ -229,7 +282,7 @@ defmodule FastestMCP.SchemaTest do
     assert {:error, _error} =
              Schema.validate(task, %{valid_task | "createdAt" => "not-a-date"})
 
-    blob = Schema.compile_protocol_definition!("BlobResourceContents")
+    blob = Schema.compile_protocol_definition!(@legacy_version, "BlobResourceContents")
 
     assert {:ok, _value} =
              Schema.validate(blob, %{"uri" => "file:///tmp/data", "blob" => "AA=="})
@@ -240,7 +293,7 @@ defmodule FastestMCP.SchemaTest do
     assert {:error, _error} =
              Schema.validate(blob, %{"uri" => "not a URI", "blob" => "AA=="})
 
-    template = Schema.compile_protocol_definition!("ResourceTemplate")
+    template = Schema.compile_protocol_definition!(@legacy_version, "ResourceTemplate")
 
     assert {:ok, _value} =
              Schema.validate(template, %{"name" => "item", "uriTemplate" => "item://{id}"})
@@ -248,7 +301,7 @@ defmodule FastestMCP.SchemaTest do
     assert {:error, _error} =
              Schema.validate(template, %{"name" => "item", "uriTemplate" => "item://{=id}"})
 
-    subscribe = Schema.compile_protocol_definition!("SubscribeRequestParams")
+    subscribe = Schema.compile_protocol_definition!(@legacy_version, "SubscribeRequestParams")
 
     assert {:ok, %{"uri" => "item://one"}} =
              Schema.validate(subscribe, %{"uri" => "item://one"})
@@ -578,15 +631,10 @@ defmodule FastestMCP.SchemaTest do
            end)
   end
 
-  test "tool schemas require object roots and structured outputs are validated" do
+  test "tool inputs require object roots and arbitrary JSON structured outputs are validated" do
     assert_raise ArgumentError, ~r/input_schema.*type: "object"/, fn ->
       FastestMCP.server("invalid-input-root")
       |> FastestMCP.add_tool("bad", fn _args -> :ok end, input_schema: %{"type" => "array"})
-    end
-
-    assert_raise ArgumentError, ~r/output_schema.*type: "object"/, fn ->
-      FastestMCP.server("invalid-output-root")
-      |> FastestMCP.add_tool("bad", fn _args -> :ok end, output_schema: %{"type" => "string"})
     end
 
     server_name = "output-schema-#{System.unique_integer([:positive])}"
@@ -594,6 +642,13 @@ defmodule FastestMCP.SchemaTest do
     server =
       FastestMCP.server(server_name)
       |> FastestMCP.add_tool("valid", fn _args -> %{count: 2} end, output_schema: @object_schema)
+      |> FastestMCP.add_tool(
+        "scalar",
+        fn _args ->
+          FastestMCP.Tools.Result.new("ok", structured_content: "ok")
+        end,
+        output_schema: %{"type" => "string"}
+      )
       |> FastestMCP.add_tool("wrong_type", fn _args -> %{count: "secret-result"} end,
         output_schema: @object_schema
       )
@@ -607,6 +662,8 @@ defmodule FastestMCP.SchemaTest do
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
     assert %{count: 2} = FastestMCP.call_tool(server_name, "valid", %{})
+
+    assert %{structuredContent: "ok"} = FastestMCP.call_tool(server_name, "scalar", %{})
 
     assert_raise Error, ~r/structuredContent.*does not match output_schema/, fn ->
       FastestMCP.call_tool(server_name, "wrong_type", %{})

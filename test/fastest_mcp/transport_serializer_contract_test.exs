@@ -3,6 +3,7 @@ defmodule FastestMCP.TransportSerializerContractTest do
 
   alias FastestMCP.Error
   alias FastestMCP.ResultNormalizer
+  alias FastestMCP.Schema
   alias FastestMCP.TaskWire
   alias FastestMCP.Transport.Serializer
 
@@ -141,23 +142,101 @@ defmodule FastestMCP.TransportSerializerContractTest do
              })
   end
 
-  test "structuredContent is always an object on the wire" do
-    assert_raise Error, ~r/structuredContent must be an object/, fn ->
-      ResultNormalizer.normalize_tool(%{
-        content: "invalid",
-        structuredContent: ["not", "an", "object"]
-      })
-    end
+  test "structuredContent preserves JSON values while the protocol profile owns wire constraints" do
+    assert %{structuredContent: ["not", "an", "object"]} =
+             ResultNormalizer.normalize_tool(%{
+               content: "valid text",
+               structuredContent: ["not", "an", "object"]
+             })
 
-    assert_raise Error, ~r/structuredContent must be an object/, fn ->
-      Serializer.tool_result(%{content: "invalid", structuredContent: 42})
-    end
+    assert %{"structuredContent" => 42} =
+             Serializer.tool_result(
+               %{content: "valid text", structuredContent: 42},
+               nil,
+               protocol_version: "2026-07-28"
+             )
 
-    list = Serializer.tool_result(["alpha", "beta"])
-    refute Map.has_key?(list, "structuredContent")
+    assert %{"structuredContent" => nil} =
+             Serializer.tool_result(
+               %{content: "valid text", structuredContent: nil},
+               nil,
+               protocol_version: "2026-07-28"
+             )
 
-    scalar = Serializer.tool_result(42)
-    refute Map.has_key?(scalar, "structuredContent")
+    assert %{"structuredContent" => nil} =
+             Serializer.tool_result(nil, nil, protocol_version: "2026-07-28")
+
+    modern_list =
+      Serializer.tool_result(["alpha", "beta"], nil, protocol_version: "2026-07-28")
+
+    assert modern_list["structuredContent"] == ["alpha", "beta"]
+
+    modern_scalar = Serializer.tool_result(42, nil, protocol_version: "2026-07-28")
+    assert modern_scalar["structuredContent"] == 42
+
+    legacy_list =
+      Serializer.tool_result(["alpha", "beta"], nil, protocol_version: "2025-11-25")
+
+    refute Map.has_key?(legacy_list, "structuredContent")
+
+    legacy_scalar = Serializer.tool_result(42, nil, protocol_version: "2025-11-25")
+    refute Map.has_key?(legacy_scalar, "structuredContent")
+
+    array_result = %{
+      "content" => [],
+      "structuredContent" => ["alpha", "beta"]
+    }
+
+    legacy_envelope = %{"jsonrpc" => "2.0", "id" => "call-1", "result" => array_result}
+
+    assert {:error, %Schema.Error{}} =
+             Schema.validate_protocol(
+               "2025-11-25",
+               :server_to_client,
+               :response,
+               "tools/call",
+               legacy_envelope
+             )
+
+    modern_envelope =
+      put_in(legacy_envelope, ["result"], Map.put(array_result, "resultType", "complete"))
+
+    assert {:ok, ^modern_envelope} =
+             Schema.validate_protocol(
+               "2026-07-28",
+               :server_to_client,
+               :response,
+               "tools/call",
+               modern_envelope
+             )
+  end
+
+  test "tool metadata exposes arbitrary output schemas and no legacy task hints only in modern" do
+    tool = %{
+      name: "scalar",
+      input_schema: %{"type" => "object"},
+      output_schema: %{"type" => "string"},
+      execution: %{taskSupport: "required"}
+    }
+
+    modern = Serializer.tool_metadata(tool, protocol_version: "2026-07-28")
+    assert modern["outputSchema"] == %{"type" => "string"}
+    refute Map.has_key?(modern, "execution")
+
+    legacy = Serializer.tool_metadata(tool, protocol_version: "2025-11-25")
+    refute Map.has_key?(legacy, "outputSchema")
+    assert legacy["execution"] == %{"taskSupport" => "required"}
+
+    explicit_scalar = %{content: "ok", structuredContent: "ok"}
+
+    assert Serializer.tool_result(explicit_scalar, nil, protocol_version: "2026-07-28")[
+             "structuredContent"
+           ] == "ok"
+
+    refute Map.has_key?(
+             Serializer.tool_result(explicit_scalar, nil, protocol_version: "2025-11-25"),
+             "structuredContent"
+           )
   end
 
   test "media and embedded blobs are base64-encoded and valid base64 is preserved" do
@@ -187,8 +266,6 @@ defmodule FastestMCP.TransportSerializerContractTest do
   test "malformed explicit tool results fail deterministically" do
     for result <- [
           %{content: nil},
-          %{content: [], structuredContent: nil},
-          %{content: [], structuredContent: []},
           %{content: [], isError: nil},
           %{content: [], isError: "false"}
         ] do

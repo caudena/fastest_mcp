@@ -48,7 +48,7 @@ defmodule FastestMCP.ClientSessionRecoveryTest do
             "jsonrpc" => "2.0",
             "id" => id,
             "result" => %{
-              "protocolVersion" => FastestMCP.Protocol.current_version(),
+              "protocolVersion" => "2025-11-25",
               "capabilities" => %{"tools" => %{}},
               "serverInfo" => %{
                 "name" => "recovery-server-#{initialize_count}",
@@ -344,6 +344,7 @@ defmodule FastestMCP.ClientSessionRecoveryTest do
         "http://127.0.0.1:#{port}/mcp",
         Keyword.merge(
           [
+            protocol_version: "2025-11-25",
             notification_handler: fn
               %{"method" => "notifications/message", "params" => %{"data" => data}} ->
                 send(parent, {:stream_message, data})

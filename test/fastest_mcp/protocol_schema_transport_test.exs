@@ -5,7 +5,6 @@ defmodule FastestMCP.ProtocolSchemaTransportTest do
   import Plug.Test
 
   alias FastestMCP.Error
-  alias FastestMCP.Protocol
   alias FastestMCP.Root
   alias FastestMCP.Session
   alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
@@ -229,6 +228,37 @@ defmodule FastestMCP.ProtocolSchemaTransportTest do
     assert canonical_error["error"]["message"] == "Internal error"
   end
 
+  test "modern local failures avoid the legacy reserved error range" do
+    modern = %Request{
+      protocol: :jsonrpc,
+      protocol_version: "2026-07-28",
+      method: "com.example/work",
+      request_id: 21,
+      payload: %{}
+    }
+
+    legacy = %{modern | protocol_version: "2025-11-25", request_id: 22}
+    timeout = %Error{code: :timeout, message: "timed out", details: %{jsonrpc_code: -32_001}}
+
+    assert %{
+             "id" => 21,
+             "error" => %{
+               "code" => -31_000,
+               "data" => %{"fastestmcp" => %{"code" => "timeout"}}
+             }
+           } = JSONRPC.error(modern, timeout)
+
+    assert get_in(JSONRPC.error(legacy, timeout), ["error", "code"]) == -32_001
+
+    header_mismatch = %Error{
+      code: :header_mismatch,
+      message: "mismatch",
+      details: %{jsonrpc_code: -32_020, header: "Mcp-Method"}
+    }
+
+    assert get_in(JSONRPC.error(modern, header_mismatch), ["error", "code"]) == -32_020
+  end
+
   test "server results validate exact tagged content, metadata, and direct resource links" do
     request = jsonrpc_request("tools/call", %{"name" => "lookup"})
 
@@ -305,7 +335,7 @@ defmodule FastestMCP.ProtocolSchemaTransportTest do
     initialize_request = jsonrpc_request("initialize", ProtocolTest.initialize_params())
 
     initialize_result = %{
-      "protocolVersion" => Protocol.current_version(),
+      "protocolVersion" => "2025-11-25",
       "capabilities" => %{
         "tools" => %{"listChanged" => true},
         "resources" => %{"listChanged" => true, "subscribe" => true},

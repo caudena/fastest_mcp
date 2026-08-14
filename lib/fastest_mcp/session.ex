@@ -39,7 +39,7 @@ defmodule FastestMCP.Session do
 
   require Logger
 
-  @supported_protocol_version Protocol.current_version()
+  @supported_protocol_version "2025-11-25"
   @termination_timeout 5_000
   @default_max_request_ids 100_000
   @default_request_timeout_ms 60_000
@@ -1978,10 +1978,26 @@ defmodule FastestMCP.Session do
     kind = if task_augmented, do: :task_response, else: :response
 
     validation =
-      if Schema.protocol_supported?(:client_to_server, kind, method) do
-        Schema.validate_protocol(:client_to_server, kind, method, payload)
+      if Schema.protocol_supported?(
+           @supported_protocol_version,
+           :client_to_server,
+           kind,
+           method
+         ) do
+        Schema.validate_protocol(
+          @supported_protocol_version,
+          :client_to_server,
+          kind,
+          method,
+          payload
+        )
       else
-        Schema.validate_protocol(:client_to_server, :response, payload)
+        Schema.validate_protocol(
+          @supported_protocol_version,
+          :client_to_server,
+          :response,
+          payload
+        )
       end
 
     case validation do
@@ -2085,8 +2101,19 @@ defmodule FastestMCP.Session do
 
     with :ok <- validate_protocol_related_task(envelope, related_task_id),
          :ok <- validate_protocol_meta(envelope, :application, allowed_reserved) do
-      if Schema.protocol_supported?(:server_to_client, :request, method) do
-        case Schema.validate_protocol(:server_to_client, :request, method, envelope) do
+      if Schema.protocol_supported?(
+           @supported_protocol_version,
+           :server_to_client,
+           :request,
+           method
+         ) do
+        case Schema.validate_protocol(
+               @supported_protocol_version,
+               :server_to_client,
+               :request,
+               method,
+               envelope
+             ) do
           {:ok, ^envelope} ->
             :ok
 

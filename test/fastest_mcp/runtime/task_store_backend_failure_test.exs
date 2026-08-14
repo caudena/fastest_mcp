@@ -151,7 +151,7 @@ defmodule FastestMCP.Runtime.TaskStoreBackendFailureTest do
       Session.begin_initialization(
         server_name,
         session_id,
-        FastestMCP.Protocol.current_version(),
+        "2025-11-25",
         %{"elicitation" => %{"form" => %{}}},
         %{"name" => "backend failure test", "version" => "1"}
       )

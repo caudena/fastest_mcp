@@ -1,22 +1,31 @@
 defmodule FastestMCP.TestSupport.ProtocolTestHelper do
   @moduledoc false
 
-  alias FastestMCP.Protocol
   alias FastestMCP.ServerRuntime
   alias FastestMCP.Session
   alias FastestMCP.SessionSupervisor
   alias FastestMCP.Transport.Stdio
   alias FastestMCP.Transport.StreamableHTTP
 
-  @version Protocol.current_version()
+  @legacy_version "2025-11-25"
+  @modern_version "2026-07-28"
   @post_accept "application/json, text/event-stream"
 
-  def protocol_version, do: @version
+  # Existing helpers model the stateful initialize lifecycle and therefore
+  # remain legacy by default. Modern calls must opt into the stateless profile
+  # explicitly; changing "current" must never mutate old test semantics.
+  def protocol_version, do: @legacy_version
+  def protocol_version(:legacy), do: @legacy_version
+  def protocol_version(:modern), do: @modern_version
+
+  def protocol_version(profile) do
+    raise ArgumentError, "unknown protocol test profile #{inspect(profile)}"
+  end
 
   def initialize_params(overrides \\ %{}) do
     Map.merge(
       %{
-        "protocolVersion" => @version,
+        "protocolVersion" => @legacy_version,
         "capabilities" => %{},
         "clientInfo" => %{"name" => "FastestMCP test client", "version" => "1.0.0"}
       },
@@ -85,6 +94,16 @@ defmodule FastestMCP.TestSupport.ProtocolTestHelper do
     )
   end
 
+  def modern_stdio_request(server_name, id, method, params \\ %{}, opts \\ []) do
+    connection_id = Keyword.get(opts, :connection_id, make_ref())
+
+    Stdio.dispatch(
+      server_name,
+      modern_request(id, method, params, opts),
+      Keyword.put(opts, :connection_id, connection_id)
+    )
+  end
+
   def http_initialize(server_name, call_opts \\ [], params \\ %{}) do
     path = Keyword.get(call_opts, :path, "/mcp")
     headers = Keyword.get(call_opts, :headers, [])
@@ -136,7 +155,43 @@ defmodule FastestMCP.TestSupport.ProtocolTestHelper do
     |> Plug.Conn.put_req_header("accept", @post_accept)
     |> Map.put(:host, "localhost")
     |> maybe_put_header("mcp-session-id", session_id)
-    |> maybe_put_header("mcp-protocol-version", @version)
+    |> maybe_put_header("mcp-protocol-version", @legacy_version)
+    |> put_headers(headers)
+    |> StreamableHTTP.call(call_opts)
+  end
+
+  def modern_request(id, method, params \\ %{}, opts \\ []) do
+    client_info =
+      Keyword.get(opts, :client_info, %{
+        "name" => "FastestMCP modern test client",
+        "version" => "1.0.0"
+      })
+
+    client_capabilities = Keyword.get(opts, :client_capabilities, %{})
+
+    meta =
+      params
+      |> Map.get("_meta", %{})
+      |> Map.new()
+      |> Map.put("io.modelcontextprotocol/protocolVersion", @modern_version)
+      |> Map.put("io.modelcontextprotocol/clientInfo", client_info)
+      |> Map.put("io.modelcontextprotocol/clientCapabilities", client_capabilities)
+
+    jsonrpc_request(id, method, Map.put(Map.new(params), "_meta", meta))
+  end
+
+  def modern_http_request(server_name, id, method, params \\ %{}, call_opts \\ []) do
+    path = Keyword.get(call_opts, :path, "/mcp")
+    headers = Keyword.get(call_opts, :headers, [])
+    call_opts = transport_opts(call_opts, server_name)
+
+    :post
+    |> Plug.Test.conn(path, JSON.encode!(modern_request(id, method, params, call_opts)))
+    |> Plug.Conn.put_req_header("content-type", "application/json")
+    |> Plug.Conn.put_req_header("accept", @post_accept)
+    |> Plug.Conn.put_req_header("mcp-protocol-version", @modern_version)
+    |> Plug.Conn.put_req_header("mcp-method", method)
+    |> Map.put(:host, "localhost")
     |> put_headers(headers)
     |> StreamableHTTP.call(call_opts)
   end

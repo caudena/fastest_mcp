@@ -3,6 +3,6 @@
   "private": true,
   "version": "0.0.0",
   "dependencies": {
-    "@modelcontextprotocol/conformance": "0.1.16"
+    "@modelcontextprotocol/conformance": "0.2.0-alpha.11"
   }
 }

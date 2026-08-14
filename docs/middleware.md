@@ -57,7 +57,7 @@ Order matters. Middleware added earlier wraps middleware added later.
 - response caching
 - response limiting
 - tool injection
-- ping and session keepalive support
+- legacy ping and session keepalive support
 
 These constructors return configured middleware objects that can be added
 directly to the server definition.

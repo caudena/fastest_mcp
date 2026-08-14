@@ -14,7 +14,7 @@ defmodule FastestMCP.ProtocolMatrixTest do
 
     server =
       FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+      |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end, task: true)
       |> FastestMCP.add_resource("existing://resource", fn _arguments, _ctx -> "ok" end)
       |> FastestMCP.add_prompt("existing-prompt", fn _arguments, _ctx -> "ok" end)
 
@@ -157,6 +157,12 @@ defmodule FastestMCP.ProtocolMatrixTest do
 
     assert tool_response.status == 200
     assert_jsonrpc_error(JSON.decode!(tool_response.resp_body), -32_602, "not_found")
+
+    modern_missing =
+      ProtocolTest.modern_http_request(server_name, 9, "missing/method")
+
+    assert modern_missing.status == 404
+    assert_jsonrpc_error(JSON.decode!(modern_missing.resp_body), -32_601, "method_not_found")
   end
 
   test "rejected notifications use empty HTTP errors while stdio remains silent", %{

@@ -9,6 +9,7 @@ defmodule FastestMCP.Transport.Engine do
 
   alias FastestMCP.Auth
   alias FastestMCP.Auth.Result, as: AuthResult
+  alias FastestMCP.Apps
   alias FastestMCP.ComponentPolicy
   alias FastestMCP.ComponentVisibility
   alias FastestMCP.Context
@@ -19,301 +20,618 @@ defmodule FastestMCP.Transport.Engine do
   alias FastestMCP.Pagination
   alias FastestMCP.Provider
   alias FastestMCP.Protocol
+  alias FastestMCP.Protocol.Extensions
+  alias FastestMCP.Protocol.HTTPHeaders
+  alias FastestMCP.Protocol.Subscriptions
   alias FastestMCP.Registry
   alias FastestMCP.ServerRuntime
   alias FastestMCP.Session
+  alias FastestMCP.SubscriptionSubscriber
   alias FastestMCP.TaskOwner
   alias FastestMCP.TaskWire
   alias FastestMCP.Transport.JSONRPC
   alias FastestMCP.Transport.Serializer
   alias FastestMCP.Transport.Request
 
+  @modern_removed_methods MapSet.new([
+                            "initialize",
+                            "ping",
+                            "logging/setLevel",
+                            "resources/subscribe",
+                            "resources/unsubscribe"
+                          ])
+
   @doc "Dispatches the normalized transport request through the operation pipeline."
   def dispatch!(server_name, %Request{} = request, opts \\ []) do
+    request = prepare_request!(server_name, request)
+
+    request_opts =
+      request_opts(server_name, request, opts)
+      |> put_server_extensions(server_name)
+
+    result =
+      case request.method do
+        "notifications/initialized" ->
+          mark_session_initialized!(server_name, request)
+          %{}
+
+        "notifications/cancelled" ->
+          request_id = fetch_required!(request.payload, "requestId", request.method)
+
+          session_result!(
+            Session.cancel_inbound_request(
+              server_name,
+              request.session_id,
+              request_id,
+              Map.get(request.payload, "reason")
+            ),
+            request.method
+          )
+
+        "notifications/progress" ->
+          session_result!(
+            Session.receive_peer_progress(server_name, request.session_id, request.payload),
+            request.method
+          )
+
+        "notifications/roots/list_changed" ->
+          session_result!(
+            Session.roots_changed(server_name, request.session_id),
+            request.method
+          )
+
+        "notifications/tasks/status" ->
+          session_result!(
+            Session.receive_peer_task_status(server_name, request.session_id, request.payload),
+            request.method
+          )
+
+        "initialize" ->
+          initialize_params = request.payload
+          result = FastestMCP.initialize(server_name, initialize_params, request_opts)
+          begin_session_initialization!(server_name, request, initialize_params, result)
+          result
+
+        "server/discover" ->
+          OperationPipeline.discover(server_name, request.payload, request_opts)
+
+        "ping" ->
+          FastestMCP.ping(server_name, request.payload, request_opts)
+
+        "logging/setLevel" ->
+          session_result!(
+            maybe_set_logging_level(
+              server_name,
+              request,
+              Map.fetch!(request.payload, "level")
+            ),
+            request.method
+          )
+
+        "completion/complete" ->
+          completion =
+            FastestMCP.complete(
+              server_name,
+              fetch_required!(request.payload, "ref", request.method),
+              fetch_required!(request.payload, "argument", request.method),
+              Keyword.merge(
+                request_opts,
+                wire: true,
+                context_arguments: get_in(request.payload, ["context", "arguments"]) || %{}
+              )
+            )
+
+          %{
+            completion:
+              %{}
+              |> Map.put("values", Map.get(completion, :values, []))
+              |> maybe_put("total", Map.get(completion, :total))
+              |> maybe_put("hasMore", Map.get(completion, :has_more))
+          }
+
+        "tools/list" ->
+          list_result =
+            server_name
+            |> component_wire_page(:tool, request, request_opts)
+            |> filter_invalid_header_tools(request)
+            |> validate_apps_tool_links!(server_name, request, request_opts)
+
+          paginated_response(
+            server_name,
+            request,
+            request_opts,
+            list_result,
+            :tools,
+            fn component ->
+              serialize_apps_metadata(component, request_opts, fn tool ->
+                Serializer.tool_metadata(tool, protocol_version: request.protocol_version)
+              end)
+            end
+          )
+
+        "tools/call" ->
+          version = transport_request_version(request.payload)
+          request_opts = maybe_put_opt(request_opts, :version, version)
+          tool_name = fetch_required!(request.payload, "name", request.method)
+          request_opts = put_tool_parameter_header_validator(request_opts, request)
+
+          {result, descriptor} =
+            OperationPipeline.call_tool_with_component(
+              server_name,
+              tool_name,
+              Map.get(request.payload, "arguments", %{}),
+              maybe_require_task_session(request, request_opts)
+            )
+
+          task_or_result(
+            result,
+            &Serializer.tool_result(&1, descriptor, serializer_opts(request, request_opts)),
+            request
+          )
+
+        "resources/list" ->
+          resources = component_wire_page(server_name, :resource, request, request_opts)
+
+          paginated_response(
+            server_name,
+            request,
+            request_opts,
+            resources,
+            :resources,
+            fn component ->
+              serialize_apps_metadata(component, request_opts, &Serializer.resource_metadata/1)
+            end
+          )
+
+        "resources/templates/list" ->
+          list_result =
+            component_wire_page(server_name, :resource_template, request, request_opts)
+
+          paginated_response(
+            server_name,
+            request,
+            request_opts,
+            list_result,
+            :resourceTemplates,
+            fn component ->
+              serialize_apps_metadata(
+                component,
+                request_opts,
+                &Serializer.resource_template_metadata/1
+              )
+            end
+          )
+
+        "resources/read" ->
+          version = transport_request_version(request.payload)
+          request_opts = maybe_put_opt(request_opts, :version, version)
+          uri = fetch_required!(request.payload, "uri", request.method)
+
+          {result, descriptor} =
+            OperationPipeline.read_resource_with_component(
+              server_name,
+              uri,
+              maybe_require_task_session(request, request_opts)
+            )
+
+          task_or_result(
+            result,
+            &serialize_resource_result(uri, descriptor, &1, request, request_opts),
+            request
+          )
+
+        "resources/subscribe" ->
+          uri = fetch_required!(request.payload, "uri", request.method)
+          session_id = ensure_subscription_session!(server_name, request)
+          :ok = FastestMCP.Session.subscribe_resource(server_name, session_id, uri)
+          %{}
+
+        "resources/unsubscribe" ->
+          uri = fetch_required!(request.payload, "uri", request.method)
+          session_id = ensure_subscription_session!(server_name, request)
+          :ok = FastestMCP.Session.unsubscribe_resource(server_name, session_id, uri)
+          %{}
+
+        "prompts/list" ->
+          list_result = component_wire_page(server_name, :prompt, request, request_opts)
+
+          paginated_response(
+            server_name,
+            request,
+            request_opts,
+            list_result,
+            :prompts,
+            &Serializer.prompt_metadata/1
+          )
+
+        "prompts/get" ->
+          {result, _descriptor} =
+            OperationPipeline.render_prompt_with_component(
+              server_name,
+              fetch_required!(request.payload, "name", request.method),
+              Map.get(request.payload, "arguments", %{}),
+              maybe_require_task_session(request, request_opts)
+            )
+
+          task_or_result(
+            result,
+            &Serializer.prompt_result/1,
+            request
+          )
+
+        "tasks/get" ->
+          access_opts = task_access_opts(server_name, request)
+          task_id = fetch_required!(request.payload, "taskId", request.method)
+
+          task =
+            fetch_protocol_task!(
+              server_name,
+              task_id,
+              access_opts,
+              request.protocol_version
+            )
+
+          TaskWire.task(
+            task,
+            Keyword.merge(
+              public_task_opts(server_name),
+              protocol_version: request.protocol_version,
+              result_serializer: task_result_serializer(server_name, task, request, request_opts)
+            )
+          )
+
+        "tasks/update" ->
+          if request.protocol_version != "2026-07-28" do
+            method_not_found!(request)
+          end
+
+          access_opts = task_access_opts(server_name, request)
+          task_id = fetch_required!(request.payload, "taskId", request.method)
+
+          _task =
+            fetch_protocol_task!(server_name, task_id, access_opts, request.protocol_version)
+
+          _updated =
+            FastestMCP.update_task(
+              server_name,
+              task_id,
+              fetch_required!(request.payload, "inputResponses", request.method),
+              access_opts
+            )
+
+          TaskWire.acknowledgement(protocol_version: request.protocol_version)
+
+        "tasks/result" ->
+          if request.protocol_version == "2026-07-28" do
+            method_not_found!(request)
+          end
+
+          access_opts = task_access_opts(server_name, request)
+
+          task =
+            FastestMCP.fetch_task(
+              server_name,
+              fetch_required!(request.payload, "taskId", request.method),
+              access_opts
+            )
+
+          result =
+            try do
+              FastestMCP.task_result(
+                server_name,
+                fetch_required!(request.payload, "taskId", request.method),
+                Keyword.put(access_opts, :request_metadata, request.request_metadata)
+              )
+            rescue
+              error in Error ->
+                error =
+                  error
+                  |> Error.with_meta(TaskWire.related_task_meta(task.id))
+                  |> ErrorExposure.public_error(
+                    Keyword.merge(public_task_opts(server_name), task: task)
+                  )
+
+                reraise error, __STACKTRACE__
+            end
+
+          task_result_response(
+            result,
+            task.id,
+            task_result_serializer(server_name, task, request, request_opts)
+          )
+
+        "tasks/list" ->
+          if request.protocol_version == "2026-07-28" do
+            method_not_found!(request)
+          end
+
+          access_opts = task_access_opts(server_name, request)
+          %{tasks: tasks} = FastestMCP.list_tasks(server_name, access_opts)
+
+          page =
+            wire_page(server_name, request, request_opts, tasks, key: &task_pagination_key/1)
+
+          TaskWire.task_list(
+            %{tasks: page.items, next_cursor: page.next_cursor},
+            public_task_opts(server_name)
+          )
+
+        "tasks/cancel" ->
+          access_opts = task_access_opts(server_name, request)
+          task_id = fetch_required!(request.payload, "taskId", request.method)
+
+          if request.protocol_version == "2026-07-28" do
+            task =
+              fetch_protocol_task!(server_name, task_id, access_opts, request.protocol_version)
+
+            unless task.status in [:completed, :failed, :cancelled] do
+              _cancelled = FastestMCP.cancel_task(server_name, task_id, access_opts)
+            end
+
+            TaskWire.acknowledgement(protocol_version: request.protocol_version)
+          else
+            TaskWire.task(
+              FastestMCP.cancel_task(server_name, task_id, access_opts),
+              public_task_opts(server_name)
+            )
+          end
+
+        method ->
+          raise Error,
+            code: :method_not_found,
+            message: "unknown #{request.transport} method #{inspect(method)}"
+      end
+
+    finalize_result(server_name, request, result)
+  end
+
+  @doc false
+  def start_subscription(server_name, %Request{} = request, opts \\ []) when is_list(opts) do
+    try do
+      request = prepare_request!(server_name, request)
+      validate_subscription_request!(request, opts)
+      runtime = fetch_runtime!(server_name)
+      request_opts = request_opts(server_name, request, opts)
+
+      requested_filter =
+        Subscriptions.normalize_filter!(Map.fetch!(request.payload, "notifications"))
+
+      subscription_profile =
+        OperationPipeline.subscription_profile(
+          server_name,
+          Map.get(requested_filter, "resourceSubscriptions", []),
+          request_opts
+        )
+
+      access_opts = [owner_fingerprint: subscription_profile.owner_fingerprint]
+
+      task_ids =
+        authorized_subscription_task_ids(
+          server_name,
+          Map.get(requested_filter, "taskIds", []),
+          access_opts
+        )
+
+      filter =
+        Subscriptions.narrow(
+          requested_filter,
+          subscription_profile.capabilities,
+          subscription_profile.resource_uris,
+          task_ids
+        )
+
+      child_opts = [
+        server_name: runtime.server.name,
+        event_bus: runtime.event_bus,
+        owner: Keyword.get(opts, :owner, self()),
+        target: Keyword.get(opts, :target, Keyword.get(opts, :owner, self())),
+        subscription_id: request.request_id,
+        owner_fingerprint: Keyword.fetch!(access_opts, :owner_fingerprint),
+        filter: filter
+      ]
+
+      case DynamicSupervisor.start_child(
+             runtime.session_notification_supervisor,
+             {SubscriptionSubscriber, child_opts}
+           ) do
+        {:ok, subscriber} ->
+          {:ok, subscriber, request}
+
+        {:error, reason} ->
+          {:error,
+           %Error{
+             code: :overloaded,
+             message: "subscription could not be started",
+             details: %{reason: inspect(reason)}
+           }}
+      end
+    rescue
+      error in Error -> {:error, error}
+    end
+  end
+
+  defp prepare_request!(server_name, %Request{} = request) do
+    request = resolve_protocol_version(server_name, request)
+    reject_removed_modern_method!(request)
     validate_protocol_request!(request)
+    validate_tasks_extension!(server_name, request)
     request = normalize_wire_task_request(server_name, request)
     ensure_protocol_session!(server_name, request)
     claim_client_request_id!(server_name, request)
     validate_stdio_lifecycle!(server_name, request)
     validate_negotiated_server_capability!(server_name, request)
+    request
+  end
 
-    request_opts =
-      Keyword.merge(
-        opts,
-        transport: request.transport,
-        session_id: request.session_id,
-        request_metadata: request.request_metadata,
-        auth_input: request.auth_input,
-        task: request.task_request,
-        task_ttl_ms: request.task_ttl_ms
-      )
-      |> put_transport_auth(request)
-      |> put_negotiated_context(server_name, request)
-
-    case request.method do
-      "notifications/initialized" ->
-        mark_session_initialized!(server_name, request)
-        %{}
-
-      "notifications/cancelled" ->
-        request_id = fetch_required!(request.payload, "requestId", request.method)
-
-        session_result!(
-          Session.cancel_inbound_request(
-            server_name,
-            request.session_id,
-            request_id,
-            Map.get(request.payload, "reason")
-          ),
-          request.method
-        )
-
-      "notifications/progress" ->
-        session_result!(
-          Session.receive_peer_progress(server_name, request.session_id, request.payload),
-          request.method
-        )
-
-      "notifications/roots/list_changed" ->
-        session_result!(
-          Session.roots_changed(server_name, request.session_id),
-          request.method
-        )
-
-      "notifications/tasks/status" ->
-        session_result!(
-          Session.receive_peer_task_status(server_name, request.session_id, request.payload),
-          request.method
-        )
-
-      "initialize" ->
-        initialize_params = request.payload
-        result = FastestMCP.initialize(server_name, initialize_params, request_opts)
-        begin_session_initialization!(server_name, request, initialize_params, result)
-        result
-
-      "ping" ->
-        FastestMCP.ping(server_name, request.payload, request_opts)
-
-      "logging/setLevel" ->
-        session_result!(
-          maybe_set_logging_level(
-            server_name,
-            request,
-            Map.fetch!(request.payload, "level")
-          ),
-          request.method
-        )
-
-      "completion/complete" ->
-        completion =
-          FastestMCP.complete(
-            server_name,
-            fetch_required!(request.payload, "ref", request.method),
-            fetch_required!(request.payload, "argument", request.method),
-            Keyword.merge(
-              request_opts,
-              wire: true,
-              context_arguments: get_in(request.payload, ["context", "arguments"]) || %{}
-            )
-          )
-
-        %{
-          completion:
-            %{}
-            |> Map.put("values", Map.get(completion, :values, []))
-            |> maybe_put("total", Map.get(completion, :total))
-            |> maybe_put("hasMore", Map.get(completion, :has_more))
-        }
-
-      "tools/list" ->
-        list_result = component_wire_page(server_name, :tool, request, request_opts)
-
-        paginated_response(
-          server_name,
-          request,
-          request_opts,
-          list_result,
-          :tools,
-          &Serializer.tool_metadata/1
-        )
-
-      "tools/call" ->
-        version = transport_request_version(request.payload)
-        request_opts = maybe_put_opt(request_opts, :version, version)
-        tool_name = fetch_required!(request.payload, "name", request.method)
-
-        {result, descriptor} =
-          OperationPipeline.call_tool_with_component(
-            server_name,
-            tool_name,
-            Map.get(request.payload, "arguments", %{}),
-            maybe_require_task_session(request, request_opts)
-          )
-
-        task_or_result(
-          result,
-          &Serializer.tool_result(&1, descriptor)
-        )
-
-      "resources/list" ->
-        resources = component_wire_page(server_name, :resource, request, request_opts)
-
-        paginated_response(
-          server_name,
-          request,
-          request_opts,
-          resources,
-          :resources,
-          &Serializer.resource_metadata/1
-        )
-
-      "resources/templates/list" ->
-        list_result =
-          component_wire_page(server_name, :resource_template, request, request_opts)
-
-        paginated_response(
-          server_name,
-          request,
-          request_opts,
-          list_result,
-          :resourceTemplates,
-          &Serializer.resource_template_metadata/1
-        )
-
-      "resources/read" ->
-        version = transport_request_version(request.payload)
-        request_opts = maybe_put_opt(request_opts, :version, version)
-        uri = fetch_required!(request.payload, "uri", request.method)
-
-        {result, descriptor} =
-          OperationPipeline.read_resource_with_component(
-            server_name,
-            uri,
-            maybe_require_task_session(request, request_opts)
-          )
-
-        task_or_result(
-          result,
-          fn value ->
-            Serializer.resource_result(uri, descriptor && descriptor.mime_type, value)
-          end
-        )
-
-      "resources/subscribe" ->
-        uri = fetch_required!(request.payload, "uri", request.method)
-        session_id = ensure_subscription_session!(server_name, request)
-        :ok = FastestMCP.Session.subscribe_resource(server_name, session_id, uri)
-        %{}
-
-      "resources/unsubscribe" ->
-        uri = fetch_required!(request.payload, "uri", request.method)
-        session_id = ensure_subscription_session!(server_name, request)
-        :ok = FastestMCP.Session.unsubscribe_resource(server_name, session_id, uri)
-        %{}
-
-      "prompts/list" ->
-        list_result = component_wire_page(server_name, :prompt, request, request_opts)
-
-        paginated_response(
-          server_name,
-          request,
-          request_opts,
-          list_result,
-          :prompts,
-          &Serializer.prompt_metadata/1
-        )
-
-      "prompts/get" ->
-        {result, _descriptor} =
-          OperationPipeline.render_prompt_with_component(
-            server_name,
-            fetch_required!(request.payload, "name", request.method),
-            Map.get(request.payload, "arguments", %{}),
-            maybe_require_task_session(request, request_opts)
-          )
-
-        task_or_result(
-          result,
-          &Serializer.prompt_result/1
-        )
-
-      "tasks/get" ->
-        access_opts = task_access_opts(server_name, request)
-
-        TaskWire.task(
-          FastestMCP.fetch_task(
-            server_name,
-            fetch_required!(request.payload, "taskId", request.method),
-            access_opts
-          ),
-          public_task_opts(server_name)
-        )
-
-      "tasks/result" ->
-        access_opts = task_access_opts(server_name, request)
-
-        task =
-          FastestMCP.fetch_task(
-            server_name,
-            fetch_required!(request.payload, "taskId", request.method),
-            access_opts
-          )
-
-        result =
-          try do
-            FastestMCP.task_result(
-              server_name,
-              fetch_required!(request.payload, "taskId", request.method),
-              Keyword.put(access_opts, :request_metadata, request.request_metadata)
-            )
-          rescue
-            error in Error ->
-              error =
-                error
-                |> Error.with_meta(TaskWire.related_task_meta(task.id))
-                |> ErrorExposure.public_error(
-                  Keyword.merge(public_task_opts(server_name), task: task)
-                )
-
-              reraise error, __STACKTRACE__
-          end
-
-        task_result_response(
-          result,
-          task.id,
-          task_result_serializer(server_name, task, request, request_opts)
-        )
-
-      "tasks/list" ->
-        access_opts = task_access_opts(server_name, request)
-        %{tasks: tasks} = FastestMCP.list_tasks(server_name, access_opts)
-
-        page =
-          wire_page(server_name, request, request_opts, tasks, key: &task_pagination_key/1)
-
-        TaskWire.task_list(
-          %{tasks: page.items, next_cursor: page.next_cursor},
-          public_task_opts(server_name)
-        )
-
-      "tasks/cancel" ->
-        access_opts = task_access_opts(server_name, request)
-
-        TaskWire.task(
-          FastestMCP.cancel_task(
-            server_name,
-            fetch_required!(request.payload, "taskId", request.method),
-            access_opts
-          ),
-          public_task_opts(server_name)
-        )
-
-      method ->
-        raise Error,
-          code: :method_not_found,
-          message: "unknown #{request.transport} method #{inspect(method)}"
+  defp validate_subscription_request!(
+         %Request{protocol_version: "2026-07-28", method: "subscriptions/listen"},
+         opts
+       ) do
+    if Keyword.get(opts, :request_id_in_use?, false) do
+      raise Error,
+        code: :invalid_request,
+        message: "JSON-RPC request id is already active on this connection"
     end
+
+    :ok
+  end
+
+  defp validate_subscription_request!(%Request{} = request, _opts) do
+    raise Error,
+      code: :method_not_found,
+      message:
+        "#{request.method} cannot open a subscription under #{inspect(request.protocol_version)}"
+  end
+
+  defp resolve_protocol_version(_server_name, %Request{protocol: protocol} = request)
+       when protocol != :jsonrpc,
+       do: request
+
+  defp resolve_protocol_version(_server_name, %Request{method: "initialize"} = request) do
+    case modern_protocol_version(request) do
+      nil ->
+        # Legacy negotiation permits the server to answer with a different
+        # version than the one requested. Modern requests never enter this
+        # lifecycle, even when they use a method removed by the modern profile.
+        %{request | protocol_version: "2025-11-25"}
+
+      _modern_or_unsupported ->
+        resolve_modern_protocol_version(request)
+    end
+  end
+
+  defp resolve_protocol_version(_server_name, %Request{} = request) do
+    case modern_protocol_version(request) do
+      nil -> resolve_legacy_protocol_version(request)
+      _modern_or_unsupported -> resolve_modern_protocol_version(request)
+    end
+  end
+
+  defp modern_protocol_version(%Request{payload: payload, protocol_version: header_version}) do
+    meta = Map.get(payload, "_meta", %{})
+
+    Map.get(meta, "io.modelcontextprotocol/protocolVersion") ||
+      if(header_version == "2026-07-28", do: header_version)
+  end
+
+  defp resolve_modern_protocol_version(%Request{} = request) do
+    meta = Map.get(request.payload, "_meta", %{})
+    modern_version = Map.get(meta, "io.modelcontextprotocol/protocolVersion")
+
+    cond do
+      modern_version == "2026-07-28" ->
+        validate_modern_meta!(meta)
+        %{request | protocol_version: modern_version, session_id: nil}
+
+      is_binary(modern_version) ->
+        unsupported_protocol_version!(modern_version)
+
+      true ->
+        raise Error,
+          code: :invalid_params,
+          message: "modern requests require io.modelcontextprotocol/protocolVersion",
+          details: %{jsonrpc_code: -32_602}
+    end
+  end
+
+  defp resolve_legacy_protocol_version(%Request{} = request) do
+    cond do
+      request.protocol_version == "2025-11-25" ->
+        request
+
+      is_binary(request.session_id) and request.session_id != "" ->
+        %{request | protocol_version: "2025-11-25"}
+
+      true ->
+        raise Error,
+          code: :invalid_params,
+          message: "request requires modern protocol metadata or an initialized legacy session",
+          details: %{jsonrpc_code: -32_602}
+    end
+  end
+
+  defp validate_modern_meta!(meta) do
+    case Map.get(meta, "io.modelcontextprotocol/clientCapabilities") do
+      %{} ->
+        :ok
+
+      _other ->
+        raise Error,
+          code: :invalid_params,
+          message: "modern requests require io.modelcontextprotocol/clientCapabilities",
+          details: %{jsonrpc_code: -32_602}
+    end
+  end
+
+  defp reject_removed_modern_method!(%Request{
+         protocol_version: "2026-07-28",
+         method: method
+       }) do
+    if MapSet.member?(@modern_removed_methods, method) do
+      raise Error,
+        code: :method_not_found,
+        message: "#{method} is not available in MCP 2026-07-28"
+    end
+  end
+
+  defp reject_removed_modern_method!(_request), do: :ok
+
+  defp validate_tasks_extension!(server_name, %Request{
+         protocol_version: "2026-07-28",
+         method: method,
+         payload: payload
+       })
+       when method in ["tasks/get", "tasks/update", "tasks/cancel"] do
+    require_tasks_extension!(server_name, method, payload)
+  end
+
+  defp validate_tasks_extension!(server_name, %Request{
+         protocol_version: "2026-07-28",
+         method: "subscriptions/listen",
+         payload: %{"notifications" => %{"taskIds" => task_ids}} = payload
+       })
+       when is_list(task_ids) do
+    require_tasks_extension!(server_name, "subscriptions/listen task notifications", payload)
+  end
+
+  defp validate_tasks_extension!(_server_name, _request), do: :ok
+
+  defp require_tasks_extension!(server_name, method, payload) do
+    runtime = fetch_runtime!(server_name)
+
+    unless Extensions.enabled?(runtime.server.extensions, Extensions.tasks()) do
+      raise Error,
+        code: :method_not_found,
+        message: "server does not support #{method}"
+    end
+
+    client_capabilities =
+      payload
+      |> Map.get("_meta", %{})
+      |> Map.get("io.modelcontextprotocol/clientCapabilities", %{})
+
+    unless Extensions.enabled?(client_capabilities, Extensions.tasks()) do
+      raise Error,
+        code: :missing_required_client_capability,
+        message: "#{method} requires the MCP Tasks extension",
+        details: %{
+          jsonrpc_code: -32_021,
+          requiredCapabilities: %{extensions: %{Extensions.tasks() => %{}}}
+        }
+    end
+
+    :ok
+  end
+
+  defp unsupported_protocol_version!(version) do
+    raise Error,
+      code: :unsupported_protocol_version,
+      message: "unsupported MCP protocol version #{inspect(version)}",
+      details: %{
+        jsonrpc_code: -32_022,
+        supported: Protocol.supported_versions(),
+        requested: version
+      }
   end
 
   defp begin_session_initialization!(_server_name, %{session_id: nil}, _params, _result), do: :ok
@@ -325,7 +643,7 @@ defmodule FastestMCP.Transport.Engine do
     case Session.begin_initialization(
            server_name,
            request.session_id,
-           Protocol.current_version(),
+           request.protocol_version,
            Map.fetch!(params, "capabilities"),
            Map.fetch!(params, "clientInfo"),
            auth_identity,
@@ -400,6 +718,13 @@ defmodule FastestMCP.Transport.Engine do
   # APIs and must not turn an otherwise valid wire request into an error.
   defp normalize_wire_task_request(
          _server_name,
+         %Request{protocol_version: "2026-07-28"} = request
+       ) do
+    %{request | task_request: false, task_ttl_ms: nil}
+  end
+
+  defp normalize_wire_task_request(
+         _server_name,
          %Request{protocol: :jsonrpc, task_request: true, method: method} = request
        )
        when method != "tools/call" do
@@ -432,6 +757,9 @@ defmodule FastestMCP.Transport.Engine do
   defp validate_stdio_lifecycle!(_server_name, %Request{transport: transport, protocol: protocol})
        when transport != :stdio or protocol != :jsonrpc,
        do: :ok
+
+  defp validate_stdio_lifecycle!(_server_name, %Request{protocol_version: "2026-07-28"}),
+    do: :ok
 
   defp validate_stdio_lifecycle!(server_name, %Request{method: "initialize"} = request) do
     case Session.lifecycle(server_name, request.session_id) do
@@ -472,7 +800,13 @@ defmodule FastestMCP.Transport.Engine do
          _server_name,
          %Request{method: method}
        )
-       when method in ["initialize", "ping", "notifications/initialized"],
+       when method in ["initialize", "server/discover", "ping", "notifications/initialized"],
+       do: :ok
+
+  defp validate_negotiated_server_capability!(
+         _server_name,
+         %Request{protocol_version: "2026-07-28"}
+       ),
        do: :ok
 
   defp validate_negotiated_server_capability!(
@@ -505,6 +839,7 @@ defmodule FastestMCP.Transport.Engine do
 
   defp ensure_protocol_session!(server_name, %Request{
          protocol: :jsonrpc,
+         protocol_version: "2025-11-25",
          method: "initialize",
          session_id: session_id
        })
@@ -538,6 +873,9 @@ defmodule FastestMCP.Transport.Engine do
   defp claim_client_request_id!(_server_name, %Request{protocol: protocol})
        when protocol != :jsonrpc,
        do: :ok
+
+  defp claim_client_request_id!(_server_name, %Request{protocol_version: "2026-07-28"}),
+    do: :ok
 
   defp claim_client_request_id!(_server_name, %Request{request_id: nil}), do: :ok
 
@@ -578,6 +916,22 @@ defmodule FastestMCP.Transport.Engine do
 
   defp put_transport_auth(opts, _request), do: opts
 
+  defp request_opts(server_name, request, opts) do
+    Keyword.merge(
+      opts,
+      transport: request.transport,
+      session_id: request.session_id,
+      request_metadata: request.request_metadata,
+      auth_input: request.auth_input,
+      task: request.task_request,
+      task_ttl_ms: request.task_ttl_ms,
+      input_responses: Map.get(request.payload, "inputResponses", %{}),
+      request_state: Map.get(request.payload, "requestState")
+    )
+    |> put_transport_auth(request)
+    |> put_negotiated_context(server_name, request)
+  end
+
   defp put_negotiated_context(opts, server_name, %Request{session_id: session_id})
        when is_binary(session_id) do
     case Session.lifecycle(server_name, session_id) do
@@ -592,7 +946,27 @@ defmodule FastestMCP.Transport.Engine do
     end
   end
 
+  defp put_negotiated_context(
+         opts,
+         _server_name,
+         %Request{protocol_version: "2026-07-28", payload: payload}
+       ) do
+    meta = Map.get(payload, "_meta", %{})
+
+    opts
+    |> Keyword.put(:negotiated_protocol_version, "2026-07-28")
+    |> Keyword.put(
+      :client_capabilities,
+      Map.get(meta, "io.modelcontextprotocol/clientCapabilities", %{})
+    )
+  end
+
   defp put_negotiated_context(opts, _server_name, _request), do: opts
+
+  defp put_server_extensions(opts, server_name) do
+    runtime = fetch_runtime!(server_name)
+    Keyword.put(opts, :server_extensions, runtime.server.extensions)
+  end
 
   defp request_auth_identity(%Request{auth_result: %AuthResult{} = auth_result}) do
     Auth.identity_fingerprint(auth_result.principal, auth_result.auth)
@@ -600,12 +974,33 @@ defmodule FastestMCP.Transport.Engine do
 
   defp request_auth_identity(_request), do: :unbound
 
+  defp authorized_subscription_task_ids(_server_name, [], _access_opts), do: []
+
+  defp authorized_subscription_task_ids(server_name, task_ids, access_opts) do
+    Enum.filter(task_ids, fn task_id ->
+      try do
+        task = FastestMCP.fetch_task(server_name, task_id, access_opts)
+        Map.get(task, :protocol_version) == "2026-07-28"
+      rescue
+        error in Error ->
+          if error.code == :invalid_task_id do
+            false
+          else
+            reraise error, __STACKTRACE__
+          end
+      end
+    end)
+  end
+
   defp fetch_required!(payload, key, method) do
     case Map.fetch(payload, key) do
       {:ok, value} -> value
       :error -> raise Error, code: :bad_request, message: "#{method} requires #{key}"
     end
   end
+
+  defp maybe_require_task_session(%Request{protocol_version: "2026-07-28"}, request_opts),
+    do: request_opts
 
   defp maybe_require_task_session(%Request{task_request: true} = request, request_opts) do
     Keyword.put(request_opts, :session_id, require_session_id!(request))
@@ -672,6 +1067,19 @@ defmodule FastestMCP.Transport.Engine do
     end
   end
 
+  defp task_access_opts(_server_name, %Request{protocol_version: "2026-07-28"} = request) do
+    owner_fingerprint =
+      case request.auth_result do
+        %AuthResult{} = auth_result ->
+          TaskOwner.from_principal_auth(auth_result.principal, auth_result.auth)
+
+        _other ->
+          nil
+      end
+
+    [owner_fingerprint: owner_fingerprint]
+  end
+
   defp task_access_opts(server_name, %Request{} = request) do
     session_id = require_session_id!(request)
     owner_fingerprint = request_owner_fingerprint(server_name, request, session_id)
@@ -724,12 +1132,41 @@ defmodule FastestMCP.Transport.Engine do
     end
   end
 
-  defp task_or_result(%FastestMCP.BackgroundTask{} = task, serializer)
-       when is_function(serializer, 1) do
-    TaskWire.create_task_result(task)
+  defp task_or_result(
+         %FastestMCP.InputRequiredResult{} = result,
+         _serializer,
+         %Request{protocol_version: "2026-07-28", method: method} = request
+       )
+       when method in ["tools/call", "resources/read", "prompts/get"] do
+    client_capabilities =
+      get_in(request.payload, [
+        "_meta",
+        "io.modelcontextprotocol/clientCapabilities"
+      ]) || %{}
+
+    case FastestMCP.InputRequiredResult.validate_client_capabilities(
+           result,
+           client_capabilities
+         ) do
+      :ok -> FastestMCP.InputRequiredResult.to_map(result)
+      {:error, %Error{} = error} -> raise error
+    end
   end
 
-  defp task_or_result(result, serializer) when is_function(serializer, 1), do: serializer.(result)
+  defp task_or_result(%FastestMCP.InputRequiredResult{}, _serializer, request) do
+    raise Error,
+      code: :internal_error,
+      message:
+        "input_required is not valid for #{request.method} under #{request.protocol_version}"
+  end
+
+  defp task_or_result(%FastestMCP.BackgroundTask{} = task, serializer, request)
+       when is_function(serializer, 1) do
+    TaskWire.create_task_result(task, protocol_version: request.protocol_version)
+  end
+
+  defp task_or_result(result, serializer, _request) when is_function(serializer, 1),
+    do: serializer.(result)
 
   defp task_result_response(result, task_id, serializer) do
     result
@@ -741,14 +1178,77 @@ defmodule FastestMCP.Transport.Engine do
     [mask_error_details: mask_error_details_enabled?(server_name)]
   end
 
+  defp fetch_protocol_task!(server_name, task_id, access_opts, protocol_version) do
+    task = FastestMCP.fetch_task(server_name, task_id, access_opts)
+    stored_version = Map.get(task, :protocol_version)
+
+    compatible? =
+      case protocol_version do
+        "2026-07-28" -> stored_version == "2026-07-28"
+        legacy when legacy in [nil, "2025-11-25"] -> stored_version in [nil, "2025-11-25"]
+      end
+
+    if compatible? do
+      task
+    else
+      raise Error,
+        code: :invalid_task_id,
+        message: "Invalid taskId: #{to_string(task_id)} not found",
+        details: %{jsonrpc_code: -32_602}
+    end
+  end
+
+  defp method_not_found!(request) do
+    raise Error,
+      code: :method_not_found,
+      message: "unknown #{request.transport} method #{inspect(request.method)}"
+  end
+
+  @cacheable_modern_methods ~w(server/discover tools/list prompts/list resources/list resources/templates/list resources/read)
+
+  defp finalize_result(
+         server_name,
+         %Request{protocol: :jsonrpc, protocol_version: "2026-07-28"} = request,
+         %{} = result
+       ) do
+    result =
+      result
+      |> Map.put_new("resultType", "complete")
+      |> put_server_info(server_name)
+
+    if request.method in @cacheable_modern_methods and result["resultType"] == "complete" do
+      result
+      |> Map.put_new("ttlMs", 0)
+      |> Map.put_new("cacheScope", "private")
+    else
+      result
+    end
+  end
+
+  defp finalize_result(_server_name, _request, result), do: result
+
+  defp put_server_info(result, server_name) do
+    meta =
+      result
+      |> Map.get("_meta", Map.get(result, :_meta, %{}))
+      |> Map.new()
+      |> Map.put("io.modelcontextprotocol/serverInfo", OperationPipeline.server_info(server_name))
+
+    result
+    |> Map.delete(:_meta)
+    |> Map.put("_meta", meta)
+  end
+
   defp task_result_serializer(
          _server_name,
          %{component_type: :tool, component_descriptor: descriptor},
-         _request,
-         _request_opts
+         request,
+         request_opts
        )
        when is_map(descriptor) do
-    fn result -> Serializer.tool_result(result, descriptor) end
+    fn result ->
+      Serializer.tool_result(result, descriptor, serializer_opts(request, request_opts))
+    end
   end
 
   defp task_result_serializer(
@@ -758,11 +1258,16 @@ defmodule FastestMCP.Transport.Engine do
          request_opts
        ) do
     descriptor = resolve_tool_descriptor(server_name, target, request, request_opts)
-    fn result -> Serializer.tool_result(result, descriptor) end
+
+    fn result ->
+      Serializer.tool_result(result, descriptor, serializer_opts(request, request_opts))
+    end
   end
 
-  defp task_result_serializer(_server_name, %{component_type: :tool}, _request, _request_opts) do
-    &Serializer.tool_result/1
+  defp task_result_serializer(_server_name, %{component_type: :tool}, request, request_opts) do
+    fn result ->
+      Serializer.tool_result(result, nil, serializer_opts(request, request_opts))
+    end
   end
 
   defp task_result_serializer(_server_name, %{component_type: :prompt}, _request, _request_opts) do
@@ -772,11 +1277,11 @@ defmodule FastestMCP.Transport.Engine do
   defp task_result_serializer(
          _server_name,
          %{component_type: :resource, target: uri, component_descriptor: descriptor},
-         _request,
-         _request_opts
+         request,
+         request_opts
        )
        when is_map(descriptor) do
-    fn result -> Serializer.resource_result(uri, Map.get(descriptor, :mime_type), result) end
+    fn result -> serialize_resource_result(uri, descriptor, result, request, request_opts) end
   end
 
   defp task_result_serializer(
@@ -786,35 +1291,15 @@ defmodule FastestMCP.Transport.Engine do
          request_opts
        ) do
     descriptor = resolve_resource_descriptor(server_name, uri, request, request_opts)
-    fn result -> Serializer.resource_result(uri, descriptor && descriptor.mime_type, result) end
+    fn result -> serialize_resource_result(uri, descriptor, result, request, request_opts) end
   end
 
   defp task_result_serializer(_server_name, _task, _request, _request_opts), do: & &1
 
-  defp resolve_resource_descriptor(server_name, uri, request, request_opts) do
-    with {:ok, runtime} <- ServerRuntime.fetch(server_name) do
-      operation =
-        transport_lookup_operation(
-          runtime,
-          request,
-          :resource,
-          uri,
-          request.method,
-          request_opts
-        )
-
-      Registry.get_resource_target(server_name, uri, version: request_opts[:version]) ||
-        Enum.find_value(runtime.server.providers, fn provider ->
-          Provider.get_resource_target(provider, uri, operation)
-        end)
-    else
-      _ -> nil
-    end
-    |> case do
-      {:exact, component, _captures} -> component
-      {:template, component, _captures} -> component
-      component -> component
-    end
+  defp resolve_resource_descriptor(server_name, uri, _request, request_opts) do
+    OperationPipeline.visible_resource_descriptor(server_name, uri, request_opts)
+  rescue
+    _error -> nil
   end
 
   defp resolve_tool_descriptor(server_name, target, request, request_opts) do
@@ -943,8 +1428,6 @@ defmodule FastestMCP.Transport.Engine do
     end
   end
 
-  defp transport_request_version(_payload), do: nil
-
   defp tool_name_matches?(%{} = tool, target) do
     Map.get(tool, :name, Map.get(tool, "name")) == to_string(target)
   end
@@ -995,6 +1478,109 @@ defmodule FastestMCP.Transport.Engine do
   defp maybe_put_opt(opts, _key, nil), do: opts
   defp maybe_put_opt(opts, key, value), do: Keyword.put(opts, key, value)
 
+  defp serialize_apps_metadata(component, request_opts, serializer) do
+    wire = serializer.(component)
+    capabilities = Keyword.get(request_opts, :client_capabilities, %{})
+    extensions = Keyword.get(request_opts, :server_extensions, %{})
+    Map.update(wire, "_meta", %{}, &Apps.filter_meta(&1, capabilities, extensions))
+  end
+
+  defp validate_apps_tool_links!(%{items: items} = page, server_name, request, request_opts) do
+    if Apps.negotiated?(
+         Keyword.get(request_opts, :client_capabilities, %{}),
+         Keyword.get(request_opts, :server_extensions, %{})
+       ) do
+      items
+      |> Enum.map(&Apps.resource_uri(Map.get(&1, :meta, %{})))
+      |> Enum.reject(&is_nil/1)
+      |> Enum.uniq()
+      |> Enum.each(fn uri ->
+        validate_apps_tool_link!(server_name, uri, request, request_opts)
+      end)
+    end
+
+    page
+  end
+
+  defp validate_apps_tool_link!(server_name, uri, request, request_opts) do
+    descriptor = resolve_resource_descriptor(server_name, uri, request, request_opts)
+
+    unless is_map(descriptor) and String.starts_with?(to_string(uri), "ui://") and
+             Map.get(descriptor, :mime_type) == Apps.mime_type() do
+      raise Error,
+        code: :internal_error,
+        message: "MCP Apps tool references an unavailable UI resource"
+    end
+  end
+
+  defp serialize_resource_result(uri, descriptor, value, request, request_opts) do
+    result =
+      Serializer.resource_result(
+        uri,
+        descriptor && descriptor.mime_type,
+        value,
+        serializer_opts(request, request_opts)
+      )
+
+    validate_apps_resource_result!(result, uri, request_opts)
+  end
+
+  defp validate_apps_resource_result!(result, uri, request_opts) do
+    negotiated? =
+      Apps.negotiated?(
+        Keyword.get(request_opts, :client_capabilities, %{}),
+        Keyword.get(request_opts, :server_extensions, %{})
+      )
+
+    if negotiated? and String.starts_with?(to_string(uri), "ui://") do
+      contents = Map.get(result, "contents", Map.get(result, :contents))
+
+      unless is_list(contents) and contents != [] and
+               Enum.all?(contents, &valid_apps_resource_content?(&1, to_string(uri))) do
+        raise Error,
+          code: :internal_error,
+          message: "MCP Apps resource handler returned an invalid UI content envelope"
+      end
+    end
+
+    result
+  end
+
+  defp valid_apps_resource_content?(content, uri) when is_map(content) do
+    text? = is_binary(Map.get(content, "text", Map.get(content, :text)))
+    blob? = is_binary(Map.get(content, "blob", Map.get(content, :blob)))
+
+    Map.get(content, "uri", Map.get(content, :uri)) == uri and
+      Map.get(content, "mimeType", Map.get(content, :mimeType)) == Apps.mime_type() and
+      text? != blob?
+  end
+
+  defp valid_apps_resource_content?(_content, _uri), do: false
+
+  defp serializer_opts(request, request_opts) do
+    [
+      protocol_version: request.protocol_version,
+      client_capabilities: Keyword.get(request_opts, :client_capabilities, %{}),
+      server_extensions: Keyword.get(request_opts, :server_extensions, %{})
+    ]
+  end
+
+  defp filter_invalid_header_tools(%{items: items} = page, %Request{
+         protocol_version: "2026-07-28"
+       }) do
+    valid_items =
+      Enum.filter(items, fn tool ->
+        case HTTPHeaders.annotations(Map.get(tool, :input_schema, Map.get(tool, "inputSchema"))) do
+          {:ok, _annotations} -> true
+          {:error, _reason} -> false
+        end
+      end)
+
+    %{page | items: valid_items}
+  end
+
+  defp filter_invalid_header_tools(page, _request), do: page
+
   defp paginated_response(server_name, request, request_opts, items, key, serializer)
        when is_list(items) and is_function(serializer, 1) do
     page = wire_page(server_name, request, request_opts, items)
@@ -1029,6 +1615,31 @@ defmodule FastestMCP.Transport.Engine do
       cursor: Map.get(request.payload, "cursor")
     )
   end
+
+  defp put_tool_parameter_header_validator(
+         request_opts,
+         %Request{protocol_version: "2026-07-28", transport: :streamable_http} = request
+       ) do
+    Keyword.put(request_opts, :before_component_execute, fn component, operation ->
+      with {:ok, annotations} <- HTTPHeaders.annotations(component.input_schema),
+           :ok <-
+             HTTPHeaders.validate(
+               annotations,
+               operation.arguments,
+               Map.get(request.request_metadata, :headers, %{})
+             ) do
+        :ok
+      else
+        {:error, mismatch} ->
+          raise Error,
+            code: :header_mismatch,
+            message: "Mcp-Param header does not match the tool arguments",
+            details: Map.put(Map.new(mismatch), :jsonrpc_code, -32_020)
+      end
+    end)
+  end
+
+  defp put_tool_parameter_header_validator(request_opts, _request), do: request_opts
 
   defp wire_page(server_name, request, request_opts, items, opts \\ []) do
     runtime = fetch_runtime!(server_name)

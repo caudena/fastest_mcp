@@ -11,6 +11,7 @@ defmodule FastestMCP.Schema do
   alias FastestMCP.Schema.Error
   alias FastestMCP.Schema.HTTPResolver
   alias FastestMCP.Schema.Resolver
+  alias FastestMCP.Protocol
   alias FastestMCP.Protocol.Formats
 
   @draft_2020_12 "https://json-schema.org/draft/2020-12/schema"
@@ -23,97 +24,260 @@ defmodule FastestMCP.Schema do
   @default_max_violations 20
   @default_compile_timeout_ms 5_000
   @default_validation_timeout_ms 1_000
-  @protocol_checksum "1ffe4c5577974012f5fa02af14ea88df4b7146679df1abaaad497c8d9230ca8a"
-  @protocol_semantic_overlay 3
-  @protocol_schema_id "urn:fastestmcp:mcp-schema:2025-11-25"
+  @legacy_version "2025-11-25"
+  @modern_version "2026-07-28"
+  @tasks_definition_prefix "ExtTasks"
+  @tasks_extension_schema_path "priv/schema/mcp-tasks-extension.schema.json"
   @protocol_directions [:client_to_server, :server_to_client]
 
+  @protocol_schemas %{
+    @legacy_version => %{
+      path: "priv/schema/mcp-2025-11-25.schema.json",
+      semantic_overlay: 3,
+      schema_id: "urn:fastestmcp:mcp-schema:2025-11-25"
+    },
+    @modern_version => %{
+      path: "priv/schema/mcp-2026-07-28.schema.json",
+      semantic_overlay: 4,
+      schema_id: "urn:fastestmcp:mcp-schema:2026-07-28"
+    }
+  }
+
   @client_requests %{
-    "initialize" => "InitializeRequest",
-    "ping" => "PingRequest",
-    "resources/list" => "ListResourcesRequest",
-    "resources/templates/list" => "ListResourceTemplatesRequest",
-    "resources/read" => "ReadResourceRequest",
-    "resources/subscribe" => "SubscribeRequest",
-    "resources/unsubscribe" => "UnsubscribeRequest",
-    "prompts/list" => "ListPromptsRequest",
-    "prompts/get" => "GetPromptRequest",
-    "tools/list" => "ListToolsRequest",
-    "tools/call" => "CallToolRequest",
-    "tasks/get" => "GetTaskRequest",
-    "tasks/result" => "GetTaskPayloadRequest",
-    "tasks/cancel" => "CancelTaskRequest",
-    "tasks/list" => "ListTasksRequest",
-    "logging/setLevel" => "SetLevelRequest",
-    "completion/complete" => "CompleteRequest"
+    @legacy_version => %{
+      "initialize" => "InitializeRequest",
+      "ping" => "PingRequest",
+      "resources/list" => "ListResourcesRequest",
+      "resources/templates/list" => "ListResourceTemplatesRequest",
+      "resources/read" => "ReadResourceRequest",
+      "resources/subscribe" => "SubscribeRequest",
+      "resources/unsubscribe" => "UnsubscribeRequest",
+      "prompts/list" => "ListPromptsRequest",
+      "prompts/get" => "GetPromptRequest",
+      "tools/list" => "ListToolsRequest",
+      "tools/call" => "CallToolRequest",
+      "tasks/get" => "GetTaskRequest",
+      "tasks/result" => "GetTaskPayloadRequest",
+      "tasks/cancel" => "CancelTaskRequest",
+      "tasks/list" => "ListTasksRequest",
+      "logging/setLevel" => "SetLevelRequest",
+      "completion/complete" => "CompleteRequest"
+    },
+    @modern_version => %{
+      "server/discover" => "DiscoverRequest",
+      "resources/list" => "ListResourcesRequest",
+      "resources/templates/list" => "ListResourceTemplatesRequest",
+      "resources/read" => "ReadResourceRequest",
+      "subscriptions/listen" => "SubscriptionsListenRequest",
+      "prompts/list" => "ListPromptsRequest",
+      "prompts/get" => "GetPromptRequest",
+      "tools/list" => "ListToolsRequest",
+      "tools/call" => "CallToolRequest",
+      "tasks/get" => "ExtTasksGetTaskRequest",
+      "tasks/update" => "ExtTasksUpdateTaskRequest",
+      "tasks/cancel" => "ExtTasksCancelTaskRequest",
+      "completion/complete" => "CompleteRequest"
+    }
   }
 
   @server_requests %{
-    "ping" => "PingRequest",
-    "tasks/get" => "GetTaskRequest",
-    "tasks/result" => "GetTaskPayloadRequest",
-    "tasks/cancel" => "CancelTaskRequest",
-    "tasks/list" => "ListTasksRequest",
-    "sampling/createMessage" => "CreateMessageRequest",
-    "roots/list" => "ListRootsRequest",
-    "elicitation/create" => "ElicitRequest"
+    @legacy_version => %{
+      "ping" => "PingRequest",
+      "tasks/get" => "GetTaskRequest",
+      "tasks/result" => "GetTaskPayloadRequest",
+      "tasks/cancel" => "CancelTaskRequest",
+      "tasks/list" => "ListTasksRequest",
+      "sampling/createMessage" => "CreateMessageRequest",
+      "roots/list" => "ListRootsRequest",
+      "elicitation/create" => "ElicitRequest"
+    },
+    @modern_version => %{
+      "sampling/createMessage" => "CreateMessageRequest",
+      "roots/list" => "ListRootsRequest",
+      "elicitation/create" => "ElicitRequest"
+    }
   }
 
   @client_notifications %{
-    "notifications/cancelled" => "CancelledNotification",
-    "notifications/initialized" => "InitializedNotification",
-    "notifications/progress" => "ProgressNotification",
-    "notifications/tasks/status" => "TaskStatusNotification",
-    "notifications/roots/list_changed" => "RootsListChangedNotification"
+    @legacy_version => %{
+      "notifications/cancelled" => "CancelledNotification",
+      "notifications/initialized" => "InitializedNotification",
+      "notifications/progress" => "ProgressNotification",
+      "notifications/tasks/status" => "TaskStatusNotification",
+      "notifications/roots/list_changed" => "RootsListChangedNotification"
+    },
+    @modern_version => %{
+      "notifications/cancelled" => "CancelledNotification"
+    }
   }
 
   @server_notifications %{
-    "notifications/cancelled" => "CancelledNotification",
-    "notifications/progress" => "ProgressNotification",
-    "notifications/resources/list_changed" => "ResourceListChangedNotification",
-    "notifications/resources/updated" => "ResourceUpdatedNotification",
-    "notifications/prompts/list_changed" => "PromptListChangedNotification",
-    "notifications/tools/list_changed" => "ToolListChangedNotification",
-    "notifications/tasks/status" => "TaskStatusNotification",
-    "notifications/message" => "LoggingMessageNotification",
-    "notifications/elicitation/complete" => "ElicitationCompleteNotification"
+    @legacy_version => %{
+      "notifications/cancelled" => "CancelledNotification",
+      "notifications/progress" => "ProgressNotification",
+      "notifications/resources/list_changed" => "ResourceListChangedNotification",
+      "notifications/resources/updated" => "ResourceUpdatedNotification",
+      "notifications/prompts/list_changed" => "PromptListChangedNotification",
+      "notifications/tools/list_changed" => "ToolListChangedNotification",
+      "notifications/tasks/status" => "TaskStatusNotification",
+      "notifications/message" => "LoggingMessageNotification",
+      "notifications/elicitation/complete" => "ElicitationCompleteNotification"
+    },
+    @modern_version => %{
+      "notifications/cancelled" => "CancelledNotification",
+      "notifications/progress" => "ProgressNotification",
+      "notifications/resources/list_changed" => "ResourceListChangedNotification",
+      "notifications/resources/updated" => "ResourceUpdatedNotification",
+      "notifications/subscriptions/acknowledged" => "SubscriptionsAcknowledgedNotification",
+      "notifications/prompts/list_changed" => "PromptListChangedNotification",
+      "notifications/tools/list_changed" => "ToolListChangedNotification",
+      "notifications/message" => "LoggingMessageNotification",
+      "notifications/tasks" => "ExtTasksTaskStatusNotification"
+    }
   }
 
   @server_results %{
-    "initialize" => "InitializeResult",
-    "ping" => "EmptyResult",
-    "resources/list" => "ListResourcesResult",
-    "resources/templates/list" => "ListResourceTemplatesResult",
-    "resources/read" => "ReadResourceResult",
-    "resources/subscribe" => "EmptyResult",
-    "resources/unsubscribe" => "EmptyResult",
-    "prompts/list" => "ListPromptsResult",
-    "prompts/get" => "GetPromptResult",
-    "tools/list" => "ListToolsResult",
-    "tools/call" => "CallToolResult",
-    "tasks/get" => "GetTaskResult",
-    "tasks/result" => "GetTaskPayloadResult",
-    "tasks/cancel" => "CancelTaskResult",
-    "tasks/list" => "ListTasksResult",
-    "logging/setLevel" => "EmptyResult",
-    "completion/complete" => "CompleteResult"
+    @legacy_version => %{
+      "initialize" => "InitializeResult",
+      "ping" => "EmptyResult",
+      "resources/list" => "ListResourcesResult",
+      "resources/templates/list" => "ListResourceTemplatesResult",
+      "resources/read" => "ReadResourceResult",
+      "resources/subscribe" => "EmptyResult",
+      "resources/unsubscribe" => "EmptyResult",
+      "prompts/list" => "ListPromptsResult",
+      "prompts/get" => "GetPromptResult",
+      "tools/list" => "ListToolsResult",
+      "tools/call" => "CallToolResult",
+      "tasks/get" => "GetTaskResult",
+      "tasks/result" => "GetTaskPayloadResult",
+      "tasks/cancel" => "CancelTaskResult",
+      "tasks/list" => "ListTasksResult",
+      "logging/setLevel" => "EmptyResult",
+      "completion/complete" => "CompleteResult"
+    },
+    @modern_version => %{
+      "server/discover" => "DiscoverResult",
+      "resources/list" => "ListResourcesResult",
+      "resources/templates/list" => "ListResourceTemplatesResult",
+      "resources/read" => "ReadResourceResult",
+      "subscriptions/listen" => "SubscriptionsListenResult",
+      "prompts/list" => "ListPromptsResult",
+      "prompts/get" => "GetPromptResult",
+      "tools/list" => "ListToolsResult",
+      "tools/call" => "ExtTasksCallToolResult",
+      "tasks/get" => "ExtTasksGetTaskResult",
+      "tasks/update" => "ExtTasksUpdateTaskResult",
+      "tasks/cancel" => "ExtTasksCancelTaskResult",
+      "completion/complete" => "CompleteResult"
+    }
   }
 
   @client_results %{
-    "ping" => "EmptyResult",
-    "tasks/get" => "GetTaskResult",
-    "tasks/result" => "GetTaskPayloadResult",
-    "tasks/cancel" => "CancelTaskResult",
-    "tasks/list" => "ListTasksResult",
-    "sampling/createMessage" => "CreateMessageResult",
-    "roots/list" => "ListRootsResult",
-    "elicitation/create" => "ElicitResult"
+    @legacy_version => %{
+      "ping" => "EmptyResult",
+      "tasks/get" => "GetTaskResult",
+      "tasks/result" => "GetTaskPayloadResult",
+      "tasks/cancel" => "CancelTaskResult",
+      "tasks/list" => "ListTasksResult",
+      "sampling/createMessage" => "CreateMessageResult",
+      "roots/list" => "ListRootsResult",
+      "elicitation/create" => "ElicitResult"
+    },
+    @modern_version => %{
+      "sampling/createMessage" => "CreateMessageResult",
+      "roots/list" => "ListRootsResult",
+      "elicitation/create" => "ElicitResult"
+    }
   }
 
   @task_results %{
-    {:server_to_client, "tools/call"} => "CreateTaskResult",
-    {:client_to_server, "sampling/createMessage"} => "CreateTaskResult",
-    {:client_to_server, "elicitation/create"} => "CreateTaskResult"
+    @legacy_version => %{
+      {:server_to_client, "tools/call"} => "CreateTaskResult",
+      {:client_to_server, "sampling/createMessage"} => "CreateTaskResult",
+      {:client_to_server, "elicitation/create"} => "CreateTaskResult"
+    },
+    @modern_version => %{
+      {:server_to_client, "tools/call"} => "ExtTasksCreateTaskResult"
+    }
+  }
+
+  @response_definitions %{
+    @legacy_version => %{},
+    @modern_version => %{
+      {:server_to_client, "server/discover"} => "DiscoverResultResponse",
+      {:server_to_client, "resources/list"} => "ListResourcesResultResponse",
+      {:server_to_client, "resources/templates/list"} => "ListResourceTemplatesResultResponse",
+      {:server_to_client, "resources/read"} => "ReadResourceResultResponse",
+      {:server_to_client, "subscriptions/listen"} => "SubscriptionsListenResultResponse",
+      {:server_to_client, "prompts/list"} => "ListPromptsResultResponse",
+      {:server_to_client, "prompts/get"} => "GetPromptResultResponse",
+      {:server_to_client, "tools/list"} => "ListToolsResultResponse",
+      {:server_to_client, "completion/complete"} => "CompleteResultResponse"
+    }
+  }
+
+  @request_definitions %{
+    @legacy_version => %{
+      client_to_server: "ClientRequest",
+      server_to_client: "ServerRequest"
+    },
+    @modern_version => %{
+      client_to_server: "ClientRequest",
+      server_to_client: "JSONRPCRequest"
+    }
+  }
+
+  @notification_definitions %{
+    @legacy_version => %{
+      client_to_server: "ClientNotification",
+      server_to_client: "ServerNotification"
+    },
+    @modern_version => %{
+      client_to_server: "ClientNotification",
+      server_to_client: "ServerNotification"
+    }
+  }
+
+  @result_definitions %{
+    @legacy_version => %{
+      client_to_server: "ClientResult",
+      server_to_client: "ServerResult"
+    },
+    @modern_version => %{
+      client_to_server: "ClientResult",
+      server_to_client: "ServerResult"
+    }
+  }
+
+  @common_definitions %{
+    @legacy_version => %{
+      response: "JSONRPCResponse",
+      message: "JSONRPCMessage",
+      error_response: "JSONRPCErrorResponse",
+      client_capabilities: "ClientCapabilities",
+      server_capabilities: "ServerCapabilities"
+    },
+    @modern_version => %{
+      response: "JSONRPCResponse",
+      message: "JSONRPCMessage",
+      error_response: "JSONRPCErrorResponse",
+      client_capabilities: "ClientCapabilities",
+      server_capabilities: "ServerCapabilities",
+      meta: "MetaObject",
+      request_meta: "RequestMetaObject",
+      notification_meta: "NotificationMetaObject",
+      result_meta: "ResultMetaObject",
+      subscriptions_listen_result_meta: "SubscriptionsListenResultMetaObject",
+      parse_error: "ParseError",
+      invalid_request_error: "InvalidRequestError",
+      method_not_found_error: "MethodNotFoundError",
+      invalid_params_error: "InvalidParamsError",
+      internal_error: "InternalError",
+      header_mismatch_error: "HeaderMismatchError",
+      missing_required_client_capability_error: "MissingRequiredClientCapabilityError",
+      unsupported_protocol_version_error: "UnsupportedProtocolVersionError"
+    }
   }
 
   @type raw :: boolean() | map()
@@ -238,52 +402,130 @@ defmodule FastestMCP.Schema do
   @doc false
   @spec compile_protocol_definition(String.t()) ::
           {:ok, Compiled.t()} | {:error, Error.t()}
-  def compile_protocol_definition(name) when is_binary(name) do
-    with {:ok, source} <- protocol_source(),
+  def compile_protocol_definition(name),
+    do: compile_protocol_definition(Protocol.current_version(), name)
+
+  @doc false
+  @spec compile_protocol_definition(Protocol.version(), String.t()) ::
+          {:ok, Compiled.t()} | {:error, Error.t()}
+  def compile_protocol_definition(version, name)
+      when is_binary(version) and is_binary(name) do
+    with {:ok, descriptor} <- protocol_descriptor(version),
+         {:ok, source} <- protocol_source(version, descriptor),
          {:ok, definition} <- fetch_protocol_definition(source, name) do
-      cache_protocol_definition(source, name, definition)
+      cache_protocol_definition(version, descriptor, source, name, definition)
     end
   end
 
-  def compile_protocol_definition(_name) do
-    {:error, compile_error("protocol schema definition name must be a string")}
+  def compile_protocol_definition(version, _name) when is_binary(version) do
+    with {:ok, _descriptor} <- protocol_descriptor(version) do
+      {:error, compile_error("protocol schema definition name must be a string")}
+    end
+  end
+
+  def compile_protocol_definition(_version, _name) do
+    {:error, compile_error("protocol version must be a string")}
   end
 
   @doc false
   @spec compile_protocol_definition!(String.t()) :: Compiled.t()
-  def compile_protocol_definition!(name) do
-    case compile_protocol_definition(name) do
+  def compile_protocol_definition!(name),
+    do: compile_protocol_definition!(Protocol.current_version(), name)
+
+  @doc false
+  @spec compile_protocol_definition!(Protocol.version(), String.t()) :: Compiled.t()
+  def compile_protocol_definition!(version, name) do
+    case compile_protocol_definition(version, name) do
       {:ok, compiled} -> compiled
       {:error, %Error{} = error} -> raise error
     end
   end
 
   @doc false
+  @spec compile_protocol(atom(), atom()) :: {:ok, Compiled.t()} | {:error, Error.t()}
+  def compile_protocol(direction, kind),
+    do: compile_protocol(Protocol.current_version(), direction, kind, nil)
+
+  @doc false
   @spec compile_protocol(atom(), atom(), String.t() | nil) ::
           {:ok, Compiled.t()} | {:error, Error.t()}
-  def compile_protocol(direction, kind, method \\ nil)
+  def compile_protocol(direction, kind, method) when direction in @protocol_directions,
+    do: compile_protocol(Protocol.current_version(), direction, kind, method)
 
-  def compile_protocol(direction, kind, method)
-      when direction in @protocol_directions and kind in [:response, :task_response] and
-             is_binary(method) do
+  @doc false
+  @spec compile_protocol(Protocol.version(), atom(), atom()) ::
+          {:ok, Compiled.t()} | {:error, Error.t()}
+  def compile_protocol(version, direction, kind) when is_binary(version),
+    do: compile_protocol(version, direction, kind, nil)
+
+  @doc false
+  @spec compile_protocol(Protocol.version(), atom(), atom(), String.t() | nil) ::
+          {:ok, Compiled.t()} | {:error, Error.t()}
+  def compile_protocol(version, direction, kind, method)
+      when is_binary(version) and direction in @protocol_directions and
+             kind in [:response, :task_response] and is_binary(method) do
     result_kind = if kind == :task_response, do: :task_result, else: :result
 
-    with {:ok, result_definition} <- protocol_definition(direction, result_kind, method),
-         {:ok, source} <- protocol_source() do
-      cache_protocol_response(source, direction, method, result_definition)
+    with {:ok, descriptor} <- protocol_descriptor(version),
+         {:ok, result_definition} <-
+           protocol_definition(version, direction, result_kind, method),
+         {:ok, source} <- protocol_source(version, descriptor) do
+      case response_definition(version, direction, kind, method) do
+        nil ->
+          cache_protocol_response(
+            version,
+            descriptor,
+            source,
+            direction,
+            method,
+            result_definition
+          )
+
+        response_definition ->
+          with {:ok, definition} <-
+                 fetch_protocol_definition(source, response_definition) do
+            cache_protocol_definition(
+              version,
+              descriptor,
+              source,
+              response_definition,
+              definition
+            )
+          end
+      end
     end
   end
 
-  def compile_protocol(direction, kind, method) do
-    with {:ok, definition} <- protocol_definition(direction, kind, method) do
-      compile_protocol_definition(definition)
+  def compile_protocol(version, direction, kind, method) when is_binary(version) do
+    with {:ok, _descriptor} <- protocol_descriptor(version),
+         {:ok, definition} <- protocol_definition(version, direction, kind, method) do
+      compile_protocol_definition(version, definition)
     end
+  end
+
+  def compile_protocol(version, _direction, _kind, _method) when not is_binary(version) do
+    {:error, compile_error("protocol version must be a string")}
   end
 
   @doc false
+  @spec compile_protocol!(atom(), atom()) :: Compiled.t()
+  def compile_protocol!(direction, kind),
+    do: compile_protocol!(Protocol.current_version(), direction, kind, nil)
+
+  @doc false
   @spec compile_protocol!(atom(), atom(), String.t() | nil) :: Compiled.t()
-  def compile_protocol!(direction, kind, method \\ nil) do
-    case compile_protocol(direction, kind, method) do
+  def compile_protocol!(direction, kind, method) when direction in @protocol_directions,
+    do: compile_protocol!(Protocol.current_version(), direction, kind, method)
+
+  @doc false
+  @spec compile_protocol!(Protocol.version(), atom(), atom()) :: Compiled.t()
+  def compile_protocol!(version, direction, kind) when is_binary(version),
+    do: compile_protocol!(version, direction, kind, nil)
+
+  @doc false
+  @spec compile_protocol!(Protocol.version(), atom(), atom(), String.t() | nil) :: Compiled.t()
+  def compile_protocol!(version, direction, kind, method) do
+    case compile_protocol(version, direction, kind, method) do
       {:ok, compiled} -> compiled
       {:error, %Error{} = error} -> raise error
     end
@@ -292,77 +534,111 @@ defmodule FastestMCP.Schema do
   @doc false
   @spec validate_protocol(atom(), atom(), term()) ::
           {:ok, term()} | {:error, Error.t()}
-  def validate_protocol(direction, kind, value) do
-    validate_protocol(direction, kind, nil, value)
-  end
+  def validate_protocol(direction, kind, value),
+    do: validate_protocol(Protocol.current_version(), direction, kind, nil, value)
 
   @doc false
   @spec validate_protocol(atom(), atom(), String.t() | nil, term()) ::
           {:ok, term()} | {:error, Error.t()}
-  def validate_protocol(direction, kind, method, value) do
-    with {:ok, compiled} <- compile_protocol(direction, kind, method) do
+  def validate_protocol(direction, kind, method, value) when direction in @protocol_directions,
+    do: validate_protocol(Protocol.current_version(), direction, kind, method, value)
+
+  @doc false
+  @spec validate_protocol(Protocol.version(), atom(), atom(), term()) ::
+          {:ok, term()} | {:error, Error.t()}
+  def validate_protocol(version, direction, kind, value) when is_binary(version),
+    do: validate_protocol(version, direction, kind, nil, value)
+
+  @doc false
+  @spec validate_protocol(Protocol.version(), atom(), atom(), String.t() | nil, term()) ::
+          {:ok, term()} | {:error, Error.t()}
+  def validate_protocol(version, direction, kind, method, value) do
+    with {:ok, compiled} <- compile_protocol(version, direction, kind, method) do
       validate(compiled, value)
     end
   end
 
   @doc false
+  @spec protocol_supported?(atom(), atom()) :: boolean()
+  def protocol_supported?(direction, kind),
+    do: protocol_supported?(Protocol.current_version(), direction, kind, nil)
+
+  @doc false
   @spec protocol_supported?(atom(), atom(), String.t() | nil) :: boolean()
-  def protocol_supported?(direction, kind, method \\ nil)
+  def protocol_supported?(direction, kind, method) when direction in @protocol_directions,
+    do: protocol_supported?(Protocol.current_version(), direction, kind, method)
 
-  def protocol_supported?(direction, :response, method) when is_binary(method) do
-    match?({:ok, _definition}, protocol_definition(direction, :result, method))
+  @doc false
+  @spec protocol_supported?(Protocol.version(), atom(), atom()) :: boolean()
+  def protocol_supported?(version, direction, kind) when is_binary(version),
+    do: protocol_supported?(version, direction, kind, nil)
+
+  @doc false
+  @spec protocol_supported?(Protocol.version(), atom(), atom(), String.t() | nil) :: boolean()
+  def protocol_supported?(version, direction, :response, method)
+      when is_binary(version) and is_binary(method) do
+    match?({:ok, _definition}, protocol_definition(version, direction, :result, method))
   end
 
-  def protocol_supported?(direction, :task_response, method) when is_binary(method) do
-    match?({:ok, _definition}, protocol_definition(direction, :task_result, method))
+  def protocol_supported?(version, direction, :task_response, method)
+      when is_binary(version) and is_binary(method) do
+    match?({:ok, _definition}, protocol_definition(version, direction, :task_result, method))
   end
 
-  def protocol_supported?(direction, kind, method) do
-    match?({:ok, _definition}, protocol_definition(direction, kind, method))
+  def protocol_supported?(version, direction, kind, method) when is_binary(version) do
+    match?({:ok, _definition}, protocol_definition(version, direction, kind, method))
   end
 
-  defp protocol_definition(direction, :request, nil) when direction in @protocol_directions do
-    {:ok, if(direction == :client_to_server, do: "ClientRequest", else: "ServerRequest")}
-  end
+  def protocol_supported?(_version, _direction, _kind, _method), do: false
 
-  defp protocol_definition(direction, :request, method)
-       when direction in @protocol_directions and is_binary(method) do
-    mapping = if direction == :client_to_server, do: @client_requests, else: @server_requests
-    fetch_protocol_method(mapping, direction, :request, method)
-  end
-
-  defp protocol_definition(direction, :notification, nil)
+  defp protocol_definition(version, direction, :request, nil)
        when direction in @protocol_directions do
-    {:ok,
-     if(direction == :client_to_server,
-       do: "ClientNotification",
-       else: "ServerNotification"
-     )}
+    fetch_version_direction_definition(@request_definitions, version, direction)
   end
 
-  defp protocol_definition(direction, :notification, method)
+  defp protocol_definition(version, direction, :request, method)
        when direction in @protocol_directions and is_binary(method) do
     mapping =
       if direction == :client_to_server,
-        do: @client_notifications,
-        else: @server_notifications
+        do: version_mapping(@client_requests, version),
+        else: version_mapping(@server_requests, version)
+
+    fetch_protocol_method(mapping, direction, :request, method)
+  end
+
+  defp protocol_definition(version, direction, :notification, nil)
+       when direction in @protocol_directions do
+    fetch_version_direction_definition(@notification_definitions, version, direction)
+  end
+
+  defp protocol_definition(version, direction, :notification, method)
+       when direction in @protocol_directions and is_binary(method) do
+    mapping =
+      if direction == :client_to_server,
+        do: version_mapping(@client_notifications, version),
+        else: version_mapping(@server_notifications, version)
 
     fetch_protocol_method(mapping, direction, :notification, method)
   end
 
-  defp protocol_definition(direction, :result, nil) when direction in @protocol_directions do
-    {:ok, if(direction == :server_to_client, do: "ServerResult", else: "ClientResult")}
+  defp protocol_definition(version, direction, :result, nil)
+       when direction in @protocol_directions do
+    fetch_version_direction_definition(@result_definitions, version, direction)
   end
 
-  defp protocol_definition(direction, :result, method)
+  defp protocol_definition(version, direction, :result, method)
        when direction in @protocol_directions and is_binary(method) do
-    mapping = if direction == :server_to_client, do: @server_results, else: @client_results
+    mapping =
+      if direction == :server_to_client,
+        do: version_mapping(@server_results, version),
+        else: version_mapping(@client_results, version)
+
     fetch_protocol_method(mapping, direction, :result, method)
   end
 
-  defp protocol_definition(direction, :task_result, method)
+  defp protocol_definition(version, direction, :task_result, method)
        when direction in @protocol_directions and is_binary(method) do
-    case Map.fetch(@task_results, {direction, method}) do
+    case @task_results |> version_mapping(version) |> Map.fetch({direction, method}) do
       {:ok, definition} ->
         {:ok, definition}
 
@@ -372,21 +648,51 @@ defmodule FastestMCP.Schema do
     end
   end
 
-  defp protocol_definition(_direction, :response, nil), do: {:ok, "JSONRPCResponse"}
-
-  defp protocol_definition(:client_to_server, :capabilities, nil),
-    do: {:ok, "ClientCapabilities"}
-
-  defp protocol_definition(:server_to_client, :capabilities, nil),
-    do: {:ok, "ServerCapabilities"}
-
-  defp protocol_definition(_direction, :message, nil), do: {:ok, "JSONRPCMessage"}
-  defp protocol_definition(_direction, :error_response, nil), do: {:ok, "JSONRPCErrorResponse"}
-
-  defp protocol_definition(direction, kind, method) do
-    {:error,
-     compile_error("unsupported protocol schema selector #{inspect({direction, kind, method})}")}
+  defp protocol_definition(version, direction, :capabilities, nil)
+       when direction in @protocol_directions do
+    key = if direction == :client_to_server, do: :client_capabilities, else: :server_capabilities
+    fetch_common_definition(version, key)
   end
+
+  defp protocol_definition(version, _direction, kind, nil) do
+    case fetch_common_definition(version, kind) do
+      {:ok, _definition} = ok -> ok
+      {:error, _error} -> unsupported_protocol_selector(version, kind, nil)
+    end
+  end
+
+  defp protocol_definition(version, direction, kind, method) do
+    {:error,
+     compile_error(
+       "unsupported protocol schema selector #{inspect({version, direction, kind, method})}"
+     )}
+  end
+
+  defp unsupported_protocol_selector(version, kind, method),
+    do:
+      {:error,
+       compile_error("unsupported protocol schema selector #{inspect({version, kind, method})}")}
+
+  defp fetch_version_direction_definition(mappings, version, direction) do
+    case mappings |> version_mapping(version) |> Map.fetch(direction) do
+      {:ok, definition} -> {:ok, definition}
+      :error -> unsupported_protocol_selector(version, direction, nil)
+    end
+  end
+
+  defp fetch_common_definition(version, key) do
+    case @common_definitions |> version_mapping(version) |> Map.fetch(key) do
+      {:ok, definition} -> {:ok, definition}
+      :error -> unsupported_protocol_selector(version, key, nil)
+    end
+  end
+
+  defp version_mapping(mappings, version), do: Map.get(mappings, version, %{})
+
+  defp response_definition(_version, _direction, :task_response, _method), do: nil
+
+  defp response_definition(version, direction, :response, method),
+    do: @response_definitions |> version_mapping(version) |> Map.get({direction, method})
 
   defp fetch_protocol_method(mapping, direction, kind, method) do
     case Map.fetch(mapping, method) do
@@ -398,23 +704,36 @@ defmodule FastestMCP.Schema do
     end
   end
 
-  defp protocol_source do
-    cache_key = {__MODULE__, :protocol_source, @protocol_checksum, @protocol_semantic_overlay}
+  defp protocol_descriptor(version) do
+    case Map.fetch(@protocol_schemas, version) do
+      {:ok, descriptor} -> {:ok, descriptor}
+      :error -> invalid_protocol_version(version)
+    end
+  end
+
+  defp invalid_protocol_version(version) do
+    {:error,
+     compile_error(
+       "unsupported MCP protocol version #{inspect(version)}; supported versions: #{Enum.join(Protocol.supported_versions(), ", ")}"
+     )}
+  end
+
+  defp protocol_source(version, descriptor) do
+    cache_key = {__MODULE__, :protocol_source, version, descriptor.semantic_overlay}
 
     case :persistent_term.get(cache_key, :missing) do
-      :missing -> load_protocol_source(cache_key)
+      :missing -> load_protocol_source(version, descriptor, cache_key)
       source -> {:ok, source}
     end
   end
 
-  defp load_protocol_source(cache_key) do
-    path = Application.app_dir(:fastest_mcp, "priv/schema/mcp-2025-11-25.schema.json")
+  defp load_protocol_source(version, descriptor, cache_key) do
+    path = Application.app_dir(:fastest_mcp, descriptor.path)
 
     with {:ok, bytes} <- File.read(path),
-         :ok <- verify_protocol_checksum(bytes),
          {:ok, %{"$defs" => definitions} = source} <- JSON.decode(bytes),
          true <- is_map(definitions),
-         source <- apply_protocol_semantic_overlay(source),
+         source <- apply_protocol_semantic_overlay(version, source),
          :ok <- validate_schema_definition(source, @draft_2020_12) do
       :persistent_term.put(cache_key, source)
       {:ok, source}
@@ -433,25 +752,15 @@ defmodule FastestMCP.Schema do
     end
   end
 
-  defp verify_protocol_checksum(bytes) do
-    checksum = bytes |> then(&:crypto.hash(:sha256, &1)) |> Base.encode16(case: :lower)
-
-    if checksum == @protocol_checksum do
-      :ok
-    else
-      {:error, compile_error("vendored MCP protocol schema checksum mismatch")}
-    end
-  end
-
   # The immutable generated schema at the tagged commit was produced without
   # the `@TJS-type number` annotations present on other floating-point fields.
   # As a result, NumberSchema.minimum/maximum/default, numeric ElicitResult
   # content, and task duration fields were emitted as integers even though the
   # authoritative schema.ts and task specification define them as numbers. The
   # generated Task timestamps also omitted their normative RFC 3339 assertion.
-  # Keep the vendored bytes/checksum intact and apply these source-backed
-  # semantic corrections only to the compiled protocol view.
-  defp apply_protocol_semantic_overlay(source) do
+  # Apply these source-backed semantic corrections only to the compiled
+  # protocol view.
+  defp apply_protocol_semantic_overlay(@legacy_version, source) do
     source
     |> update_in(["$defs", "NumberSchema", "properties"], fn properties ->
       Enum.reduce(["minimum", "maximum", "default"], properties, fn key, acc ->
@@ -480,6 +789,153 @@ defmodule FastestMCP.Schema do
     |> put_in(["$defs", "Task", "properties", "lastUpdatedAt", "format"], "date-time")
   end
 
+  defp apply_protocol_semantic_overlay(@modern_version, source) do
+    with {:ok, task_definitions} <- load_tasks_extension_definitions() do
+      merge_tasks_extension(source, task_definitions)
+    else
+      {:error, %Error{} = error} -> raise error
+    end
+  end
+
+  defp load_tasks_extension_definitions do
+    path = Application.app_dir(:fastest_mcp, @tasks_extension_schema_path)
+
+    with {:ok, bytes} <- File.read(path),
+         {:ok, %{"$defs" => definitions}} <- JSON.decode(bytes),
+         true <- is_map(definitions) do
+      {:ok, definitions}
+    else
+      {:error, %Error{} = error} -> {:error, error}
+      _other -> {:error, compile_error("could not load the vendored MCP Tasks extension schema")}
+    end
+  end
+
+  defp merge_tasks_extension(%{"$defs" => core_definitions} = source, task_definitions) do
+    task_definitions =
+      Map.new(task_definitions, fn {name, definition} ->
+        {@tasks_definition_prefix <> name,
+         definition
+         |> rewrite_tasks_extension_refs()
+         |> apply_tasks_definition_overlay(name)}
+      end)
+
+    task_ids_schema =
+      get_in(task_definitions, [
+        @tasks_definition_prefix <> "TaskSubscriptionNotifications",
+        "properties",
+        "taskIds"
+      ])
+
+    core_definitions =
+      update_in(core_definitions, ["SubscriptionFilter", "properties"], fn properties ->
+        Map.put(properties, "taskIds", task_ids_schema)
+      end)
+
+    call_tool_result = %{
+      "anyOf" => [
+        %{"$ref" => "#/$defs/CallToolResult"},
+        %{"$ref" => "#/$defs/InputRequiredResult"},
+        %{"$ref" => "#/$defs/#{@tasks_definition_prefix}CreateTaskResult"}
+      ]
+    }
+
+    definitions =
+      core_definitions
+      |> Map.merge(task_definitions)
+      |> Map.put(@tasks_definition_prefix <> "CallToolResult", call_tool_result)
+
+    Map.put(source, "$defs", definitions)
+  end
+
+  defp rewrite_tasks_extension_refs(%{} = value) do
+    Map.new(value, fn
+      {"$ref", "#/$defs/" <> name} ->
+        {"$ref", "#/$defs/" <> @tasks_definition_prefix <> name}
+
+      {key, nested} ->
+        {key, rewrite_tasks_extension_refs(nested)}
+    end)
+  end
+
+  defp rewrite_tasks_extension_refs(value) when is_list(value),
+    do: Enum.map(value, &rewrite_tasks_extension_refs/1)
+
+  defp rewrite_tasks_extension_refs(value), do: value
+
+  defp apply_tasks_definition_overlay(definition, name)
+       when name in ["GetTaskRequest", "UpdateTaskRequest", "CancelTaskRequest"] do
+    definition
+    |> put_in(["properties", "params", "properties", "_meta"], %{
+      "$ref" => "#/$defs/RequestMetaObject"
+    })
+    |> update_in(["properties", "params", "required"], fn required ->
+      Enum.uniq(["_meta" | required])
+    end)
+  end
+
+  defp apply_tasks_definition_overlay(%{"allOf" => [meta, task]} = definition, "CreateTaskResult") do
+    task = task |> add_result_meta() |> add_result_type("task")
+    %{definition | "allOf" => [meta, task]}
+  end
+
+  defp apply_tasks_definition_overlay(
+         %{"allOf" => [meta, %{"anyOf" => tasks}]} = definition,
+         "GetTaskResult"
+       ) do
+    tasks = Enum.map(tasks, &(&1 |> add_result_meta() |> add_result_type("complete")))
+    %{definition | "allOf" => [meta, %{"anyOf" => tasks}]}
+  end
+
+  defp apply_tasks_definition_overlay(
+         %{
+           "properties" => %{
+             "params" => %{"allOf" => [meta, %{"anyOf" => tasks} | extension_arms]}
+           }
+         } =
+           definition,
+         "TaskStatusNotification"
+       ) do
+    tasks = Enum.map(tasks, &add_notification_meta/1)
+
+    put_in(
+      definition,
+      ["properties", "params", "allOf"],
+      [meta, %{"anyOf" => tasks} | extension_arms]
+    )
+  end
+
+  defp apply_tasks_definition_overlay(definition, name)
+       when name in ["UpdateTaskResult", "CancelTaskResult"] do
+    add_result_type(definition, "complete")
+  end
+
+  defp apply_tasks_definition_overlay(definition, _name), do: definition
+
+  # The extension models task results and notification params as TypeScript-style
+  # intersections. Each task arm closes its object, so the shared `_meta` member
+  # must also appear in that arm for the equivalent JSON Schema `allOf` to accept it.
+  defp add_result_meta(%{"properties" => properties} = definition) do
+    Map.put(
+      definition,
+      "properties",
+      Map.put(properties, "_meta", %{"$ref" => "#/$defs/ResultMetaObject"})
+    )
+  end
+
+  defp add_notification_meta(%{"properties" => properties} = definition) do
+    Map.put(
+      definition,
+      "properties",
+      Map.put(properties, "_meta", %{"$ref" => "#/$defs/NotificationMetaObject"})
+    )
+  end
+
+  defp add_result_type(%{"properties" => properties} = definition, result_type) do
+    definition
+    |> Map.put("properties", Map.put(properties, "resultType", %{"const" => result_type}))
+    |> Map.update("required", ["resultType"], &Enum.uniq(["resultType" | &1]))
+  end
+
   defp fetch_protocol_definition(%{"$defs" => definitions}, name) do
     case Map.fetch(definitions, name) do
       {:ok, definition} ->
@@ -490,16 +946,26 @@ defmodule FastestMCP.Schema do
     end
   end
 
-  defp cache_protocol_definition(source, name, definition) do
+  defp cache_protocol_definition(version, descriptor, source, name, definition) do
     cache_key =
-      {__MODULE__, :protocol_definition, @protocol_checksum, @protocol_semantic_overlay, name}
+      {__MODULE__, :protocol_definition, version, descriptor.semantic_overlay, name}
 
     case :persistent_term.get(cache_key, :missing) do
       :missing ->
-        with_protocol_build_lock(fn ->
+        with_protocol_build_lock(version, descriptor, fn ->
           case :persistent_term.get(cache_key, :missing) do
-            :missing -> build_protocol_definition(source, name, definition, cache_key)
-            compiled -> {:ok, compiled}
+            :missing ->
+              build_protocol_definition(
+                version,
+                descriptor,
+                source,
+                name,
+                definition,
+                cache_key
+              )
+
+            compiled ->
+              {:ok, compiled}
           end
         end)
 
@@ -508,17 +974,26 @@ defmodule FastestMCP.Schema do
     end
   end
 
-  defp cache_protocol_response(source, direction, method, result_definition) do
+  defp cache_protocol_response(
+         version,
+         descriptor,
+         source,
+         direction,
+         method,
+         result_definition
+       ) do
     cache_key =
-      {__MODULE__, :protocol_response, @protocol_checksum, @protocol_semantic_overlay, direction,
-       method, result_definition}
+      {__MODULE__, :protocol_response, version, descriptor.semantic_overlay, direction, method,
+       result_definition}
 
     case :persistent_term.get(cache_key, :missing) do
       :missing ->
-        with_protocol_build_lock(fn ->
+        with_protocol_build_lock(version, descriptor, fn ->
           case :persistent_term.get(cache_key, :missing) do
             :missing ->
               build_protocol_response(
+                version,
+                descriptor,
                 source,
                 direction,
                 method,
@@ -536,20 +1011,19 @@ defmodule FastestMCP.Schema do
     end
   end
 
-  defp build_protocol_definition(source, name, definition, cache_key) do
-    state_key =
-      {__MODULE__, :protocol_build_state, @protocol_checksum, @protocol_semantic_overlay}
+  defp build_protocol_definition(version, descriptor, source, name, definition, cache_key) do
+    state_key = {__MODULE__, :protocol_build_state, version, descriptor.semantic_overlay}
 
     try do
-      context = protocol_build_context(source, state_key)
-      ref = JSV.Ref.parse!("#/$defs/" <> encode_pointer_segment(name), @protocol_schema_id)
+      context = protocol_build_context(source, descriptor, state_key)
+      ref = JSV.Ref.parse!("#/$defs/" <> encode_pointer_segment(name), descriptor.schema_id)
       {root_key, context} = JSV.build_key!(context, ref)
       root = JSV.to_root!(context, root_key)
 
       compiled = %Compiled{
         root: root,
         source: definition,
-        digest: protocol_definition_digest(name),
+        digest: protocol_definition_identity(version, descriptor, name),
         dialect: @draft_2020_12
       }
 
@@ -561,13 +1035,20 @@ defmodule FastestMCP.Schema do
     end
   end
 
-  defp build_protocol_response(source, direction, method, result_definition, cache_key) do
-    state_key =
-      {__MODULE__, :protocol_build_state, @protocol_checksum, @protocol_semantic_overlay}
+  defp build_protocol_response(
+         version,
+         descriptor,
+         source,
+         direction,
+         method,
+         result_definition,
+         cache_key
+       ) do
+    state_key = {__MODULE__, :protocol_build_state, version, descriptor.semantic_overlay}
 
     try do
-      context = protocol_build_context(source, state_key)
-      response_id = protocol_response_id(direction, method, result_definition)
+      context = protocol_build_context(source, descriptor, state_key)
+      response_id = protocol_response_id(descriptor, direction, method, result_definition)
 
       response_schema = %{
         "$id" => response_id,
@@ -576,12 +1057,12 @@ defmodule FastestMCP.Schema do
             "type" => "object",
             "properties" => %{
               "jsonrpc" => %{"const" => "2.0", "type" => "string"},
-              "id" => protocol_ref("RequestId"),
-              "result" => protocol_ref(result_definition)
+              "id" => protocol_ref(descriptor, "RequestId"),
+              "result" => protocol_ref(descriptor, result_definition)
             },
             "required" => ["jsonrpc", "id", "result"]
           },
-          protocol_ref("JSONRPCErrorResponse")
+          protocol_ref(descriptor, "JSONRPCErrorResponse")
         ]
       }
 
@@ -592,7 +1073,8 @@ defmodule FastestMCP.Schema do
       compiled = %Compiled{
         root: root,
         source: response_schema,
-        digest: protocol_definition_digest("#{direction}:response:#{method}"),
+        digest:
+          protocol_definition_identity(version, descriptor, "#{direction}:response:#{method}"),
         dialect: @draft_2020_12
       }
 
@@ -604,7 +1086,7 @@ defmodule FastestMCP.Schema do
     end
   end
 
-  defp protocol_build_context(source, state_key) do
+  defp protocol_build_context(source, descriptor, state_key) do
     case :persistent_term.get(state_key, :missing) do
       :missing ->
         context =
@@ -615,7 +1097,7 @@ defmodule FastestMCP.Schema do
             warnings: :silent
           )
 
-        source = Map.put(source, "$id", @protocol_schema_id)
+        source = Map.put(source, "$id", descriptor.schema_id)
         {_root_key, _normalized, context} = JSV.build_add!(context, source)
         context
 
@@ -624,28 +1106,25 @@ defmodule FastestMCP.Schema do
     end
   end
 
-  defp protocol_definition_digest(name) do
-    (@protocol_checksum <> ":overlay-#{@protocol_semantic_overlay}:" <> name)
-    |> then(&:crypto.hash(:sha256, &1))
-    |> Base.encode16(case: :lower)
+  defp protocol_definition_identity(version, descriptor, name),
+    do: "mcp:#{version}:overlay-#{descriptor.semantic_overlay}:#{name}"
+
+  defp protocol_ref(descriptor, name) do
+    %{"$ref" => descriptor.schema_id <> "#/$defs/" <> encode_pointer_segment(name)}
   end
 
-  defp protocol_ref(name) do
-    %{"$ref" => @protocol_schema_id <> "#/$defs/" <> encode_pointer_segment(name)}
-  end
-
-  defp protocol_response_id(direction, method, result_definition) do
+  defp protocol_response_id(descriptor, direction, method, result_definition) do
     suffix =
       {direction, method, result_definition}
       |> :erlang.term_to_binary([:deterministic])
       |> then(&:crypto.hash(:sha256, &1))
       |> Base.url_encode64(padding: false)
 
-    @protocol_schema_id <> ":response:" <> suffix
+    descriptor.schema_id <> ":response:" <> suffix
   end
 
-  defp with_protocol_build_lock(fun) do
-    case :global.trans({protocol_build_lock(), self()}, fun) do
+  defp with_protocol_build_lock(version, descriptor, fun) do
+    case :global.trans({protocol_build_lock(version, descriptor), self()}, fun) do
       {:aborted, _reason} ->
         {:error, compile_error("MCP protocol schema cache is unavailable")}
 
@@ -654,8 +1133,8 @@ defmodule FastestMCP.Schema do
     end
   end
 
-  defp protocol_build_lock,
-    do: {__MODULE__, :protocol_build, @protocol_checksum, @protocol_semantic_overlay}
+  defp protocol_build_lock(version, descriptor),
+    do: {__MODULE__, :protocol_build, version, descriptor.semantic_overlay}
 
   defp encode_pointer_segment(segment) do
     segment

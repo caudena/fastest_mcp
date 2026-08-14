@@ -22,6 +22,7 @@ defmodule FastestMCP.BackgroundTaskStore do
   alias FastestMCP.Elicitation
   alias FastestMCP.Error
   alias FastestMCP.EventBus
+  alias FastestMCP.InputRequiredResult
   alias FastestMCP.Operation
   alias FastestMCP.Session
   alias FastestMCP.TaskBackend.Memory, as: MemoryTaskBackend
@@ -76,6 +77,12 @@ defmodule FastestMCP.BackgroundTaskStore do
   def send_input(store, task_id, action, content, opts \\ [])
       when is_pid(store) or is_atom(store) do
     GenServer.call(store, {:send_input, to_string(task_id), action, content, opts})
+  end
+
+  @doc "Applies responses to input requests currently outstanding for a task."
+  def update(store, task_id, input_responses, opts \\ [])
+      when (is_pid(store) or is_atom(store)) and is_map(input_responses) do
+    GenServer.call(store, {:update, to_string(task_id), input_responses, opts})
   end
 
   @doc "Lists the values owned by this module."
@@ -169,7 +176,9 @@ defmodule FastestMCP.BackgroundTaskStore do
             request_id: background_context.request_id,
             origin_request_id: Context.origin_request_id(background_context),
             transport: background_context.transport,
+            protocol_version: background_context.negotiated_protocol_version,
             owner_fingerprint: TaskOwner.from_context(operation.context),
+            client_capabilities: operation.context.client_capabilities,
             poll_interval_ms: poll_interval_ms,
             ttl_ms: ttl_ms,
             submitted_at: submitted_at,
@@ -182,6 +191,8 @@ defmodule FastestMCP.BackgroundTaskStore do
             failure_message: nil,
             terminal_outcome: nil,
             elicitation: nil,
+            input_requests: %{},
+            answered_input_request_ids: MapSet.new(),
             interaction_status_message: nil,
             pid: pid,
             monitor_ref: monitor_ref
@@ -301,6 +312,15 @@ defmodule FastestMCP.BackgroundTaskStore do
                   message: request.message,
                   requested_schema: request.requested_schema
                 })
+                |> Map.put(:input_requests, %{
+                  request.request_id => %{
+                    "method" => "elicitation/create",
+                    "params" => %{
+                      "message" => request.message,
+                      "requestedSchema" => request.requested_schema
+                    }
+                  }
+                })
 
               case put_task(state, updated_task) do
                 :ok ->
@@ -363,6 +383,9 @@ defmodule FastestMCP.BackgroundTaskStore do
                 |> Map.put(:status, :input_required)
                 |> Map.put(:updated_at, System.system_time(:millisecond))
                 |> Map.put(:interaction_status_message, "Waiting for client sampling")
+                |> Map.put(:input_requests, %{
+                  request_id => %{"method" => "sampling/createMessage", "params" => params}
+                })
 
               case put_task(state, updated_task) do
                 :ok ->
@@ -440,6 +463,21 @@ defmodule FastestMCP.BackgroundTaskStore do
     end)
   end
 
+  def handle_call({:update, task_id, input_responses, opts}, _from, state) do
+    with_expired_tasks(state, fn state ->
+      case fetch_task(state, task_id, opts) do
+        {:ok, task} ->
+          apply_task_input_responses(state, task, task_id, input_responses)
+
+        {:error, :not_found} ->
+          {:reply, {:error, :not_found}, state}
+
+        {:error, reason} ->
+          {:reply, {:error, reason}, fail_task_orchestration(state, task_id, reason)}
+      end
+    end)
+  end
+
   def handle_call({:list, opts}, _from, state) do
     with_expired_tasks(state, fn state ->
       case backend(state).list_tasks(store(state), opts) do
@@ -484,6 +522,7 @@ defmodule FastestMCP.BackgroundTaskStore do
             |> Map.put(:pid, nil)
             |> Map.put(:monitor_ref, nil)
             |> Map.put(:elicitation, nil)
+            |> Map.put(:input_requests, %{})
             |> Map.put(:interaction_status_message, nil)
 
           case put_task(state, cancelled) do
@@ -553,10 +592,55 @@ defmodule FastestMCP.BackgroundTaskStore do
   @impl true
   def handle_info({:task_result, task_id, component_type, {:ok, result}}, state) do
     {status, terminal_outcome, failure_message} =
-      classify_successful_result(component_type, result)
+      classify_successful_result(state, task_id, component_type, result)
 
     {:noreply,
      complete_task(state, task_id, status, result, nil, terminal_outcome, failure_message)}
+  end
+
+  def handle_info({:task_input_required, task_id, %InputRequiredResult{} = result}, state) do
+    case fetch_task(state, task_id, []) do
+      {:ok, %{status: status}} when status in [:completed, :failed, :cancelled] ->
+        {:noreply, state}
+
+      {:ok, task} ->
+        input_requests = result.input_requests || %{}
+
+        case validate_new_input_request_ids(task, input_requests) do
+          :ok ->
+            updated_task =
+              task
+              |> Map.put(:status, :input_required)
+              |> Map.put(:updated_at, System.system_time(:millisecond))
+              |> Map.put(:input_requests, input_requests)
+              |> Map.put(:interaction_status_message, "Waiting for task input")
+
+            case put_task(state, updated_task) do
+              :ok ->
+                emit_status_notification(
+                  state,
+                  updated_task,
+                  "input_required",
+                  "Waiting for task input"
+                )
+
+                {:noreply, state}
+
+              {:error, reason} ->
+                {:noreply, fail_task_orchestration(state, task_id, reason)}
+            end
+
+          {:error, %Error{} = error} ->
+            {:noreply,
+             complete_task(state, task_id, :failed, nil, error, :request_error, error.message)}
+        end
+
+      {:error, :not_found} ->
+        {:noreply, state}
+
+      {:error, reason} ->
+        {:noreply, fail_task_orchestration(state, task_id, reason)}
+    end
   end
 
   def handle_info({:task_result, task_id, _component_type, {:error, %Error{} = error}}, state) do
@@ -790,8 +874,46 @@ defmodule FastestMCP.BackgroundTaskStore do
         )
     end
 
-    send(store, {:task_result, task_id, operation.component_type, result})
-    :ok
+    case result do
+      {:ok, %InputRequiredResult{input_requests: requests} = input_required}
+      when is_map(requests) and map_size(requests) > 0 ->
+        case InputRequiredResult.validate_client_capabilities(
+               input_required,
+               operation.context.client_capabilities
+             ) do
+          :ok ->
+            send(store, {:task_input_required, task_id, input_required})
+
+            receive do
+              {:resume_background_task, input_responses} when is_map(input_responses) ->
+                context = %{
+                  operation.context
+                  | input_responses:
+                      Map.merge(operation.context.input_responses, input_responses),
+                    request_state: input_required.request_state
+                }
+
+                run_task(store, task_id, executor, %{operation | context: context})
+            end
+
+          {:error, %Error{} = error} ->
+            send(store, {:task_result, task_id, operation.component_type, {:error, error}})
+            :ok
+        end
+
+      {:ok, %InputRequiredResult{}} ->
+        error = %Error{
+          code: :invalid_params,
+          message: "background task input_required result must include inputRequests"
+        }
+
+        send(store, {:task_result, task_id, operation.component_type, {:error, error}})
+        :ok
+
+      _terminal ->
+        send(store, {:task_result, task_id, operation.component_type, result})
+        :ok
+    end
   end
 
   defp complete_task(state, task_id, status, result, error, terminal_outcome, failure_message) do
@@ -816,6 +938,7 @@ defmodule FastestMCP.BackgroundTaskStore do
           |> Map.put(:pid, nil)
           |> Map.put(:monitor_ref, nil)
           |> Map.put(:elicitation, nil)
+          |> Map.put(:input_requests, %{})
           |> Map.put(:interaction_status_message, nil)
 
         case put_task(state, updated_task) do
@@ -865,12 +988,14 @@ defmodule FastestMCP.BackgroundTaskStore do
       request_id: task.request_id,
       origin_request_id: task.origin_request_id,
       transport: task.transport,
+      protocol_version: Map.get(task, :protocol_version),
       poll_interval_ms: task.poll_interval_ms,
       ttl_ms: task.ttl_ms,
       submitted_at: task.submitted_at,
       updated_at: task.updated_at,
       completed_at: task.completed_at,
       elicitation: Map.get(task, :elicitation),
+      input_requests: Map.get(task, :input_requests, %{}),
       progress: task.progress,
       result: task.result,
       error: task.error,
@@ -883,15 +1008,23 @@ defmodule FastestMCP.BackgroundTaskStore do
     backend(state).fetch_task(store(state), task_id, opts)
   end
 
-  defp classify_successful_result(:tool, result) do
+  defp classify_successful_result(state, task_id, :tool, result) do
+    modern? =
+      case fetch_task(state, task_id, []) do
+        {:ok, task} -> Map.get(task, :protocol_version) == "2026-07-28"
+        _other -> false
+      end
+
     if tool_error_result?(result) do
-      {:failed, :tool_error_result, tool_error_message(result)}
+      if modern?,
+        do: {:completed, :tool_error_result, tool_error_message(result)},
+        else: {:failed, :tool_error_result, tool_error_message(result)}
     else
       {:completed, :success_result, nil}
     end
   end
 
-  defp classify_successful_result(_component_type, _result),
+  defp classify_successful_result(_state, _task_id, _component_type, _result),
     do: {:completed, :success_result, nil}
 
   defp component_descriptor(component) do
@@ -914,8 +1047,6 @@ defmodule FastestMCP.BackgroundTaskStore do
     |> Map.get(:content, Map.get(result, "content"))
     |> tool_error_content_message()
   end
-
-  defp tool_error_message(_result), do: "Tool task failed"
 
   defp tool_error_content_message([first | _rest]), do: tool_error_content_message(first)
   defp tool_error_content_message(%{text: text}) when is_binary(text) and text != "", do: text
@@ -1043,7 +1174,8 @@ defmodule FastestMCP.BackgroundTaskStore do
         task,
         status_override,
         status_message_override,
-        mask_error_details: state.mask_error_details
+        mask_error_details: state.mask_error_details,
+        protocol_version: Map.get(task, :protocol_version, "2025-11-25")
       )
 
     EventBus.emit(
@@ -1223,6 +1355,113 @@ defmodule FastestMCP.BackgroundTaskStore do
     end
   end
 
+  defp apply_task_input_responses(state, task, task_id, input_responses) do
+    outstanding = Map.get(task, :input_requests, %{})
+
+    matching =
+      input_responses
+      |> Map.new(fn {key, value} -> {to_string(key), value} end)
+      |> Map.take(Map.keys(outstanding))
+
+    cond do
+      map_size(matching) == 0 ->
+        {:reply, {:ok, public_task(task)}, state}
+
+      Map.has_key?(state.interaction_waiters, task_id) ->
+        apply_interaction_waiter_responses(state, task, task_id, matching)
+
+      is_pid(task.pid) and Process.alive?(task.pid) ->
+        resumed_task =
+          task
+          |> mark_answered_input_requests(Map.keys(matching))
+          |> Map.put(:status, :working)
+          |> Map.put(:updated_at, System.system_time(:millisecond))
+          |> Map.put(:input_requests, Map.drop(outstanding, Map.keys(matching)))
+          |> Map.put(:interaction_status_message, nil)
+
+        case put_task(state, resumed_task) do
+          :ok ->
+            send(task.pid, {:resume_background_task, matching})
+            emit_status_notification(state, resumed_task, "working", nil)
+            {:reply, {:ok, public_task(resumed_task)}, state}
+
+          {:error, reason} ->
+            {:reply, {:error, reason}, fail_task_orchestration(state, task_id, reason)}
+        end
+
+      true ->
+        {:reply,
+         {:error,
+          %Error{
+            code: :internal_error,
+            message: "background task cannot resume its outstanding input requests"
+          }}, state}
+    end
+  end
+
+  defp apply_interaction_waiter_responses(state, task, task_id, matching) do
+    with {:ok, waiter} <- fetch_interaction_waiter(state, task_id) do
+      case Map.fetch(matching, waiter.request_id) do
+        :error ->
+          {:reply, {:ok, public_task(task)}, state}
+
+        {:ok, response} ->
+          with {:ok, resolved} <- resolve_task_input_response(waiter, response) do
+            task = mark_answered_input_requests(task, [waiter.request_id])
+
+            case resolve_interaction(state, task, task_id, {:ok, resolved}) do
+              {:ok, next_state, resumed_task} ->
+                emit_status_notification(next_state, resumed_task, "working", nil)
+                {:reply, {:ok, public_task(resumed_task)}, next_state}
+
+              {:error, reason, next_state} ->
+                {:reply, {:error, reason}, next_state}
+            end
+          else
+            {:error, %Error{} = error} -> {:reply, {:error, error}, state}
+          end
+      end
+    end
+  end
+
+  defp resolve_task_input_response(%{type: :elicitation, request: request}, response)
+       when is_map(response) do
+    Elicitation.resolve(request, Map.get(response, "action"), Map.get(response, "content"))
+  end
+
+  defp resolve_task_input_response(%{type: :sampling}, response) when is_map(response),
+    do: {:ok, response}
+
+  defp resolve_task_input_response(_waiter, _response) do
+    {:error, %Error{code: :invalid_params, message: "invalid task input response"}}
+  end
+
+  defp mark_answered_input_requests(task, request_ids) do
+    answered = Map.get(task, :answered_input_request_ids, MapSet.new())
+
+    Map.put(
+      task,
+      :answered_input_request_ids,
+      Enum.reduce(request_ids, answered, &MapSet.put(&2, &1))
+    )
+  end
+
+  defp validate_new_input_request_ids(task, input_requests) do
+    answered = Map.get(task, :answered_input_request_ids, MapSet.new())
+    reused = Enum.filter(Map.keys(input_requests), &MapSet.member?(answered, &1))
+
+    if reused == [] do
+      :ok
+    else
+      {:error,
+       %Error{
+         code: :invalid_params,
+         message: "background task reused an input request identifier",
+         details: %{request_ids: reused}
+       }}
+    end
+  end
+
   defp ensure_elicitation_waiter(%{type: :elicitation}), do: :ok
 
   defp ensure_elicitation_waiter(_waiter) do
@@ -1265,6 +1504,7 @@ defmodule FastestMCP.BackgroundTaskStore do
           |> Map.put(:status, :working)
           |> Map.put(:updated_at, System.system_time(:millisecond))
           |> Map.put(:elicitation, nil)
+          |> Map.put(:input_requests, %{})
           |> Map.put(:interaction_status_message, nil)
 
         case put_task(state, resumed_task) do

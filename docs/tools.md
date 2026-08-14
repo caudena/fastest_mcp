@@ -403,8 +403,10 @@ Return lists for streams or other lazy enumerables whose size is not known.
 FastestMCP does not automatically materialize arbitrary `Stream` values because
 they may be infinite.
 
-Over the wire, that becomes text plus `structuredContent`, so MCP clients can
-use both a readable representation and machine-readable structure.
+On the modern wire, that becomes text plus JSON-valued `structuredContent`, so
+clients get both a readable representation and machine-readable structure.
+The legacy wire includes `structuredContent` only for object values, matching
+its tagged schema.
 
 This is the normal path for map-like results. You only need an explicit helper
 when you want to control the exact MCP envelope.
@@ -702,7 +704,7 @@ Global visibility is server-scoped:
   )
 ```
 
-Session visibility is narrower and uses `%FastestMCP.Context{}`:
+Legacy session visibility is narrower and uses `%FastestMCP.Context{}`:
 
 ```elixir
 alias FastestMCP.Context
@@ -715,12 +717,13 @@ server =
   end)
 ```
 
-Server-scoped visibility is authoritative. A session can narrow the visible set
-further, but it cannot re-expose a tool that the server already disabled.
+Server-scoped visibility is authoritative. A legacy session can narrow the
+visible set further, but it cannot re-expose a tool that the server already
+disabled.
 
-When the visible tool list changes, FastestMCP emits
-`notifications/tools/list_changed` to connected initialized HTTP and stdio
-sessions.
+When the visible tool list changes, legacy initialized sessions receive
+`notifications/tools/list_changed`. Modern listeners receive it only when
+their acknowledged subscription filter includes tool-list changes.
 
 See [Versioning and Visibility](versioning-and-visibility.md) for selectors,
 version targeting, and session behavior.
@@ -836,16 +839,19 @@ provider =
 
 ## Runtime Change Notifications
 
-If tools are added, removed, enabled, disabled, or hidden for one session,
-FastestMCP can emit `notifications/tools/list_changed`.
+If tools are added, removed, enabled, disabled, or hidden, FastestMCP can emit
+`notifications/tools/list_changed`.
 
-That notification path is session-aware:
+On `2025-11-25`, that path is session-aware:
 
 - it is delivered through one active HTTP or stdio session output sink
 - it is emitted only when the visible tool set actually changes for that
   session
 - session visibility changes can trigger it even when the global registry did
   not change
+
+On `2026-07-28`, a long-lived `subscriptions/listen` request receives the
+notification only when its acknowledged filter includes tool-list changes.
 
 ## Current Compatibility Boundary
 
@@ -858,8 +864,8 @@ That notification path is session-aware:
 - there is no automatic coercion into UUID, datetime, or path objects; values
   stay JSON-native unless your handler converts them
 - duplicate handling defaults to `on_duplicate: :error`
-- session notifications only exist on transports with a live session event
-  stream
+- legacy notifications require a live session event stream; modern
+  notifications require a matching long-lived listener
 
 ## Why This Shape
 

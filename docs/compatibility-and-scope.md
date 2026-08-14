@@ -9,10 +9,14 @@ Elixir application structure.
 
 ## Supported Protocol
 
-FastestMCP 0.2 targets MCP `2025-11-25` across streamable HTTP and stdio. The
-shared schema, JSON-RPC, Session, transport, and operation boundaries are
-covered by native tests, raw-peer transport tests, and separate direct and
-narrowly shimmed conformance-runner lanes. Version 0.2.0 remains unreleased.
+FastestMCP supports MCP `2026-07-28` and `2025-11-25` across streamable HTTP
+and stdio. The connected client defaults to `:auto`, prefers the modern
+`2026-07-28` profile, and falls back only on explicit legacy evidence. One
+running server can serve both revisions without a compatibility proxy.
+
+Native tests, raw-peer transport tests, package consumer tests, and direct
+official-runner lanes cover the boundary. There is no protocol translation
+shim in the release gate.
 
 ## Compatibility Rules
 
@@ -29,13 +33,13 @@ narrowly shimmed conformance-runner lanes. Version 0.2.0 remains unreleased.
 
 The active compatibility target includes:
 
-- MCP `2025-11-25` as the sole protocol version
+- MCP `2026-07-28` and `2025-11-25`, with distinct modern and legacy profiles
 - server declaration and lifecycle
 - tools, resources, resource templates, and prompts
 - standard prompt/resource wire completion plus Elixir-native tool and
   resource-template completion helpers
 - middleware, providers, auth, and transport-independent execution
-- explicit request, session, and task context handling
+- explicit request and task context handling, plus legacy session context
 - request-context snapshots and narrow current-context helpers for nested code
 - streamable HTTP and stdio server behavior
 - strict JSON-RPC 2.0 with one message per HTTP POST or stdio line
@@ -43,18 +47,25 @@ The active compatibility target includes:
 - connected client support for streamable HTTP and stdio
 - asynchronous connected-client requests with explicit cancellation and
   caller-lifetime cleanup
-- connected client completions and session-scoped resource subscriptions
-- client-side roots, logging-level control, sampling, form/URL elicitation,
-  completion tracking, log, and progress callbacks
+- connected client completions and version-appropriate resource subscriptions
+- client-side roots, version-appropriate logging control, sampling, form/URL
+  elicitation, completion tracking, log, and progress callbacks
 - server-side sampling and interaction helpers
-- server-originated roots, ping, cancellation, progress, logging, form and URL
-  elicitation, and requester-side peer tasks
+- legacy server-originated roots and ping, plus version-appropriate
+  cancellation, progress, logging, interaction rounds, and requester-side
+  peer tasks
 - identity-bound URL-elicitation completion
 - RFC 9728 Protected Resource Metadata for configured HTTP resource servers
 - an OAuth 2.1 HTTP client boundary with RFC 8414/OIDC discovery, PKCE S256,
   RFC 8707 resource indicators, explicit registration, refresh rotation, and
   bounded scope step-up
-- bounded same-session, same-stream SSE event replay and client resumption
+- stable MCP Apps metadata/resource helpers and connected-client preservation;
+  Apps Host/View rendering remains host-owned
+- experimental modern Tasks v2 plus the backwards-compatible legacy Tasks v1
+- OAuth Client Credentials and Enterprise-Managed Authorization client grants
+  through explicit secret/signing/enterprise identity host boundaries
+- bounded legacy same-session, same-stream SSE event replay and client
+  resumption; modern streams are fresh request lifetimes
 - RFC 6570 level 1-4 resource-template parsing, expansion, and reverse routing
 - Draft 2020-12 and Draft 7 JSON Schema through one non-coercing compile-once
   boundary
@@ -74,7 +85,7 @@ The following are intentionally outside the current milestone:
 - CLI tooling
 - cluster-aware runtime behavior
 - publishing automation after the first manual Hex release is proven
-- custom app or UI layer
+- browser/native MCP Apps Host and View runtime
 - deprecated compatibility behaviors
 
 ## Intentional Elixir-native Divergences
@@ -83,9 +94,9 @@ The following are intentionally outside the current milestone:
   only.
 - No legacy method-specific HTTP routes or JSON-RPC batches. MCP traffic uses
   the single configured endpoint, `/mcp` by default.
-- Remote task augmentation is limited to standard `tools/call`. Local Elixir
-  prompt/resource tasks remain runtime conveniences rather than wire
-  extensions, and there is no `tasks/sendInput` MCP method.
+- Remote task behavior is versioned. The legacy profile keeps its experimental
+  core Tasks contract; the modern profile uses the separately negotiated Tasks
+  v2 extension. Local Elixir prompt/resource tasks remain runtime conveniences.
 - No signature rewriting or annotation-based dependency injection. Elixir keeps
   explicit `%FastestMCP.Context{}` and
   `FastestMCP.add_dependency/3`.
@@ -95,7 +106,8 @@ The following are intentionally outside the current milestone:
 - HTTP integration stays Plug-first.
 - No external component management REST API. Runtime mutation lives inside the
   supervised runtime through `FastestMCP.ComponentManager`.
-- Client ergonomics are session-first and GenServer-based.
+- Client ergonomics are connection-first and GenServer-based. Modern
+  connections are sessionless; legacy connections own one initialized session.
 - FastestMCP does not implement an authorization server. RFC 9728
   protected-resource discovery and challenges plus the connected-client OAuth
   flow are available, while token issuance, signing, introspection,
@@ -113,19 +125,21 @@ only public `FastestMCP.Client` APIs.
 
 Current status:
 
-- the 0.2 implementation has one shared schema/JSON-RPC boundary and one
-  bidirectional Session coordinator for HTTP and stdio
+- the implementation has a versioned schema/JSON-RPC boundary, a request-
+  stateless modern profile, and a legacy Session coordinator for HTTP and stdio
 - connected client support exists for streamable HTTP and stdio
 - standard completion, sampling tool rounds, form and URL elicitation, roots,
-  requester tasks, cancellation, progress, logging, ping, OAuth, SSE replay,
-  and RFC 6570 templates have focused native and raw-peer transport coverage
+  requester tasks, cancellation, progress, logging, OAuth, and RFC 6570
+  templates have focused native and raw-peer transport coverage; ping and SSE
+  replay are legacy-only
 - runtime component mutation is implemented through `FastestMCP.ComponentManager`
 - explicit tool, prompt, and resource helper modules are part of the curated public API
 - session-state storage is configurable; broader runtime storage is still local
 - standalone SSE remains an intentional non-goal; GET SSE is part of the
   Streamable HTTP endpoint
-- zero-session HTTP is removed; `state_scope: :request` resets handler state
-  while retaining a normal negotiated MCP session
+- legacy zero-session HTTP is removed; `state_scope: :request` resets legacy
+  handler state while retaining its negotiated session. Modern HTTP is
+  intentionally sessionless by protocol design.
 
 Treat advertised capabilities and executable transport tests—not merely the
 presence of a helper or a green shimmed runner—as the support boundary.

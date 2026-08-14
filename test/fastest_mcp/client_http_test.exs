@@ -6,7 +6,6 @@ defmodule FastestMCP.ClientHTTPTest do
   alias FastestMCP.Context
   alias FastestMCP.Elicitation.Accepted
   alias FastestMCP.Error
-  alias FastestMCP.Protocol
   alias FastestMCP.Session
 
   test "connected client initializes and works against a live streamable HTTP server" do
@@ -42,6 +41,7 @@ defmodule FastestMCP.ClientHTTPTest do
     client =
       Client.connect!(
         "http://127.0.0.1:#{port}/mcp",
+        protocol_version: "2025-11-25",
         client_info: %{"name" => "client-http-test", "version" => "1.0.0"},
         max_in_flight: 1
       )
@@ -51,7 +51,7 @@ defmodule FastestMCP.ClientHTTPTest do
     end)
 
     assert Client.connected?(client)
-    assert Client.protocol_version(client) == Protocol.current_version()
+    assert Client.protocol_version(client) == "2025-11-25"
     assert is_map(Client.initialize_result(client))
     assert is_map(Client.capabilities(client))
 
@@ -128,7 +128,9 @@ defmodule FastestMCP.ClientHTTPTest do
       )
 
     {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
-    client = Client.connect!("http://127.0.0.1:#{port}/mcp")
+
+    client =
+      Client.connect!("http://127.0.0.1:#{port}/mcp", protocol_version: "2025-11-25")
 
     on_exit(fn ->
       if Client.connected?(client), do: Client.disconnect(client)
@@ -223,7 +225,9 @@ defmodule FastestMCP.ClientHTTPTest do
       )
 
     {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
-    client = Client.connect!("http://127.0.0.1:#{port}/mcp")
+
+    client =
+      Client.connect!("http://127.0.0.1:#{port}/mcp", protocol_version: "2025-11-25")
 
     on_exit(fn ->
       if Client.connected?(client), do: Client.disconnect(client)
@@ -278,7 +282,9 @@ defmodule FastestMCP.ClientHTTPTest do
       )
 
     {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
-    client = Client.connect!("http://127.0.0.1:#{port}/mcp")
+
+    client =
+      Client.connect!("http://127.0.0.1:#{port}/mcp", protocol_version: "2025-11-25")
 
     on_exit(fn ->
       if Client.connected?(client), do: Client.disconnect(client)
@@ -356,6 +362,7 @@ defmodule FastestMCP.ClientHTTPTest do
     client =
       Client.connect!(
         "http://127.0.0.1:#{port}/mcp",
+        protocol_version: "2025-11-25",
         log_handler: fn payload -> send(parent, {:log_notification, payload}) end,
         progress_handler: fn payload -> send(parent, {:progress_notification, payload}) end
       )
@@ -415,6 +422,7 @@ defmodule FastestMCP.ClientHTTPTest do
     client =
       Client.connect!(
         "http://127.0.0.1:#{port}/mcp",
+        protocol_version: "2025-11-25",
         sampling_handler: fn messages, params ->
           send(test_pid, {:sampling_handler_called, messages, params})
           assert is_list(messages)
@@ -476,6 +484,7 @@ defmodule FastestMCP.ClientHTTPTest do
 
     client =
       Client.connect!("http://127.0.0.1:#{port}/mcp",
+        protocol_version: "2025-11-25",
         session_stream: true,
         elicitation_handler: fn message, params ->
           send(parent, {:standalone_elicitation, message, params})
@@ -575,6 +584,7 @@ defmodule FastestMCP.ClientHTTPTest do
     client =
       Client.connect!(
         "http://127.0.0.1:#{port}/mcp",
+        protocol_version: "2025-11-25",
         access_token: "dev-token",
         sampling_handler: fn messages, params ->
           send(test_pid, {:protected_sampling_handler_called, messages, params})
@@ -641,7 +651,12 @@ defmodule FastestMCP.ClientHTTPTest do
       )
 
     {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
-    client = Client.connect!("http://127.0.0.1:#{port}/mcp", session_stream: false)
+
+    client =
+      Client.connect!("http://127.0.0.1:#{port}/mcp",
+        protocol_version: "2025-11-25",
+        session_stream: false
+      )
 
     on_exit(fn ->
       if Client.connected?(client), do: Client.disconnect(client)
@@ -693,7 +708,12 @@ defmodule FastestMCP.ClientHTTPTest do
       )
 
     {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
-    client = Client.connect!("http://127.0.0.1:#{port}/mcp", access_token: "dev-token")
+
+    client =
+      Client.connect!("http://127.0.0.1:#{port}/mcp",
+        protocol_version: "2025-11-25",
+        access_token: "dev-token"
+      )
 
     on_exit(fn ->
       if Client.connected?(client), do: Client.disconnect(client)
@@ -763,6 +783,7 @@ defmodule FastestMCP.ClientHTTPTest do
     client =
       Client.connect!(
         "http://127.0.0.1:#{port}/mcp",
+        protocol_version: "2025-11-25",
         session_stream: true,
         notification_handler: fn payload ->
           send(parent, {:session_stream_notification, payload})
@@ -836,6 +857,7 @@ defmodule FastestMCP.ClientHTTPTest do
     client =
       Client.connect!(
         "http://127.0.0.1:#{port}/mcp",
+        protocol_version: "2025-11-25",
         log_handler: fn _payload -> raise "boom" end,
         progress_handler: fn _payload -> raise "boom" end,
         notification_handler: fn _payload -> raise "boom" end
@@ -899,6 +921,7 @@ defmodule FastestMCP.ClientHTTPTest do
     client =
       Client.connect!(
         "http://127.0.0.1:#{port}/mcp",
+        protocol_version: "2025-11-25",
         auto_initialize: false
       )
 
