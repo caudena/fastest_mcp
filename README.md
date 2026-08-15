@@ -58,7 +58,7 @@ Add FastestMCP to your dependencies:
 ```elixir
 def deps do
   [
-    {:fastest_mcp, "~> 0.3.0"}
+    {:fastest_mcp, "~> 0.3.1"}
   ]
 end
 ```

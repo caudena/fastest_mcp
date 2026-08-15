@@ -157,6 +157,7 @@ defmodule FastestMCP.ServerRuntime do
     with {:ok, state} <- monitor_registry(initial),
          {:ok, state} <- claim_server_owner(state),
          {:ok, state} <- claim_server(state),
+         {:ok, state} <- resolve_request_id_policy(state),
          {:ok, state} <- start_lifespans(state),
          {:ok, state} <- start_component_manager(state),
          {:ok, state} <- materialize_runtime(state),
@@ -575,6 +576,31 @@ defmodule FastestMCP.ServerRuntime do
       other ->
         raise ArgumentError,
               "max_request_ids must be a positive integer, got: #{inspect(other)}"
+    end
+  end
+
+  # Whether a `2025-11-25` session rejects a client request id that was already
+  # used earlier in the same session. Off by default: some production clients
+  # (claude.ai after resuming a conversation, for example) restart their JSON-RPC
+  # id numbering inside a live session and treat the resulting `invalid_request`
+  # as a tool failure instead of re-initializing, which leaves the connection
+  # unusable. Concurrent reuse of an in-flight id is rejected regardless of this
+  # setting.
+  defp resolve_request_id_policy(state) do
+    case safe_start(fn -> strict_request_ids(state.opts) end) do
+      {:ok, strict?} -> {:ok, Map.put(state, :strict_request_ids, strict?)}
+      {:error, reason} -> {:error, reason, state}
+    end
+  end
+
+  defp strict_request_ids(opts) do
+    case Keyword.get(opts, :strict_request_ids, false) do
+      value when is_boolean(value) ->
+        value
+
+      other ->
+        raise ArgumentError,
+              "strict_request_ids must be a boolean, got: #{inspect(other)}"
     end
   end
 

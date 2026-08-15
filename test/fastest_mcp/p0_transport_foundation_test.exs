@@ -1,6 +1,7 @@
 defmodule FastestMCP.P0TransportFoundationTest do
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog, only: [with_log: 1]
   import Plug.Conn
   import Plug.Test
 
@@ -304,16 +305,59 @@ defmodule FastestMCP.P0TransportFoundationTest do
     assert ProtocolTest.http_request(server_name, session_id, 4, "ping").status == 200
   end
 
-  test "request ids cannot be reused within one HTTP or stdio session" do
-    server_name = unique_server_name("request-id-ledger")
+  test "reused request ids are accepted with a warning by default within one HTTP or stdio session" do
+    server_name = unique_server_name("request-id-lenient")
     start_server!(FastestMCP.server(server_name))
     {session_id, _initialize, _initialized} = ProtocolTest.initialize_http(server_name)
 
     assert ProtocolTest.http_request(server_name, session_id, 2, "ping").status == 200
 
-    reused = ProtocolTest.http_request(server_name, session_id, 2, "ping")
+    # claude.ai restarts its JSON-RPC id numbering inside a live session after
+    # resuming a conversation and treats a rejection as a tool failure without
+    # re-initializing, so a reused id must still be served.
+    {reused, log} =
+      with_log(fn -> ProtocolTest.http_request(server_name, session_id, 2, "ping") end)
+
     assert reused.status == 200
-    assert %{"error" => %{"code" => -32_600}} = JSON.decode!(reused.resp_body)
+    assert %{"id" => 2, "result" => %{}} = JSON.decode!(reused.resp_body)
+    assert log =~ "[warning]"
+    assert log =~ "reused JSON-RPC request id"
+    assert log =~ "request_id=2"
+    assert log =~ "session_id=#{inspect(session_id)}"
+    assert log =~ ~s(method="ping")
+
+    # The session keeps serving fresh ids after a reuse.
+    assert %{"result" => %{}} =
+             JSON.decode!(ProtocolTest.http_request(server_name, session_id, 3, "ping").resp_body)
+
+    {connection_id, _initialize} = ProtocolTest.initialize_stdio(server_name)
+    assert %{"result" => %{}} = ProtocolTest.stdio_request(server_name, connection_id, 2, "ping")
+
+    {stdio_reused, stdio_log} =
+      with_log(fn -> ProtocolTest.stdio_request(server_name, connection_id, 2, "ping") end)
+
+    assert %{"id" => 2, "result" => %{}} = stdio_reused
+    assert stdio_log =~ "reused JSON-RPC request id"
+    assert stdio_log =~ "request_id=2"
+  end
+
+  test "strict_request_ids: true rejects reused request ids within one HTTP or stdio session" do
+    server_name = unique_server_name("request-id-ledger")
+    start_server!(FastestMCP.server(server_name), strict_request_ids: true)
+    {session_id, _initialize, _initialized} = ProtocolTest.initialize_http(server_name)
+
+    assert ProtocolTest.http_request(server_name, session_id, 2, "ping").status == 200
+
+    {reused, log} =
+      with_log(fn -> ProtocolTest.http_request(server_name, session_id, 2, "ping") end)
+
+    assert reused.status == 200
+
+    assert %{"id" => 2, "error" => %{"code" => -32_600, "message" => message}} =
+             JSON.decode!(reused.resp_body)
+
+    assert message =~ "already been used"
+    refute log =~ "reused JSON-RPC request id"
 
     distinct_string = ProtocolTest.http_request(server_name, session_id, "2", "ping")
     assert distinct_string.status == 200
@@ -324,6 +368,15 @@ defmodule FastestMCP.P0TransportFoundationTest do
 
     assert %{"error" => %{"code" => -32_600}} =
              ProtocolTest.stdio_request(server_name, connection_id, 2, "ping")
+  end
+
+  test "strict_request_ids must be a boolean" do
+    server_name = unique_server_name("request-id-policy-invalid")
+
+    assert {:error, %ArgumentError{message: message}} =
+             FastestMCP.start_server(FastestMCP.server(server_name), strict_request_ids: "yes")
+
+    assert message =~ "strict_request_ids must be a boolean"
   end
 
   test "request id exhaustion returns one bounded correlated error before terminating HTTP and stdio sessions" do

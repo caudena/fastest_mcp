@@ -1,6 +1,22 @@
 # Changelog
 
-## Unreleased
+## 0.3.1 - 2026-08-16
+
+### Compatibility fix
+
+- stop rejecting `2025-11-25` client requests whose JSON-RPC id was already
+  used by an earlier, finished request in the same session; the request is now
+  served and one `Logger` warning names the request id, session id, and method.
+  claude.ai (`Anthropic/ClaudeAI`, protocol `2025-06-18`) restarts its id
+  numbering inside a live session after resuming a conversation and treats the
+  `-32600 invalid_request` rejection as a tool failure without re-initializing,
+  which left the connection permanently broken while authentication kept
+  succeeding
+- add the `strict_request_ids: true` runtime option to opt back into rejecting
+  reused ids; the `max_request_ids:` capacity error, the in-flight duplicate
+  check, and the sessionless `2026-07-28` path are unchanged
+
+## 0.3.0 - 2026-08-14
 
 ### MCP `2026-07-28` and compatibility
 
