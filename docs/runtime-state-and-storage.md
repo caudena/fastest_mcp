@@ -173,6 +173,7 @@ environment variable changes protocol behavior.
 | --- | ---: | --- |
 | Request/callback timeout | 60 seconds | `request_timeout_ms:` / `stream_request_timeout_ms:` |
 | Used request ids | 100,000 per direction and session | `max_request_ids:` |
+| Reused client request ids | accepted with a warning | `strict_request_ids:` (default `false`) |
 | Pending peer callbacks | 128 per session; 10,000 per runtime | `max_pending_requests:` / `max_runtime_pending_requests:` |
 | Active inbound requests | 128 per session; 10,000 per runtime | `max_active_requests:` / `max_runtime_active_requests:` |
 | Peer task records | 128 per session | `max_peer_tasks:` |
@@ -183,6 +184,18 @@ environment variable changes protocol behavior.
 | Inbound progress | 100 updates per second and session | `max_inbound_progress_per_second:` |
 | Protocol logging | 100 messages per second and session | `max_logs_per_second:` |
 | Session idle lifetime | 15 minutes | `session_idle_ttl:` |
+
+On `2025-11-25`, every client request id is recorded in a per-session ledger so
+the runtime can bound it with `max_request_ids:`. A client that reuses an id
+already consumed by an earlier, finished request in the same session is served
+anyway by default, with one `Logger` warning that names the request id, session
+id, and method. Some production clients (claude.ai after resuming a
+conversation, for example) restart their JSON-RPC id numbering inside a live
+session and treat a rejection as a tool failure without re-initializing, which
+would otherwise leave the connection unusable. Set `strict_request_ids: true`
+to reject such reuse with `-32600 invalid_request` instead. Reusing an id that
+is still in flight is rejected regardless of this setting, and `2026-07-28`
+requests are sessionless and never consult the ledger.
 
 Active callbacks, requests, peer tasks, background tasks, and attached output
 sinks hold the session open. Replay records by themselves do not prevent idle

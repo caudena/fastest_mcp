@@ -35,6 +35,8 @@ defmodule FastestMCP.Transport.Engine do
   alias FastestMCP.Transport.Request
   alias FastestMCP.Transport.Serializer
 
+  require Logger
+
   @modern_removed_methods MapSet.new([
                             "initialize",
                             "ping",
@@ -949,9 +951,7 @@ defmodule FastestMCP.Transport.Engine do
         :ok
 
       {:error, :duplicate} ->
-        raise Error,
-          code: :invalid_request,
-          message: "JSON-RPC request id has already been used in this session"
+        handle_reused_client_request_id!(server_name, request)
 
       {:error, :overloaded} ->
         raise Error,
@@ -964,6 +964,41 @@ defmodule FastestMCP.Transport.Engine do
         raise Error,
           code: :invalid_request,
           message: "initialize must be called first"
+    end
+  end
+
+  # A `2025-11-25` client reused a JSON-RPC id that an earlier, already finished
+  # request in this session consumed. Strict rejection is opt-in
+  # (`strict_request_ids: true`): some production clients — claude.ai after
+  # resuming a conversation, for example — restart their id numbering inside a
+  # live session and treat the `invalid_request` error as a tool failure rather
+  # than re-initializing, which leaves the connection permanently broken. The
+  # default therefore logs the reuse and lets the request through. Reusing an id
+  # that is still in flight is a separate check
+  # (`Session.register_inbound_request/5`) and stays rejected either way.
+  defp handle_reused_client_request_id!(server_name, %Request{} = request) do
+    if strict_request_ids?(server_name) do
+      raise Error,
+        code: :invalid_request,
+        message: "JSON-RPC request id has already been used in this session"
+    end
+
+    Logger.warning(
+      "FastestMCP accepted a reused JSON-RPC request id: " <>
+        "request_id=#{inspect(request.request_id)}; " <>
+        "session_id=#{inspect(request.session_id)}; " <>
+        "method=#{inspect(request.method)}; " <>
+        "protocol_version=#{inspect(request.protocol_version)}; " <>
+        "set strict_request_ids: true to reject reused ids"
+    )
+
+    :ok
+  end
+
+  defp strict_request_ids?(server_name) do
+    case ServerRuntime.fetch(server_name) do
+      {:ok, %{strict_request_ids: strict?}} -> strict? == true
+      _other -> false
     end
   end
 
