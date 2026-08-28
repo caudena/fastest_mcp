@@ -129,6 +129,7 @@ defmodule FastestMCP.ClientStdioTest do
              {:stdio, elixir, stdio_server_args(server_name)},
              client_info: %{"name" => "client-stdio-test", "version" => "1.0.0"},
              env: %{
+               "ELIXIR_ERL_OPTIONS" => "+fnu",
                "FASTMCP_CHILD_TEST" => "from-client",
                "PATH" => System.fetch_env!("PATH")
              }

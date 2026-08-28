@@ -117,7 +117,7 @@ defmodule FastestMCP.Client.StdioProcess do
         false
 
       command ->
-        case System.cmd(command, ["-0", Integer.to_string(pid)], stderr_to_stdout: true) do
+        case System.cmd(command, ["-0", "--", Integer.to_string(pid)], stderr_to_stdout: true) do
           {_output, 0} -> true
           {output, _status} -> String.contains?(output, "Operation not permitted")
         end
@@ -160,7 +160,7 @@ defmodule FastestMCP.Client.StdioProcess do
         {:error, :unsupported}
 
       command ->
-        case System.cmd(command, [signal, signal_argument(target)], stderr_to_stdout: true) do
+        case System.cmd(command, [signal, "--", signal_argument(target)], stderr_to_stdout: true) do
           {_output, 0} -> :ok
           {_output, _status} -> {:error, :signal_failed}
         end
@@ -201,7 +201,7 @@ defmodule FastestMCP.Client.StdioProcess do
         false
 
       command ->
-        case System.cmd(command, ["-0", "-#{pid}"], stderr_to_stdout: true) do
+        case System.cmd(command, ["-0", "--", "-#{pid}"], stderr_to_stdout: true) do
           {_output, 0} -> true
           {output, _status} -> String.contains?(output, "Operation not permitted")
         end
