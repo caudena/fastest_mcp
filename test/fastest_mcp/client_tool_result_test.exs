@@ -5,6 +5,7 @@ defmodule FastestMCP.ClientToolResultTest do
   alias FastestMCP.Client.ToolResult
 
   test "call_tool_result preserves complete modern result presence and scalar shapes" do
+    parent = self()
     server_name = "client-tool-result-#{System.unique_integer([:positive])}"
 
     server =
@@ -27,6 +28,20 @@ defmodule FastestMCP.ClientToolResultTest do
           "isError" => true
         }
       end)
+      |> FastestMCP.add_tool(
+        "blocked",
+        fn _arguments, _context ->
+          send(parent, {:blocked_tool_started, self()})
+
+          receive do
+            :release -> %{"content" => []}
+          end
+        end,
+        task: [mode: :optional]
+      )
+      |> FastestMCP.add_tool("large", fn _arguments, _context ->
+        %{"content" => [%{"type" => "text", "text" => String.duplicate("x", 32_768)}]}
+      end)
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
 
@@ -36,9 +51,16 @@ defmodule FastestMCP.ClientToolResultTest do
     legacy_client =
       Client.connect!({:in_process, server_name}, protocol_version: "2025-11-25")
 
+    bounded_client =
+      Client.connect!({:in_process, server_name},
+        protocol_version: "2026-07-28",
+        max_response_bytes: 16_384
+      )
+
     on_exit(fn ->
       if Client.connected?(client), do: Client.disconnect(client)
       if Client.connected?(legacy_client), do: Client.disconnect(legacy_client)
+      if Client.connected?(bounded_client), do: Client.disconnect(bounded_client)
       FastestMCP.stop_server(server_name)
     end)
 
@@ -91,5 +113,24 @@ defmodule FastestMCP.ClientToolResultTest do
     assert_raise ArgumentError, ~r/call_tool_task/, fn ->
       Client.call_tool_result(client, "not_advertised", %{}, task: true)
     end
+
+    error =
+      assert_raise FastestMCP.Error, fn ->
+        Client.call_tool_result(bounded_client, "large")
+      end
+
+    assert error.code == :bad_request
+    assert error.message == "MCP response exceeds configured size limit"
+    assert error.details.max_response_bytes == 16_384
+    assert error.details.terminal_response_observed == true
+
+    request = Client.start_tool_result(legacy_client, "blocked")
+    assert_receive {:blocked_tool_started, blocked_tool}, 1_000
+    assert :ok = Client.cancel_tool_result(request, "test cancellation")
+
+    error = assert_raise FastestMCP.Error, fn -> Client.await_tool_result(request, 1_000) end
+    assert error.code == :cancelled
+    monitor = Process.monitor(blocked_tool)
+    assert_receive {:DOWN, ^monitor, :process, ^blocked_tool, _reason}, 1_000
   end
 end

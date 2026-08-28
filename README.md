@@ -114,6 +114,12 @@ FastestMCP.Client.protocol_version(client)
 %FastestMCP.Client.ToolResult{structured_content: 42} =
   FastestMCP.Client.call_tool_result(client, "sum", %{"a" => 20, "b" => 22})
 
+request =
+  FastestMCP.Client.start_tool_result(client, "slow_sum", %{"a" => 20, "b" => 22})
+
+# This remains valid if tools/call becomes a negotiated remote task.
+:ok = FastestMCP.Client.cancel_tool_result(request, "no longer needed")
+
 :ok = FastestMCP.Client.disconnect(client)
 ```
 

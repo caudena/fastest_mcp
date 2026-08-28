@@ -10,6 +10,7 @@ defmodule FastestMCP.Transport.SSEDecoder do
   @retry_value ~r/\A[0-9]+\z/
   @max_scheduler_timeout 4_294_967_295
   @default_max_seen_event_ids 4_096
+  @max_oversized_response_probe_bytes 16 * 1_024 * 1_024
 
   defstruct buffer: "",
             max_event_bytes: @default_max_event_bytes,
@@ -84,13 +85,14 @@ defmodule FastestMCP.Transport.SSEDecoder do
     case next_separator(decoder.buffer) do
       nil ->
         if byte_size(decoder.buffer) > decoder.max_event_bytes do
-          {:error, oversized(decoder.max_event_bytes)}
+          {:error, oversized(decoder.max_event_bytes, nil)}
         else
           {:ok, Enum.reverse(events), decoder}
         end
 
       {offset, _length} when offset > decoder.max_event_bytes ->
-        {:error, oversized(decoder.max_event_bytes)}
+        raw_event = binary_part(decoder.buffer, 0, offset)
+        {:error, oversized(decoder.max_event_bytes, raw_event)}
 
       {offset, length} ->
         <<raw_event::binary-size(^offset), _separator::binary-size(^length), rest::binary>> =
@@ -248,12 +250,43 @@ defmodule FastestMCP.Transport.SSEDecoder do
     |> Enum.all?(&(&1 in [9, 10, 13, 32]))
   end
 
-  defp oversized(limit) do
+  defp oversized(limit, raw_event) do
+    details =
+      %{max_event_bytes: limit, frame_complete: is_binary(raw_event)}
+      |> maybe_put_oversized_response_id(raw_event)
+
     %Error{
       code: :bad_request,
       message: "SSE event exceeds configured size limit",
-      details: %{max_event_bytes: limit}
+      details: details
     }
+  end
+
+  defp maybe_put_oversized_response_id(details, raw_event)
+       when is_binary(raw_event) and byte_size(raw_event) <= @max_oversized_response_probe_bytes do
+    if String.valid?(raw_event) do
+      put_oversized_response_id(details, raw_event)
+    else
+      details
+    end
+  end
+
+  defp maybe_put_oversized_response_id(details, _raw_event), do: details
+
+  defp put_oversized_response_id(details, raw_event) do
+    fields =
+      raw_event
+      |> String.split(@line_separator)
+      |> Enum.reduce(%{data: [], id: :unchanged, retry_ms: :unchanged}, &decode_field/2)
+
+    with lines when lines != [] <- Enum.reverse(fields.data),
+         encoded when encoded != "" <- Enum.join(lines, "\n"),
+         {:ok, %{"jsonrpc" => "2.0", "id" => id} = payload} <- JSON.decode(encoded),
+         true <- Map.has_key?(payload, "result") or Map.has_key?(payload, "error") do
+      Map.put(details, :response_id, id)
+    else
+      _other -> details
+    end
   end
 
   defp malformed(message, reason \\ nil) do

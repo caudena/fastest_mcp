@@ -402,6 +402,15 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
         end,
         task: [mode: :optional, poll_interval_ms: 10]
       )
+      |> FastestMCP.add_tool(
+        "large",
+        fn _arguments, _context ->
+          %{
+            content: [%{type: "text", text: String.duplicate("x", 32_768)}]
+          }
+        end,
+        task: [mode: :required, poll_interval_ms: 10]
+      )
 
     start_server!(server_name, server)
     bandit = start_http_transport!(server_name)
@@ -414,7 +423,25 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
         client_info: @client_info
       )
 
-    on_exit(fn -> if Client.connected?(client), do: Client.disconnect(client) end)
+    bounded_client =
+      Client.connect!("http://127.0.0.1:#{port}/mcp",
+        protocol_version: @modern_version,
+        extensions: tasks_extensions(),
+        client_info: @client_info,
+        max_response_bytes: 16_384
+      )
+
+    direct_client =
+      Client.connect!({:in_process, server_name},
+        protocol_version: @modern_version,
+        client_info: @client_info
+      )
+
+    on_exit(fn ->
+      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(bounded_client), do: Client.disconnect(bounded_client)
+      if Client.connected?(direct_client), do: Client.disconnect(direct_client)
+    end)
 
     call =
       Task.async(fn ->
@@ -443,10 +470,50 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
              is_error: false
            } = Task.await(stable_call, 3_000)
 
+    cancellable =
+      Client.start_tool_result(client, "echo", %{"value" => "cancelled"}, task_timeout_ms: 2_000)
+
+    assert_receive {:task_worker, cancellable_worker}, 1_000
+    assert :ok = Client.cancel_tool_result(cancellable, "test cancellation")
+
+    cancellation =
+      assert_raise Error, fn -> Client.await_tool_result(cancellable, 2_000) end
+
+    assert cancellation.code == :cancelled
+    monitor = Process.monitor(cancellable_worker)
+    assert_receive {:DOWN, ^monitor, :process, ^cancellable_worker, _reason}, 1_000
+
+    direct =
+      Client.start_tool_result(direct_client, "echo", %{"value" => "cancelled-direct"},
+        task_timeout_ms: 2_000
+      )
+
+    assert_receive {:task_worker, direct_worker}, 1_000
+    assert :ok = Client.cancel_tool_result(direct, "test direct cancellation")
+
+    direct_cancellation =
+      assert_raise Error, fn -> Client.await_tool_result(direct, 2_000) end
+
+    assert direct_cancellation.code == :cancelled
+    direct_monitor = Process.monitor(direct_worker)
+    assert_receive {:DOWN, ^direct_monitor, :process, ^direct_worker, _reason}, 1_000
+
     assert %ToolResult{
              content: [%{"type" => "text", "text" => "rejected"}],
              is_error: true
            } = Client.call_tool_result(client, "reject", %{}, task_timeout_ms: 2_000)
+
+    oversized =
+      assert_raise Error, fn ->
+        Client.call_tool_result(bounded_client, "large", %{}, task_timeout_ms: 2_000)
+      end
+
+    assert oversized.code == :bad_request
+    assert oversized.message == "MCP response exceeds configured size limit"
+    assert oversized.details.max_response_bytes == 16_384
+    # The HTTP stream crosses the bound before its terminal frame is observed.
+    # The caller must therefore preserve an unknown effect outcome.
+    assert oversized.details.terminal_response_observed == false
 
     assert %RemoteTask{task_id: task_id} =
              task = Client.call_tool_task(client, "echo", %{"value" => "handle"})

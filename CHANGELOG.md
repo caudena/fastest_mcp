@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.2 - 2026-08-28
+
+### Connected client cancellation
+
+- add `start_tool_result/4`, `await_tool_result/2`, and
+  `cancel_tool_result/2` for cancellable terminal tool calls; the returned
+  handle remains valid while `tools/call` transitions from its initial request
+  into a server-owned remote task, and `call_tool_result/4` now uses the same
+  shared execution path
+- cancel an ordinary in-flight request directly, but preserve the race where a
+  task-capable request may publish a remote task and cancel that task through
+  `tasks/cancel` once its handle becomes available
+- treat a tool request as task-capable only for MCP `2026-07-28` connections
+  where the Tasks extension was negotiated by both peers; legacy connections
+  and modern connections without Tasks now cancel the initial request instead
+  of waiting indefinitely for an impossible task transition
+- cancel outstanding work when its owning process exits or an await times out,
+  while preserving the existing typed cancellation and protocol-error behavior
+
 ## 0.3.1 - 2026-08-16
 
 ### Compatibility fix

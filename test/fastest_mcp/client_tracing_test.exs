@@ -283,11 +283,13 @@ defmodule FastestMCP.ClientTracingTest do
     spans = TraceTestHelper.drain_spans()
     parent = TraceTestHelper.find_span!(spans, "stdio-parent")
 
-    client_span =
-      Enum.find(spans, fn span ->
+    client_spans =
+      Enum.filter(spans, fn span ->
         TraceTestHelper.span_name(span) == "tools/call trace_context" and
           TraceTestHelper.span_kind(span) == :client
-      end) || flunk("missing stdio client span")
+      end)
+
+    assert [client_span] = client_spans
 
     assert TraceTestHelper.parent_span_id(client_span) == TraceTestHelper.span_id(parent)
     assert TraceTestHelper.span_attributes(client_span)["fastestmcp.transport"] == "stdio"
@@ -339,11 +341,13 @@ defmodule FastestMCP.ClientTracingTest do
 
     spans = TraceTestHelper.drain_spans()
 
-    client_span =
-      Enum.find(spans, fn span ->
+    client_spans =
+      Enum.filter(spans, fn span ->
         TraceTestHelper.span_name(span) == "tools/call ask" and
           TraceTestHelper.span_kind(span) == :client
-      end) || flunk("missing MRTR client span")
+      end)
+
+    assert [client_span] = client_spans
 
     callback_span = TraceTestHelper.find_span!(spans, "elicitation-callback")
     continuation_span = TraceTestHelper.find_span!(spans, "mcp.mrtr.continue tools/call")

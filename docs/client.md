@@ -68,6 +68,18 @@ the replacement session.
 defaults to 1 MiB. Use a smaller positive value when the connected server has a
 tighter response contract.
 
+`max_response_bytes:` bounds one complete MCP response across HTTP, SSE, stdio,
+and in-process transports and defaults to 16 MiB. The same ceiling applies when
+`tools/call` is transparently completed through `tasks/result`; an oversized
+response fails without retaining its payload. Set this on the client connection
+when the embedding host has a tighter durable-result limit.
+
+Oversize errors include `details.terminal_response_observed`. It is `true` only
+when the client observed a complete response frame for the in-flight request;
+crossing the limit before the HTTP stream, SSE event, or stdio frame completed
+leaves it `false`. Effectful hosts should preserve that distinction instead of
+assuming an incomplete response is safe to replay.
+
 ## OTP Supervision and Readiness
 
 Production clients can be ordinary supervised workers. `start_link/1` does not
@@ -149,8 +161,42 @@ FastestMCP.Client.connect!(stdio_target, stdio_restart: false)
 `stdio_restart: true` selects the bounded defaults. Legacy child exits and an
 explicit `FastestMCP.Client.disconnect/1` remain terminal.
 
-`env:` is the explicit environment for the child process. FastestMCP does not
-send credentials in protocol metadata by default. The old non-standard
+Hosts that need descendant-safe lifecycle control may supply a process-group
+launcher. FastestMCP appends the original stdio executable and argv after the
+host-owned launcher arguments, assigns a monotonically increasing launch
+generation, and terminates the complete old process group before opening a
+replacement generation:
+
+```elixir
+FastestMCP.Client.connect!(stdio_target,
+  stdio_process_group: [
+    launcher: "/absolute/path/to/process-group-launcher",
+    launcher_args: ["host", "owned", "identity", "arguments"]
+  ]
+)
+```
+
+The launcher contract is strict: its own OS pid must become the process-group
+id before it execs the appended target. A failed or stale-generation shutdown
+never opens a replacement process. The library does not infer this guarantee
+from an arbitrary shell wrapper.
+
+`FastestMCP.Client.disconnect_with_evidence/1` returns `:ok` only after the
+current transport proves cleanup. `disconnect/1` uses the same boundary. An
+unproven process-group shutdown returns `{:error, reason}` and retains the
+client's generation handle so the owning host can reconcile or try cleanup
+again instead of silently losing the descendant identity.
+
+When supervised, `FastestMCP.Client.child_spec/1` accepts
+`restart: :permanent | :transient | :temporary` (default `:permanent`). Hosts
+that persist their own server generation and recovery state should normally
+select `:temporary` and decide when to admit a fresh client themselves.
+
+When `env:` is omitted, the child inherits the caller environment for backward
+compatibility. When `env:` is supplied, it is a complete replacement: an empty
+map creates an empty child environment and a nonempty map exposes only those
+entries. Include `PATH` explicitly when the executable or its launcher needs
+it. FastestMCP does not send credentials in protocol metadata by default. The old non-standard
 `_meta.fastestmcp.auth` bridge is deprecated and is emitted only when
 `legacy_stdio_auth_metadata: true` is set for a controlled legacy peer. Prefer
 child environment or another host-owned stdio credential channel.
@@ -193,6 +239,7 @@ normal server authentication. HTTP and process-launch options are rejected:
 `oauth:`, `headers:`, `authorization:`, `access_token:`, `session_id:`,
 `session_stream:`, SSE options, `env:`, `legacy_stdio_auth_metadata:`, and
 `stdio_restart:`.
+The same restriction applies to `stdio_process_group:`.
 
 ## Protected Servers
 
@@ -277,6 +324,9 @@ The client mirrors the main MCP surfaces:
 - `FastestMCP.Client.list_all_tools/2`
 - `FastestMCP.Client.call_tool/4`
 - `FastestMCP.Client.call_tool_result/4`
+- `FastestMCP.Client.start_tool_result/4`
+- `FastestMCP.Client.await_tool_result/2`
+- `FastestMCP.Client.cancel_tool_result/2`
 - `FastestMCP.Client.call_tool_task/4`
 - `FastestMCP.Client.list_resources/2`
 - `FastestMCP.Client.list_all_resources/2`
@@ -312,6 +362,40 @@ existing exception contract. Explicit task-handle options belong to
 `call_tool_task/4`; a server-created modern task is transparently driven to its
 terminal tool result.
 
+Use a phase-covering tool-result handle when the caller may need to cancel while
+the peer is deciding whether `tools/call` will finish directly or become a
+server-owned task:
+
+```elixir
+request =
+  FastestMCP.Client.start_tool_result(
+    client,
+    "slow_report",
+    %{"id" => 42}
+  )
+
+# The same handle remains valid before and after a negotiated task transition.
+:ok = FastestMCP.Client.cancel_tool_result(request, "caller no longer needs it")
+
+# Or wait for the stable terminal result.
+result = FastestMCP.Client.await_tool_result(request, 30_000)
+```
+
+`call_tool_result/4` uses this same path and waits indefinitely. A
+`FastestMCP.Client.ToolResultRequest` is owned by the process that created it and
+must be awaited by that process. If the owner exits, or if `await_tool_result/2`
+times out, FastestMCP requests cancellation and does not leave the coordinator
+detached. An explicit cancellation request is asynchronous: it returns `:ok`
+after signalling the coordinator, while the subsequent await preserves the
+normal typed cancellation, transport, protocol, MRTR, and task error contract.
+
+On an ordinary request, cancellation sends `notifications/cancelled`. On a
+modern MCP `2026-07-28` connection where both peers negotiated the Tasks
+extension, the coordinator also covers the race in which the initial response
+publishes a remote task and cancellation must continue through `tasks/cancel`.
+Legacy connections and modern connections without negotiated Tasks cancel only
+the initial request; they never wait for a task transition that cannot occur.
+
 On a legacy `2025-11-25` connection, use
 `FastestMCP.Client.set_log_level/3` to send `logging/setLevel` after the server
 advertises logging. The method does not exist in `2026-07-28`. Modern logging
@@ -325,7 +409,10 @@ FastestMCP.Client.call_tool(client, "report", %{},
 
 ## Asynchronous Requests and Cancellation
 
-Every synchronous helper uses the same tracked request engine exposed by
+Use `start_tool_result/4` for cancellable terminal tool calls that may cross the
+ordinary-request-to-remote-task boundary. For raw MCP methods and applications
+that intentionally manage the protocol phases themselves, the lower-level
+tracked request engine remains available through
 `FastestMCP.Client.request_async/4`:
 
 ```elixir
@@ -339,12 +426,14 @@ request =
 result = FastestMCP.Client.Request.await(request, 10_000)
 ```
 
-Cancel explicitly with `FastestMCP.Client.Request.cancel/2`. An explicit
+Cancel a low-level request explicitly with
+`FastestMCP.Client.Request.cancel/2`. An explicit
 cancel, an await timeout, or termination of the owning caller sends
 `notifications/cancelled` for an active ordinary request and ignores a late
 response. Task-augmented operations use `FastestMCP.Client.Task.cancel/2`,
-which sends `tasks/cancel`; the two cancellation mechanisms are not
-interchangeable.
+which sends `tasks/cancel`; these two low-level handles are not interchangeable.
+The phase-covering `ToolResultRequest` described above is the supported bridge
+when one terminal tool call may move between them.
 
 Closing a modern HTTP request's SSE response also cancels the corresponding
 server worker. Closing a legacy session GET does not cancel detached work;
