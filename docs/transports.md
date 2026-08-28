@@ -255,6 +255,13 @@ active `subscriptions/listen` handles are reissued with fresh ids. Configure
 `Client.connect/2`. A legacy child exit or explicit disconnect remains
 terminal.
 
+For a host-provided process-group launcher, pass
+`stdio_process_group: [launcher:, launcher_args:]`. The launcher arguments are
+followed by the original stdio executable and argv. The launcher must make its
+own pid the process-group id before exec. FastestMCP generation-fences
+shutdown, proves the old group terminal with bounded TERM/KILL escalation, and
+will not open a replacement generation when cleanup is unproven.
+
 The transport gives handler and callback workers an stderr-backed group leader
 so ordinary `IO.puts/1`, Logger output, startup messages, and malformed-input
 diagnostics cannot contaminate the wire. Startup fails with an actionable error

@@ -163,7 +163,7 @@ defmodule FastestMCP.SSEDecoderTest do
     assert {:error, error} = SSEDecoder.feed(decoder, "data: 123")
     assert error.code == :bad_request
     assert error.message == "SSE event exceeds configured size limit"
-    assert error.details == %{max_event_bytes: 8}
+    assert error.details == %{max_event_bytes: 8, frame_complete: false}
   end
 
   test "rejects an oversized complete event even when the delimiter is present" do
@@ -172,7 +172,37 @@ defmodule FastestMCP.SSEDecoderTest do
     assert {:error, error} = SSEDecoder.feed(decoder, "data: {}\n\n")
     assert error.code == :bad_request
     assert error.message == "SSE event exceeds configured size limit"
-    assert error.details == %{max_event_bytes: 7}
+    assert error.details == %{max_event_bytes: 7, frame_complete: true}
+  end
+
+  test "retains only a completed oversized JSON-RPC response id as terminal evidence" do
+    decoder = SSEDecoder.new(max_event_bytes: 32)
+
+    response =
+      "data: " <>
+        JSON.encode!(%{
+          "jsonrpc" => "2.0",
+          "id" => "request-1",
+          "result" => %{"content" => String.duplicate("x", 64)}
+        }) <>
+        "\n\n"
+
+    assert {:error, response_error} = SSEDecoder.feed(decoder, response)
+    assert response_error.details.frame_complete == true
+    assert response_error.details.response_id == "request-1"
+
+    notification =
+      "data: " <>
+        JSON.encode!(%{
+          "jsonrpc" => "2.0",
+          "method" => "notifications/progress",
+          "params" => %{"value" => String.duplicate("x", 64)}
+        }) <>
+        "\n\n"
+
+    assert {:error, notification_error} = SSEDecoder.feed(decoder, notification)
+    assert notification_error.details.frame_complete == true
+    refute Map.has_key?(notification_error.details, :response_id)
   end
 
   test "reports malformed JSON data" do
@@ -231,7 +261,10 @@ defmodule FastestMCP.TestSupport.PrimedSSEPlug do
           "jsonrpc" => "2.0",
           "id" => request["id"],
           "result" => %{
-            "tools" => [%{"name" => "echo", "inputSchema" => %{"type" => "object"}}]
+            "tools" => [
+              %{"name" => "echo", "inputSchema" => %{"type" => "object"}},
+              %{"name" => "large", "inputSchema" => %{"type" => "object"}}
+            ]
           }
         }
 
@@ -240,11 +273,16 @@ defmodule FastestMCP.TestSupport.PrimedSSEPlug do
         |> send_resp(200, JSON.encode!(payload))
 
       "tools/call" ->
+        text =
+          if get_in(request, ["params", "name"]) == "large",
+            do: String.duplicate("x", 2_048),
+            else: "primed"
+
         payload = %{
           "jsonrpc" => "2.0",
           "id" => request["id"],
           "result" => %{
-            "content" => [%{"type" => "text", "text" => "primed"}],
+            "content" => [%{"type" => "text", "text" => text}],
             "structuredContent" => %{"primed" => true}
           }
         }
@@ -307,7 +345,7 @@ defmodule FastestMCP.SSEClientCleanupTest do
       Client.connect!("http://127.0.0.1:#{port}/mcp",
         protocol_version: "2025-11-25",
         timeout_ms: 5_000,
-        max_sse_event_bytes: 512
+        max_response_bytes: 512
       )
 
     on_exit(fn ->
@@ -320,7 +358,8 @@ defmodule FastestMCP.SSEClientCleanupTest do
       end
 
     assert bounded_error.code == :bad_request
-    assert bounded_error.message == "streamed JSON response exceeds configured size limit"
+    assert bounded_error.message == "MCP response exceeds configured size limit"
+    assert bounded_error.details.terminal_response_observed == false
     assert :ok = Client.disconnect(bounded_client)
 
     started_at = System.monotonic_time(:millisecond)
@@ -345,5 +384,25 @@ defmodule FastestMCP.SSEClientCleanupTest do
 
     assert %{"structuredContent" => %{"primed" => true}} =
              Client.call_tool(client, "echo", %{})
+
+    bounded_client =
+      Client.connect!("http://127.0.0.1:#{port}/mcp",
+        protocol_version: "2025-11-25",
+        max_response_bytes: 512
+      )
+
+    on_exit(fn ->
+      if Client.connected?(bounded_client), do: Client.disconnect(bounded_client)
+    end)
+
+    error =
+      assert_raise FastestMCP.Error, fn ->
+        Client.call_tool_result(bounded_client, "large", %{})
+      end
+
+    assert error.code == :bad_request
+    assert error.message == "SSE event exceeds configured size limit"
+    assert error.details.frame_complete == true
+    assert error.details.terminal_response_observed == true
   end
 end

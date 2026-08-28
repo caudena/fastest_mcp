@@ -6,7 +6,7 @@ defmodule FastestMCP.Client.Transport do
   @callback open(state(), pid(), keyword()) :: {:ok, state()} | {:error, term()}
   @callback connected?(state()) :: boolean()
   @callback send_envelope(state(), map()) :: :ok | {:error, term()}
-  @callback close(state()) :: :ok
+  @callback close(state()) :: :ok | {:error, term()}
 
   @spec open(state(), pid(), keyword()) :: {:ok, state()} | {:error, term()}
   def open(%{adapter: adapter} = transport, owner, opts \\ []) do
@@ -21,6 +21,6 @@ defmodule FastestMCP.Client.Transport do
     adapter.send_envelope(transport, envelope)
   end
 
-  @spec close(state()) :: :ok
+  @spec close(state()) :: :ok | {:error, term()}
   def close(%{adapter: adapter} = transport), do: adapter.close(transport)
 end

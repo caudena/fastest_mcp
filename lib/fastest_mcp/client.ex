@@ -71,6 +71,7 @@ defmodule FastestMCP.Client do
   alias FastestMCP.Client.Request, as: ClientRequest
   alias FastestMCP.Client.ResponseCache
   alias FastestMCP.Client.Task, as: RemoteTask
+  alias FastestMCP.Client.ToolResultRequest
   alias FastestMCP.Client.ToolCatalog
   alias FastestMCP.Client.ToolResult, as: ClientToolResult
   alias FastestMCP.Client.Transport, as: ClientTransport
@@ -112,6 +113,8 @@ defmodule FastestMCP.Client do
   @default_sse_retry_ms 1_000
   @default_sse_max_retry_ms 30_000
   @default_sse_max_reconnect_attempts 3
+  @default_max_response_bytes 16 * 1_024 * 1_024
+  @max_terminal_response_probe_bytes 16 * 1_024 * 1_024
   @default_stdio_restart_retry_ms 1_000
   @default_stdio_restart_max_retry_ms 30_000
   @default_stdio_restart_max_attempts 3
@@ -144,16 +147,19 @@ defmodule FastestMCP.Client do
     raise ArgumentError, "client start options must be a keyword list, got: #{inspect(other)}"
   end
 
-  @doc "Returns a permanent worker specification for a supervised MCP client."
+  @doc "Returns a worker specification for a supervised MCP client."
   def child_spec(opts) when is_list(opts) do
     unless Keyword.keyword?(opts) do
       raise ArgumentError, "client child options must be a keyword list"
     end
 
+    restart = normalize_child_restart!(Keyword.get(opts, :restart, :permanent))
+    start_opts = opts |> Keyword.delete(:id) |> Keyword.delete(:restart)
+
     %{
       id: Keyword.get(opts, :id, Keyword.get(opts, :name, __MODULE__)),
-      start: {__MODULE__, :start_link, [Keyword.delete(opts, :id)]},
-      restart: :permanent,
+      start: {__MODULE__, :start_link, [start_opts]},
+      restart: restart,
       shutdown: 20_000,
       type: :worker
     }
@@ -161,6 +167,14 @@ defmodule FastestMCP.Client do
 
   def child_spec(other) do
     raise ArgumentError, "client child options must be a keyword list, got: #{inspect(other)}"
+  end
+
+  defp normalize_child_restart!(restart) when restart in [:permanent, :transient, :temporary],
+    do: restart
+
+  defp normalize_child_restart!(restart) do
+    raise ArgumentError,
+          "client child restart must be :permanent, :transient, or :temporary, got: #{inspect(restart)}"
   end
 
   @doc "Connects a client to the given transport target."
@@ -227,9 +241,13 @@ defmodule FastestMCP.Client do
   end
 
   @doc "Disconnects a client and releases its transport resources."
-  def disconnect(client_ref) do
+  def disconnect(client_ref), do: disconnect_with_evidence(client_ref)
+
+  @doc "Disconnects only after the transport proves its resources are released."
+  @spec disconnect_with_evidence(ref()) :: :ok | {:error, term()}
+  def disconnect_with_evidence(client_ref) do
     %__MODULE__{pid: pid} = pin_client!(client_ref)
-    GenServer.stop(pid, :normal)
+    GenServer.call(pid, :disconnect_with_evidence, 5_000)
   end
 
   @doc "Returns whether the client process is still alive."
@@ -493,13 +511,7 @@ defmodule FastestMCP.Client do
       when is_binary(method) and is_map(params) and is_list(opts) do
     %__MODULE__{pid: pid} = client = pin_client!(client_ref)
     timeout_ms = Keyword.get(opts, :timeout_ms, @default_timeout_ms)
-    target = client_trace_target(method, params)
-    trace = Telemetry.start_client_span(Telemetry.current_context(), method, target)
-
-    opts =
-      opts
-      |> Keyword.put(:__fastestmcp_trace_context, trace.context)
-      |> Keyword.put(:__fastestmcp_async_trace, trace)
+    {trace, opts} = prepare_async_request_trace(method, params, opts)
 
     try do
       case GenServer.call(
@@ -522,11 +534,11 @@ defmodule FastestMCP.Client do
       end
     rescue
       error ->
-        Telemetry.finish_client_span(trace, {:error, error})
+        finish_started_client_span(trace, {:error, error})
         reraise error, __STACKTRACE__
     catch
       kind, reason ->
-        Telemetry.finish_client_span(trace, {:error, {kind, reason}})
+        finish_started_client_span(trace, {:error, {kind, reason}})
         :erlang.raise(kind, reason, __STACKTRACE__)
     end
   end
@@ -653,30 +665,305 @@ defmodule FastestMCP.Client do
 
   @doc "Calls a tool and returns one stable, protocol-faithful terminal result."
   def call_tool_result(client_ref, name, arguments \\ %{}, opts \\ []) do
+    client_ref
+    |> start_tool_result(name, arguments, opts)
+    |> await_tool_result(:infinity)
+  end
+
+  @doc "Starts a terminal tool-result call and returns a phase-covering handle."
+  def start_tool_result(client_ref, name, arguments \\ %{}, opts \\ []) do
     client = pin_client!(client_ref)
     reject_tool_result_handle_option!(opts)
     name = to_string(name)
+    arguments = Map.new(arguments)
+    owner = self()
+    ref = make_ref()
+    trace_context = Telemetry.current_context()
 
-    Telemetry.with_client_span("tools/call", name, %{}, fn trace ->
-      traced_opts = trace_propagation_opts(opts, trace)
-      modern_protocol? = protocol_version(client) == "2026-07-28"
+    pid =
+      spawn(fn ->
+        tool_result_coordinator(owner, ref, client, name, arguments, opts, trace_context)
+      end)
 
-      raw_result =
-        case execute_tool_call(client, name, arguments, traced_opts, modern_protocol?) do
-          {:complete, %{} = result} ->
-            result
+    %ToolResultRequest{pid: pid, ref: ref, owner: owner}
+  end
 
-          {:task, %RemoteTask{} = task} ->
-            task_opts = transparent_task_opts(traced_opts)
-            remote_task_raw_result(client, task, task_opts)
+  @doc "Waits for a terminal tool-result handle."
+  def await_tool_result(request, timeout \\ :infinity)
+
+  def await_tool_result(%ToolResultRequest{owner: owner, ref: ref} = request, timeout)
+      when owner == self() and (timeout == :infinity or (is_integer(timeout) and timeout >= 0)) do
+    receive do
+      {:fastest_mcp_tool_result, ^ref, {:ok, result}} ->
+        result
+
+      {:fastest_mcp_tool_result, ^ref, {:error, {kind, reason, stacktrace}}} ->
+        :erlang.raise(kind, reason, stacktrace)
+    after
+      timeout ->
+        _ = cancel_tool_result(request, "await timed out")
+
+        raise Error,
+          code: :timeout,
+          message: "tools/call timed out",
+          details: %{timeout_ms: timeout}
+    end
+  end
+
+  def await_tool_result(%ToolResultRequest{}, _timeout) do
+    raise ArgumentError, "a tool-result request must be awaited by its owner process"
+  end
+
+  @doc "Requests cancellation across the initial request and remote-task phases."
+  def cancel_tool_result(%ToolResultRequest{pid: pid, ref: ref}, reason \\ nil)
+      when is_binary(reason) or is_nil(reason) do
+    send(pid, {:cancel_tool_result, ref, reason})
+    :ok
+  end
+
+  defp tool_result_coordinator(owner, ref, client, name, arguments, opts, trace_context) do
+    owner_monitor = Process.monitor(owner)
+    coordinator = self()
+
+    {worker, worker_monitor} =
+      spawn_monitor(fn ->
+        tool_result_worker(coordinator, ref, client, name, arguments, opts, trace_context)
+      end)
+
+    await_tool_result_worker(%{
+      owner: owner,
+      owner_monitor: owner_monitor,
+      ref: ref,
+      worker: worker,
+      worker_monitor: worker_monitor,
+      remote_task: nil,
+      request: nil,
+      task_capable: false,
+      cancel_requested: false,
+      cancel_reason: nil,
+      notify_owner_on_cancel: true
+    })
+  end
+
+  defp tool_result_worker(coordinator, ref, client, name, arguments, opts, trace_context) do
+    result =
+      try do
+        value =
+          Telemetry.with_client_span(trace_context, "tools/call", name, %{}, fn trace ->
+            traced_opts = trace_propagation_opts(opts, trace)
+            modern_protocol? = protocol_version(client) == "2026-07-28"
+
+            raw_result =
+              case execute_tool_call_cancellable(
+                     coordinator,
+                     ref,
+                     client,
+                     name,
+                     arguments,
+                     traced_opts,
+                     modern_protocol?
+                   ) do
+                {:complete, %{} = direct_result} ->
+                  direct_result
+
+                {:task, %RemoteTask{} = task} ->
+                  send(coordinator, {:fastest_mcp_remote_task, ref, task})
+
+                  receive do
+                    {:continue_tool_result, ^ref} ->
+                      remote_task_raw_result(client, task, transparent_task_opts(traced_opts))
+                  end
+              end
+
+            maybe_mark_tool_error(raw_result, trace, "tools/call")
+            ClientToolResult.from_raw(raw_result)
+          end)
+
+        {:ok, value}
+      catch
+        kind, reason -> {:error, {kind, reason, __STACKTRACE__}}
+      end
+
+    send(coordinator, {:fastest_mcp_tool_result_worker, ref, result})
+  end
+
+  defp await_tool_result_worker(state) do
+    receive do
+      {:fastest_mcp_tool_request_capability, ref, task_capable} when ref == state.ref ->
+        await_tool_result_worker(%{state | task_capable: task_capable})
+
+      {:fastest_mcp_client_request, ref, %ClientRequest{} = request} when ref == state.ref ->
+        next_state = %{
+          state
+          | request: request,
+            task_capable: state.task_capable or request.task_augmented
+        }
+
+        if state.cancel_requested do
+          request_tool_result_cancellation(
+            next_state,
+            state.cancel_reason,
+            state.notify_owner_on_cancel
+          )
+        else
+          await_tool_result_worker(next_state)
         end
 
-      maybe_mark_tool_error(raw_result, trace, "tools/call")
-      ClientToolResult.from_raw(raw_result)
-    end)
+      {:fastest_mcp_client_request_complete, ref, request_ref} when ref == state.ref ->
+        next_state =
+          case state.request do
+            %ClientRequest{ref: ^request_ref} -> %{state | request: nil}
+            _other -> state
+          end
+
+        await_tool_result_worker(next_state)
+
+      {:fastest_mcp_remote_task, ref, %RemoteTask{} = task} when ref == state.ref ->
+        next_state = %{state | remote_task: task, request: nil}
+
+        if state.cancel_requested do
+          cancel_remote_tool_result_task(next_state)
+        else
+          send(state.worker, {:continue_tool_result, state.ref})
+          await_tool_result_worker(next_state)
+        end
+
+      {:fastest_mcp_tool_result_worker, ref, result} when ref == state.ref ->
+        Process.demonitor(state.owner_monitor, [:flush])
+        Process.demonitor(state.worker_monitor, [:flush])
+        send(state.owner, {:fastest_mcp_tool_result, state.ref, result})
+        :ok
+
+      {:cancel_tool_result, ref, reason} when ref == state.ref ->
+        request_tool_result_cancellation(state, reason, true)
+
+      {:DOWN, monitor, :process, _pid, _reason} when monitor == state.owner_monitor ->
+        request_tool_result_cancellation(state, "owner exited", false)
+
+      {:DOWN, monitor, :process, _pid, reason} when monitor == state.worker_monitor ->
+        Process.demonitor(state.owner_monitor, [:flush])
+
+        send(
+          state.owner,
+          {:fastest_mcp_tool_result, state.ref,
+           {:error, {:exit, {:tool_result_worker_exited, reason}, []}}}
+        )
+
+        :ok
+    end
+  end
+
+  defp request_tool_result_cancellation(state, reason, notify_owner?) do
+    next_state = %{
+      state
+      | cancel_requested: true,
+        cancel_reason: reason,
+        notify_owner_on_cancel: notify_owner?
+    }
+
+    cond do
+      match?(%RemoteTask{}, next_state.remote_task) ->
+        cancel_remote_tool_result_task(next_state)
+
+      next_state.task_capable ->
+        # The request can complete as a server-owned task between the worker's
+        # completion notification and publication of the task handle. Wait for
+        # that ordered phase transition so the exact task can be cancelled.
+        await_tool_result_worker(next_state)
+
+      match?(%ClientRequest{}, next_state.request) ->
+        cancel_initial_tool_result_request(next_state)
+
+      true ->
+        await_tool_result_worker(next_state)
+    end
+  end
+
+  defp cancel_initial_tool_result_request(%{request: %ClientRequest{} = request} = state) do
+    try do
+      :ok = cancel(request, state.cancel_reason)
+      finish_tool_result_cancellation(state)
+    rescue
+      _error in Error ->
+        # A task-augmented response can complete immediately before this
+        # cancellation. Wait for the ordered phase notification so the remote
+        # task is cancelled rather than abandoned.
+        await_tool_result_worker(%{state | request: nil})
+    end
+  end
+
+  defp cancel_remote_tool_result_task(%{remote_task: %RemoteTask{} = task} = state) do
+    try do
+      _result = RemoteTask.cancel(task, timeout_ms: 5_000)
+      finish_tool_result_cancellation(state)
+    catch
+      kind, reason -> finish_tool_result_cancellation_failure(state, kind, reason, __STACKTRACE__)
+    end
+  end
+
+  defp finish_tool_result_cancellation(state) do
+    stop_tool_result_worker(state)
+
+    if state.notify_owner_on_cancel do
+      error = %Error{code: :cancelled, message: "tools/call was cancelled"}
+      send(state.owner, {:fastest_mcp_tool_result, state.ref, {:error, {:error, error, []}}})
+    end
+
+    :ok
+  end
+
+  defp finish_tool_result_cancellation_failure(state, kind, reason, stacktrace) do
+    stop_tool_result_worker(state)
+
+    if state.notify_owner_on_cancel do
+      send(
+        state.owner,
+        {:fastest_mcp_tool_result, state.ref, {:error, {kind, reason, stacktrace}}}
+      )
+    end
+
+    :ok
+  end
+
+  defp stop_tool_result_worker(state) do
+    Process.exit(state.worker, :kill)
+    Process.demonitor(state.worker_monitor, [:flush])
+    Process.demonitor(state.owner_monitor, [:flush])
   end
 
   defp execute_tool_call(client, name, arguments, opts, modern_protocol?) do
+    {descriptor, params, request_opts} =
+      prepare_tool_call_request(client, name, arguments, opts, modern_protocol?)
+
+    result = request_with_mrtr(client, "tools/call", params, request_opts)
+    classify_tool_call_result(client, descriptor, name, opts, modern_protocol?, result)
+  end
+
+  defp execute_tool_call_cancellable(
+         coordinator,
+         ref,
+         client,
+         name,
+         arguments,
+         opts,
+         modern_protocol?
+       ) do
+    {descriptor, params, request_opts} =
+      prepare_tool_call_request(client, name, arguments, opts, modern_protocol?)
+
+    send(
+      coordinator,
+      {:fastest_mcp_tool_request_capability, ref,
+       modern_protocol? and GenServer.call(client.pid, :tasks_negotiated?)}
+    )
+
+    result =
+      request_with_mrtr_async(coordinator, ref, client, "tools/call", params, request_opts)
+
+    classify_tool_call_result(client, descriptor, name, opts, modern_protocol?, result)
+  end
+
+  defp prepare_tool_call_request(client, name, arguments, opts, modern_protocol?) do
     name = to_string(name)
     arguments = Map.new(arguments)
     timeout_ms = Keyword.get(opts, :timeout_ms, @default_timeout_ms)
@@ -710,8 +997,10 @@ defmodule FastestMCP.Client do
         http_parameter_headers!(client, descriptor, arguments)
       )
 
-    result = request_with_mrtr(client, "tools/call", params, request_opts)
+    {descriptor, params, request_opts}
+  end
 
+  defp classify_tool_call_result(client, descriptor, name, opts, modern_protocol?, result) do
     case result do
       %{"task" => task} ->
         task =
@@ -1355,12 +1644,17 @@ defmodule FastestMCP.Client do
           callback_task_refs: %{},
           callback_result_waiters: %{},
           pending_stdio_buffer: "",
+          max_response_bytes:
+            validate_max_response_bytes!(
+              Keyword.get(opts, :max_response_bytes, @default_max_response_bytes)
+            ),
           pending_stdio_ref: nil,
           pending_stdio_refs: %{},
           stdio_restart: normalize_stdio_restart!(Keyword.get(opts, :stdio_restart, true)),
           stdio_restart_attempt: 0,
           stdio_restart_timer_ref: nil,
           stdio_restart_token: nil,
+          disconnecting?: false,
           sampling_handler: Keyword.get(opts, :sampling_handler),
           sampling_tools: normalize_sampling_tools(Keyword.get(opts, :sampling_tools, [])),
           sampling_context: Keyword.get(opts, :sampling_context),
@@ -1429,6 +1723,16 @@ defmodule FastestMCP.Client do
   @doc "Processes synchronous GenServer calls for the state owned by this module."
   def handle_call(:session_id, _from, state), do: {:reply, state.session_id, state}
 
+  def handle_call(:disconnect_with_evidence, _from, state) do
+    case retire_client_transport(state) do
+      {:ok, retired_state} ->
+        {:stop, :normal, :ok, retired_state}
+
+      {:error, reason, retained_state} ->
+        {:reply, {:error, reason}, %{retained_state | disconnecting?: true}}
+    end
+  end
+
   def handle_call(:initialize_result, _from, %{lifecycle_state: :initialized} = state),
     do: {:reply, state.initialize_result, state}
 
@@ -1444,6 +1748,9 @@ defmodule FastestMCP.Client do
     result = state.discovery_result || state.initialize_result || %{}
     {:reply, Map.get(result, "capabilities", %{}), state}
   end
+
+  def handle_call(:tasks_negotiated?, _from, state),
+    do: {:reply, server_supports_method?(state, "tasks/cancel"), state}
 
   def handle_call(:mrtr_snapshot, _from, state) do
     snapshot =
@@ -2490,8 +2797,7 @@ defmodule FastestMCP.Client do
   end
 
   def handle_info({port, {:data, data}}, %{transport: %{type: :stdio, port: port}} = state) do
-    state = %{state | pending_stdio_buffer: state.pending_stdio_buffer <> data}
-    {:noreply, drain_stdio_buffer(state)}
+    handle_connected_transport_data(state, data)
   end
 
   def handle_info(
@@ -2499,8 +2805,7 @@ defmodule FastestMCP.Client do
         %{transport: %{type: :in_process, coordinator: coordinator}} = state
       )
       when is_binary(data) do
-    state = %{state | pending_stdio_buffer: state.pending_stdio_buffer <> data}
-    {:noreply, drain_stdio_buffer(state)}
+    handle_connected_transport_data(state, data)
   end
 
   def handle_info(
@@ -2514,10 +2819,28 @@ defmodule FastestMCP.Client do
         details: %{status: status}
       }
 
-    if restartable_modern_stdio?(state) do
-      {:noreply, begin_stdio_restart(state, error)}
-    else
-      {:stop, :normal, fail_connected_transport_requests(state, error)}
+    case retire_stdio_transport(state) do
+      {:ok, retired_state} ->
+        if restartable_modern_stdio?(retired_state) do
+          {:noreply, begin_stdio_restart(retired_state, error)}
+        else
+          {:stop, :normal, fail_connected_transport_requests(retired_state, error)}
+        end
+
+      {:error, reason, retained_state} ->
+        cleanup_error = %Error{
+          code: :internal_error,
+          message: "stdio process cleanup could not prove termination",
+          details: %{status: status, reason: inspect(reason)}
+        }
+
+        retained_state = %{
+          retained_state
+          | lifecycle_state: :failed,
+            disconnecting?: true
+        }
+
+        {:noreply, fail_connected_transport_requests(retained_state, cleanup_error)}
     end
   end
 
@@ -2702,6 +3025,27 @@ defmodule FastestMCP.Client do
   defp put_trace_context(opts, context),
     do: Keyword.put(opts, :__fastestmcp_trace_context, context)
 
+  defp prepare_async_request_trace(method, params, opts) do
+    case Keyword.get(opts, :__fastestmcp_trace_mode, :span) do
+      :propagate_only ->
+        {nil, opts}
+
+      :span ->
+        target = client_trace_target(method, params)
+        trace = Telemetry.start_client_span(Telemetry.current_context(), method, target)
+
+        traced_opts =
+          opts
+          |> Keyword.put(:__fastestmcp_trace_context, trace.context)
+          |> Keyword.put(:__fastestmcp_async_trace, trace)
+
+        {trace, traced_opts}
+    end
+  end
+
+  defp finish_started_client_span(nil, _result), do: :ok
+  defp finish_started_client_span(trace, result), do: Telemetry.finish_client_span(trace, result)
+
   defp trace_propagation_opts(opts, trace) do
     opts
     |> put_client_trace(trace)
@@ -2842,6 +3186,104 @@ defmodule FastestMCP.Client do
       max_rounds,
       normalizer
     )
+  end
+
+  defp request_with_mrtr_async(coordinator, ref, client, method, params, opts) do
+    snapshot = GenServer.call(client.pid, :mrtr_snapshot)
+
+    max_rounds =
+      opts
+      |> Keyword.get(:max_mrtr_rounds, snapshot.max_mrtr_rounds)
+      |> normalize_positive_integer!(:max_mrtr_rounds)
+
+    deadline =
+      Keyword.get_lazy(opts, :deadline, fn ->
+        System.monotonic_time(:millisecond) +
+          normalize_positive_integer!(
+            Keyword.get(opts, :timeout_ms, @default_timeout_ms),
+            :timeout_ms
+          )
+      end)
+
+    do_request_with_mrtr_async(
+      coordinator,
+      ref,
+      client,
+      method,
+      params,
+      opts,
+      snapshot,
+      deadline,
+      0,
+      max_rounds
+    )
+  end
+
+  defp do_request_with_mrtr_async(
+         coordinator,
+         ref,
+         client,
+         method,
+         params,
+         opts,
+         snapshot,
+         deadline,
+         round,
+         max_rounds
+       ) do
+    timeout_ms = remaining_timeout!(deadline, method)
+    request_opts = Keyword.put(opts, :timeout_ms, timeout_ms)
+    request = request_async(client, method, params, request_opts)
+    send(coordinator, {:fastest_mcp_client_request, ref, request})
+
+    result =
+      try do
+        await(request, timeout_ms)
+      after
+        send(coordinator, {:fastest_mcp_client_request_complete, ref, request.ref})
+      end
+
+    case result do
+      %{"resultType" => "input_required"} when round < max_rounds ->
+        input_requests = Map.get(result, "inputRequests", %{})
+
+        responses =
+          if map_size(input_requests) == 0,
+            do: nil,
+            else: fulfill_input_requests(client, input_requests, snapshot, deadline)
+
+        retry_params = latest_mrtr_retry_params(params, result, responses)
+
+        with_internal_client_span(
+          "mcp.mrtr.continue",
+          method,
+          opts,
+          %{"mcp.mrtr.round" => round + 1},
+          fn continuation_opts ->
+            do_request_with_mrtr_async(
+              coordinator,
+              ref,
+              client,
+              method,
+              retry_params,
+              continuation_opts,
+              snapshot,
+              deadline,
+              round + 1,
+              max_rounds
+            )
+          end
+        )
+
+      %{"resultType" => "input_required"} ->
+        raise Error,
+          code: :overloaded,
+          message: "#{method} exceeded max_mrtr_rounds",
+          details: %{max_mrtr_rounds: max_rounds}
+
+      _complete ->
+        result
+    end
   end
 
   defp do_request_with_mrtr(
@@ -3424,7 +3866,9 @@ defmodule FastestMCP.Client do
 
   defp normalize_transport({:stdio, command, args}, opts)
        when is_binary(command) and is_list(args) do
-    with {:ok, env} <- normalize_stdio_env(Keyword.get(opts, :env)) do
+    with {:ok, env} <- normalize_stdio_env_option(Keyword.fetch(opts, :env)),
+         {:ok, process_group} <-
+           normalize_stdio_process_group(Keyword.get(opts, :stdio_process_group)) do
       {:ok,
        %{
          type: :stdio,
@@ -3432,6 +3876,10 @@ defmodule FastestMCP.Client do
          command: command,
          args: Enum.map(args, &to_string/1),
          env: env,
+         process_group: process_group,
+         stdio_process: nil,
+         generation: 0,
+         port: nil,
          session_id: nil
        }}
     end
@@ -3530,7 +3978,8 @@ defmodule FastestMCP.Client do
         :max_sse_event_bytes,
         :env,
         :legacy_stdio_auth_metadata,
-        :stdio_restart
+        :stdio_restart,
+        :stdio_process_group
       ]
       |> Enum.filter(&Keyword.has_key?(opts, &1))
 
@@ -3546,41 +3995,140 @@ defmodule FastestMCP.Client do
     end
   end
 
-  defp normalize_stdio_env(nil), do: {:ok, []}
+  defp normalize_stdio_env_option(:error), do: {:ok, :inherit}
+  defp normalize_stdio_env_option({:ok, env}), do: normalize_stdio_env(env)
+
+  defp normalize_stdio_process_group(nil), do: {:ok, nil}
+
+  defp normalize_stdio_process_group(opts) when is_list(opts) do
+    if Keyword.keyword?(opts) do
+      allowed = [:launcher, :launcher_args]
+      unsupported = Keyword.keys(opts) -- allowed
+
+      with [] <- unsupported,
+           launcher when is_binary(launcher) <- Keyword.get(opts, :launcher),
+           true <- Path.type(launcher) == :absolute and not String.contains?(launcher, <<0>>),
+           launcher_args when is_list(launcher_args) <- Keyword.get(opts, :launcher_args, []),
+           true <- length(launcher_args) <= 64,
+           {:ok, launcher_args} <- normalize_stdio_launcher_args(launcher_args),
+           true <-
+             Enum.reduce(launcher_args, byte_size(launcher), &(byte_size(&1) + &2)) <= 16_384 do
+        {:ok, %{launcher: launcher, launcher_args: launcher_args}}
+      else
+        _other -> invalid_stdio_process_group()
+      end
+    else
+      invalid_stdio_process_group()
+    end
+  end
+
+  defp normalize_stdio_process_group(_opts) do
+    {:error,
+     %Error{
+       code: :invalid_params,
+       message: "stdio_process_group must be a keyword list"
+     }}
+  end
+
+  defp invalid_stdio_process_group do
+    {:error,
+     %Error{
+       code: :invalid_params,
+       message: "stdio_process_group requires an absolute launcher and bounded launcher_args"
+     }}
+  end
+
+  defp normalize_stdio_launcher_args(args) do
+    Enum.reduce_while(args, {:ok, []}, fn
+      value, {:ok, values} when is_binary(value) or is_atom(value) or is_integer(value) ->
+        value = to_string(value)
+
+        if byte_size(value) <= 4_096 and not String.contains?(value, <<0>>),
+          do: {:cont, {:ok, [value | values]}},
+          else: {:halt, :error}
+
+      _value, _acc ->
+        {:halt, :error}
+    end)
+    |> case do
+      {:ok, values} -> {:ok, Enum.reverse(values)}
+      :error -> :error
+    end
+  end
 
   defp normalize_stdio_env(env) when is_map(env),
     do: env |> Map.to_list() |> normalize_stdio_env()
 
   defp normalize_stdio_env(env) when is_list(env) do
-    if Enum.all?(env, fn
-         {name, value}
-         when (is_binary(name) or is_atom(name)) and
-                (is_binary(value) or is_integer(value) or is_atom(value)) ->
-           true
+    normalized =
+      Enum.map(env, fn
+        {name, value}
+        when (is_binary(name) or is_atom(name)) and
+               (is_binary(value) or is_integer(value) or
+                  (is_atom(value) and value not in [false, nil])) ->
+          {to_string(name), to_string(value)}
 
-         _other ->
-           false
-       end) do
-      {:ok,
-       Enum.map(env, fn {name, value} ->
-         {name |> to_string() |> String.to_charlist(),
-          value |> to_string() |> String.to_charlist()}
-       end)}
-    else
-      {:error,
-       %Error{
-         code: :invalid_params,
-         message: "stdio env must be a map or keyword list of scalar values"
-       }}
+        _other ->
+          :invalid
+      end)
+
+    cond do
+      :invalid in normalized ->
+        invalid_stdio_env()
+
+      duplicate_stdio_env_names?(normalized) ->
+        {:error,
+         %Error{
+           code: :invalid_params,
+           message: "stdio env contains duplicate variable names"
+         }}
+
+      not Enum.all?(normalized, &valid_stdio_env_entry?/1) ->
+        invalid_stdio_env()
+
+      stdio_env_bounds_exceeded?(normalized) ->
+        {:error,
+         %Error{
+           code: :invalid_params,
+           message: "stdio env exceeds the bounded environment size"
+         }}
+
+      true ->
+        {:ok, {:replace, Enum.sort_by(normalized, &elem(&1, 0))}}
     end
   end
 
-  defp normalize_stdio_env(_env) do
+  defp normalize_stdio_env(_env), do: invalid_stdio_env()
+
+  defp invalid_stdio_env do
     {:error,
      %Error{
        code: :invalid_params,
        message: "stdio env must be a map or keyword list of scalar values"
      }}
+  end
+
+  defp valid_stdio_env_entry?({name, value}) do
+    byte_size(name) in 1..128 and
+      Regex.match?(~r/\A[A-Za-z_][A-Za-z0-9_]*\z/, name) and
+      not String.contains?(value, <<0>>)
+  end
+
+  defp stdio_env_bounds_exceeded?(entries) do
+    length(entries) > 512 or
+      Enum.any?(entries, fn {_name, value} -> byte_size(value) > 16_384 end) or
+      environment_bytes(entries) > 65_536
+  end
+
+  defp environment_bytes(entries) do
+    Enum.reduce(entries, 0, fn {name, value}, total ->
+      total + byte_size(name) + byte_size(value) + 2
+    end)
+  end
+
+  defp duplicate_stdio_env_names?(entries) do
+    names = Enum.map(entries, &elem(&1, 0))
+    length(names) != MapSet.size(MapSet.new(names))
   end
 
   defp open_client_transport(state) do
@@ -3602,9 +4150,19 @@ defmodule FastestMCP.Client do
   end
 
   defp restartable_modern_stdio?(state) do
-    state.lifecycle_state == :initialized and
+    not state.disconnecting? and state.lifecycle_state == :initialized and
       state.selected_protocol_version == "2026-07-28" and
       state.stdio_restart.max_attempts > state.stdio_restart_attempt
+  end
+
+  defp retire_client_transport(%{transport: %{type: :stdio}} = state),
+    do: retire_stdio_transport(state)
+
+  defp retire_client_transport(state) do
+    case ClientTransport.close(state.transport) do
+      :ok -> {:ok, state}
+      {:error, reason} -> {:error, reason, state}
+    end
   end
 
   defp begin_stdio_restart(state, error) do
@@ -3615,6 +4173,18 @@ defmodule FastestMCP.Client do
     |> case do
       {:ok, next_state} -> next_state
       {:error, next_state} -> next_state
+    end
+  end
+
+  defp retire_stdio_transport(%{transport: %{type: :stdio} = transport} = state) do
+    retired_transport =
+      transport
+      |> Map.put(:port, nil)
+      |> Map.put(:stdio_process, nil)
+
+    case ClientTransport.close(transport) do
+      :ok -> {:ok, %{state | transport: retired_transport}}
+      {:error, reason} -> {:error, reason, state}
     end
   end
 
@@ -3691,7 +4261,10 @@ defmodule FastestMCP.Client do
 
     %{
       state
-      | transport: Map.put(state.transport, :port, nil),
+      | transport:
+          state.transport
+          |> Map.put(:port, nil)
+          |> Map.put(:stdio_process, nil),
         in_flight: subscriptions,
         worker_refs: %{},
         request_owner_refs: request_owner_refs,
@@ -3768,8 +4341,13 @@ defmodule FastestMCP.Client do
 
     transport =
       case state.transport.type do
-        :stdio -> Map.put(state.transport, :port, nil)
-        :in_process -> Map.put(state.transport, :coordinator, nil)
+        # Preserve a live stdio handle until terminate/2 so fatal decoder or
+        # protocol failures still shut down the complete process group.
+        :stdio ->
+          state.transport
+
+        :in_process ->
+          Map.put(state.transport, :coordinator, nil)
       end
 
     %{
@@ -4653,13 +5231,6 @@ defmodule FastestMCP.Client do
            message: "the initialize request cannot be cancelled"
          }}
 
-      %{task_augmented: true} ->
-        {:error,
-         %Error{
-           code: :bad_request,
-           message: "task-augmented requests must be cancelled with tasks/cancel"
-         }}
-
       entry ->
         _ = maybe_send_outbound_cancellation(state, entry, reason)
         {:ok, locally_cancel_outbound_request(state, ref, entry)}
@@ -4694,7 +5265,6 @@ defmodule FastestMCP.Client do
   end
 
   defp maybe_send_outbound_cancellation(_state, %{method: "initialize"}, _reason), do: :ok
-  defp maybe_send_outbound_cancellation(_state, %{task_augmented: true}, _reason), do: :ok
 
   defp maybe_send_outbound_cancellation(
          %{transport: %{type: :stdio, port: port}},
@@ -6043,7 +6613,7 @@ defmodule FastestMCP.Client do
   end
 
   defp stream_http_request(request, method, timeout_ms, state, opts) do
-    decoder = SSEDecoder.new(max_event_bytes: state.max_sse_event_bytes)
+    decoder = SSEDecoder.new(max_event_bytes: response_event_limit(state))
 
     opts =
       opts
@@ -6107,7 +6677,7 @@ defmodule FastestMCP.Client do
         end
 
       {:http, {^request_ref, :stream, chunk}} ->
-        case feed_streamed_response(response_body, chunk, state.max_sse_event_bytes) do
+        case feed_streamed_response(response_body, chunk, state.max_response_bytes) do
           {:ok, {:sse, next_decoder}, events} ->
             case handle_stream_events(events, original_id, method, state, opts) do
               {:ok, result} ->
@@ -6129,20 +6699,20 @@ defmodule FastestMCP.Client do
                 {:error, error}
             end
 
-          {:ok, {:json, body}, []} ->
+          {:ok, {:json, chunks, bytes}, []} ->
             receive_stream_events(
               request_ref,
               original_id,
               method,
               timeout_ms,
-              {:json, body},
+              {:json, chunks, bytes},
               headers,
               state,
               opts
             )
 
           {:error, %Error{} = error} ->
-            {:error, error}
+            {:error, annotate_sse_terminal_response(error, original_id)}
         end
 
       {:http, {^request_ref, :stream_end, _response_headers}} ->
@@ -6158,7 +6728,8 @@ defmodule FastestMCP.Client do
 
       {:http, {^request_ref, {{_version, status, _reason}, response_headers, body}}}
       when status in 200..299 ->
-        with :ok <- validate_json_response_content_type(response_headers),
+        with :ok <- validate_complete_response_size(body, state.max_response_bytes, method),
+             :ok <- validate_json_response_content_type(response_headers),
              {:ok, result} <-
                decode_jsonrpc_response(
                  body,
@@ -6173,12 +6744,18 @@ defmodule FastestMCP.Client do
       {:http, {^request_ref, {{_version, status, reason}, response_headers, body}}} ->
         headers = normalize_httpc_headers(response_headers)
 
-        {:http_error, status, headers, body,
-         decode_http_error(
-           body,
-           status,
-           "HTTP client request failed with HTTP #{status} #{reason}"
-         )}
+        case validate_complete_response_size(body, state.max_response_bytes, method, status) do
+          :ok ->
+            {:http_error, status, headers, body,
+             decode_http_error(
+               body,
+               status,
+               "HTTP client request failed with HTTP #{status} #{reason}"
+             )}
+
+          {:error, %Error{} = error} ->
+            {:http_error, status, headers, nil, error}
+        end
 
       {:http, {^request_ref, {:error, reason}}} ->
         resume_or_fail_streamed_response(
@@ -6211,7 +6788,7 @@ defmodule FastestMCP.Client do
     case singleton_response_header(headers, "content-type") do
       {:ok, content_type} ->
         cond do
-          MIME.content_type?(content_type, "application/json") -> {:ok, {:json, ""}}
+          MIME.content_type?(content_type, "application/json") -> {:ok, {:json, [], 0}}
           MIME.content_type?(content_type, "text/event-stream") -> {:ok, {:sse, decoder}}
           true -> {:error, invalid_http_response_media_type(content_type)}
         end
@@ -6231,23 +6808,69 @@ defmodule FastestMCP.Client do
     end
   end
 
-  defp feed_streamed_response({:json, body}, chunk, max_bytes) do
-    body = body <> IO.iodata_to_binary(chunk)
+  defp feed_streamed_response({:json, chunks, bytes}, chunk, max_bytes) do
+    chunk = IO.iodata_to_binary(chunk)
+    next_bytes = bytes + byte_size(chunk)
 
-    if byte_size(body) <= max_bytes do
-      {:ok, {:json, body}, []}
+    if next_bytes <= max_bytes do
+      {:ok, {:json, [chunk | chunks], next_bytes}, []}
     else
-      {:error,
-       %Error{
-         code: :bad_request,
-         message: "streamed JSON response exceeds configured size limit",
-         details: %{max_event_bytes: max_bytes}
-       }}
+      {:error, response_too_large_error("HTTP", next_bytes, max_bytes)}
     end
   end
 
+  defp response_event_limit(state) do
+    min(state.max_sse_event_bytes, state.max_response_bytes)
+  end
+
+  defp validate_complete_response_size(body, max_bytes, method, status \\ nil) do
+    bytes = IO.iodata_length(body)
+
+    if bytes <= max_bytes do
+      :ok
+    else
+      {:error, response_too_large_error(method, bytes, max_bytes, status, true)}
+    end
+  end
+
+  defp response_too_large_error(
+         method,
+         observed_bytes,
+         max_bytes,
+         status \\ nil,
+         terminal_response_observed \\ false
+       ) do
+    details = %{
+      method: method,
+      observed_bytes: observed_bytes,
+      max_response_bytes: max_bytes,
+      terminal_response_observed: terminal_response_observed
+    }
+
+    details = if is_integer(status), do: Map.put(details, :http_status, status), else: details
+
+    %Error{
+      code: :bad_request,
+      message: "MCP response exceeds configured size limit",
+      details: details
+    }
+  end
+
+  defp annotate_sse_terminal_response(
+         %Error{message: "SSE event exceeds configured size limit", details: details} = error,
+         original_id
+       )
+       when is_map(details) do
+    terminal? =
+      details[:frame_complete] == true and Map.fetch(details, :response_id) == {:ok, original_id}
+
+    %{error | details: Map.put(details, :terminal_response_observed, terminal?)}
+  end
+
+  defp annotate_sse_terminal_response(%Error{} = error, _original_id), do: error
+
   defp finish_streamed_response(
-         {:json, body},
+         {:json, chunks, _bytes},
          headers,
          original_id,
          method,
@@ -6255,6 +6878,8 @@ defmodule FastestMCP.Client do
          _state,
          opts
        ) do
+    body = chunks |> Enum.reverse() |> IO.iodata_to_binary()
+
     case decode_jsonrpc_response(
            body,
            original_id,
@@ -8687,9 +9312,35 @@ defmodule FastestMCP.Client do
     end
   end
 
+  defp handle_connected_transport_data(state, data) do
+    state = %{state | pending_stdio_buffer: state.pending_stdio_buffer <> data}
+
+    case drain_stdio_buffer(state) do
+      {:ok, next_state} ->
+        {:noreply, next_state}
+
+      {:error, %Error{} = error, next_state} ->
+        {:stop, :normal, fail_connected_transport_requests(next_state, error)}
+    end
+  end
+
   defp drain_stdio_buffer(%{pending_stdio_buffer: buffer} = state) do
-    case String.split(buffer, "\n", parts: 2) do
-      [line, rest] ->
+    case :binary.match(buffer, "\n") do
+      {line_bytes, 1} when line_bytes > state.max_response_bytes ->
+        line = binary_part(buffer, 0, line_bytes)
+
+        {:error,
+         response_too_large_error(
+           "stdio",
+           line_bytes,
+           state.max_response_bytes,
+           nil,
+           stdio_terminal_response?(state, line)
+         ), %{state | pending_stdio_buffer: ""}}
+
+      {line_bytes, 1} ->
+        <<line::binary-size(^line_bytes), "\n", rest::binary>> = buffer
+
         next_state =
           if String.trim(line) == "" do
             %{state | pending_stdio_buffer: rest}
@@ -8701,10 +9352,31 @@ defmodule FastestMCP.Client do
 
         drain_stdio_buffer(next_state)
 
-      [_single] ->
-        state
+      :nomatch when byte_size(buffer) > state.max_response_bytes ->
+        {:error,
+         response_too_large_error(
+           "stdio",
+           byte_size(buffer),
+           state.max_response_bytes
+         ), %{state | pending_stdio_buffer: ""}}
+
+      :nomatch ->
+        {:ok, state}
     end
   end
+
+  defp stdio_terminal_response?(state, line)
+       when byte_size(line) <= @max_terminal_response_probe_bytes do
+    with {:ok, %{"jsonrpc" => "2.0", "id" => id} = payload} <- JSON.decode(line),
+         true <- Map.has_key?(payload, "result") or Map.has_key?(payload, "error"),
+         {_ref, _entry} <- find_outbound_request_by_id(state, id) do
+      true
+    else
+      _other -> false
+    end
+  end
+
+  defp stdio_terminal_response?(_state, _line), do: false
 
   defp handle_stdio_line(state, line) do
     case JSON.decode(line) do
@@ -9228,6 +9900,12 @@ defmodule FastestMCP.Client do
 
   defp validate_max_sse_event_bytes!(value) do
     raise ArgumentError, "max_sse_event_bytes must be a positive integer, got #{inspect(value)}"
+  end
+
+  defp validate_max_response_bytes!(value) when is_integer(value) and value > 0, do: value
+
+  defp validate_max_response_bytes!(value) do
+    raise ArgumentError, "max_response_bytes must be a positive integer, got #{inspect(value)}"
   end
 
   defp validate_max_callback_request_ids!(value) when is_integer(value) and value > 0,
