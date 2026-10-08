@@ -144,19 +144,19 @@ defmodule FastestMCP.ClientStdioTest do
       end
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     assert Client.connected?(client)
-    assert Client.protocol_version(client) == Protocol.current_version()
-    assert %{items: tools, next_cursor: nil} = Client.list_tools(client)
+    assert Client.protocol_version!(client) == Protocol.current_version()
+    assert %{items: tools, next_cursor: nil} = Client.list_tools!(client)
     assert Enum.sort(Enum.map(tools, & &1["name"])) == ["child_env", "echo"]
 
-    assert %{"structuredContent" => %{"message" => "hi"}} =
-             Client.call_tool(client, "echo", %{"message" => "hi"})
+    assert %{raw: %{"structuredContent" => %{"message" => "hi"}}} =
+             Client.call_tool!(client, "echo", %{"message" => "hi"})
 
-    assert %{"structuredContent" => %{"value" => "from-client"}} =
-             Client.call_tool(client, "child_env", %{})
+    assert %{raw: %{"structuredContent" => %{"value" => "from-client"}}} =
+             Client.call_tool!(client, "child_env", %{})
   end
 
   test "connected client authenticates protected stdio servers" do
@@ -179,11 +179,11 @@ defmodule FastestMCP.ClientStdioTest do
       end
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
-    assert %{"structuredContent" => %{"sub" => "local-client"}} =
-             Client.call_tool(client, "whoami", %{})
+    assert %{raw: %{"structuredContent" => %{"sub" => "local-client"}}} =
+             Client.call_tool!(client, "whoami", %{})
   end
 
   test "stdio authentication metadata is omitted unless the legacy option is explicit" do
@@ -197,10 +197,10 @@ defmodule FastestMCP.ClientStdioTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
-    assert get_in(Client.initialize_result(client), ["serverInfo", "name"]) == "clean-wire"
+    assert get_in(Client.initialize_result!(client), ["serverInfo", "name"]) == "clean-wire"
   end
 
   test "stdio clients reject max_in_flight values above one" do
@@ -242,31 +242,31 @@ defmodule FastestMCP.ClientStdioTest do
       end
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     error =
       assert_raise Error, fn ->
-        Client.call_tool(client, "slow", %{}, timeout_ms: 10)
+        Client.call_tool!(client, "slow", %{}, timeout_ms: 10)
       end
 
-    assert error.code == :timeout
+    assert error.code == :timeout, inspect(error)
 
     assert Client.connected?(client)
 
-    assert %{"structuredContent" => %{"message" => "hi"}} =
-             Client.call_tool(client, "echo", %{"message" => "hi"})
+    assert %{raw: %{"structuredContent" => %{"message" => "hi"}}} =
+             Client.call_tool!(client, "echo", %{"message" => "hi"})
   end
 
   test "automatic stdio negotiation falls back on the same live process after a non-modern error" do
     elixir = System.find_executable("elixir") || flunk("elixir executable not found on PATH")
 
     client = Client.connect!({:stdio, elixir, legacy_fallback_stdio_server_args()})
-    on_exit(fn -> if Client.connected?(client), do: Client.disconnect(client) end)
+    on_exit(fn -> if Client.connected?(client), do: Client.disconnect!(client) end)
 
-    assert Client.protocol_version(client) == "2025-11-25"
-    assert get_in(Client.initialize_result(client), ["serverInfo", "name"]) == "same-process"
-    assert %{items: [%{"name" => "fallback-ok"}]} = Client.list_tools(client)
+    assert Client.protocol_version!(client) == "2025-11-25"
+    assert get_in(Client.initialize_result!(client), ["serverInfo", "name"]) == "same-process"
+    assert %{items: [%{"name" => "fallback-ok"}]} = Client.list_tools!(client)
   end
 
   test "stdio client routes notifications without consuming the matching response" do
@@ -281,7 +281,7 @@ defmodule FastestMCP.ClientStdioTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     assert_receive {:stdio_notification,
@@ -290,7 +290,7 @@ defmodule FastestMCP.ClientStdioTest do
                       "params" => %{"level" => "info", "data" => "ready"}
                     }}
 
-    assert %{items: [%{"name" => "echo"}], next_cursor: nil} = Client.list_tools(client)
+    assert %{items: [%{"name" => "echo"}], next_cursor: nil} = Client.list_tools!(client)
 
     assert_receive {:stdio_notification,
                     %{
@@ -316,11 +316,11 @@ defmodule FastestMCP.ClientStdioTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     listener =
-      Client.listen(
+      Client.listen!(
         client,
         %{"resourceSubscriptions" => ["status://modern"]},
         on_notification: fn message -> send(test_pid, {:subscription_notification, message}) end
@@ -340,28 +340,28 @@ defmodule FastestMCP.ClientStdioTest do
     assert subscription_id == listener.request_id
 
     slow =
-      Client.request_async(client, "tools/call", %{
+      Client.request_async!(client, "tools/call", %{
         "name" => "slow",
         "arguments" => %{}
       })
 
     fast =
-      Client.request_async(client, "tools/call", %{
+      Client.request_async!(client, "tools/call", %{
         "name" => "fast",
         "arguments" => %{}
       })
 
-    assert %{"structuredContent" => %{"name" => "fast"}} = Client.await(fast, 2_000)
-    assert %{"structuredContent" => %{"name" => "slow"}} = Client.await(slow, 2_000)
+    assert %{"structuredContent" => %{"name" => "fast"}} = Client.await!(fast, 2_000)
+    assert %{"structuredContent" => %{"name" => "slow"}} = Client.await!(slow, 2_000)
 
     cancelled =
-      Client.request_async(client, "tools/call", %{
+      Client.request_async!(client, "tools/call", %{
         "name" => "slow",
         "arguments" => %{}
       })
 
     cancelled_id = cancelled.request_id
-    assert :ok = Client.cancel(cancelled, "ordinary request cancellation")
+    assert :ok = Client.cancel!(cancelled, "ordinary request cancellation")
 
     refute_receive {:global_notification,
                     %{
@@ -370,7 +370,7 @@ defmodule FastestMCP.ClientStdioTest do
                     }},
                    300
 
-    assert %{items: tools} = Client.list_tools(client)
+    assert %{items: tools} = Client.list_tools!(client)
     assert Enum.any?(tools, &(&1["name"] == "fast"))
 
     assert_receive {:subscription_notification,
@@ -397,15 +397,15 @@ defmodule FastestMCP.ClientStdioTest do
                     }},
                    2_000
 
-    assert :ok = Client.cancel(listener, "test complete")
+    assert :ok = Client.cancel!(listener, "test complete")
 
     assert %{"structuredContent" => %{"name" => "fast"}} =
              client
-             |> Client.request_async("tools/call", %{
+             |> Client.request_async!("tools/call", %{
                "name" => "fast",
                "arguments" => %{}
              })
-             |> Client.await(2_000)
+             |> Client.await!(2_000)
 
     refute_receive {:subscription_notification,
                     %{
@@ -421,7 +421,7 @@ defmodule FastestMCP.ClientStdioTest do
                     }},
                    100
 
-    assert %{items: tools} = Client.list_tools(client)
+    assert %{items: tools} = Client.list_tools!(client)
     assert Enum.map(tools, & &1["name"]) == ["fast", "slow"]
     assert Client.connected?(client)
   end
@@ -441,15 +441,15 @@ defmodule FastestMCP.ClientStdioTest do
         stdio_restart: [max_attempts: 3, retry_ms: 10, max_retry_ms: 50]
       )
 
-    on_exit(fn -> if Client.connected?(client), do: Client.disconnect(client) end)
+    on_exit(fn -> if Client.connected?(client), do: Client.disconnect!(client) end)
 
-    assert %{"structuredContent" => %{"name" => "fast"}} =
-             Client.call_tool(client, "fast", %{})
+    assert %{raw: %{"structuredContent" => %{"name" => "fast"}}} =
+             Client.call_tool!(client, "fast", %{})
 
-    catalog_generation = :sys.get_state(client.pid).tool_catalog.generation
+    catalog_generation = :sys.get_state(client.pid).catalog.tool_catalog.generation
 
     listener =
-      Client.listen(
+      Client.listen!(
         client,
         %{"resourceSubscriptions" => ["status://restart"]},
         on_notification: fn message -> send(test_pid, {:restart_notification, message}) end
@@ -467,12 +467,12 @@ defmodule FastestMCP.ClientStdioTest do
                    2_000
 
     crash =
-      Client.request_async(client, "tools/call", %{
+      Client.request_async!(client, "tools/call", %{
         "name" => "crash",
         "arguments" => %{}
       })
 
-    assert_raise Error, fn -> Client.await(crash, 3_000) end
+    assert_raise Error, fn -> Client.await!(crash, 3_000) end
 
     assert_receive {:restart_notification,
                     %{
@@ -489,11 +489,11 @@ defmodule FastestMCP.ClientStdioTest do
     assert first_subscription_id == listener.request_id
 
     restarted_state = :sys.get_state(client.pid)
-    assert restarted_state.tool_catalog.generation > catalog_generation
-    refute restarted_state.tool_catalog_ready?
+    assert restarted_state.catalog.tool_catalog.generation > catalog_generation
+    refute restarted_state.catalog.tool_catalog_ready?
 
-    assert %{"structuredContent" => %{"name" => "fast"}} =
-             Client.call_tool(client, "fast", %{})
+    assert %{raw: %{"structuredContent" => %{"name" => "fast"}}} =
+             Client.call_tool!(client, "fast", %{})
 
     assert_receive {:restart_notification,
                     %{
@@ -508,7 +508,7 @@ defmodule FastestMCP.ClientStdioTest do
                    2_000
 
     assert Client.connected?(client)
-    assert :ok = Client.cancel(listener, "test complete")
+    assert :ok = Client.cancel!(listener, "test complete")
   end
 
   test "process-group stdio restart and disconnect terminate spawned descendants" do
@@ -551,7 +551,7 @@ defmodule FastestMCP.ClientStdioTest do
             put_in(state.transport.adapter, FastestMCP.Client.Transport.Stdio)
           end)
 
-          Client.disconnect(client)
+          Client.disconnect!(client)
         end
 
         marker
@@ -567,12 +567,12 @@ defmodule FastestMCP.ClientStdioTest do
       assert StdioProcess.alive?(first_descendant)
 
       crash =
-        Client.request_async(client, "tools/call", %{
+        Client.request_async!(client, "tools/call", %{
           "name" => "crash",
           "arguments" => %{}
         })
 
-      assert_raise Error, fn -> Client.await(crash, 3_000) end
+      assert_raise Error, fn -> Client.await!(crash, 3_000) end
       wait_for_stdio_generation(client.pid, initial_generation + 1)
 
       [^first_descendant, second_descendant] = wait_for_descendants(marker, 2)
@@ -585,7 +585,9 @@ defmodule FastestMCP.ClientStdioTest do
         put_in(state.transport.adapter, UnprovenCloseTransport)
       end)
 
-      assert {:error, :process_still_alive} = Client.disconnect_with_evidence(client)
+      assert {:error, %FastestMCP.Error{details: %{reason: :process_still_alive}}} =
+               Client.disconnect_with_evidence(client)
+
       assert Process.alive?(client.pid)
       assert StdioProcess.alive?(second_descendant)
 
@@ -593,7 +595,7 @@ defmodule FastestMCP.ClientStdioTest do
         put_in(state.transport.adapter, original_adapter)
       end)
 
-      assert :ok = Client.disconnect_with_evidence(client)
+      assert :ok = Client.disconnect_with_evidence!(client)
       wait_until_dead(second_descendant)
     end
   end
@@ -638,11 +640,11 @@ defmodule FastestMCP.ClientStdioTest do
 
     on_exit(fn ->
       File.rm(marker)
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     listener =
-      Client.listen(client, %{"resourceSubscriptions" => ["status://restart"]},
+      Client.listen!(client, %{"resourceSubscriptions" => ["status://restart"]},
         on_notification: fn message -> send(test_pid, {:exhaustion_notification, message}) end
       )
 
@@ -651,13 +653,13 @@ defmodule FastestMCP.ClientStdioTest do
                    2_000
 
     crash =
-      Client.request_async(client, "tools/call", %{
+      Client.request_async!(client, "tools/call", %{
         "name" => "crash",
         "arguments" => %{}
       })
 
-    assert_raise Error, fn -> Client.await(crash, 3_000) end
-    assert_raise Error, fn -> Client.await(listener, 5_000) end
+    assert_raise Error, fn -> Client.await!(crash, 3_000) end
+    assert_raise Error, fn -> Client.await!(listener, 5_000) end
 
     assert_receive {:DOWN, ^client_ref, :process, _pid, :normal}, 5_000
     refute Client.connected?(client)
@@ -675,11 +677,11 @@ defmodule FastestMCP.ClientStdioTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     assert %FastestMCP.Client.Task{task_id: "remote-progress-task"} =
-             Client.call_tool(client, "background", %{},
+             Client.call_tool_task!(client, "background", %{},
                task: true,
                progress_token: "retained-progress"
              )
@@ -699,7 +701,7 @@ defmodule FastestMCP.ClientStdioTest do
 
     error =
       assert_raise Error, fn ->
-        Client.request_async(client, "ping", %{
+        Client.request_async!(client, "ping", %{
           "_meta" => %{"progressToken" => "retained-progress"}
         })
       end
@@ -707,14 +709,14 @@ defmodule FastestMCP.ClientStdioTest do
     assert error.code == :invalid_params
 
     # The probe emits a terminal task notification before answering ping.
-    assert %{} = Client.ping(client)
+    assert %{} = Client.ping!(client)
 
     request =
-      Client.request_async(client, "ping", %{
+      Client.request_async!(client, "ping", %{
         "_meta" => %{"progressToken" => "retained-progress"}
       })
 
-    assert %{} = Client.await(request)
+    assert %{} = Client.await!(request)
   end
 
   defp stdio_server_args(server_name) do

@@ -199,33 +199,33 @@ defmodule FastestMCP.AuthorizationTest do
 
     assert ["public_tool"] ==
              server_name
-             |> FastestMCP.list_tools()
+             |> FastestMCP.list_tools!()
              |> Enum.map(& &1.name)
              |> Enum.sort()
 
     assert ["admin_tool", "public_tool", "tagged_tool"] ==
              server_name
-             |> FastestMCP.list_tools(auth_input: %{"token" => "admin-token"})
+             |> FastestMCP.list_tools!(auth_input: %{"token" => "admin-token"})
              |> Enum.map(& &1.name)
              |> Enum.sort()
 
     error =
       assert_raise Error, fn ->
-        FastestMCP.call_tool(server_name, "admin_tool", %{})
+        FastestMCP.call_tool!(server_name, "admin_tool", %{})
       end
 
     assert error.code == :forbidden
 
     denial =
       assert_raise Error, fn ->
-        FastestMCP.call_tool(server_name, "custom_denial", %{})
+        FastestMCP.call_tool!(server_name, "custom_denial", %{})
       end
 
     assert denial.code == :forbidden
     assert denial.message == ~s(not authorized to access tool "custom_denial")
 
     assert "admin" ==
-             FastestMCP.call_tool(server_name, "admin_tool", %{},
+             FastestMCP.call_tool!(server_name, "admin_tool", %{},
                auth_input: %{"token" => "admin-token"}
              )
   end
@@ -247,20 +247,20 @@ defmodule FastestMCP.AuthorizationTest do
     assert {:ok, _pid} = FastestMCP.start_server(parent)
     on_exit(fn -> FastestMCP.stop_server(parent_name) end)
 
-    assert [] == FastestMCP.list_tools(parent_name)
+    assert [] == FastestMCP.list_tools!(parent_name)
 
     assert [%{name: "child_admin_tool"}] =
-             FastestMCP.list_tools(parent_name, auth_input: %{"token" => "admin-token"})
+             FastestMCP.list_tools!(parent_name, auth_input: %{"token" => "admin-token"})
 
     error =
       assert_raise Error, fn ->
-        FastestMCP.call_tool(parent_name, "child_admin_tool", %{})
+        FastestMCP.call_tool!(parent_name, "child_admin_tool", %{})
       end
 
     assert error.code == :forbidden
 
     assert "child-admin" ==
-             FastestMCP.call_tool(parent_name, "child_admin_tool", %{},
+             FastestMCP.call_tool!(parent_name, "child_admin_tool", %{},
                auth_input: %{"token" => "admin-token"}
              )
   end
@@ -275,20 +275,20 @@ defmodule FastestMCP.AuthorizationTest do
         auth: Authorization.require_scopes("admin")
       )
       |> FastestMCP.add_tool("outer", fn _arguments, _context ->
-        FastestMCP.call_tool(server_name, "inner", %{})
+        FastestMCP.call_tool!(server_name, "inner", %{})
       end)
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
     assert "authorized" ==
-             FastestMCP.call_tool(server_name, "outer", %{},
+             FastestMCP.call_tool!(server_name, "outer", %{},
                auth_input: %{"token" => "admin-token"}
              )
 
     error =
       assert_raise Error, fn ->
-        FastestMCP.call_tool(server_name, "outer", %{}, auth_input: %{"token" => "reader-token"})
+        FastestMCP.call_tool!(server_name, "outer", %{}, auth_input: %{"token" => "reader-token"})
       end
 
     assert error.code == :forbidden

@@ -25,7 +25,7 @@ defmodule FastestMCP.ErrorExposureTest do
 
     local_error =
       assert_raise Error, fn ->
-        FastestMCP.call_tool(server_name, "explode", %{})
+        FastestMCP.call_tool!(server_name, "explode", %{})
       end
 
     assert local_error.message =~ "secret token 123"
@@ -83,7 +83,9 @@ defmodule FastestMCP.ErrorExposureTest do
 
     local_error =
       assert_raise Error, fn ->
-        FastestMCP.call_tool(server_name, "explode", %{}, auth_input: %{"token" => "valid-token"})
+        FastestMCP.call_tool!(server_name, "explode", %{},
+          auth_input: %{"token" => "valid-token"}
+        )
       end
 
     assert local_error.message =~ "secret token 123"
@@ -243,16 +245,16 @@ defmodule FastestMCP.ErrorExposureTest do
     subscribe_to_task_events(server_name)
 
     handle =
-      FastestMCP.call_tool(server_name, "explode", %{}, task: true, session_id: "task-session")
+      FastestMCP.call_tool!(server_name, "explode", %{}, task: true, session_id: "task-session")
 
     local_error =
       assert_raise Error, fn ->
-        FastestMCP.await_task(handle, 1_000)
+        FastestMCP.await_task!(handle, 1_000)
       end
 
     assert local_error.message =~ "database password 123"
 
-    local_task = FastestMCP.fetch_task(handle)
+    local_task = FastestMCP.fetch_task!(handle)
     assert local_task.error.message =~ "database password 123"
 
     failed_notification =
@@ -310,7 +312,7 @@ defmodule FastestMCP.ErrorExposureTest do
       )
 
     assert_raise Error, fn ->
-      FastestMCP.await_task(server_name, stdio_task_id, 1_000, session_id: stdio_session_id)
+      FastestMCP.await_task!(server_name, stdio_task_id, 1_000, session_id: stdio_session_id)
     end
 
     stdio_result =
@@ -353,11 +355,11 @@ defmodule FastestMCP.ErrorExposureTest do
     subscribe_to_task_events(server_name)
 
     handle =
-      FastestMCP.call_tool(server_name, "explicit", %{}, task: true, session_id: "task-session")
+      FastestMCP.call_tool!(server_name, "explicit", %{}, task: true, session_id: "task-session")
 
     error =
       assert_raise Error, fn ->
-        FastestMCP.await_task(handle, 1_000)
+        FastestMCP.await_task!(handle, 1_000)
       end
 
     assert error.message == "safe task failure"

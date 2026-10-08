@@ -171,7 +171,7 @@ Clients can attach request-scoped metadata, and FastestMCP exposes it through
 From the connected client:
 
 ```elixir
-FastestMCP.Client.call_tool(client, "send_email", %{"to" => "ops@example.com"},
+FastestMCP.Client.call_tool!(client, "send_email", %{"to" => "ops@example.com"},
   meta: %{trace_id: "trace-123", user_id: "user-42"}
 )
 ```

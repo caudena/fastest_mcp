@@ -40,6 +40,6 @@ defmodule FastestMCP.Client.CallbackContext do
 
   @doc "Sends a monotonic progress update for this callback."
   def report_progress(%__MODULE__{} = context, progress, opts \\ []) do
-    FastestMCP.Client.report_progress(context, progress, opts)
+    FastestMCP.Client.report_progress!(context, progress, opts)
   end
 end

@@ -3,8 +3,8 @@ defmodule FastestMCP.Middleware.Timing do
   Middleware that logs request timings.
 
   Middleware modules in FastestMCP are configured as explicit structs that
-  carry options plus a ready-to-run `middleware` function. That keeps runtime
-  assembly cheap while making the configured value easy to inspect in tests.
+  carry immutable configuration. Dispatch calls the module with that configuration;
+  runtime state is owned separately by the server.
 
   Most applications reach this module through `FastestMCP.Middleware` helper
   functions or by adding the configured struct directly with
@@ -13,31 +13,38 @@ defmodule FastestMCP.Middleware.Timing do
 
   require Logger
 
+  @behaviour FastestMCP.Middleware
+
   alias FastestMCP.Operation
 
-  defstruct [:log_fn, :middleware, log_level: :info]
+  defstruct [:log_fn, label: nil, log_level: :info]
 
   @doc "Builds a new value for this module from the supplied options."
   def new(opts \\ []) do
     middleware = %__MODULE__{
       log_fn: Keyword.get(opts, :log_fn, &default_log/2),
+      label: Keyword.get(opts, :label),
       log_level: Keyword.get(opts, :log_level, :info)
     }
 
-    %{middleware | middleware: fn operation, next -> call(middleware, operation, next) end}
+    middleware
   end
 
   @doc "Runs the middleware around the next operation."
+  @impl FastestMCP.Middleware
   def call(%__MODULE__{} = middleware, %Operation{} = operation, next)
       when is_function(next, 1) do
     started_at = System.monotonic_time()
+
+    label =
+      if middleware.label, do: middleware.label.(operation), else: "Request #{operation.method}"
 
     try do
       result = next.(operation)
 
       middleware.log_fn.(
         middleware.log_level,
-        "Request #{operation.method} completed in #{format_duration(started_at)}ms"
+        "#{label} completed in #{format_duration(started_at)}ms"
       )
 
       result
@@ -45,7 +52,7 @@ defmodule FastestMCP.Middleware.Timing do
       error ->
         middleware.log_fn.(
           middleware.log_level,
-          "Request #{operation.method} failed after #{format_duration(started_at)}ms: #{Exception.message(error)}"
+          "#{label} failed after #{format_duration(started_at)}ms: #{Exception.message(error)}"
         )
 
         reraise error, __STACKTRACE__

@@ -21,7 +21,7 @@ defmodule FastestMCP.Runtime.ConcurrencyTest do
 
     tasks =
       for _ <- 1..3 do
-        Task.async(fn -> FastestMCP.call_tool(server_name, "wait", %{}) end)
+        Task.async(fn -> FastestMCP.call_tool!(server_name, "wait", %{}) end)
       end
 
     entered =

@@ -42,7 +42,7 @@ server =
 Read it in process:
 
 ```elixir
-FastestMCP.read_resource("resources", "config://app")
+FastestMCP.read_resource!("resources", "config://app")
 # => %{app_name: "FastestMCP", version: "0.1.0", environment: "production"}
 ```
 
@@ -67,7 +67,7 @@ server =
 ```
 
 ```elixir
-FastestMCP.read_resource("resources", "weather://london/current")
+FastestMCP.read_resource!("resources", "weather://london/current")
 # => %{city: "London", temperature: 22, condition: "Sunny", unit: "celsius"}
 ```
 
@@ -90,11 +90,11 @@ server =
   FastestMCP.server("template-query")
   |> FastestMCP.add_resource_template(
     "repos://{owner}/{repo}/info{?format}",
-    fn %{"owner" => owner, "repo" => repo, "format" => format}, _ctx ->
+    fn %{"owner" => owner, "repo" => repo} = arguments, _ctx ->
       %{
         owner: owner,
         repo: repo,
-        format: format || "summary",
+        format: Map.get(arguments, "format", "summary"),
         stars: 120,
         forks: 48
       }
@@ -103,44 +103,45 @@ server =
 ```
 
 ```elixir
-FastestMCP.read_resource("template-query", "repos://phoenixframework/phoenix/info?format=json")
+FastestMCP.read_resource!("template-query", "repos://phoenixframework/phoenix/info?format=json")
 # => %{owner: "phoenixframework", repo: "phoenix", format: "json", stars: 120, forks: 48}
 ```
 
-Wildcard captures keep path separators and are URI-decoded before they reach
-the handler:
+Use reserved expansion (`{+path}`) for a path that keeps slash separators.
+Captures are URI-decoded before they reach the handler:
 
 ```elixir
 server =
   FastestMCP.server("template-wildcards")
   |> FastestMCP.add_resource_template(
-    "repo://{owner}/{path*}",
+    "repo://{owner}/{+path}",
     fn arguments, _ctx -> arguments end
   )
 ```
 
 ```elixir
-FastestMCP.read_resource("template-wildcards", "repo://prefecthq/src/templates/release.md")
+FastestMCP.read_resource!("template-wildcards", "repo://prefecthq/src/templates/release.md")
 # => %{"owner" => "prefecthq", "path" => "src/templates/release.md"}
 ```
 
-Hyphenated template names are normalized to underscore handler keys:
+RFC 6570 variable names are preserved as handler keys. Dots and underscores are
+supported; hyphenated names are rejected during registration:
 
 ```elixir
 server =
-  FastestMCP.server("template-hyphen")
+  FastestMCP.server("template-names")
   |> FastestMCP.add_resource_template(
-    "users://{user-id}{?include-empty}",
-    fn %{"user_id" => user_id, "include_empty" => include_empty}, _ctx ->
-      %{user_id: user_id, include_empty: include_empty}
+    "users://{user.id}{?include_empty}",
+    fn %{"user.id" => user_id} = arguments, _ctx ->
+      %{user_id: user_id, include_empty: Map.get(arguments, "include_empty")}
     end
   )
 ```
 
-Blank query values are preserved. Path captures take precedence over query
-captures, and templates that would create a hyphen/underscore collision are
-rejected. Literal and expanded fragments are matched consistently for exact
-and templated lookup.
+Blank query values are preserved as `""`; omitted optional query variables are
+absent from the argument map. Path captures take precedence over query captures.
+Literal and expanded fragments are matched consistently for exact and templated
+lookup.
 
 ## Resource Template Security
 
@@ -207,7 +208,7 @@ server =
 ```
 
 ```elixir
-FastestMCP.read_resource("resource-parameters", "repos://phoenixframework/phoenix/issues?page=2")
+FastestMCP.read_resource!("resource-parameters", "repos://phoenixframework/phoenix/issues?page=2")
 # => %{owner: "phoenixframework", repo: "phoenix", page: "2"}
 ```
 
@@ -236,7 +237,7 @@ server =
 ```
 
 ```elixir
-FastestMCP.complete(
+FastestMCP.complete!(
   "resource-completion",
   %{"type" => "ref/resource", "uri" => "repos://{owner}/{repo}"},
   %{"name" => "owner", "value" => "pre"}
@@ -301,7 +302,7 @@ server =
 ```
 
 ```elixir
-FastestMCP.read_resource("resource-results", "reports://daily")
+FastestMCP.read_resource!("resource-results", "reports://daily")
 # => %{
 #      contents: [
 #        %{
@@ -477,8 +478,8 @@ server =
 In process:
 
 ```elixir
-[resource] = FastestMCP.list_resources("resource-contract")
-[template] = FastestMCP.list_resource_templates("resource-contract")
+[resource] = FastestMCP.list_resources!("resource-contract")
+[template] = FastestMCP.list_resource_templates!("resource-contract")
 
 resource.meta
 # => %{vendor: %{surface: "resource"}, fastestmcp: %{hint: "cached", _internal: "hidden"}}
@@ -505,11 +506,11 @@ client =
     }
   },
   "uri" => "memo://report"
-}]} = FastestMCP.Client.list_resources(client)
+}]} = FastestMCP.Client.list_resources!(client)
 ```
 
 The same `_meta.fastestmcp` metadata contract is used for resource templates in
-`FastestMCP.Client.list_resource_templates/2`.
+`FastestMCP.Client.list_resource_templates!/2`.
 
 ## Context-Aware Resources
 
@@ -555,11 +556,11 @@ The same resource can then be read synchronously or as a local task:
 
 ```elixir
 task =
-  FastestMCP.read_resource("resource-tasks", "file://report.txt",
+  FastestMCP.read_resource!("resource-tasks", "file://report.txt",
     task: true
   )
 
-FastestMCP.await_task(task, 5_000)
+FastestMCP.await_task!(task, 5_000)
 ```
 
 Use this when the read itself may block inside an Elixir-owned workflow. Remote
@@ -573,7 +574,7 @@ Resources and resource templates can be added, disabled, or removed after
 startup through the component manager:
 
 ```elixir
-manager = FastestMCP.component_manager("dynamic-resources")
+manager = FastestMCP.component_manager!("dynamic-resources")
 
 {:ok, _resource} =
   FastestMCP.ComponentManager.add_resource(
@@ -640,7 +641,7 @@ On `2026-07-28`, resource updates are selected through the long-lived
 
 ```elixir
 listener =
-  FastestMCP.Client.listen(
+  FastestMCP.Client.listen!(
     client,
     %{"resourceSubscriptions" => ["config://release"]},
     on_notification: &MyApp.MCPNotifications.handle/1
@@ -654,7 +655,7 @@ one concrete resource URI:
 ```elixir
 client = FastestMCP.Client.connect!("http://127.0.0.1:4100/mcp", session_stream: true)
 
-%{} = FastestMCP.Client.subscribe_resource(client, "config://release")
+%{} = FastestMCP.Client.subscribe_resource!(client, "config://release")
 ```
 
 Resource templates remain available for discovery and reads, but their
@@ -665,7 +666,7 @@ needs.
 When the server knows that resource changed, emit an update:
 
 ```elixir
-:ok = FastestMCP.notify_resource_updated("resources", "config://release")
+:ok = FastestMCP.notify_resource_updated!("resources", "config://release")
 ```
 
 Or from inside a handler:
@@ -744,11 +745,17 @@ or undefined variables. Malformed templates are rejected during registration.
 Reverse routing keeps the existing handler map interface and decodes captures
 deterministically as strings, ordered lists, or maps.
 
+Percent-encoded template literals match either hexadecimal spelling: `%C3%A9`
+and `%c3%a9` identify the same literal bytes. This does not make ordinary URI
+text case-insensitive or relax the protocol's absolute-URI validation. Encode
+non-ASCII URI characters before sending them over MCP.
+
 The repository runs the official `uri-templates/uritemplate-test` positive and
 negative fixtures together with reverse-routing fixtures for fragment, prefix,
 exploded, and ambiguous templates.
 
-Resource update notifications require an active session event stream.
+Legacy resource updates use the session event stream; modern clients use
+`subscriptions/listen`. See [Resource Subscriptions](client.md#resource-subscriptions).
 
 ## Why This Shape
 

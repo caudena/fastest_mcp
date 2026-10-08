@@ -150,7 +150,7 @@ defmodule FastestMCP.OpenAPIProviderFeaturesTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    tools = FastestMCP.list_tools(server_name)
+    tools = FastestMCP.list_tools!(server_name)
     update_user = Enum.find(tools, &(&1.name == "update_user"))
     search_users = Enum.find(tools, &(&1.name == "search_users"))
     parameter_docs = Enum.find(tools, &(&1.name == "parameter_docs"))
@@ -174,7 +174,7 @@ defmodule FastestMCP.OpenAPIProviderFeaturesTest do
     refute String.contains?(parameter_docs.description, "user ID")
 
     assert %{"id" => 123, "name" => "Nate", "email" => "nate@example.com"} ==
-             FastestMCP.call_tool(server_name, "update_user", %{
+             FastestMCP.call_tool!(server_name, "update_user", %{
                "id__path" => 123,
                "id" => 456,
                "name" => "Nate",
@@ -185,7 +185,7 @@ defmodule FastestMCP.OpenAPIProviderFeaturesTest do
     assert update_opts[:json] == %{"id" => 456, "name" => "Nate", "email" => "nate@example.com"}
 
     assert %{"ok" => true} ==
-             FastestMCP.call_tool(server_name, "search_users", %{
+             FastestMCP.call_tool!(server_name, "search_users", %{
                "filter" => %{"age" => %{"min" => 20, "max" => 40}, "active" => true}
              })
 

@@ -57,13 +57,13 @@ defmodule FastestMCP.Transport.StreamableHTTP do
     server_name = Keyword.fetch!(opts, :server_name)
     conn = fetch_cookies(fetch_query_params(conn))
 
-    response =
+    {response, conn} =
       case HTTPCommon.validate_dns_rebinding(conn, opts) do
         :ok ->
           fetch_and_dispatch(conn, server_name, opts)
 
         {:error, %Error{} = error} ->
-          {:transport_error, error, nil, HTTPCommon.http_context(conn, %{}, opts)}
+          {{:transport_error, error, nil, HTTPCommon.http_context(conn, %{}, opts)}, conn}
       end
 
     case response do
@@ -184,29 +184,30 @@ defmodule FastestMCP.Transport.StreamableHTTP do
     case ServerRuntime.fetch(server_name) do
       {:ok, runtime} ->
         http_context = HTTPCommon.http_context(conn, runtime, opts)
+        authentication = HTTPCommon.authenticate(conn, runtime, opts)
+        {decoded, conn} = StreamableHTTPAdapter.decode_with_conn(conn, opts)
 
-        case HTTPCommon.authenticate(conn, runtime, opts) do
-          {:ok, auth_result} ->
-            dispatch(conn, runtime, opts, auth_result)
-            |> expose_dispatch_error(runtime, http_context)
+        response =
+          case authentication do
+            {:ok, auth_result} -> dispatch(conn, runtime, opts, auth_result, decoded)
+            {:error, %Error{} = error} -> authentication_error(decoded, error)
+          end
 
-          {:error, %Error{} = error} ->
-            authentication_error(conn, opts, error)
-            |> expose_dispatch_error(runtime, http_context)
-        end
+        {expose_dispatch_error(response, runtime, http_context), conn}
 
       {:error, :not_found} ->
-        {:transport_error,
-         %Error{code: :not_found, message: "unknown server #{inspect(server_name)}"}, nil,
-         HTTPCommon.http_context(conn, %{}, opts)}
+        {{:transport_error,
+          %Error{code: :not_found, message: "unknown server #{inspect(server_name)}"}, nil,
+          HTTPCommon.http_context(conn, %{}, opts)}, conn}
 
       {:error, reason} ->
-        {:transport_error,
-         %Error{
-           code: :internal_error,
-           message: "failed to fetch server runtime",
-           details: %{reason: inspect(reason)}
-         }, nil, HTTPCommon.http_context(conn, %{}, opts)}
+        error = %Error{
+          code: :internal_error,
+          message: "failed to fetch server runtime",
+          details: %{reason: inspect(reason)}
+        }
+
+        {{:transport_error, error, nil, HTTPCommon.http_context(conn, %{}, opts)}, conn}
     end
   end
 
@@ -267,8 +268,8 @@ defmodule FastestMCP.Transport.StreamableHTTP do
     end)
   end
 
-  defp authentication_error(conn, opts, error) do
-    case StreamableHTTPAdapter.decode(conn, opts) do
+  defp authentication_error(decoded, error) do
+    case decoded do
       {:ok, %FastestMCP.Transport.Request{} = request} ->
         {:transport_error, request, error}
 
@@ -288,8 +289,8 @@ defmodule FastestMCP.Transport.StreamableHTTP do
     end
   end
 
-  defp dispatch(conn, runtime, opts, auth_result) do
-    case StreamableHTTPAdapter.decode(conn, opts) do
+  defp dispatch(conn, runtime, opts, auth_result, decoded) do
+    case decoded do
       {:ok, %FastestMCP.Transport.Request{} = request} ->
         request = %{request | auth_result: auth_result}
 

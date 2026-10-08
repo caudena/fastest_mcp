@@ -123,28 +123,28 @@ defmodule FastestMCP.Protocol2026IntegrationTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(modern), do: Client.disconnect(modern)
-      if Client.connected?(legacy), do: Client.disconnect(legacy)
+      if Client.connected?(modern), do: Client.disconnect!(modern)
+      if Client.connected?(legacy), do: Client.disconnect!(legacy)
     end)
 
-    assert Client.protocol_version(modern) == "2026-07-28"
-    assert Client.initialize_result(modern) == nil
-    assert Client.session_id(modern) == nil
+    assert Client.protocol_version!(modern) == "2026-07-28"
+    assert Client.initialize_result!(modern) == nil
+    assert Client.session_id!(modern) == nil
 
     assert %{"supportedVersions" => ["2026-07-28", "2025-11-25"]} =
-             Client.discovery_result(modern)
+             Client.discovery_result!(modern)
 
-    assert Client.protocol_version(legacy) == "2025-11-25"
-    assert is_map(Client.initialize_result(legacy))
-    assert is_binary(Client.session_id(legacy))
+    assert Client.protocol_version!(legacy) == "2025-11-25"
+    assert is_map(Client.initialize_result!(legacy))
+    assert is_binary(Client.session_id!(legacy))
 
-    modern_call = Task.async(fn -> Client.call_tool(modern, "echo", %{"client" => "modern"}) end)
-    legacy_call = Task.async(fn -> Client.call_tool(legacy, "echo", %{"client" => "legacy"}) end)
+    modern_call = Task.async(fn -> Client.call_tool!(modern, "echo", %{"client" => "modern"}) end)
+    legacy_call = Task.async(fn -> Client.call_tool!(legacy, "echo", %{"client" => "legacy"}) end)
 
-    assert get_in(Task.await(modern_call), ["structuredContent", "client"]) == "modern"
-    assert Task.await(legacy_call) == %{"client" => "legacy"}
-    assert Client.session_id(modern) == nil
-    assert is_binary(Client.session_id(legacy))
+    assert get_in(Task.await(modern_call).structured_content, ["client"]) == "modern"
+    assert Task.await(legacy_call).structured_content == %{"client" => "legacy"}
+    assert Client.session_id!(modern) == nil
+    assert is_binary(Client.session_id!(legacy))
   end
 
   test "modern results carry the central result and cache contract", %{server_name: server_name} do
@@ -190,13 +190,13 @@ defmodule FastestMCP.Protocol2026IntegrationTest do
         roots: [Root.new("file:///workspace", name: "workspace")]
       )
 
-    on_exit(fn -> if Client.connected?(client), do: Client.disconnect(client) end)
+    on_exit(fn -> if Client.connected?(client), do: Client.disconnect!(client) end)
 
-    result = Client.call_tool(client, "workspace_root", %{})
+    result = Client.call_tool!(client, "workspace_root", %{})
 
-    assert result["resultType"] == "complete"
+    assert result.raw["resultType"] == "complete"
 
-    assert result["structuredContent"] == %{
+    assert result.structured_content == %{
              "requestState" => "opaque-state",
              "root" => "file:///workspace"
            }
@@ -214,11 +214,11 @@ defmodule FastestMCP.Protocol2026IntegrationTest do
         roots: [Root.new("file:///workspace", name: "workspace")]
       )
 
-    on_exit(fn -> if Client.connected?(client), do: Client.disconnect(client) end)
+    on_exit(fn -> if Client.connected?(client), do: Client.disconnect!(client) end)
 
-    result = Client.call_tool(client, "mrtr_state_rounds", %{})
+    result = Client.call_tool!(client, "mrtr_state_rounds", %{})
 
-    assert result["structuredContent"] == %{
+    assert result.structured_content == %{
              "request_state_omitted" => true,
              "response_keys" => ["second"]
            }
@@ -233,21 +233,21 @@ defmodule FastestMCP.Protocol2026IntegrationTest do
         max_mrtr_rounds: 1
       )
 
-    on_exit(fn -> if Client.connected?(client), do: Client.disconnect(client) end)
+    on_exit(fn -> if Client.connected?(client), do: Client.disconnect!(client) end)
 
-    error = assert_raise FastestMCP.Error, fn -> Client.call_tool(client, "mrtr_loop", %{}) end
+    error = assert_raise FastestMCP.Error, fn -> Client.call_tool!(client, "mrtr_loop", %{}) end
     assert error.code == :overloaded
     assert error.details.max_mrtr_rounds == 1
 
     override_error =
       assert_raise FastestMCP.Error, fn ->
-        Client.call_tool(client, "mrtr_loop", %{}, max_mrtr_rounds: 2)
+        Client.call_tool!(client, "mrtr_loop", %{}, max_mrtr_rounds: 2)
       end
 
     assert override_error.details.max_mrtr_rounds == 2
 
     assert_raise ArgumentError, "max_mrtr_rounds must be a positive integer, got 0", fn ->
-      Client.call_tool(client, "mrtr_loop", %{}, max_mrtr_rounds: 0)
+      Client.call_tool!(client, "mrtr_loop", %{}, max_mrtr_rounds: 0)
     end
   end
 
@@ -263,16 +263,16 @@ defmodule FastestMCP.Protocol2026IntegrationTest do
         end
       )
 
-    on_exit(fn -> if Client.connected?(client), do: Client.disconnect(client) end)
+    on_exit(fn -> if Client.connected?(client), do: Client.disconnect!(client) end)
 
-    assert %{"structuredContent" => %{"response_keys" => ["a", "z"]}} =
-             Client.call_tool(client, "mrtr_order", %{})
+    assert %{raw: %{"structuredContent" => %{"response_keys" => ["a", "z"]}}} =
+             Client.call_tool!(client, "mrtr_order", %{})
 
     assert_receive {:input_callback, "a"}
     assert_receive {:input_callback, "z"}
 
     assert :ok =
-             Client.set_elicitation_handler(client, fn _message, _params, _context ->
+             Client.set_elicitation_handler!(client, fn _message, _params, _context ->
                send(parent, {:slow_callback_started, self()})
                Process.sleep(2_000)
                {:accept, %{}}
@@ -280,7 +280,7 @@ defmodule FastestMCP.Protocol2026IntegrationTest do
 
     timeout_error =
       assert_raise FastestMCP.Error, fn ->
-        Client.call_tool(client, "mrtr_order", %{}, timeout_ms: 250)
+        Client.call_tool!(client, "mrtr_order", %{}, timeout_ms: 250)
       end
 
     assert timeout_error.code == :timeout

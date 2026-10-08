@@ -59,12 +59,12 @@ defmodule FastestMCP.ServerModuleTest do
 
     assert {:ok, _pid} = start_supervised(ConfiguredServer)
 
-    assert [%{name: "repo_name"}] = FastestMCP.list_tools(ConfiguredServer)
+    assert [%{name: "repo_name"}] = FastestMCP.list_tools!(ConfiguredServer)
 
     assert %{
              repo: ":app_repo",
              server_name: server_name
-           } = FastestMCP.call_tool(ConfiguredServer, "repo_name", %{})
+           } = FastestMCP.call_tool!(ConfiguredServer, "repo_name", %{})
 
     assert server_name == to_string(ConfiguredServer)
 
@@ -88,7 +88,7 @@ defmodule FastestMCP.ServerModuleTest do
                {ConfiguredServer, repo: :override_repo, runtime: [max_sessions: 9]}
              )
 
-    assert %{repo: ":override_repo"} = FastestMCP.call_tool(ConfiguredServer, "repo_name", %{})
+    assert %{repo: ":override_repo"} = FastestMCP.call_tool!(ConfiguredServer, "repo_name", %{})
 
     assert {:ok, runtime} = ServerRuntime.fetch(ConfiguredServer)
     assert runtime.opts[:max_concurrent_calls] == 7
@@ -103,8 +103,8 @@ defmodule FastestMCP.ServerModuleTest do
       _ = FastestMCP.stop_server(HTTPServer)
     end)
 
-    assert [%{name: "echo"}] = FastestMCP.list_tools(HTTPServer)
-    assert %{"message" => "hi"} = FastestMCP.call_tool(HTTPServer, "echo", %{message: "hi"})
+    assert [%{name: "echo"}] = FastestMCP.list_tools!(HTTPServer)
+    assert %{"message" => "hi"} = FastestMCP.call_tool!(HTTPServer, "echo", %{message: "hi"})
 
     assert :ok = FastestMCP.stop_server(HTTPServer)
     refute Process.alive?(owner_pid)
@@ -135,7 +135,7 @@ defmodule FastestMCP.ServerModuleTest do
     end)
 
     assert Process.alive?(owner_pid)
-    assert [%{name: "echo"}] = FastestMCP.list_tools(HTTPServer)
+    assert [%{name: "echo"}] = FastestMCP.list_tools!(HTTPServer)
 
     assert :ok = FastestMCP.stop_server(HTTPServer)
     assert_eventually(fn -> not Process.alive?(owner_pid) end)

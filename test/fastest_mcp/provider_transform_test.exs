@@ -68,14 +68,14 @@ defmodule FastestMCP.ProviderTransformTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    assert [%{name: "ns_my_tool"}] = FastestMCP.list_tools(server_name)
-    assert [%{name: "ns_my_prompt"}] = FastestMCP.list_prompts(server_name)
-    assert [%{uri: "resource://ns/data"}] = FastestMCP.list_resources(server_name)
+    assert [%{name: "ns_my_tool"}] = FastestMCP.list_tools!(server_name)
+    assert [%{name: "ns_my_prompt"}] = FastestMCP.list_prompts!(server_name)
+    assert [%{uri: "resource://ns/data"}] = FastestMCP.list_resources!(server_name)
 
     assert [%{uri_template: "resource://ns/{name}/data"}] =
-             FastestMCP.list_resource_templates(server_name)
+             FastestMCP.list_resource_templates!(server_name)
 
-    assert "content" == FastestMCP.read_resource(server_name, "resource://ns/data")
+    assert "content" == FastestMCP.read_resource!(server_name, "resource://ns/data")
   end
 
   test "renamed provider tools are callable through reverse lookup without falling back to list" do
@@ -102,11 +102,11 @@ defmodule FastestMCP.ProviderTransformTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    assert [%{name: "renamed_echo"}] = FastestMCP.list_tools(server_name)
+    assert [%{name: "renamed_echo"}] = FastestMCP.list_tools!(server_name)
     assert_receive :list_tools_called, 1_000
 
     assert %{source: "provider", value: "hello"} ==
-             FastestMCP.call_tool(server_name, "renamed_echo", %{"value" => "hello"})
+             FastestMCP.call_tool!(server_name, "renamed_echo", %{"value" => "hello"})
 
     assert_receive :get_tool_called, 1_000
     refute_receive :list_tools_called, 50
@@ -132,8 +132,8 @@ defmodule FastestMCP.ProviderTransformTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    assert [%{name: "short"}] = FastestMCP.list_tools(server_name)
-    assert "success" == FastestMCP.call_tool(server_name, "short", %{})
+    assert [%{name: "short"}] = FastestMCP.list_tools!(server_name)
+    assert "success" == FastestMCP.call_tool!(server_name, "short", %{})
   end
 
   test "duplicate rename targets raise" do
@@ -176,7 +176,7 @@ defmodule FastestMCP.ProviderTransformTest do
 
     error =
       assert_raise Error, fn ->
-        FastestMCP.initialize(invalid_provider_server)
+        FastestMCP.initialize!(invalid_provider_server)
       end
 
     assert error.code == :internal_error
@@ -199,10 +199,10 @@ defmodule FastestMCP.ProviderTransformTest do
     on_exit(fn -> FastestMCP.stop_server(invalid_transform_server) end)
 
     assert %{"protocolVersion" => "2025-11-25"} =
-             FastestMCP.initialize(invalid_transform_server)
+             FastestMCP.initialize!(invalid_transform_server)
 
     assert [%{output_schema: %{"type" => "array"}}] =
-             FastestMCP.list_tools(invalid_transform_server)
+             FastestMCP.list_tools!(invalid_transform_server)
   end
 
   test "provider schema refresh uses runtime schema options and the digest cache" do
@@ -246,19 +246,19 @@ defmodule FastestMCP.ProviderTransformTest do
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
     assert [%{name: "dynamic_echo", input_schema: ^input_schema}] =
-             FastestMCP.list_tools(server_name)
+             FastestMCP.list_tools!(server_name)
 
     assert drain_schema_resolutions(target) > 0
 
-    assert [%{name: "dynamic_echo"}] = FastestMCP.list_tools(server_name)
+    assert [%{name: "dynamic_echo"}] = FastestMCP.list_tools!(server_name)
     refute_receive {:provider_schema_resolved, ^target}, 50
 
     assert %{"value" => 3} =
-             FastestMCP.call_tool(server_name, "dynamic_echo", %{"value" => 3})
+             FastestMCP.call_tool!(server_name, "dynamic_echo", %{"value" => 3})
 
     error =
       assert_raise Error, fn ->
-        FastestMCP.call_tool(server_name, "dynamic_echo", %{"value" => "3"})
+        FastestMCP.call_tool!(server_name, "dynamic_echo", %{"value" => "3"})
       end
 
     assert error.code == :bad_request
@@ -311,12 +311,12 @@ defmodule FastestMCP.ProviderTransformTest do
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
     assert [%{name: "ns_dynamic_echo", input_schema: ^input_schema}] =
-             FastestMCP.list_tools(server_name)
+             FastestMCP.list_tools!(server_name)
 
     refute_receive {:provider_schema_resolved, ^target}, 50
 
     assert %{"value" => 7} =
-             FastestMCP.call_tool(server_name, "ns_dynamic_echo", %{"value" => 7})
+             FastestMCP.call_tool!(server_name, "ns_dynamic_echo", %{"value" => 7})
   end
 
   defp drain_schema_resolutions(target, count \\ 0) do

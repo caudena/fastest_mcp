@@ -18,26 +18,26 @@ defmodule FastestMCP.TaskDefaultsTest do
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
 
-    tool_task = FastestMCP.call_tool(server_name, "tool_job", %{}, task: true)
-    prompt_task = FastestMCP.render_prompt(server_name, "prompt_job", %{}, task: true)
-    resource_task = FastestMCP.read_resource(server_name, "file://report.txt", task: true)
+    tool_task = FastestMCP.call_tool!(server_name, "tool_job", %{}, task: true)
+    prompt_task = FastestMCP.render_prompt!(server_name, "prompt_job", %{}, task: true)
+    resource_task = FastestMCP.read_resource!(server_name, "file://report.txt", task: true)
 
     template_task =
-      FastestMCP.read_resource(server_name, "file://reports/42.txt", task: true)
+      FastestMCP.read_resource!(server_name, "file://reports/42.txt", task: true)
 
     assert %BackgroundTask{} = tool_task
     assert %BackgroundTask{} = prompt_task
     assert %BackgroundTask{} = resource_task
     assert %BackgroundTask{} = template_task
 
-    assert FastestMCP.await_task(tool_task, 1_000) == :tool_done
+    assert FastestMCP.await_task!(tool_task, 1_000) == :tool_done
 
-    assert FastestMCP.await_task(prompt_task, 1_000) == %{
-             messages: [%{role: "user", content: "prompt_done"}]
-           }
+    assert %{
+             messages: [%{role: "user", content: %{type: "text", text: "prompt_done"}}]
+           } = FastestMCP.await_task!(prompt_task, 1000)
 
-    assert FastestMCP.await_task(resource_task, 1_000) == "resource_done"
-    assert FastestMCP.await_task(template_task, 1_000) == "report:42"
+    assert FastestMCP.await_task!(resource_task, 1_000) == "resource_done"
+    assert FastestMCP.await_task!(template_task, 1_000) == "report:42"
   end
 
   test "component task options override the server default" do
@@ -54,18 +54,18 @@ defmodule FastestMCP.TaskDefaultsTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
 
     assert %BackgroundTask{} =
-             FastestMCP.call_tool(server_name, "default_task", %{}, task: true)
+             FastestMCP.call_tool!(server_name, "default_task", %{}, task: true)
 
     forbidden_error =
       assert_raise Error, fn ->
-        FastestMCP.call_tool(server_name, "no_task", %{}, task: true)
+        FastestMCP.call_tool!(server_name, "no_task", %{}, task: true)
       end
 
     assert forbidden_error.code == :method_not_found
 
     required_error =
       assert_raise Error, fn ->
-        FastestMCP.call_tool(server_name, "required_task", %{})
+        FastestMCP.call_tool!(server_name, "required_task", %{})
       end
 
     assert required_error.code == :method_not_found
@@ -82,7 +82,7 @@ defmodule FastestMCP.TaskDefaultsTest do
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
 
-    tools = FastestMCP.list_tools(server_name)
+    tools = FastestMCP.list_tools!(server_name)
 
     assert Enum.find(tools, &(&1.name == "inherited")).execution == %{taskSupport: "optional"}
     assert Enum.find(tools, &(&1.name == "disabled")).execution == nil
@@ -110,9 +110,9 @@ defmodule FastestMCP.TaskDefaultsTest do
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
 
-    prompts = FastestMCP.list_prompts(server_name)
-    resources = FastestMCP.list_resources(server_name)
-    templates = FastestMCP.list_resource_templates(server_name)
+    prompts = FastestMCP.list_prompts!(server_name)
+    resources = FastestMCP.list_resources!(server_name)
+    templates = FastestMCP.list_resource_templates!(server_name)
 
     assert Enum.find(prompts, &(&1.name == "prompt_default")).execution == %{
              taskSupport: "optional"

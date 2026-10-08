@@ -32,8 +32,8 @@ defmodule FastestMCP.TelemetryTest do
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
 
-    assert %{status: "ok"} == FastestMCP.call_tool(server_name, "ok", %{})
-    assert_raise Error, fn -> FastestMCP.call_tool(server_name, "fail", %{}) end
+    assert %{status: "ok"} == FastestMCP.call_tool!(server_name, "ok", %{})
+    assert_raise Error, fn -> FastestMCP.call_tool!(server_name, "fail", %{}) end
 
     assert_receive {:telemetry, [:fastest_mcp, :operation, :start], _measurements,
                     %{method: "tools/call", server_name: ^server_name}},
@@ -79,12 +79,12 @@ defmodule FastestMCP.TelemetryTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
 
     assert %{} ==
-             FastestMCP.call_tool(server_name, "echo", %{},
+             FastestMCP.call_tool!(server_name, "echo", %{},
                auth_input: %{"authorization" => "Bearer valid-token"}
              )
 
     assert_raise Error, fn ->
-      FastestMCP.call_tool(server_name, "echo", %{}, auth_input: %{"token" => "missing"})
+      FastestMCP.call_tool!(server_name, "echo", %{}, auth_input: %{"token" => "missing"})
     end
 
     provider = inspect(FastestMCP.Auth.StaticToken)

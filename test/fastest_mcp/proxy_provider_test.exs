@@ -213,11 +213,11 @@ defmodule FastestMCP.ProxyProviderTest do
       |> FastestMCP.add_tool(
         "echo",
         fn arguments, _context ->
-          %{
+          FastestMCP.Tools.Result.from(%{
             content: [%{type: "text", text: "ordinary fallback"}],
             structuredContent: [arguments, 7, false],
             _meta: %{"vendor" => %{"trace" => "upstream-tool"}}
-          }
+          })
         end,
         title: "Echo title",
         description: "Echoes arbitrary structured data",
@@ -238,11 +238,11 @@ defmodule FastestMCP.ProxyProviderTest do
       |> FastestMCP.add_tool(
         "scalar",
         fn _arguments, _context ->
-          %{
+          FastestMCP.Tools.Result.from(%{
             content: [%{type: "text", text: "scalar fallback"}],
             structuredContent: 42,
             _meta: %{"vendor" => %{"trace" => "upstream-scalar"}}
-          }
+          })
         end,
         output_schema: %{"type" => "integer"}
       )
@@ -512,7 +512,7 @@ defmodule FastestMCP.ProxyProviderTest do
       |> FastestMCP.add_tool(
         "show_report",
         fn _arguments, _context ->
-          %{content: [%{type: "text", text: "Report is ready"}]}
+          FastestMCP.Tools.Result.from(%{content: [%{type: "text", text: "Report is ready"}]})
         end,
         meta: Apps.tool_meta(uri)
       )
@@ -734,8 +734,8 @@ defmodule FastestMCP.ProxyProviderTest do
         }
       )
 
-    assert %{"content" => _content} =
-             FastestMCP.call_tool(front_name, "progress", %{},
+    assert %FastestMCP.Tools.Result{content: _content} =
+             FastestMCP.call_tool!(front_name, "progress", %{},
                state_scope: :request,
                transport: :streamable_http,
                negotiated_protocol_version: "2026-07-28",
@@ -786,7 +786,7 @@ defmodule FastestMCP.ProxyProviderTest do
     legacy_front = start_proxy_server!(endpoint)
 
     assert [%{name: "echo"}] =
-             FastestMCP.list_tools(legacy_front,
+             FastestMCP.list_tools!(legacy_front,
                state_scope: :request,
                negotiated_protocol_version: "2025-11-25",
                client_capabilities: %{}
@@ -843,7 +843,7 @@ defmodule FastestMCP.ProxyProviderTest do
 
     error =
       assert_raise Error, fn ->
-        FastestMCP.call_tool(front_name, "remote_task", %{},
+        FastestMCP.call_tool!(front_name, "remote_task", %{},
           state_scope: :request,
           negotiated_protocol_version: "2026-07-28",
           client_capabilities: %{

@@ -107,19 +107,19 @@ defmodule FastestMCP.ClientLifecycleTest do
   test "initialization has one owner and completes only after initialized is accepted" do
     client = start_client(:block_initialized)
 
-    assert Client.lifecycle_state(client) == :new
+    assert Client.lifecycle_state!(client) == :new
 
-    before_init = capture_error(fn -> Client.ping(client) end)
+    before_init = capture_error(fn -> Client.ping!(client) end)
     assert before_init.code == :invalid_request
     assert before_init.details.lifecycle_state == :new
 
-    initializer = Task.async(fn -> capture_result(fn -> Client.initialize(client) end) end)
+    initializer = Task.async(fn -> capture_result(fn -> Client.initialize!(client) end) end)
 
     assert_receive {:initialized_notification_received, notification_pid}, 1_000
     assert Task.yield(initializer, 0) == nil
 
-    duplicate = Task.async(fn -> capture_result(fn -> Client.initialize(client) end) end)
-    initializing_ping = Task.async(fn -> capture_result(fn -> Client.ping(client) end) end)
+    duplicate = Task.async(fn -> capture_result(fn -> Client.initialize!(client) end) end)
+    initializing_ping = Task.async(fn -> capture_result(fn -> Client.ping!(client) end) end)
 
     assert Task.yield(duplicate, 0) == nil
     assert Task.yield(initializing_ping, 0) == nil
@@ -134,10 +134,10 @@ defmodule FastestMCP.ClientLifecycleTest do
 
     assert {:ok, %{"protocolVersion" => version}} = Task.await(initializer, 1_000)
     assert version == "2025-11-25"
-    assert Client.lifecycle_state(client) == :initialized
-    assert Client.initialize_result(client)["protocolVersion"] == version
+    assert Client.lifecycle_state!(client) == :initialized
+    assert Client.initialize_result!(client)["protocolVersion"] == version
 
-    after_init = capture_error(fn -> Client.initialize(client) end)
+    after_init = capture_error(fn -> Client.initialize!(client) end)
     assert after_init.code == :invalid_request
     assert after_init.details.lifecycle_state == :initialized
   end
@@ -145,16 +145,16 @@ defmodule FastestMCP.ClientLifecycleTest do
   test "a failed initialized notification makes initialization terminal" do
     client = start_client(:fail_initialized)
 
-    error = capture_error(fn -> Client.initialize(client) end)
+    error = capture_error(fn -> Client.initialize!(client) end)
     assert error.code in [:bad_request, :internal_error]
-    assert Client.lifecycle_state(client) == :failed
-    assert Client.initialize_result(client) == nil
+    assert Client.lifecycle_state!(client) == :failed
+    assert Client.initialize_result!(client) == nil
 
-    retry_error = capture_error(fn -> Client.initialize(client) end)
+    retry_error = capture_error(fn -> Client.initialize!(client) end)
     assert retry_error.code == :invalid_request
     assert retry_error.details.lifecycle_state == :failed
 
-    request_error = capture_error(fn -> Client.ping(client) end)
+    request_error = capture_error(fn -> Client.ping!(client) end)
     assert request_error.code == :invalid_request
     assert request_error.details.lifecycle_state == :failed
   end
@@ -177,19 +177,19 @@ defmodule FastestMCP.ClientLifecycleTest do
       )
 
     assert Client.ready?(client_name)
-    assert :ok = Client.await_ready(client_name, 100)
-    assert %{items: [%{"name" => "echo"}]} = Client.list_tools(client_name)
+    assert :ok = Client.await_ready!(client_name, 100)
+    assert %{items: [%{"name" => "echo"}]} = Client.list_tools!(client_name)
 
     old_client = %Client{pid: pid}
     Process.exit(pid, :kill)
 
-    assert :ok = Client.await_ready(client_name, 2_000)
+    assert :ok = Client.await_ready!(client_name, 2_000)
     replacement = GenServer.whereis(client_name)
     assert is_pid(replacement)
     refute replacement == pid
 
-    assert_raise Error, ~r/not running/, fn -> Client.list_tools(old_client) end
-    assert %{items: [%{"name" => "echo"}]} = Client.list_tools(client_name)
+    assert_raise Error, ~r/not running/, fn -> Client.list_tools!(old_client) end
+    assert %{items: [%{"name" => "echo"}]} = Client.list_tools!(client_name)
   end
 
   test "manual negotiation releases readiness waiters" do
@@ -211,16 +211,16 @@ defmodule FastestMCP.ClientLifecycleTest do
     refute Client.ready?(client_name)
 
     assert_raise Error, ~r/did not become ready/, fn ->
-      Client.await_ready(client_name, 1)
+      Client.await_ready!(client_name, 1)
     end
 
     Process.sleep(10)
-    assert :sys.get_state(GenServer.whereis(client_name)).readiness_waiters == %{}
+    assert :sys.get_state(GenServer.whereis(client_name)).lifecycle.readiness_waiters == %{}
 
-    waiter = Task.async(fn -> Client.await_ready(client_name, 1_000) end)
+    waiter = Task.async(fn -> Client.await_ready!(client_name, 1_000) end)
     assert Task.yield(waiter, 0) == nil
 
-    assert %{"supportedVersions" => supported_versions} = Client.discover(client_name)
+    assert %{"supportedVersions" => supported_versions} = Client.discover!(client_name)
     assert "2026-07-28" in supported_versions
     assert :ok = Task.await(waiter, 1_000)
     assert Client.ready?(client_name)
@@ -255,8 +255,8 @@ defmodule FastestMCP.ClientLifecycleTest do
 
     assert Client.ready?(registry_name)
     assert Client.ready?(unnamed)
-    assert Client.protocol_version(registry_name) == "2026-07-28"
-    assert Client.protocol_version(%Client{pid: unnamed}) == "2026-07-28"
+    assert Client.protocol_version!(registry_name) == "2026-07-28"
+    assert Client.protocol_version!(%Client{pid: unnamed}) == "2026-07-28"
   end
 
   test "one discovery owner excludes concurrent attempts" do
@@ -274,12 +274,12 @@ defmodule FastestMCP.ClientLifecycleTest do
         protocol_version: "2026-07-28"
       )
 
-    on_exit(fn -> if Client.connected?(client), do: Client.disconnect(client) end)
+    on_exit(fn -> if Client.connected?(client), do: Client.disconnect!(client) end)
 
-    owner = Task.async(fn -> Client.discover(client) end)
+    owner = Task.async(fn -> Client.discover!(client) end)
     assert_receive {:discovery_request, request_pid}, 1_000
 
-    error = capture_error(fn -> Client.discover(client) end)
+    error = capture_error(fn -> Client.discover!(client) end)
     assert error.code == :invalid_request
     assert error.message =~ "already in progress"
 
@@ -323,11 +323,11 @@ defmodule FastestMCP.ClientLifecycleTest do
          target: "http://127.0.0.1:#{port}/mcp", name: client_name, protocol_version: "2026-07-28"}
       )
 
-    _request = Client.request_async(client_name, "example/block", %{}, timeout_ms: :infinity)
+    _request = Client.request_async!(client_name, "example/block", %{}, timeout_ms: :infinity)
     assert_receive {:blocking_request, request_pid}, 1_000
 
     state = :sys.get_state(client_pid)
-    [%{worker_pid: worker_pid}] = Map.values(state.in_flight)
+    [%{worker_pid: worker_pid}] = Map.values(state.pending.in_flight)
     worker_supervisor = state.worker_supervisor
     assert Process.alive?(worker_pid)
     assert Process.alive?(worker_supervisor)
@@ -354,7 +354,7 @@ defmodule FastestMCP.ClientLifecycleTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     client

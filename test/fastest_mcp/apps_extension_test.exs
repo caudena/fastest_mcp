@@ -156,7 +156,7 @@ defmodule FastestMCP.AppsExtensionTest do
     for protocol_version <- ["2026-07-28", "2025-11-25"] do
       assert_raise FastestMCP.Error, ~r/non-empty content fallback/, fn ->
         Serializer.tool_result(
-          %{content: []},
+          FastestMCP.Tools.Result.from(%{content: []}),
           descriptor,
           Keyword.put(opts, :protocol_version, protocol_version)
         )
@@ -164,7 +164,7 @@ defmodule FastestMCP.AppsExtensionTest do
 
       assert %{"content" => [%{"text" => "available without a Host"}]} =
                Serializer.tool_result(
-                 %{content: ["available without a Host"]},
+                 FastestMCP.Tools.Result.from(%{content: ["available without a Host"]}),
                  descriptor,
                  Keyword.put(opts, :protocol_version, protocol_version)
                )
@@ -176,7 +176,9 @@ defmodule FastestMCP.AppsExtensionTest do
              "content" => [%{"type" => "text", "text" => "false"}],
              "structuredContent" => false
            } =
-             Serializer.tool_result(%{structuredContent: false}, nil,
+             Serializer.tool_result(
+               FastestMCP.Tools.Result.from(%{structuredContent: false}),
+               nil,
                protocol_version: "2026-07-28"
              )
 
@@ -184,7 +186,7 @@ defmodule FastestMCP.AppsExtensionTest do
              "content" => [%{"type" => "text", "text" => "null"}],
              "structuredContent" => nil
            } =
-             Serializer.tool_result(%{structuredContent: nil}, nil,
+             Serializer.tool_result(FastestMCP.Tools.Result.from(%{structuredContent: nil}), nil,
                protocol_version: "2026-07-28"
              )
   end
@@ -237,7 +239,7 @@ defmodule FastestMCP.AppsExtensionTest do
       |> FastestMCP.add_tool(
         "show_report",
         fn _arguments, _context ->
-          %{content: [%{type: "text", text: "Report is ready"}]}
+          FastestMCP.Tools.Result.from(%{content: [%{type: "text", text: "Report is ready"}]})
         end,
         meta: Apps.tool_meta(uri)
       )
@@ -337,20 +339,20 @@ defmodule FastestMCP.AppsExtensionTest do
           extensions: %{Extensions.apps() => Apps.client_settings()}
         )
 
-      assert get_in(Client.capabilities(client), ["extensions", Extensions.apps()]) == %{}
-      assert %{items: [tool]} = Client.list_tools(client)
+      assert get_in(Client.capabilities!(client), ["extensions", Extensions.apps()]) == %{}
+      assert %{items: [tool]} = Client.list_tools!(client)
       assert Apps.resource_uri(fetch(tool, :_meta)) == uri
 
-      read = Client.read_resource(client, uri)
+      read = Client.read_resource!(client, uri)
       [content] = fetch(read, :contents)
       assert fetch(content, :mimeType) == Apps.mime_type()
       assert fetch(content, :text) == html
 
-      metadata_free_read = Client.read_resource(client, metadata_free_uri)
+      metadata_free_read = Client.read_resource!(client, metadata_free_uri)
       [metadata_free_content] = fetch(metadata_free_read, :contents)
       assert fetch(metadata_free_content, :mimeType) == Apps.mime_type()
       assert fetch(metadata_free_content, :text) == external_html
-      Client.disconnect(client)
+      Client.disconnect!(client)
     end
   end
 

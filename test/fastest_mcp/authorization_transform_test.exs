@@ -39,23 +39,23 @@ defmodule FastestMCP.AuthorizationTransformTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    assert [] == FastestMCP.list_tools(server_name)
+    assert [] == FastestMCP.list_tools!(server_name)
 
     assert ["other_tool", "public_tool"] ==
              server_name
-             |> FastestMCP.list_tools(auth_input: %{"token" => "api-token"})
+             |> FastestMCP.list_tools!(auth_input: %{"token" => "api-token"})
              |> Enum.map(& &1.name)
              |> Enum.sort()
 
     error =
       assert_raise Error, fn ->
-        FastestMCP.call_tool(server_name, "public_tool", %{})
+        FastestMCP.call_tool!(server_name, "public_tool", %{})
       end
 
     assert error.code == :forbidden
 
     assert "public" ==
-             FastestMCP.call_tool(server_name, "public_tool", %{},
+             FastestMCP.call_tool!(server_name, "public_tool", %{},
                auth_input: %{"token" => "api-token"}
              )
   end
@@ -78,19 +78,19 @@ defmodule FastestMCP.AuthorizationTransformTest do
 
     assert ["public_tool"] ==
              server_name
-             |> FastestMCP.list_tools()
+             |> FastestMCP.list_tools!()
              |> Enum.map(& &1.name)
              |> Enum.sort()
 
     assert ["admin_tool", "public_tool"] ==
              server_name
-             |> FastestMCP.list_tools(auth_input: %{"token" => "admin-token"})
+             |> FastestMCP.list_tools!(auth_input: %{"token" => "admin-token"})
              |> Enum.map(& &1.name)
              |> Enum.sort()
 
     error =
       assert_raise Error, fn ->
-        FastestMCP.call_tool(server_name, "admin_tool", %{})
+        FastestMCP.call_tool!(server_name, "admin_tool", %{})
       end
 
     assert error.code == :forbidden
@@ -111,15 +111,15 @@ defmodule FastestMCP.AuthorizationTransformTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    assert [] == FastestMCP.list_tools(server_name)
-    assert [] == FastestMCP.list_tools(server_name, auth_input: %{"token" => "api-token"})
+    assert [] == FastestMCP.list_tools!(server_name)
+    assert [] == FastestMCP.list_tools!(server_name, auth_input: %{"token" => "api-token"})
 
     assert [%{name: "write_tool"}] =
-             FastestMCP.list_tools(server_name, auth_input: %{"token" => "full-token"})
+             FastestMCP.list_tools!(server_name, auth_input: %{"token" => "full-token"})
 
     error =
       assert_raise Error, fn ->
-        FastestMCP.call_tool(server_name, "write_tool", %{},
+        FastestMCP.call_tool!(server_name, "write_tool", %{},
           auth_input: %{"token" => "api-token"}
         )
       end
@@ -127,7 +127,7 @@ defmodule FastestMCP.AuthorizationTransformTest do
     assert error.code == :forbidden
 
     assert "write" ==
-             FastestMCP.call_tool(server_name, "write_tool", %{},
+             FastestMCP.call_tool!(server_name, "write_tool", %{},
                auth_input: %{"token" => "full-token"}
              )
   end
@@ -150,10 +150,10 @@ defmodule FastestMCP.AuthorizationTransformTest do
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
     assert [%{name: "write_tool"}] =
-             FastestMCP.list_tools(server_name, auth_input: %{"token" => "api-token"})
+             FastestMCP.list_tools!(server_name, auth_input: %{"token" => "api-token"})
 
     assert "write" ==
-             FastestMCP.call_tool(server_name, "write_tool", %{},
+             FastestMCP.call_tool!(server_name, "write_tool", %{},
                auth_input: %{"token" => "api-token"}
              )
   end

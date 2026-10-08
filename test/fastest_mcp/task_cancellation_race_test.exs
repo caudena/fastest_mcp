@@ -43,7 +43,7 @@ defmodule FastestMCP.TaskCancellationRaceTest do
     try do
       cancel =
         Task.async(fn ->
-          FastestMCP.cancel_task(server_name, task_id, session_id: session_id)
+          FastestMCP.cancel_task!(server_name, task_id, session_id: session_id)
         end)
 
       assert eventually(fn -> cancel_queued?(task_store, task_id) end)
@@ -54,7 +54,7 @@ defmodule FastestMCP.TaskCancellationRaceTest do
       assert %{status: :cancelled} = Task.await(cancel, 1_000)
 
       assert %{status: :cancelled} =
-               FastestMCP.fetch_task(server_name, task_id, session_id: session_id)
+               FastestMCP.fetch_task!(server_name, task_id, session_id: session_id)
     after
       resume_if_suspended(task_store)
     end

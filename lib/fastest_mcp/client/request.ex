@@ -7,16 +7,17 @@ defmodule FastestMCP.Client.Request do
   """
 
   @enforce_keys [:client, :ref, :request_id, :method, :owner]
-  defstruct [:client, :ref, :request_id, :method, :owner, task_augmented: false]
+  defstruct [:client, :ref, :request_id, :method, :owner, :monitor, task_augmented: false]
 
-  @type t :: %__MODULE__{
-          client: FastestMCP.Client.t(),
-          ref: reference(),
-          request_id: String.t() | integer(),
-          method: String.t(),
-          owner: pid(),
-          task_augmented: boolean()
-        }
+  @opaque t :: %__MODULE__{
+            client: FastestMCP.Client.t(),
+            ref: reference(),
+            request_id: String.t() | integer(),
+            method: String.t(),
+            owner: pid(),
+            monitor: reference(),
+            task_augmented: boolean()
+          }
 
   @doc "Waits for the request result."
   def await(%__MODULE__{} = request, timeout \\ :infinity) do
@@ -27,4 +28,12 @@ defmodule FastestMCP.Client.Request do
   def cancel(%__MODULE__{} = request, reason \\ nil) do
     FastestMCP.Client.cancel(request, reason)
   end
+
+  @doc "Raising variant of `await/2`."
+  def await!(request, timeout \\ :infinity),
+    do: FastestMCP.OperationResult.unwrap!(await(request, timeout))
+
+  @doc "Raising variant of `cancel/2`."
+  def cancel!(request, reason \\ nil),
+    do: FastestMCP.OperationResult.unwrap!(cancel(request, reason))
 end

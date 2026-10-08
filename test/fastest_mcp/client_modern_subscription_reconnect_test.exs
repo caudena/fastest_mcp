@@ -138,11 +138,11 @@ defmodule FastestMCP.ClientModernSubscriptionReconnectTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     listener =
-      Client.listen(client, %{"resourceSubscriptions" => ["status://reconnect"]},
+      Client.listen!(client, %{"resourceSubscriptions" => ["status://reconnect"]},
         on_notification: fn notification ->
           send(parent, {:listener_notification, notification})
         end
@@ -199,10 +199,10 @@ defmodule FastestMCP.ClientModernSubscriptionReconnectTest do
                     }},
                    1_000
 
-    assert :ok = Client.cancel(listener, "test complete")
+    assert :ok = Client.cancel!(listener, "test complete")
     send(second_pid, :close_listener)
 
     refute_receive {:modern_listener_request, 3, _pid, _method, _headers, _request}, 250
-    assert :sys.get_state(client.pid).in_flight == %{}
+    assert :sys.get_state(client.pid).pending.in_flight == %{}
   end
 end

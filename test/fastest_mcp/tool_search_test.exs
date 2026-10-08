@@ -64,6 +64,21 @@ defmodule FastestMCP.ToolSearchTest do
     def get_component_candidates(%__MODULE__{}, _component_type, _identifier, _operation), do: []
   end
 
+  test "search normalizes Unicode without renaming tools" do
+    name = unique_name("unicode-search")
+
+    server =
+      FastestMCP.server(name, tool_search: true)
+      |> FastestMCP.add_tool("original", fn _, _ -> "ok" end, description: "café Straße")
+
+    start_server!(server)
+
+    for query <- ["café", "café", "ＣＡＦÉ", "STRASSE", "Straße"] do
+      assert %{"tools" => [%{"name" => "original"}]} =
+               FastestMCP.call_tool!(name, "search_tools", %{"query" => query})
+    end
+  end
+
   test "listing exposes only pinned model tools and the synthetic pair" do
     server_name = unique_name("tool-search-list")
 
@@ -83,10 +98,10 @@ defmodule FastestMCP.ToolSearchTest do
 
     assert ["pinned", "search_tools", "call_tool"] ==
              server_name
-             |> FastestMCP.list_tools(audience: :app)
+             |> FastestMCP.list_tools!(audience: :app)
              |> Enum.map(& &1.name)
 
-    assert %{"source" => "ordinary"} = FastestMCP.call_tool(server_name, "ordinary", %{})
+    assert %{"source" => "ordinary"} = FastestMCP.call_tool!(server_name, "ordinary", %{})
   end
 
   test "search ranking is deterministic and rejects tokenless queries" do
@@ -107,7 +122,7 @@ defmodule FastestMCP.ToolSearchTest do
     start_server!(server)
 
     assert %{"tools" => tools, "truncated" => false} =
-             FastestMCP.call_tool(server_name, "search_tools", %{"query" => "DEPLOY"})
+             FastestMCP.call_tool!(server_name, "search_tools", %{"query" => "DEPLOY"})
 
     assert Enum.map(tools, & &1["name"]) == [
              "deploy",
@@ -118,7 +133,7 @@ defmodule FastestMCP.ToolSearchTest do
 
     error =
       assert_raise Error, fn ->
-        FastestMCP.call_tool(server_name, "search_tools", %{"query" => "---"})
+        FastestMCP.call_tool!(server_name, "search_tools", %{"query" => "---"})
       end
 
     assert error.code == :bad_request
@@ -151,20 +166,20 @@ defmodule FastestMCP.ToolSearchTest do
     start_server!(server)
 
     assert %{"tools" => tools} =
-             FastestMCP.call_tool(server_name, "search_tools", %{"query" => "recipient"})
+             FastestMCP.call_tool!(server_name, "search_tools", %{"query" => "recipient"})
 
     assert Enum.map(tools, & &1["name"]) == ["recipient", "account_lookup"]
 
     assert %{"tools" => [%{"name" => "account_lookup"}]} =
-             FastestMCP.call_tool(server_name, "search_tools", %{"query" => "record id"})
+             FastestMCP.call_tool!(server_name, "search_tools", %{"query" => "record id"})
 
     assert %{"tools" => [%{"name" => "account_lookup"}]} =
-             FastestMCP.call_tool(server_name, "search_tools", %{
+             FastestMCP.call_tool!(server_name, "search_tools", %{
                "query" => "lookup recipient"
              })
 
     assert %{"tools" => []} =
-             FastestMCP.call_tool(server_name, "search_tools", %{"query" => "secret code"})
+             FastestMCP.call_tool!(server_name, "search_tools", %{"query" => "secret code"})
   end
 
   test "search does not index injected parameters" do
@@ -194,10 +209,10 @@ defmodule FastestMCP.ToolSearchTest do
     start_server!(server)
 
     assert %{"tools" => [%{"name" => "lookup"}]} =
-             FastestMCP.call_tool(server_name, "search_tools", %{"query" => "visible query"})
+             FastestMCP.call_tool!(server_name, "search_tools", %{"query" => "visible query"})
 
     assert %{"tools" => []} =
-             FastestMCP.call_tool(server_name, "search_tools", %{"query" => "private tenant"})
+             FastestMCP.call_tool!(server_name, "search_tools", %{"query" => "private tenant"})
   end
 
   test "bounded search uses provider pages and never calls the list fallback" do
@@ -225,14 +240,14 @@ defmodule FastestMCP.ToolSearchTest do
 
     assert ["tool_01", "search_tools", "call_tool"] ==
              server_name
-             |> FastestMCP.list_tools()
+             |> FastestMCP.list_tools!()
              |> Enum.map(& &1.name)
 
     refute_receive :materialized_provider_catalog
     refute_receive {:provider_page, _, _}
 
     assert %{"tools" => tools, "truncated" => true} =
-             FastestMCP.call_tool(server_name, "search_tools", %{"query" => "bounded"})
+             FastestMCP.call_tool!(server_name, "search_tools", %{"query" => "bounded"})
 
     assert Enum.map(tools, & &1["name"]) == ["tool_01", "tool_02"]
     assert_receive {:provider_page, nil, 5}
@@ -268,7 +283,7 @@ defmodule FastestMCP.ToolSearchTest do
     start_server!(server)
 
     assert %{"tools" => results, "truncated" => true} =
-             FastestMCP.call_tool(server_name, "search_tools", %{"query" => "legacy"})
+             FastestMCP.call_tool!(server_name, "search_tools", %{"query" => "legacy"})
 
     assert Enum.map(results, & &1["name"]) == ["legacy_alpha", "legacy_zulu"]
     assert_receive {:list_only_exact_lookup, "search_tools"}
@@ -299,10 +314,10 @@ defmodule FastestMCP.ToolSearchTest do
     start_server!(server)
 
     assert %{"tools" => [%{"name" => "ns_remote_find"}]} =
-             FastestMCP.call_tool(server_name, "search_tools", %{"query" => "remote"})
+             FastestMCP.call_tool!(server_name, "search_tools", %{"query" => "remote"})
 
     assert %{"source" => "provider"} =
-             FastestMCP.call_tool(server_name, "call_tool", %{
+             FastestMCP.call_tool!(server_name, "call_tool", %{
                "name" => "ns_remote_find",
                "arguments" => %{}
              })
@@ -339,7 +354,7 @@ defmodule FastestMCP.ToolSearchTest do
     ]
 
     assert %{"tools" => tools} =
-             FastestMCP.call_tool(
+             FastestMCP.call_tool!(
                server_name,
                "search_tools",
                %{"query" => "model"},
@@ -349,7 +364,7 @@ defmodule FastestMCP.ToolSearchTest do
     assert Enum.map(tools, & &1["name"]) == ["model_public", "model_scoped"]
 
     assert %{"name" => "ok"} =
-             FastestMCP.call_tool(
+             FastestMCP.call_tool!(
                server_name,
                "call_tool",
                %{"name" => "model_public"},
@@ -358,7 +373,7 @@ defmodule FastestMCP.ToolSearchTest do
 
     app_error =
       assert_raise Error, fn ->
-        FastestMCP.call_tool(
+        FastestMCP.call_tool!(
           server_name,
           "call_tool",
           %{"name" => "app_secret"},
@@ -390,21 +405,21 @@ defmodule FastestMCP.ToolSearchTest do
         input_schema: sum_schema
       )
       |> FastestMCP.add_tool("recursive", fn _arguments, context ->
-        FastestMCP.call_tool(context.server_name, "call_tool", %{"name" => "recursive"})
+        FastestMCP.call_tool!(context.server_name, "call_tool", %{"name" => "recursive"})
       end)
       |> FastestMCP.enable_tool_search()
 
     start_server!(server)
 
     assert %{"sum" => 7} =
-             FastestMCP.call_tool(server_name, "call_tool", %{
+             FastestMCP.call_tool!(server_name, "call_tool", %{
                "name" => "sum",
                "arguments" => %{"a" => 3, "b" => 4}
              })
 
     schema_error =
       assert_raise Error, fn ->
-        FastestMCP.call_tool(server_name, "call_tool", %{
+        FastestMCP.call_tool!(server_name, "call_tool", %{
           "name" => "sum",
           "arguments" => %{"a" => "3", "b" => 4}
         })
@@ -415,7 +430,7 @@ defmodule FastestMCP.ToolSearchTest do
     for target <- ["call_tool", "search_tools", "recursive"] do
       recursion_error =
         assert_raise Error, fn ->
-          FastestMCP.call_tool(server_name, "call_tool", %{"name" => target})
+          FastestMCP.call_tool!(server_name, "call_tool", %{"name" => target})
         end
 
       assert recursion_error.code == :bad_request, inspect({target, recursion_error})
@@ -459,7 +474,7 @@ defmodule FastestMCP.ToolSearchTest do
 
     start_server!(server)
 
-    error = assert_raise Error, fn -> FastestMCP.list_tools(server.name) end
+    error = assert_raise Error, fn -> FastestMCP.list_tools!(server.name) end
     assert error.code == :internal_error
 
     assert error.message ==
@@ -483,7 +498,7 @@ defmodule FastestMCP.ToolSearchTest do
     start_server!(server)
 
     assert %{"tools" => [%{"_meta" => unnegotiated_meta} = unnegotiated]} =
-             FastestMCP.call_tool(server_name, "search_tools", %{"query" => "dashboard"})
+             FastestMCP.call_tool!(server_name, "search_tools", %{"query" => "dashboard"})
 
     refute Map.has_key?(unnegotiated_meta, "ui")
     refute Map.has_key?(unnegotiated, "outputSchema")
@@ -500,7 +515,7 @@ defmodule FastestMCP.ToolSearchTest do
                }
              ]
            } =
-             FastestMCP.call_tool(
+             FastestMCP.call_tool!(
                server_name,
                "search_tools",
                %{"query" => "dashboard"},

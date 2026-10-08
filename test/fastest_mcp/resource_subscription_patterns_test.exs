@@ -44,19 +44,19 @@ defmodule FastestMCP.ResourceSubscriptionPatternsTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     assert wait_for_session_stream(client) == :ok
-    session_id = Client.session_id(client)
-    assert %{} = Client.subscribe_resource(client, "users://42?format=json")
+    session_id = Client.session_id!(client)
+    assert :ok = Client.subscribe_resource!(client, "users://42?format=json")
 
     assert :ok = Session.subscribe_resource(server_name, session_id, "users://{id}")
 
-    FastestMCP.notify_resource_updated(server_name, "users://99")
+    FastestMCP.notify_resource_updated!(server_name, "users://99")
     refute_receive {:resource_notification, _payload}, 250
 
-    FastestMCP.notify_resource_updated(server_name, "users://42?format=json")
+    FastestMCP.notify_resource_updated!(server_name, "users://42?format=json")
 
     assert_receive {:resource_notification,
                     %{
@@ -65,9 +65,9 @@ defmodule FastestMCP.ResourceSubscriptionPatternsTest do
                     }},
                    1_000
 
-    assert %{} = Client.unsubscribe_resource(client, "users://42?format=json")
+    assert :ok = Client.unsubscribe_resource!(client, "users://42?format=json")
 
-    FastestMCP.notify_resource_updated(server_name, "users://42?format=json")
+    FastestMCP.notify_resource_updated!(server_name, "users://42?format=json")
 
     refute_receive {:resource_notification, _payload}, 250
   end

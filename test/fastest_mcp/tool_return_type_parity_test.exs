@@ -13,22 +13,22 @@ defmodule FastestMCP.ToolReturnTypeParityTest do
     server =
       FastestMCP.server(server_name)
       |> FastestMCP.add_tool("text_block", fn _args, _ctx ->
-        %{type: "text", text: "Direct text content"}
+        FastestMCP.Tools.Result.new(%{type: "text", text: "Direct text content"})
       end)
       |> FastestMCP.add_tool("mixed_content", fn _args, _ctx ->
-        [
+        FastestMCP.Tools.Result.new([
           %{type: "text", text: "First block"},
           %{type: "image", data: Base.encode64(image_bytes), mimeType: "image/png"},
           %{"key" => "value"},
           "Fourth block"
-        ]
+        ])
       end)
       |> FastestMCP.add_tool("plain_list", fn _args, _ctx -> ["apple", "banana", "cherry"] end)
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
 
     assert %{content: [%{type: "text", text: "Direct text content"}]} =
-             FastestMCP.call_tool(server_name, "text_block", %{})
+             FastestMCP.call_tool!(server_name, "text_block", %{})
 
     assert %{
              content: [
@@ -37,12 +37,12 @@ defmodule FastestMCP.ToolReturnTypeParityTest do
                %{type: "text", text: encoded_map},
                %{type: "text", text: "Fourth block"}
              ]
-           } = FastestMCP.call_tool(server_name, "mixed_content", %{})
+           } = FastestMCP.call_tool!(server_name, "mixed_content", %{})
 
     assert Base.decode64!(encoded_image) == image_bytes
     assert JSON.decode!(encoded_map) == %{"key" => "value"}
 
-    assert ["apple", "banana", "cherry"] == FastestMCP.call_tool(server_name, "plain_list", %{})
+    assert ["apple", "banana", "cherry"] == FastestMCP.call_tool!(server_name, "plain_list", %{})
   end
 
   test "tool return values normalize transport-unsafe scalars and explicit envelopes" do
@@ -54,22 +54,22 @@ defmodule FastestMCP.ToolReturnTypeParityTest do
       |> FastestMCP.add_tool("datetime_value", fn _args, _ctx -> ~U[2025-11-05 12:30:45Z] end)
       |> FastestMCP.add_tool("range_value", fn _args, _ctx -> 1..3 end)
       |> FastestMCP.add_tool("explicit_envelope", fn _args, _ctx ->
-        %{
+        FastestMCP.Tools.Result.from(%{
           content: [%{type: "text", text: "hello"}],
           structuredContent: %{count: 2, at: ~U[2025-11-05 12:30:45Z]}
-        }
+        })
       end)
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
 
-    assert [42, "hello", true] == FastestMCP.call_tool(server_name, "tuple_value", %{})
-    assert "2025-11-05T12:30:45Z" == FastestMCP.call_tool(server_name, "datetime_value", %{})
-    assert [1, 2, 3] == FastestMCP.call_tool(server_name, "range_value", %{})
+    assert [42, "hello", true] == FastestMCP.call_tool!(server_name, "tuple_value", %{})
+    assert "2025-11-05T12:30:45Z" == FastestMCP.call_tool!(server_name, "datetime_value", %{})
+    assert [1, 2, 3] == FastestMCP.call_tool!(server_name, "range_value", %{})
 
     assert %{
              content: [%{type: "text", text: "hello"}],
-             structuredContent: %{count: 2, at: "2025-11-05T12:30:45Z"}
-           } = FastestMCP.call_tool(server_name, "explicit_envelope", %{})
+             structured_content: %{count: 2, at: "2025-11-05T12:30:45Z"}
+           } = FastestMCP.call_tool!(server_name, "explicit_envelope", %{})
   end
 
   test "task results keep normalized tool return values through the task protocol" do
@@ -81,18 +81,18 @@ defmodule FastestMCP.ToolReturnTypeParityTest do
       |> FastestMCP.add_tool(
         "image_block",
         fn _args, _ctx ->
-          %{type: "image", data: image_bytes, mimeType: "image/png"}
+          FastestMCP.Tools.Result.new(%{type: "image", data: image_bytes, mimeType: "image/png"})
         end,
         task: true
       )
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
 
-    task = FastestMCP.call_tool(server_name, "image_block", %{}, task: true)
+    task = FastestMCP.call_tool!(server_name, "image_block", %{}, task: true)
     assert %BackgroundTask{} = task
 
     assert %{content: [%{type: "image", data: encoded_image, mimeType: "image/png"}]} =
-             FastestMCP.await_task(task, 1_000)
+             FastestMCP.await_task!(task, 1_000)
 
     assert Base.decode64!(encoded_image) == image_bytes
 
@@ -169,7 +169,7 @@ defmodule FastestMCP.ToolReturnTypeParityTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
       if Process.alive?(bandit), do: Supervisor.stop(bandit)
       FastestMCP.stop_server(server_name)
     end)
@@ -202,10 +202,10 @@ defmodule FastestMCP.ToolReturnTypeParityTest do
                payload: %{"name" => "list_values", "arguments" => %{}}
              })
 
-    assert %{"values" => ["alpha", "beta"]} =
-             Client.call_tool(client, "list_values", %{})
+    assert %{structured_content: %{"values" => ["alpha", "beta"]}} =
+             Client.call_tool!(client, "list_values", %{})
 
-    task = Client.call_tool(client, "list_values", %{}, task: true)
+    task = Client.call_tool_task!(client, "list_values", %{}, task: true)
     task_id = task.task_id
 
     assert %{
@@ -213,7 +213,7 @@ defmodule FastestMCP.ToolReturnTypeParityTest do
              "_meta" => %{
                "io.modelcontextprotocol/related-task" => %{"taskId" => ^task_id}
              }
-           } = Client.task_result(client, task.task_id)
+           } = Client.task_result!(client, task.task_id)
   end
 
   test "task results keep the executed tool descriptor after version visibility changes" do
@@ -265,7 +265,7 @@ defmodule FastestMCP.ToolReturnTypeParityTest do
     assert %{status: :completed} = wait_for_task_completion(server_name, task_id, "task-session")
 
     :ok =
-      FastestMCP.disable_components(server_name,
+      FastestMCP.disable_components!(server_name,
         names: ["calc"],
         version: %{eq: "1.0.0"},
         components: [:tool]
@@ -293,7 +293,7 @@ defmodule FastestMCP.ToolReturnTypeParityTest do
   end
 
   defp do_wait_for_task_completion(server_name, task_id, session_id, deadline) do
-    task = FastestMCP.fetch_task(server_name, task_id, session_id: session_id)
+    task = FastestMCP.fetch_task!(server_name, task_id, session_id: session_id)
 
     cond do
       task.status == :completed ->

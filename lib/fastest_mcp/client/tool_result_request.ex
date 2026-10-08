@@ -6,9 +6,9 @@ defmodule FastestMCP.Client.ToolResultRequest do
   upgrades `tools/call` into a remote task.
   """
 
-  defstruct [:pid, :ref, :owner]
+  defstruct [:pid, :ref, :owner, :monitor]
 
-  @type t :: %__MODULE__{pid: pid(), ref: reference(), owner: pid()}
+  @opaque t :: %__MODULE__{pid: pid(), ref: reference(), owner: pid(), monitor: reference()}
 
   @doc "Waits for the terminal tool result."
   def await(%__MODULE__{} = request, timeout \\ :infinity) do
@@ -19,4 +19,12 @@ defmodule FastestMCP.Client.ToolResultRequest do
   def cancel(%__MODULE__{} = request, reason \\ nil) do
     FastestMCP.Client.cancel_tool_result(request, reason)
   end
+
+  @doc "Raising variant of `await/2`."
+  def await!(request, timeout \\ :infinity),
+    do: FastestMCP.OperationResult.unwrap!(await(request, timeout))
+
+  @doc "Raising variant of `cancel/2`."
+  def cancel!(request, reason \\ nil),
+    do: FastestMCP.OperationResult.unwrap!(cancel(request, reason))
 end

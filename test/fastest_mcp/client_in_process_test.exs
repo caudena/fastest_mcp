@@ -26,12 +26,12 @@ defmodule FastestMCP.ClientInProcessTest do
         client_info: %{"name" => "in-process-test", "version" => "1.0.0"}
       )
 
-    on_exit(fn -> if Client.connected?(client), do: Client.disconnect(client) end)
+    on_exit(fn -> if Client.connected?(client), do: Client.disconnect!(client) end)
 
-    assert Client.protocol_version(client) == "2026-07-28"
-    assert Client.session_id(client) == nil
-    assert Client.initialize_result(client) == nil
-    assert %{"supportedVersions" => versions} = Client.discovery_result(client)
+    assert Client.protocol_version!(client) == "2026-07-28"
+    assert Client.session_id!(client) == nil
+    assert Client.initialize_result!(client) == nil
+    assert %{"supportedVersions" => versions} = Client.discovery_result!(client)
     assert "2026-07-28" in versions
 
     slow = delayed_request(client, "slow", 80)
@@ -40,12 +40,12 @@ defmodule FastestMCP.ClientInProcessTest do
 
     assert [slow.request_id, fast.request_id, middle.request_id] |> Enum.uniq() |> length() == 3
 
-    assert get_in(Client.await(fast, 1_000), ["structuredContent", "value"]) == "fast"
-    assert get_in(Client.await(middle, 1_000), ["structuredContent", "value"]) == "middle"
-    assert get_in(Client.await(slow, 1_000), ["structuredContent", "value"]) == "slow"
+    assert get_in(Client.await!(fast, 1_000), ["structuredContent", "value"]) == "fast"
+    assert get_in(Client.await!(middle, 1_000), ["structuredContent", "value"]) == "middle"
+    assert get_in(Client.await!(slow, 1_000), ["structuredContent", "value"]) == "slow"
 
-    assert %{"structuredContent" => %{"message" => "hello"}} =
-             Client.call_tool(client, "echo", %{"message" => "hello"})
+    assert %{raw: %{"structuredContent" => %{"message" => "hello"}}} =
+             Client.call_tool!(client, "echo", %{"message" => "hello"})
   end
 
   test "legacy client initializes through the same stdio session lifecycle" do
@@ -60,14 +60,17 @@ defmodule FastestMCP.ClientInProcessTest do
     client =
       Client.connect!({:in_process, server_name}, protocol_version: "2025-11-25")
 
-    on_exit(fn -> if Client.connected?(client), do: Client.disconnect(client) end)
+    on_exit(fn -> if Client.connected?(client), do: Client.disconnect!(client) end)
 
-    assert Client.protocol_version(client) == "2025-11-25"
-    assert Client.session_id(client) == nil
-    assert is_map(Client.initialize_result(client))
-    assert Client.call_tool(client, "echo", %{"era" => "legacy"}) == %{"era" => "legacy"}
+    assert Client.protocol_version!(client) == "2025-11-25"
+    assert Client.session_id!(client) == nil
+    assert is_map(Client.initialize_result!(client))
 
-    error = assert_raise Error, fn -> Client.open_session_stream(client) end
+    assert Client.call_tool!(client, "echo", %{"era" => "legacy"}).structured_content == %{
+             "era" => "legacy"
+           }
+
+    error = assert_raise Error, fn -> Client.open_session_stream!(client) end
     assert error.code == :bad_request
   end
 
@@ -106,16 +109,20 @@ defmodule FastestMCP.ClientInProcessTest do
         end
       )
 
-    on_exit(fn -> if Client.connected?(client), do: Client.disconnect(client) end)
+    on_exit(fn -> if Client.connected?(client), do: Client.disconnect!(client) end)
 
-    assert "sampled" = Client.call_tool(client, "sample", %{})
+    assert %{structured_content: %{"content" => %{"text" => "sampled"}}} =
+             Client.call_tool!(client, "sample", %{})
+
     assert_receive {:sampling, [%{"content" => %{"text" => "Reply with sampled"}}], _}, 1_000
 
-    assert %{"name" => "Alice"} = Client.call_tool(client, "ask_name", %{})
+    assert %{structured_content: %{"name" => "Alice"}} =
+             Client.call_tool!(client, "ask_name", %{})
+
     assert_receive {:elicitation, "What is your name?", _}, 1_000
 
-    assert %{"done" => true} =
-             Client.call_tool(client, "progress", %{},
+    assert %{structured_content: %{"done" => true}} =
+             Client.call_tool!(client, "progress", %{},
                progress_handler: fn params -> send(test_pid, {:progress, params}) end
              )
 
@@ -153,10 +160,10 @@ defmodule FastestMCP.ClientInProcessTest do
         notification_handler: fn message -> send(test_pid, {:global_notification, message}) end
       )
 
-    on_exit(fn -> if Client.connected?(client), do: Client.disconnect(client) end)
+    on_exit(fn -> if Client.connected?(client), do: Client.disconnect!(client) end)
 
     listener =
-      Client.listen(
+      Client.listen!(
         client,
         %{"resourceSubscriptions" => ["status://in-process"]},
         on_notification: fn message -> send(test_pid, {:subscription_notification, message}) end
@@ -176,20 +183,23 @@ defmodule FastestMCP.ClientInProcessTest do
     assert subscription_id == listener.request_id
 
     blocked =
-      Client.request_async(client, "tools/call", %{
+      Client.request_async!(client, "tools/call", %{
         "name" => "block",
         "arguments" => %{}
       })
 
     assert_receive {:blocking_worker, worker}, 1_000
     worker_monitor = Process.monitor(worker)
-    assert :ok = Client.cancel(blocked, "test cancellation")
+    assert :ok = Client.cancel!(blocked, "test cancellation")
 
-    error = assert_raise Error, fn -> Client.await(blocked, 1_000) end
+    error = assert_raise Error, fn -> Client.await!(blocked, 1_000) end
     assert error.code == :cancelled
     assert_receive {:DOWN, ^worker_monitor, :process, ^worker, _reason}, 1_000
 
-    assert get_in(Client.call_tool(client, "notify", %{}), ["structuredContent", "notified"]) ==
+    assert get_in(Client.call_tool!(client, "notify", %{}), [
+             Access.key(:structured_content),
+             "notified"
+           ]) ==
              true
 
     assert_receive {:subscription_notification,
@@ -211,7 +221,7 @@ defmodule FastestMCP.ClientInProcessTest do
                     }},
                    1_000
 
-    assert :ok = Client.cancel(listener, "test complete")
+    assert :ok = Client.cancel!(listener, "test complete")
     assert Client.connected?(client)
   end
 
@@ -242,25 +252,25 @@ defmodule FastestMCP.ClientInProcessTest do
         extensions: task_extensions
       )
 
-    on_exit(fn -> if Client.connected?(client), do: Client.disconnect(client) end)
+    on_exit(fn -> if Client.connected?(client), do: Client.disconnect!(client) end)
 
     transparent =
       Task.async(fn ->
-        Client.call_tool(client, "deferred", %{"value" => "transparent"}, task_timeout_ms: 2_000)
+        Client.call_tool!(client, "deferred", %{"value" => "transparent"}, task_timeout_ms: 2_000)
       end)
 
     assert_receive {:task_worker, transparent_worker, "transparent"}, 1_000
     send(transparent_worker, :release)
-    assert %{"value" => "transparent"} = Task.await(transparent, 3_000)
+    assert %{structured_content: %{"value" => "transparent"}} = Task.await(transparent, 3_000)
     refute Client.session_stream_open?(client)
 
     assert %RemoteTask{task_id: task_id} =
-             task = Client.call_tool_task(client, "deferred", %{"value" => "handle"})
+             task = Client.call_tool_task!(client, "deferred", %{"value" => "handle"})
 
     assert_receive {:task_worker, handle_worker, "handle"}, 1_000
 
     listener =
-      Client.listen(client, %{"taskIds" => [task_id]},
+      Client.listen!(client, %{"taskIds" => [task_id]},
         on_notification: fn message -> send(test_pid, {:task_notification, message}) end
       )
 
@@ -268,7 +278,7 @@ defmodule FastestMCP.ClientInProcessTest do
                     %{"method" => "notifications/subscriptions/acknowledged"}},
                    1_000
 
-    result_waiter = Task.async(fn -> RemoteTask.result(task, timeout_ms: 2_000) end)
+    result_waiter = Task.async(fn -> RemoteTask.result!(task, timeout_ms: 2_000) end)
     send(handle_worker, :release)
 
     assert_receive {:task_notification,
@@ -278,8 +288,8 @@ defmodule FastestMCP.ClientInProcessTest do
                     }},
                    1_000
 
-    assert %{"value" => "handle"} = Task.await(result_waiter, 3_000)
-    assert :ok = Client.cancel(listener, "test complete")
+    assert %{structured_content: %{"value" => "handle"}} = Task.await(result_waiter, 3_000)
+    assert :ok = Client.cancel!(listener, "test complete")
   end
 
   test "current and per-call auth input traverses normal authentication" do
@@ -303,18 +313,24 @@ defmodule FastestMCP.ClientInProcessTest do
     start_server!(server_name, server)
 
     client = Client.connect!({:in_process, server_name}, auth_input: %{token: "alpha"})
-    on_exit(fn -> if Client.connected?(client), do: Client.disconnect(client) end)
+    on_exit(fn -> if Client.connected?(client), do: Client.disconnect!(client) end)
 
-    assert get_in(Client.call_tool(client, "principal", %{}), ["structuredContent", "principal"]) ==
+    assert get_in(Client.call_tool!(client, "principal", %{}), [
+             Access.key(:structured_content),
+             "principal"
+           ]) ==
              ["in-process-test", "alpha"]
 
-    assert :ok = Client.set_auth_input(client, %{token: "beta"})
+    assert :ok = Client.set_auth_input!(client, %{token: "beta"})
 
-    assert get_in(Client.call_tool(client, "principal", %{}), ["structuredContent", "principal"]) ==
+    assert get_in(Client.call_tool!(client, "principal", %{}), [
+             Access.key(:structured_content),
+             "principal"
+           ]) ==
              ["in-process-test", "beta"]
 
     assert get_in(
-             Client.request(
+             Client.request!(
                client,
                "tools/call",
                %{"name" => "principal", "arguments" => %{}},
@@ -325,7 +341,7 @@ defmodule FastestMCP.ClientInProcessTest do
 
     error =
       assert_raise Error, fn ->
-        Client.request(
+        Client.request!(
           client,
           "tools/call",
           %{"name" => "principal", "arguments" => %{}},
@@ -370,15 +386,17 @@ defmodule FastestMCP.ClientInProcessTest do
         auth_input: %{"credential" => secret}
       )
 
-    on_exit(fn -> if Client.connected?(client), do: Client.disconnect(client) end)
+    on_exit(fn -> if Client.connected?(client), do: Client.disconnect!(client) end)
 
     assert %{
-             "structuredContent" => %{
-               "retained_wire_auth" => nil,
-               "request_context" => request_context,
-               "context" => context
+             raw: %{
+               "structuredContent" => %{
+                 "retained_wire_auth" => nil,
+                 "request_context" => request_context,
+                 "context" => context
+               }
              }
-           } = Client.call_tool(client, "inspect_auth_metadata", %{})
+           } = Client.call_tool!(client, "inspect_auth_metadata", %{})
 
     refute request_context =~ secret
     refute context =~ secret
@@ -433,7 +451,7 @@ defmodule FastestMCP.ClientInProcessTest do
     client = Client.connect!({:in_process, server_name})
 
     request =
-      Client.request_async(
+      Client.request_async!(
         client,
         "tools/call",
         %{"name" => "block", "arguments" => %{}},
@@ -443,7 +461,7 @@ defmodule FastestMCP.ClientInProcessTest do
     assert_receive :block_started, 1_000
     assert :ok = FastestMCP.stop_server(server_name)
 
-    error = assert_raise Error, fn -> Client.await(request, 2_000) end
+    error = assert_raise Error, fn -> Client.await!(request, 2_000) end
     assert error.code == :internal_error
     assert eventually(fn -> not Client.connected?(client) end)
   end
@@ -466,7 +484,7 @@ defmodule FastestMCP.ClientInProcessTest do
   end
 
   defp delayed_request(client, value, delay) do
-    Client.request_async(
+    Client.request_async!(
       client,
       "tools/call",
       %{"name" => "delay", "arguments" => %{"value" => value, "delay" => delay}}

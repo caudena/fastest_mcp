@@ -411,8 +411,7 @@ defmodule FastestMCP.MiddlewareResponseCachingTest do
     results = [
       InputRequiredResult.new(nil, request_state: "next"),
       %BackgroundTask{server_name: "cache-nonterminal", task_id: "task-1"},
-      %{"resultType" => "task", "taskId" => "task-2"},
-      %{content: [%{type: "text", text: "no"}], isError: true}
+      FastestMCP.Tools.Result.new("no", is_error: true)
     ]
 
     Enum.each(results, fn result ->
@@ -429,7 +428,7 @@ defmodule FastestMCP.MiddlewareResponseCachingTest do
       assert count(counter) == 2
     end)
 
-    assert %{hits: 0, misses: 8, puts: 0} =
+    assert %{hits: 0, misses: 6, puts: 0} =
              ResponseCaching.statistics(middleware)["tools/call"]
   end
 
@@ -471,13 +470,13 @@ defmodule FastestMCP.MiddlewareResponseCachingTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
 
     assert %{"message" => "hello"} ==
-             FastestMCP.call_tool(server_name, "echo", %{"message" => "hello"})
+             FastestMCP.call_tool!(server_name, "echo", %{"message" => "hello"})
 
     assert %{"message" => "hello"} ==
-             FastestMCP.call_tool(server_name, "echo", %{"message" => "hello"})
+             FastestMCP.call_tool!(server_name, "echo", %{"message" => "hello"})
 
     assert %{"message" => "different"} ==
-             FastestMCP.call_tool(server_name, "echo", %{"message" => "different"})
+             FastestMCP.call_tool!(server_name, "echo", %{"message" => "different"})
 
     assert count(counter) == 2
   end

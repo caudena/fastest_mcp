@@ -133,32 +133,26 @@ defmodule FastestMCP.Transport.Serializer do
 
   @doc false
   def tool_result(%ToolResult{} = result, tool, opts) do
-    result
-    |> ToolResult.to_map()
-    |> tool_result(tool, opts)
+    envelope = ToolResult.to_map(result)
+    structured = envelope |> structured_content_payload!() |> compatible_structured_content(opts)
+
+    content =
+      if is_nil(result.content) and result.structured_content_present?,
+        do: [text_block(result.structured_content)],
+        else: result.content
+
+    result.extra
+    |> normalize_json()
+    |> Map.put("content", normalize_content_payload(content))
+    |> put_explicit_structured_content(envelope, structured, opts)
+    |> maybe_put("_meta", normalize_output_meta(result.meta))
+    |> put_is_error(envelope)
+    |> validate_apps_tool_fallback!(tool, opts)
   end
 
   def tool_result(result, tool, opts) do
     payload =
       cond do
-        explicit_tool_result?(result) ->
-          structured_content = structured_content_payload!(result)
-          structured_content = compatible_structured_content(structured_content, opts)
-
-          content = tool_result_content_payload(result, structured_content)
-
-          %{}
-          |> Map.put("content", normalize_content_payload(content))
-          |> put_explicit_structured_content(result, structured_content, opts)
-          |> maybe_put("_meta", normalize_output_meta(fetch_meta(result)))
-          |> put_is_error(result)
-
-        content_block?(result) ->
-          %{"content" => [normalize_content_block(result)]}
-
-        is_list(result) and Enum.any?(result, &contentish?/1) ->
-          %{"content" => normalize_content_payload(result)}
-
         is_binary(result) ->
           %{"content" => [text_block(result)]}
 
@@ -184,19 +178,13 @@ defmodule FastestMCP.Transport.Serializer do
   def resource_result(uri, mime_type, result, opts) do
     cond do
       match?(%ResourceResult{}, result) ->
-        resource_result(
-          uri,
-          mime_type,
-          %{contents: result.contents, meta: result.meta},
-          opts
+        result.extra
+        |> normalize_json()
+        |> Map.put(
+          "contents",
+          Enum.map(result.contents, &resource_content(uri, mime_type, &1, opts))
         )
-
-      is_map(result) and not is_nil(fetch(result, :contents)) ->
-        %{
-          "contents" =>
-            Enum.map(fetch(result, :contents), &resource_content(uri, mime_type, &1, opts))
-        }
-        |> maybe_put("_meta", apps_meta(fetch_meta(result), opts))
+        |> maybe_put("_meta", apps_meta(result.meta, opts))
 
       match?(%ResourceContent{}, result) ->
         %{"contents" => [resource_content(uri, mime_type, result, opts)]}
@@ -213,29 +201,16 @@ defmodule FastestMCP.Transport.Serializer do
   end
 
   @doc "Serializes a prompt result for transport exposure."
-  def prompt_result(result) do
-    result =
-      case result do
-        %PromptResult{} = prompt_result -> PromptResult.to_map(prompt_result)
-        other -> other
-      end
-
-    messages =
-      cond do
-        is_map(result) and not is_nil(fetch(result, :messages)) ->
-          Enum.map(fetch(result, :messages), &prompt_message/1)
-
-        is_list(result) ->
-          Enum.map(result, &prompt_message/1)
-
-        true ->
-          [prompt_message(result)]
-      end
-
-    %{"messages" => messages}
-    |> maybe_put("description", if(is_map(result), do: fetch(result, :description)))
-    |> maybe_put("_meta", if(is_map(result), do: normalize_output_meta(fetch_meta(result))))
+  def prompt_result(%PromptResult{} = result) do
+    result.extra
+    |> normalize_json()
+    |> Map.put("messages", Enum.map(result.messages, &prompt_message/1))
+    |> maybe_put("description", result.description)
+    |> maybe_put("_meta", normalize_output_meta(result.meta))
   end
+
+  def prompt_result(value) when is_binary(value), do: prompt_result(PromptResult.new(value))
+  def prompt_result(value), do: prompt_result(PromptResult.new(JSONValue.encode!(value)))
 
   defp prompt_message(message) when is_map(message) do
     message =
@@ -334,30 +309,6 @@ defmodule FastestMCP.Transport.Serializer do
       Keyword.get(opts, :client_capabilities, %{}),
       Keyword.get(opts, :server_extensions, %{})
     )
-  end
-
-  defp explicit_tool_result?(value) when is_map(value) do
-    Enum.any?(
-      [
-        :content,
-        "content",
-        :structuredContent,
-        "structuredContent",
-        :structured_content,
-        "structured_content"
-      ],
-      &Map.has_key?(value, &1)
-    )
-  end
-
-  defp explicit_tool_result?(_value), do: false
-
-  defp tool_result_content_payload(result, structured_content) do
-    if Map.has_key?(result, :content) or Map.has_key?(result, "content") do
-      fetch(result, :content)
-    else
-      [text_block(structured_content)]
-    end
   end
 
   defp validate_apps_tool_fallback!(payload, tool, opts) do
@@ -472,8 +423,6 @@ defmodule FastestMCP.Transport.Serializer do
   defp normalize_resource_block(_resource) do
     raise Error, code: :internal_error, message: "embedded resource content requires an object"
   end
-
-  defp contentish?(value), do: content_block?(value)
 
   defp content_block?(value) when is_map(value) do
     value

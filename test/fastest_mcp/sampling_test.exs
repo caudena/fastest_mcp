@@ -72,17 +72,19 @@ defmodule FastestMCP.SamplingTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     assert %{
-             "text" => "summary",
-             "raw" => %{
-               "role" => "assistant",
-               "model" => "test-model",
-               "content" => [%{"type" => "text", "text" => "summary"}]
+             structured_content: %{
+               "text" => "summary",
+               "raw" => %{
+                 "role" => "assistant",
+                 "model" => "test-model",
+                 "content" => [%{"type" => "text", "text" => "summary"}]
+               }
              }
-           } = Client.call_tool(client, "summarize", %{})
+           } = Client.call_tool!(client, "summarize", %{})
 
     assert_receive {:sampling_seen, messages, params}, 1_000
 
@@ -141,10 +143,10 @@ defmodule FastestMCP.SamplingTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
-    assert %{"text" => "ok"} = Client.call_tool(client, "chat", %{})
+    assert %{structured_content: %{"text" => "ok"}} = Client.call_tool!(client, "chat", %{})
 
     assert_receive {:sampling_messages_seen, messages, params}, 1_000
     assert [%{"role" => "user", "content" => %{"type" => "text", "text" => "hello"}}] = messages
@@ -233,7 +235,8 @@ defmodule FastestMCP.SamplingTest do
         end
       )
 
-    assert Client.call_tool(client, "orchestrate", %{}) == "done"
+    assert %{content: [%{"type" => "text", "text" => "done"}]} =
+             Client.call_tool!(client, "orchestrate", %{})
 
     assert_receive {:sampling_tool_capabilities, capabilities}, 1_000
     assert get_in(capabilities, ["sampling", "tools"]) == %{}
@@ -298,9 +301,11 @@ defmodule FastestMCP.SamplingTest do
       )
 
     assert %{
-             "code" => "bad_request",
-             "message" => "connected client did not declare sampling.tools support"
-           } = Client.call_tool(client, "validate", %{})
+             structured_content: %{
+               "code" => "bad_request",
+               "message" => "connected client did not declare sampling.tools support"
+             }
+           } = Client.call_tool!(client, "validate", %{})
 
     refute_receive :unexpected_sampling_request
   end
@@ -327,11 +332,13 @@ defmodule FastestMCP.SamplingTest do
       )
 
     assert %{
-             "code" => "bad_request",
-             "message" => "connected client did not declare sampling.context support"
-           } = Client.call_tool(unsupported, "sample", %{})
+             structured_content: %{
+               "code" => "bad_request",
+               "message" => "connected client did not declare sampling.context support"
+             }
+           } = Client.call_tool!(unsupported, "sample", %{})
 
-    Client.disconnect(unsupported)
+    Client.disconnect!(unsupported)
 
     supported =
       connect_client!(server_name,
@@ -342,7 +349,7 @@ defmodule FastestMCP.SamplingTest do
         end
       )
 
-    assert %{"text" => "ok"} = Client.call_tool(supported, "sample", %{})
+    assert %{structured_content: %{"text" => "ok"}} = Client.call_tool!(supported, "sample", %{})
     assert_receive {:sampling_context_params, %{"includeContext" => "thisServer"}}, 1_000
   end
 
@@ -418,30 +425,38 @@ defmodule FastestMCP.SamplingTest do
       )
 
     assert %{
-             "code" => "peer_error",
-             "message" => "sampling result tool_use requires a non-empty id"
-           } = Client.call_tool(client, "validate", %{"case" => "missing_id"})
+             structured_content: %{
+               "code" => "peer_error",
+               "message" => "sampling result tool_use requires a non-empty id"
+             }
+           } = Client.call_tool!(client, "validate", %{"case" => "missing_id"})
 
     assert %{
-             "code" => "peer_error",
-             "message" => "sampling handler returned tool input outside inputSchema"
-           } = Client.call_tool(client, "validate", %{"case" => "bad_input"})
+             structured_content: %{
+               "code" => "peer_error",
+               "message" => "sampling handler returned tool input outside inputSchema"
+             }
+           } = Client.call_tool!(client, "validate", %{"case" => "bad_input"})
 
     assert %{
-             "code" => "peer_error",
-             "message" => "client callback returned an invalid sampling/createMessage result"
-           } = Client.call_tool(client, "validate", %{"case" => "bad_meta"})
+             structured_content: %{
+               "code" => "peer_error",
+               "message" => "client callback returned an invalid sampling/createMessage result"
+             }
+           } = Client.call_tool!(client, "validate", %{"case" => "bad_meta"})
 
-    assert %{"code" => "peer_error", "message" => message} =
-             Client.call_tool(client, "validate", %{"case" => "duplicate"})
+    assert %{structured_content: %{"code" => "peer_error", "message" => message}} =
+             Client.call_tool!(client, "validate", %{"case" => "duplicate"})
 
     assert message =~ "duplicate sampling tool_use id"
 
     assert %{
-             "code" => "peer_error",
-             "message" => "sampling handler selected an unknown tool"
+             structured_content: %{
+               "code" => "peer_error",
+               "message" => "sampling handler selected an unknown tool"
+             }
            } =
-             Client.call_tool(client, "validate", %{"case" => "unknown"})
+             Client.call_tool!(client, "validate", %{"case" => "unknown"})
 
     refute_receive :unexpected_tool_execution
   end
@@ -482,8 +497,8 @@ defmodule FastestMCP.SamplingTest do
         end
       )
 
-    assert %{"code" => "bad_request", "message" => message} =
-             Client.call_tool(client, "validate", %{})
+    assert %{structured_content: %{"code" => "bad_request", "message" => message}} =
+             Client.call_tool!(client, "validate", %{})
 
     assert message =~ "duplicate sampling tool_use id"
     assert_receive :sampling_tool_executed, 1_000
@@ -534,8 +549,13 @@ defmodule FastestMCP.SamplingTest do
         end
       )
 
-    assert %{"code" => "bad_request", "message" => "sampling exceeded max_tool_rounds"} =
-             Client.call_tool(client, "loop", %{})
+    assert %{
+             structured_content: %{
+               "code" => "bad_request",
+               "message" => "sampling exceeded max_tool_rounds"
+             }
+           } =
+             Client.call_tool!(client, "loop", %{})
 
     for round <- 0..8 do
       assert_receive {:sampling_round, ^round}, 1_000
@@ -588,7 +608,7 @@ defmodule FastestMCP.SamplingTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    assert :error = FastestMCP.call_tool(server_name, "probe", %{})
+    assert :error = FastestMCP.call_tool!(server_name, "probe", %{})
 
     assert_receive {:sampling_error,
                     %FastestMCP.Error{
@@ -620,7 +640,7 @@ defmodule FastestMCP.SamplingTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     client

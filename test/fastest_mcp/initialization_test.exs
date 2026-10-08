@@ -38,7 +38,7 @@ defmodule FastestMCP.InitializationTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
 
     result =
-      FastestMCP.initialize(server_name, %{
+      FastestMCP.initialize!(server_name, %{
         "clientInfo" => %{"name" => "CLI Client"},
         "protocolVersion" => protocol_version
       })
@@ -73,7 +73,7 @@ defmodule FastestMCP.InitializationTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    result = FastestMCP.initialize(server_name, %{})
+    result = FastestMCP.initialize!(server_name, %{})
 
     refute Map.has_key?(result["capabilities"], "completions")
   end
@@ -90,7 +90,7 @@ defmodule FastestMCP.InitializationTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    result = FastestMCP.initialize(server_name, %{})
+    result = FastestMCP.initialize!(server_name, %{})
 
     assert get_in(result, ["capabilities", "experimental", "feature_flags", "alpha"]) == true
   end
@@ -125,7 +125,7 @@ defmodule FastestMCP.InitializationTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    result = FastestMCP.initialize(server_name)
+    result = FastestMCP.initialize!(server_name)
 
     assert result["protocolVersion"] == ProtocolTest.protocol_version()
     refute Map.has_key?(result["capabilities"], "resources")
@@ -176,7 +176,7 @@ defmodule FastestMCP.InitializationTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    result = FastestMCP.initialize(server_name, %{})
+    result = FastestMCP.initialize!(server_name, %{})
 
     refute Map.has_key?(result["capabilities"], "completions")
   end
@@ -227,7 +227,7 @@ defmodule FastestMCP.InitializationTest do
              }
            } = JSON.decode!(conn.resp_body)
 
-    assert %{} == FastestMCP.ping(server_name)
+    assert %{} == FastestMCP.ping!(server_name)
   end
 
   test "callback capabilities require a real JSON-RPC connection" do
@@ -242,7 +242,7 @@ defmodule FastestMCP.InitializationTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    result = FastestMCP.initialize(server_name, %{}, transport: :stdio)
+    result = FastestMCP.initialize!(server_name, %{}, transport: :stdio)
 
     refute Map.has_key?(result["capabilities"], "logging")
     refute Map.has_key?(result["capabilities"], "tasks")
@@ -358,7 +358,7 @@ defmodule FastestMCP.InitializationTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     assert_receive {:client_capabilities, capabilities}, 1_000
@@ -416,11 +416,11 @@ defmodule FastestMCP.InitializationTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     assert is_map(
-             Client.initialize(client, %{
+             Client.initialize!(client, %{
                "capabilities" => %{"roots" => %{"listChanged" => true}}
              })
            )

@@ -182,7 +182,7 @@ defmodule FastestMCP.ClientResponseCacheTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     %{client: client, counters: counters}
@@ -192,28 +192,28 @@ defmodule FastestMCP.ClientResponseCacheTest do
     client: client,
     counters: counters
   } do
-    assert %{items: [_tool]} = Client.list_tools(client)
-    assert %{items: [_tool]} = Client.list_tools(client)
+    assert %{items: [_tool]} = Client.list_tools!(client)
+    assert %{items: [_tool]} = Client.list_tools!(client)
     assert count(counters, "tools/list") == 1
 
-    assert %{items: [_tool]} = Client.list_tools(client, cache: :refresh)
-    assert %{items: [_tool]} = Client.list_tools(client)
+    assert %{items: [_tool]} = Client.list_tools!(client, cache: :refresh)
+    assert %{items: [_tool]} = Client.list_tools!(client)
     assert count(counters, "tools/list") == 2
 
-    assert %{items: [_tool]} = Client.list_tools(client, cache: :bypass)
+    assert %{items: [_tool]} = Client.list_tools!(client, cache: :bypass)
     assert count(counters, "tools/list") == 3
 
-    assert %{items: [_tool]} = Client.list_tools(client, cursor: "")
-    assert %{items: [_tool]} = Client.list_tools(client, cursor: "")
+    assert %{items: [_tool]} = Client.list_tools!(client, cursor: "")
+    assert %{items: [_tool]} = Client.list_tools!(client, cursor: "")
     assert count(counters, "tools/list") == 5
 
-    :ok = Client.set_access_token(client, "connection-secret")
-    assert %{items: [_tool]} = Client.list_tools(client)
-    assert %{items: [_tool]} = Client.list_tools(client)
+    :ok = Client.set_access_token!(client, "connection-secret")
+    assert %{items: [_tool]} = Client.list_tools!(client)
+    assert %{items: [_tool]} = Client.list_tools!(client)
     assert count(counters, "tools/list") == 6
 
-    :ok = Client.set_roots(client, [FastestMCP.Root.new("file:///workspace")])
-    assert %{items: [_tool]} = Client.list_tools(client)
+    :ok = Client.set_roots!(client, [FastestMCP.Root.new("file:///workspace")])
+    assert %{items: [_tool]} = Client.list_tools!(client)
     assert count(counters, "tools/list") == 7
   end
 
@@ -222,11 +222,11 @@ defmodule FastestMCP.ClientResponseCacheTest do
     _ = TraceTestHelper.drain_spans()
 
     Tracer.with_span "first-caller" do
-      assert %{items: [_tool]} = Client.list_tools(client)
+      assert %{items: [_tool]} = Client.list_tools!(client)
     end
 
     Tracer.with_span "second-caller" do
-      assert %{items: [_tool]} = Client.list_tools(client)
+      assert %{items: [_tool]} = Client.list_tools!(client)
     end
 
     assert count(counters, "tools/list") == 1
@@ -252,21 +252,21 @@ defmodule FastestMCP.ClientResponseCacheTest do
   } do
     secret = "Bearer request-only-secret"
 
-    assert %{items: [_tool]} = Client.list_tools(client, authorization: secret)
-    assert %{items: [_tool]} = Client.list_tools(client, authorization: secret)
+    assert %{items: [_tool]} = Client.list_tools!(client, authorization: secret)
+    assert %{items: [_tool]} = Client.list_tools!(client, authorization: secret)
     assert count(counters, "tools/list") == 2
 
     meta_secret = "Bearer semantic-meta-secret"
 
     assert %{"request" => 1} =
-             Client.read_resource(client, "memory://secret", meta: %{"opaque" => meta_secret})
+             Client.read_resource!(client, "memory://secret", meta: %{"opaque" => meta_secret})
 
     assert %{"request" => 1} =
-             Client.read_resource(client, "memory://secret", meta: %{"opaque" => meta_secret})
+             Client.read_resource!(client, "memory://secret", meta: %{"opaque" => meta_secret})
 
     assert count(counters, "resources/read") == 1
 
-    cache = :sys.get_state(client.pid).response_cache
+    cache = :sys.get_state(client.pid).catalog.response_cache
     rendered_cache = inspect(cache, limit: :infinity, printable_limit: :infinity)
     refute rendered_cache =~ "request-only-secret"
     refute rendered_cache =~ "semantic-meta-secret"
@@ -279,15 +279,23 @@ defmodule FastestMCP.ClientResponseCacheTest do
   } do
     Agent.update(counters, &Map.put(&1, :tools_ttl_ms, 0))
 
-    assert "ok" = Client.call_tool(client, "progress_echo", %{})
-    assert "ok" = Client.call_tool(client, "progress_echo", %{})
+    assert %{content: [%{"type" => "text", "text" => "ok"}]} =
+             Client.call_tool!(client, "progress_echo", %{})
+
+    assert %{content: [%{"type" => "text", "text" => "ok"}]} =
+             Client.call_tool!(client, "progress_echo", %{})
+
     assert count(counters, "tools/list") == 2
 
     Agent.update(counters, &Map.put(&1, :tools_ttl_ms, 60_000))
-    assert :ok = Client.set_auth_input(client, %{})
+    assert :ok = Client.set_auth_input!(client, %{})
 
-    assert "ok" = Client.call_tool(client, "progress_echo", %{})
-    assert "ok" = Client.call_tool(client, "progress_echo", %{})
+    assert %{content: [%{"type" => "text", "text" => "ok"}]} =
+             Client.call_tool!(client, "progress_echo", %{})
+
+    assert %{content: [%{"type" => "text", "text" => "ok"}]} =
+             Client.call_tool!(client, "progress_echo", %{})
+
     assert count(counters, "tools/list") == 3
   end
 
@@ -295,18 +303,18 @@ defmodule FastestMCP.ClientResponseCacheTest do
     client: client,
     counters: counters
   } do
-    assert %{"request" => 1} = Client.read_resource(client, "memory://cached")
-    assert %{"request" => 1} = Client.read_resource(client, "memory://cached")
+    assert %{"request" => 1} = Client.read_resource!(client, "memory://cached")
+    assert %{"request" => 1} = Client.read_resource!(client, "memory://cached")
     assert count(counters, "resources/read") == 1
 
     assert [
              %{"name" => "first", "uri" => "memory://first"},
              %{"name" => "second", "uri" => "memory://second"}
-           ] = Client.list_all_resources(client)
+           ] = Client.list_all_resources!(client)
 
     assert count(counters, "resources/list") == 2
 
-    assert [_first, _second] = Client.list_all_resources(client)
+    assert [_first, _second] = Client.list_all_resources!(client)
     assert count(counters, "resources/list") == 3
   end
 
@@ -314,15 +322,15 @@ defmodule FastestMCP.ClientResponseCacheTest do
     client: client
   } do
     parent = self()
-    :ok = Client.set_progress_handler(client, fn params -> send(parent, {:global, params}) end)
+    :ok = Client.set_progress_handler!(client, fn params -> send(parent, {:global, params}) end)
 
     :ok =
-      Client.set_notification_handler(client, fn message ->
+      Client.set_notification_handler!(client, fn message ->
         send(parent, {:generic, message})
       end)
 
-    assert "ok" ==
-             Client.call_tool(client, "progress_echo", %{},
+    assert %{content: [%{"type" => "text", "text" => "ok"}]} =
+             Client.call_tool!(client, "progress_echo", %{},
                progress_handler: fn params -> send(parent, {:scoped, params}) end
              )
 

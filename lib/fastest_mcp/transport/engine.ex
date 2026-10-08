@@ -92,7 +92,7 @@ defmodule FastestMCP.Transport.Engine do
 
         "initialize" ->
           initialize_params = request.payload
-          result = FastestMCP.initialize(server_name, initialize_params, request_opts)
+          result = FastestMCP.initialize!(server_name, initialize_params, request_opts)
           begin_session_initialization!(server_name, request, initialize_params, result)
           result
 
@@ -100,7 +100,7 @@ defmodule FastestMCP.Transport.Engine do
           OperationPipeline.discover(server_name, request.payload, request_opts)
 
         "ping" ->
-          FastestMCP.ping(server_name, request.payload, request_opts)
+          FastestMCP.ping!(server_name, request.payload, request_opts)
 
         "logging/setLevel" ->
           session_result!(
@@ -114,7 +114,7 @@ defmodule FastestMCP.Transport.Engine do
 
         "completion/complete" ->
           completion =
-            FastestMCP.complete(
+            FastestMCP.complete!(
               server_name,
               fetch_required!(request.payload, "ref", request.method),
               fetch_required!(request.payload, "argument", request.method),
@@ -296,7 +296,7 @@ defmodule FastestMCP.Transport.Engine do
             fetch_protocol_task!(server_name, task_id, access_opts, request.protocol_version)
 
           _updated =
-            FastestMCP.update_task(
+            FastestMCP.update_task!(
               server_name,
               task_id,
               fetch_required!(request.payload, "inputResponses", request.method),
@@ -313,7 +313,7 @@ defmodule FastestMCP.Transport.Engine do
           access_opts = task_access_opts(server_name, request)
 
           task =
-            FastestMCP.fetch_task(
+            FastestMCP.fetch_task!(
               server_name,
               fetch_required!(request.payload, "taskId", request.method),
               access_opts
@@ -321,7 +321,7 @@ defmodule FastestMCP.Transport.Engine do
 
           result =
             try do
-              FastestMCP.task_result(
+              FastestMCP.task_result!(
                 server_name,
                 fetch_required!(request.payload, "taskId", request.method),
                 Keyword.put(access_opts, :request_metadata, request.request_metadata)
@@ -350,7 +350,7 @@ defmodule FastestMCP.Transport.Engine do
           end
 
           access_opts = task_access_opts(server_name, request)
-          %{tasks: tasks} = FastestMCP.list_tasks(server_name, access_opts)
+          %{tasks: tasks} = FastestMCP.list_tasks!(server_name, access_opts)
 
           page =
             wire_page(server_name, request, request_opts, tasks, key: &task_pagination_key/1)
@@ -369,13 +369,13 @@ defmodule FastestMCP.Transport.Engine do
               fetch_protocol_task!(server_name, task_id, access_opts, request.protocol_version)
 
             unless task.status in [:completed, :failed, :cancelled] do
-              _cancelled = FastestMCP.cancel_task(server_name, task_id, access_opts)
+              _cancelled = FastestMCP.cancel_task!(server_name, task_id, access_opts)
             end
 
             TaskWire.acknowledgement(protocol_version: request.protocol_version)
           else
             TaskWire.task(
-              FastestMCP.cancel_task(server_name, task_id, access_opts),
+              FastestMCP.cancel_task!(server_name, task_id, access_opts),
               public_task_opts(server_name)
             )
           end
@@ -1023,6 +1023,7 @@ defmodule FastestMCP.Transport.Engine do
 
     Keyword.merge(
       opts,
+      __fastestmcp_invocation: :protocol,
       transport: request.transport,
       session_id: request.session_id,
       request_metadata: request_metadata,
@@ -1094,7 +1095,7 @@ defmodule FastestMCP.Transport.Engine do
   defp authorized_subscription_task_ids(server_name, task_ids, access_opts) do
     Enum.filter(task_ids, fn task_id ->
       try do
-        task = FastestMCP.fetch_task(server_name, task_id, access_opts)
+        task = FastestMCP.fetch_task!(server_name, task_id, access_opts)
         Map.get(task, :protocol_version) == "2026-07-28"
       rescue
         error in Error ->
@@ -1294,7 +1295,7 @@ defmodule FastestMCP.Transport.Engine do
   end
 
   defp fetch_protocol_task!(server_name, task_id, access_opts, protocol_version) do
-    task = FastestMCP.fetch_task(server_name, task_id, access_opts)
+    task = FastestMCP.fetch_task!(server_name, task_id, access_opts)
     stored_version = Map.get(task, :protocol_version)
 
     compatible? =

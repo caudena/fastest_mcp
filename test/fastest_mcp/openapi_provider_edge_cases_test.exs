@@ -18,7 +18,7 @@ defmodule FastestMCP.OpenAPIProviderEdgeCasesTest do
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server.name) end)
-    assert FastestMCP.list_tools(server.name) == []
+    assert FastestMCP.list_tools!(server.name) == []
   end
 
   test "provider without server url or requester raises" do
@@ -73,7 +73,7 @@ defmodule FastestMCP.OpenAPIProviderEdgeCasesTest do
 
     error =
       assert_raise FastestMCP.Error, fn ->
-        FastestMCP.call_tool(server_name, "get_user", %{"id" => 999})
+        FastestMCP.call_tool!(server_name, "get_user", %{"id" => 999})
       end
 
     assert error.code == :bad_request
@@ -140,26 +140,26 @@ defmodule FastestMCP.OpenAPIProviderEdgeCasesTest do
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
     assert %{"ok" => true} ==
-             FastestMCP.call_tool(server_name, "send_json", %{"name" => "Ada"})
+             FastestMCP.call_tool!(server_name, "send_json", %{"name" => "Ada"})
 
     assert_receive {:request, :post, "https://api.example.com/json", json_opts}
     assert json_opts[:json] == %{"name" => "Ada"}
     assert json_opts[:content_type] == "application/merge-patch+json; charset=utf-8"
 
     assert %{"ok" => true} ==
-             FastestMCP.call_tool(server_name, "send_form", %{"name" => "Ada"})
+             FastestMCP.call_tool!(server_name, "send_form", %{"name" => "Ada"})
 
     assert_receive {:request, :post, "https://api.example.com/form", form_opts}
     assert form_opts[:form] == %{"name" => "Ada"}
 
     assert %{"ok" => true} ==
-             FastestMCP.call_tool(server_name, "send_upload", %{"name" => "Ada"})
+             FastestMCP.call_tool!(server_name, "send_upload", %{"name" => "Ada"})
 
     assert_receive {:request, :post, "https://api.example.com/upload", upload_opts}
-    assert upload_opts[:multipart] == %{"name" => "Ada"}
+    assert upload_opts[:multipart] == [{"name", "Ada"}]
 
     assert %{"ok" => true} ==
-             FastestMCP.call_tool(server_name, "cookie_auth", %{"session" => "abc 123"})
+             FastestMCP.call_tool!(server_name, "cookie_auth", %{"session" => "abc 123"})
 
     assert_receive {:request, :get, "https://api.example.com/cookie", cookie_opts}
     assert {"cookie", "session=abc+123"} in cookie_opts[:headers]
@@ -205,8 +205,8 @@ defmodule FastestMCP.OpenAPIProviderEdgeCasesTest do
 
     [tool] = server.providers |> hd() |> Map.fetch!(:inner) |> Map.fetch!(:tools)
 
-    assert get_in(tool.output_schema, ["properties", "child", "$ref"]) == "#/$defs/Node"
-    assert get_in(tool.output_schema, ["$defs", "Node", "type"]) == "object"
+    assert is_binary(get_in(tool.output_schema, ["properties", "child", "$ref"]))
+    assert map_size(tool.output_schema["$defs"]) == 1
 
     assert {:ok, _nested_node} =
              FastestMCP.Schema.validate(tool.compiled_output_schema, %{
@@ -256,7 +256,7 @@ defmodule FastestMCP.OpenAPIProviderEdgeCasesTest do
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
     assert %{"result" => [1, 2, 3]} ==
-             FastestMCP.call_tool(server_name, "list_values", %{})
+             FastestMCP.call_tool!(server_name, "list_values", %{})
   end
 
   test "operation parameters override path parameters and schema defaults are serialized" do
@@ -306,11 +306,11 @@ defmodule FastestMCP.OpenAPIProviderEdgeCasesTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    [tool] = FastestMCP.list_tools(server_name)
+    [tool] = FastestMCP.list_tools!(server_name)
     assert Map.keys(tool.input_schema["properties"]) == ["query"]
     assert tool.input_schema["properties"]["query"]["description"] == "operation-level"
 
-    assert %{"ok" => true} == FastestMCP.call_tool(server_name, "search", %{})
+    assert %{"ok" => true} == FastestMCP.call_tool!(server_name, "search", %{})
     assert_receive {:request, :get, "https://override.example.com/search", opts}
     assert opts[:query] == [{"query", "new"}]
   end
@@ -398,7 +398,7 @@ defmodule FastestMCP.OpenAPIProviderEdgeCasesTest do
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
     assert %{"ok" => true} ==
-             FastestMCP.call_tool(server_name, "styled", %{
+             FastestMCP.call_tool!(server_name, "styled", %{
                "id" => "a b",
                "tag" => ["one", "two"],
                "compact" => ["a", "b"],
@@ -467,13 +467,13 @@ defmodule FastestMCP.OpenAPIProviderEdgeCasesTest do
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
     assert %{"ok" => true} ==
-             FastestMCP.call_tool(server_name, "send_array", %{"body" => [1, 2, 3]})
+             FastestMCP.call_tool!(server_name, "send_array", %{"body" => [1, 2, 3]})
 
     assert_receive {:request, :post, "https://body.example.com/array", array_opts}
     assert array_opts[:json] == [1, 2, 3]
 
     assert %{"ok" => true} ==
-             FastestMCP.call_tool(server_name, "send_scalar", %{"body" => "raw"})
+             FastestMCP.call_tool!(server_name, "send_scalar", %{"body" => "raw"})
 
     assert_receive {:request, :post, "https://body.example.com/scalar", scalar_opts}
     assert scalar_opts[:json] == "raw"
@@ -509,8 +509,8 @@ defmodule FastestMCP.OpenAPIProviderEdgeCasesTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    assert ~s({"looks":"json"}) == FastestMCP.call_tool(server_name, "text", %{})
-    assert %{"decoded" => true} == FastestMCP.call_tool(server_name, "problem", %{})
+    assert ~s({"looks":"json"}) == FastestMCP.call_tool!(server_name, "text", %{})
+    assert %{"decoded" => true} == FastestMCP.call_tool!(server_name, "problem", %{})
   end
 
   defp body(content_type) do

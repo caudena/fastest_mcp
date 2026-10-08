@@ -1,4 +1,5 @@
 defmodule FastestMCP.Providers.Skill do
+  @behaviour FastestMCP.Provider
   @moduledoc """
   Provider that exposes a single skill directory as MCP resources.
 
@@ -31,9 +32,11 @@ defmodule FastestMCP.Providers.Skill do
   end
 
   @doc "Returns the provider type label."
+  @impl FastestMCP.Provider
   def provider_type(%__MODULE__{}), do: "SkillProvider"
 
   @doc "Lists the components exposed by this module."
+  @impl FastestMCP.Provider
   def list_components(%__MODULE__{} = provider, :resource, _operation) do
     resources =
       [
@@ -57,6 +60,7 @@ defmodule FastestMCP.Providers.Skill do
   def list_components(%__MODULE__{}, _component_type, _operation), do: []
 
   @doc "Resolves one component by type and identifier."
+  @impl FastestMCP.Provider
   def get_component(%__MODULE__{} = provider, :resource, identifier, _operation) do
     provider
     |> list_components(:resource, nil)
@@ -74,6 +78,7 @@ defmodule FastestMCP.Providers.Skill do
   def get_component(%__MODULE__{}, _component_type, _identifier, _operation), do: nil
 
   @doc "Resolves the backing resource target for a concrete URI."
+  @impl FastestMCP.Provider
   def get_resource_target(%__MODULE__{} = provider, uri, _operation) do
     case parse_skill_uri(uri) do
       {:ok, skill_name, "_manifest"} when skill_name == provider.skill_info.name ->

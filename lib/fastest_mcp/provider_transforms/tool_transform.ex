@@ -1,4 +1,5 @@
 defmodule FastestMCP.ProviderTransforms.ToolTransform do
+  @behaviour FastestMCP.ProviderTransform
   @moduledoc """
   Renames provider tools while preserving reverse lookup back to the source name.
 
@@ -39,6 +40,7 @@ defmodule FastestMCP.ProviderTransforms.ToolTransform do
   end
 
   @doc "Transforms a component before it is exposed."
+  @impl FastestMCP.ProviderTransform
   def transform_component(%__MODULE__{mappings: mappings}, %Tool{} = component, _operation) do
     case Map.get(mappings, component.name) do
       %ToolTransformConfig{name: target_name} -> %Tool{component | name: to_string(target_name)}
@@ -49,6 +51,7 @@ defmodule FastestMCP.ProviderTransforms.ToolTransform do
   def transform_component(%__MODULE__{}, component, _operation), do: component
 
   @doc "Maps an exposed identifier back to the source identifier."
+  @impl FastestMCP.ProviderTransform
   def reverse_identifier(%__MODULE__{reverse_names: reverse_names}, :tool, identifier, _operation) do
     {:ok, Map.get(reverse_names, to_string(identifier), to_string(identifier))}
   end

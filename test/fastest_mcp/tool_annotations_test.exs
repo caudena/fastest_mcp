@@ -25,7 +25,7 @@ defmodule FastestMCP.ToolAnnotationsTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    [tool] = FastestMCP.list_tools(server_name)
+    [tool] = FastestMCP.list_tools!(server_name)
     assert tool.annotations == Map.new(annotations)
     assert tool.execution == %{taskSupport: "optional"}
 
@@ -131,7 +131,7 @@ defmodule FastestMCP.ToolAnnotationsTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
       if Process.alive?(bandit), do: Supervisor.stop(bandit)
       FastestMCP.stop_server(server_name)
     end)
@@ -151,7 +151,7 @@ defmodule FastestMCP.ToolAnnotationsTest do
                }
              ],
              next_cursor: nil
-           } = Client.list_tools(client)
+           } = Client.list_tools!(client)
   end
 
   test "resource metadata emits execution and fastestmcp _meta consistently" do

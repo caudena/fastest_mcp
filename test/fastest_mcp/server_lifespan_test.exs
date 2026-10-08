@@ -36,7 +36,7 @@ defmodule FastestMCP.ServerLifespanTest do
     assert_receive {:second_enter, ^server_name}, 1_000
 
     assert %{"cache" => "warm", "db" => "connected", "shared" => "second"} ==
-             FastestMCP.call_tool(server_name, "lifespan_info", %{})
+             FastestMCP.call_tool!(server_name, "lifespan_info", %{})
 
     assert :ok = FastestMCP.stop_server(server_name)
     assert_receive {:second_exit, "second", "warm"}, 1_000

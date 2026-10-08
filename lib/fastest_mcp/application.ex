@@ -18,7 +18,8 @@ defmodule FastestMCP.Application do
   def start(_type, _args) do
     children = [
       FastestMCP.Registry,
-      FastestMCP.ServerSupervisor
+      FastestMCP.ServerSupervisor,
+      {Task.Supervisor, name: FastestMCP.Client.ExecutionSupervisor}
     ]
 
     Supervisor.start_link(children, strategy: :one_for_one, name: FastestMCP.Supervisor)

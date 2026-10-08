@@ -1,4 +1,5 @@
 defmodule FastestMCP.Providers.Local do
+  @behaviour FastestMCP.Provider
   @moduledoc """
   Standalone in-memory provider for dynamic local components.
 
@@ -94,6 +95,7 @@ defmodule FastestMCP.Providers.Local do
     do: drop_component(provider, :prompts, to_string(name))
 
   @doc "Lists the components exposed by this module."
+  @impl FastestMCP.Provider
   def list_components(%__MODULE__{} = provider, :tool, _operation), do: provider.tools
   def list_components(%__MODULE__{} = provider, :resource, _operation), do: provider.resources
 
@@ -104,6 +106,7 @@ defmodule FastestMCP.Providers.Local do
   def list_components(%__MODULE__{}, _component_type, _operation), do: []
 
   @doc "Resolves one component by type and identifier."
+  @impl FastestMCP.Provider
   def get_component(%__MODULE__{} = provider, component_type, identifier, operation) do
     provider
     |> get_component_candidates(component_type, identifier, operation)
@@ -111,6 +114,7 @@ defmodule FastestMCP.Providers.Local do
   end
 
   @doc false
+  @impl FastestMCP.Provider
   def get_component_candidates(%__MODULE__{} = provider, component_type, identifier, operation) do
     provider
     |> list_components(component_type, nil)
@@ -122,6 +126,7 @@ defmodule FastestMCP.Providers.Local do
   end
 
   @doc "Resolves the backing resource target for a concrete URI."
+  @impl FastestMCP.Provider
   def get_resource_target(%__MODULE__{} = provider, uri, operation) do
     provider
     |> get_resource_target_candidates(uri, operation)
@@ -129,6 +134,7 @@ defmodule FastestMCP.Providers.Local do
   end
 
   @doc false
+  @impl FastestMCP.Provider
   def get_resource_target_candidates(%__MODULE__{} = provider, uri, operation) do
     exact = get_component_candidates(provider, :resource, uri, operation)
 

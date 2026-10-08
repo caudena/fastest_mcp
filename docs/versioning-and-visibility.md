@@ -23,22 +23,22 @@ server =
 By default, FastestMCP picks the highest visible version:
 
 ```elixir
-FastestMCP.call_tool("versioning", "calc", %{})
+FastestMCP.call_tool!("versioning", "calc", %{})
 # => 2
 ```
 
 Callers can request one exact version:
 
 ```elixir
-FastestMCP.call_tool("versioning", "calc", %{}, version: "1.0.0")
+FastestMCP.call_tool!("versioning", "calc", %{}, version: "1.0.0")
 # => 1
 ```
 
 Connected clients use the same option:
 
 ```elixir
-FastestMCP.Client.call_tool(client, "calc", %{}, version: "1.0.0")
-# => 1
+FastestMCP.Client.call_tool!(client, "calc", %{}, version: "1.0.0")
+# => %FastestMCP.Client.ToolResult{structured_content: 1, ...}
 ```
 
 On the wire, FastestMCP sends the version through `_meta.fastestmcp.version`, so
@@ -62,19 +62,19 @@ Use the public server visibility API to change the catalog for every session:
 
 ```elixir
 :ok =
-  FastestMCP.disable_components("catalog",
+  FastestMCP.disable_components!("catalog",
     tags: ["internal"],
     components: [:tool]
   )
 
 :ok =
-  FastestMCP.enable_components("catalog",
+  FastestMCP.enable_components!("catalog",
     tags: ["finance"],
     components: [:tool],
     only: true
   )
 
-:ok = FastestMCP.reset_component_visibility("catalog")
+:ok = FastestMCP.reset_component_visibility!("catalog")
 ```
 
 Selectors are shared across `enable_components/2` and `disable_components/2`:

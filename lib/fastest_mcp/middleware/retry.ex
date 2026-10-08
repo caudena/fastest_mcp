@@ -3,8 +3,8 @@ defmodule FastestMCP.Middleware.Retry do
   Middleware that retries transient failures with exponential backoff.
 
   Middleware modules in FastestMCP are configured as explicit structs that
-  carry options plus a ready-to-run `middleware` function. That keeps runtime
-  assembly cheap while making the configured value easy to inspect in tests.
+  carry immutable configuration. Dispatch calls the module with that configuration;
+  runtime state is owned separately by the server.
 
   Most applications reach this module through `FastestMCP.Middleware` helper
   functions or by adding the configured struct directly with
@@ -14,11 +14,12 @@ defmodule FastestMCP.Middleware.Retry do
   require Logger
 
   alias FastestMCP.Error
+  @behaviour FastestMCP.Middleware
+
   alias FastestMCP.Operation
 
   defstruct [
     :logger,
-    :middleware,
     max_retries: 3,
     base_delay: 1.0,
     max_delay: 60.0,
@@ -29,7 +30,6 @@ defmodule FastestMCP.Middleware.Retry do
 
   @type t :: %__MODULE__{
           logger: (String.t() -> any()),
-          middleware: (Operation.t(), (Operation.t() -> any()) -> any()),
           max_retries: non_neg_integer(),
           base_delay: float(),
           max_delay: float(),
@@ -50,10 +50,11 @@ defmodule FastestMCP.Middleware.Retry do
       retry_exceptions: List.wrap(Keyword.get(opts, :retry_exceptions, []))
     }
 
-    %{middleware | middleware: fn operation, next -> call(middleware, operation, next) end}
+    middleware
   end
 
   @doc "Runs the middleware around the next operation."
+  @impl FastestMCP.Middleware
   def call(%__MODULE__{} = middleware, %Operation{} = operation, next)
       when is_function(next, 1) do
     do_call(middleware, operation, next, 0)

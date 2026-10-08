@@ -21,10 +21,10 @@ defmodule FastestMCP.SubscriptionAuthorizationTest do
         max_in_flight: 4
       )
 
-    on_exit(fn -> if Client.connected?(client), do: Client.disconnect(client) end)
+    on_exit(fn -> if Client.connected?(client), do: Client.disconnect!(client) end)
 
     listener =
-      Client.listen(
+      Client.listen!(
         client,
         %{
           "toolsListChanged" => true,
@@ -52,8 +52,8 @@ defmodule FastestMCP.SubscriptionAuthorizationTest do
                     }},
                    2_000
 
-    assert %{"structuredContent" => %{"notified" => true}} =
-             Client.call_tool(client, "notify", %{})
+    assert %{raw: %{"structuredContent" => %{"notified" => true}}} =
+             Client.call_tool!(client, "notify", %{})
 
     assert_receive {:stdio_subscription,
                     %{
@@ -62,7 +62,7 @@ defmodule FastestMCP.SubscriptionAuthorizationTest do
                     }},
                    2_000
 
-    assert :ok = Client.cancel(listener, "test complete")
+    assert :ok = Client.cancel!(listener, "test complete")
   end
 
   test "acknowledges only advertised list changes and readable resource URIs" do

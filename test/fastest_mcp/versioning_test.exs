@@ -17,9 +17,9 @@ defmodule FastestMCP.VersioningTest do
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
 
-    assert 2 == FastestMCP.call_tool(server_name, "calc", %{})
-    assert 1 == FastestMCP.call_tool(server_name, "calc", %{}, version: "1.0")
-    assert 2 == FastestMCP.call_tool(server_name, "calc", %{}, version: "2.0")
+    assert 2 == FastestMCP.call_tool!(server_name, "calc", %{})
+    assert 1 == FastestMCP.call_tool!(server_name, "calc", %{}, version: "1.0")
+    assert 2 == FastestMCP.call_tool!(server_name, "calc", %{}, version: "2.0")
   end
 
   test "provider candidates fall back to the highest visible version and expose what executed" do
@@ -89,19 +89,19 @@ defmodule FastestMCP.VersioningTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    assert "tool_v1" == FastestMCP.call_tool(server_name, "secure", %{})
-    assert "template_v1:42" == FastestMCP.read_resource(server_name, "secure://items/42")
+    assert "tool_v1" == FastestMCP.call_tool!(server_name, "secure", %{})
+    assert "template_v1:42" == FastestMCP.read_resource!(server_name, "secure://items/42")
 
     tool_error =
       assert_raise Error, fn ->
-        FastestMCP.call_tool(server_name, "secure", %{}, version: "2.0.0")
+        FastestMCP.call_tool!(server_name, "secure", %{}, version: "2.0.0")
       end
 
     assert tool_error.code == :forbidden
 
     template_error =
       assert_raise Error, fn ->
-        FastestMCP.read_resource(server_name, "secure://items/42", version: "2.0.0")
+        FastestMCP.read_resource!(server_name, "secure://items/42", version: "2.0.0")
       end
 
     assert template_error.code == :forbidden
@@ -135,7 +135,7 @@ defmodule FastestMCP.VersioningTest do
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
     :ok =
-      FastestMCP.disable_components(server_name,
+      FastestMCP.disable_components!(server_name,
         version: %{eq: "2.0.0"},
         components: [:resource, :resource_template]
       )
@@ -184,11 +184,11 @@ defmodule FastestMCP.VersioningTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    assert 1 == FastestMCP.call_tool(server_name, "child_calc", %{})
-    assert "resource_v1" == FastestMCP.read_resource(server_name, "memo://child/config")
+    assert 1 == FastestMCP.call_tool!(server_name, "child_calc", %{})
+    assert "resource_v1" == FastestMCP.read_resource!(server_name, "memo://child/config")
 
     assert "template_v1:42" ==
-             FastestMCP.read_resource(server_name, "memo://child/users/42")
+             FastestMCP.read_resource!(server_name, "memo://child/users/42")
   end
 
   test "mixing versioned and unversioned definitions is rejected" do
@@ -223,20 +223,20 @@ defmodule FastestMCP.VersioningTest do
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
     :ok =
-      FastestMCP.disable_components(server_name,
+      FastestMCP.disable_components!(server_name,
         names: ["calc"],
         version: %{eq: "2.0.0"},
         components: [:tool]
       )
 
     assert [{"calc", "1.0.0"}] ==
-             FastestMCP.list_tools(server_name)
+             FastestMCP.list_tools!(server_name)
              |> Enum.map(&{&1.name, &1.version})
 
-    assert 1 == FastestMCP.call_tool(server_name, "calc", %{})
+    assert 1 == FastestMCP.call_tool!(server_name, "calc", %{})
 
     assert_raise Error, ~r/disabled/, fn ->
-      FastestMCP.call_tool(server_name, "calc", %{}, version: "2.0.0")
+      FastestMCP.call_tool!(server_name, "calc", %{}, version: "2.0.0")
     end
 
     assert_scalar_tool_result(
@@ -343,30 +343,30 @@ defmodule FastestMCP.VersioningTest do
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
     :ok =
-      FastestMCP.disable_components(server_name,
+      FastestMCP.disable_components!(server_name,
         version: %{eq: "2.0.0"},
         components: [:resource, :resource_template]
       )
 
     assert [{"memo://config", "1.0.0"}] ==
-             FastestMCP.list_resources(server_name)
+             FastestMCP.list_resources!(server_name)
              |> Enum.map(&{&1.uri, &1.version})
 
     assert [{"memo://users/{id}", "1.0.0"}] ==
-             FastestMCP.list_resource_templates(server_name)
+             FastestMCP.list_resource_templates!(server_name)
              |> Enum.map(&{&1.uri_template, &1.version})
 
-    assert %{version: "1.0.0"} == FastestMCP.read_resource(server_name, "memo://config")
+    assert %{version: "1.0.0"} == FastestMCP.read_resource!(server_name, "memo://config")
 
     assert %{id: "42", version: "1.0.0"} ==
-             FastestMCP.read_resource(server_name, "memo://users/42")
+             FastestMCP.read_resource!(server_name, "memo://users/42")
 
     assert_raise Error, ~r/disabled/, fn ->
-      FastestMCP.read_resource(server_name, "memo://config", version: "2.0.0")
+      FastestMCP.read_resource!(server_name, "memo://config", version: "2.0.0")
     end
 
     assert_raise Error, ~r/disabled/, fn ->
-      FastestMCP.read_resource(server_name, "memo://users/42", version: "2.0.0")
+      FastestMCP.read_resource!(server_name, "memo://users/42", version: "2.0.0")
     end
 
     assert %{"contents" => [%{"text" => "{\"version\":\"1.0.0\"}"}]} =

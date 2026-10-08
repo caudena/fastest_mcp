@@ -465,20 +465,20 @@ defmodule FastestMCP.ClientProtocolResponseTest do
     client = Client.connect!(url, protocol_version: "2025-11-25")
     on_exit(fn -> disconnect_if_alive(client) end)
 
-    assert Client.session_id(client) == "all-sse-session"
+    assert Client.session_id!(client) == "all-sse-session"
 
     assert %{
              items: [
                %{"name" => "from-sse", "inputSchema" => %{"type" => "object"}}
              ],
              next_cursor: nil
-           } = Client.list_tools(client)
+           } = Client.list_tools!(client)
 
-    assert %{} = Client.ping(client)
-    assert :ok = Client.set_log_level(client, :warning)
+    assert %{} = Client.ping!(client)
+    assert :ok = Client.set_log_level!(client, :warning)
 
-    request = Client.request_async(client, "ping")
-    assert %{} = Client.await(request, 2_000)
+    request = Client.request_async!(client, "ping")
+    assert %{} = Client.await!(request, 2_000)
   end
 
   test "HTTP JSON and SSE responses require valid correlated JSON-RPC envelopes" do
@@ -486,19 +486,19 @@ defmodule FastestMCP.ClientProtocolResponseTest do
     client = Client.connect!(url, protocol_version: "2025-11-25")
     on_exit(fn -> disconnect_if_alive(client) end)
 
-    error = assert_raise Error, fn -> Client.ping(client) end
+    error = assert_raise Error, fn -> Client.ping!(client) end
     assert error.code == :invalid_request
     assert error.message == ~s(JSON-RPC message must include jsonrpc: "2.0")
 
-    error = assert_raise Error, fn -> Client.list_tools(client) end
+    error = assert_raise Error, fn -> Client.list_tools!(client) end
     assert error.code == :invalid_request
     assert error.message == "JSON-RPC response id does not match the request"
 
-    error = assert_raise Error, fn -> Client.list_prompts(client) end
+    error = assert_raise Error, fn -> Client.list_prompts!(client) end
     assert error.code == :invalid_request
     assert error.message == "JSON-RPC response cannot contain both result and error"
 
-    error = assert_raise Error, fn -> Client.list_resources(client) end
+    error = assert_raise Error, fn -> Client.list_resources!(client) end
     assert error.code == :invalid_request
     assert error.message == ~s(JSON-RPC message must include jsonrpc: "2.0")
   end
@@ -520,7 +520,7 @@ defmodule FastestMCP.ClientProtocolResponseTest do
     client = Client.connect!(url, protocol_version: "2026-07-28")
     on_exit(fn -> disconnect_if_alive(client) end)
 
-    assert Client.protocol_version(client) == "2026-07-28"
+    assert Client.protocol_version!(client) == "2026-07-28"
 
     assert_receive {:client_protocol_request, %{"method" => "server/discover"}}
     assert_receive {:client_protocol_request, %{"method" => "server/discover"}}
@@ -532,8 +532,8 @@ defmodule FastestMCP.ClientProtocolResponseTest do
     client = Client.connect!(url)
     on_exit(fn -> disconnect_if_alive(client) end)
 
-    assert Client.protocol_version(client) == "2025-11-25"
-    assert Client.session_id(client) == "legacy-fallback-session"
+    assert Client.protocol_version!(client) == "2025-11-25"
+    assert Client.session_id!(client) == "legacy-fallback-session"
     assert_receive {:client_protocol_request, %{"method" => "server/discover"}}
     assert_receive {:client_protocol_request, %{"method" => "initialize"}}
     assert_receive {:client_protocol_request, %{"method" => "notifications/initialized"}}
@@ -597,7 +597,7 @@ defmodule FastestMCP.ClientProtocolResponseTest do
     client = Client.connect!(url, protocol_version: "2025-11-25")
     on_exit(fn -> disconnect_if_alive(client) end)
 
-    error = assert_raise ProtocolError, fn -> Client.list_tools(client) end
+    error = assert_raise ProtocolError, fn -> Client.list_tools!(client) end
     assert error.method == "tools/list"
     assert error.direction == :server_to_client
     assert error.kind == :response
@@ -612,7 +612,7 @@ defmodule FastestMCP.ClientProtocolResponseTest do
     client = Client.connect!(url, protocol_version: "2025-11-25")
     on_exit(fn -> disconnect_if_alive(client) end)
 
-    error = assert_raise Error, fn -> Client.list_tools(client) end
+    error = assert_raise Error, fn -> Client.list_tools!(client) end
     assert error.code == :bad_request
     assert error.message == "HTTP MCP response has an unsupported Content-Type"
     assert error.details.content_type == "application/problem+json"
@@ -623,7 +623,7 @@ defmodule FastestMCP.ClientProtocolResponseTest do
       url = start_protocol_server(mode)
       client = Client.connect!(url, protocol_version: "2025-11-25")
 
-      error = assert_raise Error, fn -> Client.list_tools(client) end
+      error = assert_raise Error, fn -> Client.list_tools!(client) end
       assert error.code == :bad_request
       assert error.message == "HTTP MCP response has an unsupported Content-Type"
       assert length(error.details.content_type) == 2
@@ -642,7 +642,7 @@ defmodule FastestMCP.ClientProtocolResponseTest do
 
     error =
       assert_raise Error, fn ->
-        Client.initialize(client, %{"capabilities" => %{"roots" => %{"listChanged" => true}}})
+        Client.initialize!(client, %{"capabilities" => %{"roots" => %{"listChanged" => true}}})
       end
 
     assert error.code == :invalid_params
@@ -654,14 +654,14 @@ defmodule FastestMCP.ClientProtocolResponseTest do
     client = Client.connect!(url, protocol_version: "2025-11-25")
     on_exit(fn -> disconnect_if_alive(client) end)
 
-    request = Client.request_async(client, "ping", %{}, timeout_ms: 5_000)
+    request = Client.request_async!(client, "ping", %{}, timeout_ms: 5_000)
     assert_receive {:client_protocol_request, %{"id" => request_id, "method" => "ping"}}, 1_000
     assert request.request_id == request_id
 
     assert %{direction: :client_to_server, method: "ping", request_id: ^request_id} =
-             :sys.get_state(client.pid).in_flight[request.ref]
+             :sys.get_state(client.pid).pending.in_flight[request.ref]
 
-    assert :ok = Client.cancel(request, "user cancelled")
+    assert :ok = Client.cancel!(request, "user cancelled")
 
     assert_receive {:client_protocol_request,
                     %{
@@ -673,7 +673,7 @@ defmodule FastestMCP.ClientProtocolResponseTest do
                     }},
                    1_000
 
-    error = assert_raise Error, fn -> Client.await(request, 1_000) end
+    error = assert_raise Error, fn -> Client.await!(request, 1_000) end
     assert error.code == :cancelled
   end
 
@@ -682,13 +682,13 @@ defmodule FastestMCP.ClientProtocolResponseTest do
     client = Client.connect!(url, protocol_version: "2025-11-25")
     on_exit(fn -> disconnect_if_alive(client) end)
 
-    assert_error_code(:method_not_found, fn -> Client.ping(client) end)
-    assert_error_code(:invalid_params, fn -> Client.list_tools(client) end)
-    assert_error_code(:not_found, fn -> Client.list_resources(client) end)
-    assert_error_code(:method_not_found, fn -> Client.list_prompts(client) end)
-    assert_error_code(:invalid_task_id, fn -> Client.fetch_task(client, "missing-task") end)
+    assert_error_code(:method_not_found, fn -> Client.ping!(client) end)
+    assert_error_code(:invalid_params, fn -> Client.list_tools!(client) end)
+    assert_error_code(:not_found, fn -> Client.list_resources!(client) end)
+    assert_error_code(:method_not_found, fn -> Client.list_prompts!(client) end)
+    assert_error_code(:invalid_task_id, fn -> Client.fetch_task!(client, "missing-task") end)
 
-    error = assert_raise Error, fn -> Client.read_resource(client, "https://example.com") end
+    error = assert_raise Error, fn -> Client.read_resource!(client, "https://example.com") end
     assert error.code == :url_elicitation_required
 
     assert error.details["elicitations"] == [
@@ -712,7 +712,7 @@ defmodule FastestMCP.ClientProtocolResponseTest do
   end
 
   defp disconnect_if_alive(client) do
-    if Client.connected?(client), do: Client.disconnect(client)
+    if Client.connected?(client), do: Client.disconnect!(client)
   end
 
   defp assert_error_code(code, fun) do

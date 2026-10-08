@@ -71,10 +71,10 @@ end
 ## 3. Call it in process
 
 ```elixir
-FastestMCP.call_tool(MyApp.MCPServer, "sum", %{"a" => 20, "b" => 22})
+FastestMCP.call_tool!(MyApp.MCPServer, "sum", %{"a" => 20, "b" => 22})
 # => 42
 
-FastestMCP.call_tool(MyApp.MCPServer, "visit", %{}, session_id: "docs-session")
+FastestMCP.call_tool!(MyApp.MCPServer, "visit", %{}, session_id: "docs-session")
 # => %{visits: 1, server: "Elixir.MyApp.MCPServer"}
 ```
 
@@ -122,9 +122,9 @@ client =
     session_stream: true
   )
 
-%{items: tools} = FastestMCP.Client.list_tools(client)
-FastestMCP.Client.call_tool(client, "sum", %{"a" => 20, "b" => 22})
-FastestMCP.Client.complete(
+%{items: tools} = FastestMCP.Client.list_tools!(client)
+FastestMCP.Client.call_tool!(client, "sum", %{"a" => 20, "b" => 22})
+FastestMCP.Client.complete!(
   client,
   %{"type" => "ref/prompt", "name" => "draft_release"},
   %{"name" => "environment", "value" => "pr"}

@@ -15,9 +15,10 @@ defmodule FastestMCP.Middleware.ResponseCaching do
   alias FastestMCP.Auth
   alias FastestMCP.BackgroundTask
   alias FastestMCP.InputRequiredResult
-  alias FastestMCP.Middleware
+  alias FastestMCP.Middleware.Runtime
+  @behaviour FastestMCP.Middleware
+
   alias FastestMCP.Operation
-  alias FastestMCP.Registry
 
   @default_list_ttl_ms 5 * 60_000
   @default_read_ttl_ms 60 * 60_000
@@ -39,7 +40,6 @@ defmodule FastestMCP.Middleware.ResponseCaching do
   defstruct [
     :instance_id,
     :runtime_id,
-    :middleware,
     :state,
     :cache_table,
     :stats_table,
@@ -85,7 +85,6 @@ defmodule FastestMCP.Middleware.ResponseCaching do
   @type t :: %__MODULE__{
           instance_id: reference(),
           runtime_id: reference() | nil,
-          middleware: (Operation.t(), (Operation.t() -> any()) -> any()),
           state: pid() | nil,
           cache_table: :ets.tid() | nil,
           stats_table: :ets.tid() | nil,
@@ -150,10 +149,11 @@ defmodule FastestMCP.Middleware.ResponseCaching do
       max_item_size: max_item_size
     }
 
-    bind_middleware(middleware)
+    middleware
   end
 
   @doc "Runs the middleware around the next operation."
+  @impl FastestMCP.Middleware
   def call(%__MODULE__{} = middleware, %Operation{} = operation, next)
       when is_function(next, 1) do
     middleware = ensure_runtime(middleware)
@@ -199,43 +199,23 @@ defmodule FastestMCP.Middleware.ResponseCaching do
   def close(%__MODULE__{} = middleware), do: deactivate_runtime(middleware)
 
   @doc false
+  @impl FastestMCP.Middleware
   def activate_runtime(%__MODULE__{} = middleware) do
-    if middleware.runtime_id, do: deactivate_runtime(middleware)
-
-    runtime_id = make_ref()
-
-    {:ok, state} = __MODULE__.State.start_link(middleware.cleanup_interval_ms)
-    {cache_table, stats_table} = __MODULE__.State.tables(state)
-
-    runtime =
-      middleware
-      |> Map.put(:runtime_id, runtime_id)
-      |> Map.put(:state, state)
-      |> Map.put(:cache_table, cache_table)
-      |> Map.put(:stats_table, stats_table)
-      |> bind_middleware()
-
-    :ok =
-      Registry.register_middleware_runtime(middleware.instance_id, runtime_id, %{
-        pid: state,
-        cache_table: cache_table,
-        stats_table: stats_table
-      })
-
-    runtime
+    Runtime.activate(
+      middleware,
+      fn ->
+        with {:ok, pid} <- __MODULE__.State.start_link(middleware.cleanup_interval_ms) do
+          {cache_table, stats_table} = __MODULE__.State.tables(pid)
+          {:ok, pid, %{cache_table: cache_table, stats_table: stats_table}}
+        end
+      end,
+      :state
+    )
   end
 
   @doc false
-  def deactivate_runtime(%__MODULE__{} = middleware) do
-    middleware
-    |> runtime_middlewares()
-    |> Enum.each(fn %{runtime_id: runtime_id, state: pid} ->
-      Registry.unregister_middleware_runtime(runtime_id)
-      Middleware.shutdown_runtime_pid(pid)
-    end)
-
-    :ok
-  end
+  @impl FastestMCP.Middleware
+  def deactivate_runtime(config), do: Runtime.close(config, :state)
 
   @doc false
   def state_pid(%__MODULE__{} = middleware) do
@@ -346,22 +326,7 @@ defmodule FastestMCP.Middleware.ResponseCaching do
   defp cacheable_result?(%InputRequiredResult{}), do: false
   defp cacheable_result?(%BackgroundTask{}), do: false
 
-  defp cacheable_result?(%{} = result) do
-    result_type =
-      Map.get(result, "resultType", Map.get(result, :resultType, Map.get(result, :result_type)))
-
-    is_error =
-      Map.get(
-        result,
-        "isError",
-        Map.get(result, :isError, Map.get(result, "is_error", Map.get(result, :is_error)))
-      )
-
-    result_type not in ["input_required", :input_required, "task", :task] and
-      is_error != true and
-      not Map.has_key?(result, "task") and
-      not Map.has_key?(result, :task)
-  end
+  defp cacheable_result?(%FastestMCP.Tools.Result{is_error: true}), do: false
 
   defp cacheable_result?(_result), do: true
 
@@ -597,46 +562,9 @@ defmodule FastestMCP.Middleware.ResponseCaching do
     end)
   end
 
-  defp ensure_runtime(%__MODULE__{} = middleware) do
-    runtime_middleware(middleware) || activate_runtime(middleware)
-  end
-
-  defp runtime_middleware(%__MODULE__{} = middleware) do
-    case runtime_middlewares(middleware) do
-      [runtime] -> runtime
-      _other -> nil
-    end
-  end
-
-  defp runtime_middlewares(%__MODULE__{runtime_id: runtime_id} = middleware)
-       when is_reference(runtime_id) do
-    case Registry.lookup_middleware_runtime(runtime_id) do
-      {:ok, runtime} -> [hydrate_runtime(middleware, runtime)]
-      {:error, :not_found} -> []
-    end
-  end
-
-  defp runtime_middlewares(%__MODULE__{} = middleware) do
-    middleware.instance_id
-    |> Registry.list_middleware_runtimes()
-    |> Enum.map(&hydrate_runtime(middleware, &1))
-  end
-
-  defp hydrate_runtime(
-         %__MODULE__{} = middleware,
-         %{runtime_id: runtime_id, pid: pid, cache_table: cache_table, stats_table: stats_table}
-       ) do
-    middleware
-    |> Map.put(:runtime_id, runtime_id)
-    |> Map.put(:state, pid)
-    |> Map.put(:cache_table, cache_table)
-    |> Map.put(:stats_table, stats_table)
-    |> bind_middleware()
-  end
-
-  defp bind_middleware(%__MODULE__{} = middleware) do
-    %{middleware | middleware: fn operation, next -> call(middleware, operation, next) end}
-  end
+  defp ensure_runtime(config), do: Runtime.ensure(config, :state)
+  defp runtime_middleware(config), do: Runtime.fetch(config, :state)
+  defp runtime_middlewares(config), do: Runtime.all(config, :state)
 
   defmodule State do
     @moduledoc """

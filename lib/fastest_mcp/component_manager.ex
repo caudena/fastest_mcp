@@ -1,4 +1,5 @@
 defmodule FastestMCP.ComponentManager do
+  @behaviour FastestMCP.Provider
   @moduledoc ~S"""
   Runtime-owned mutable component store.
 
@@ -17,7 +18,7 @@ defmodule FastestMCP.ComponentManager do
   Fetch the live manager from a running server:
 
   ```elixir
-  manager = FastestMCP.component_manager(server_name)
+  manager = FastestMCP.component_manager!(server_name)
   FastestMCP.ComponentManager.add_tool(manager, "dynamic", fn _args, _ctx -> :ok end)
   ```
 
@@ -73,6 +74,7 @@ defmodule FastestMCP.ComponentManager do
   end
 
   @doc "Returns the provider type label."
+  @impl FastestMCP.Provider
   def provider_type(_manager), do: "ComponentManager"
 
   @doc "Fetches the live component manager for the named running server."
@@ -168,11 +170,13 @@ defmodule FastestMCP.ComponentManager do
     do: toggle_component(target, :prompt, name, false, opts)
 
   @doc "Lists the components exposed by this module."
+  @impl FastestMCP.Provider
   def list_components(%__MODULE__{} = manager, component_type, _operation) do
     list(manager, component_type)
   end
 
   @doc "Resolves one component by type and identifier."
+  @impl FastestMCP.Provider
   def get_component(%__MODULE__{} = manager, component_type, identifier, operation) do
     get(
       manager,
@@ -183,6 +187,7 @@ defmodule FastestMCP.ComponentManager do
   end
 
   @doc false
+  @impl FastestMCP.Provider
   def get_component_candidates(%__MODULE__{} = manager, component_type, identifier, operation) do
     get_candidates(
       manager,
@@ -194,6 +199,7 @@ defmodule FastestMCP.ComponentManager do
   end
 
   @doc "Resolves the backing resource target for a concrete URI."
+  @impl FastestMCP.Provider
   def get_resource_target(%__MODULE__{} = manager, uri, operation) do
     manager
     |> get_resource_target_candidates(uri, operation)
@@ -202,6 +208,7 @@ defmodule FastestMCP.ComponentManager do
   end
 
   @doc false
+  @impl FastestMCP.Provider
   def get_resource_target_candidates(%__MODULE__{} = manager, uri, operation) do
     GenServer.call(
       manager.pid,

@@ -3,7 +3,7 @@ defmodule FastestMCP.OperationPipeline do
   Shared execution pipeline for local MCP operations.
 
   This module is where the runtime stops being "builder API" and starts being
-  "request execution". In-process calls like `FastestMCP.call_tool/4` eventually
+  "request execution". In-process calls like `FastestMCP.call_tool!/4` eventually
   land here, and the transport layer mirrors the same execution shape.
 
   Every request goes through one predictable path:
@@ -518,7 +518,7 @@ defmodule FastestMCP.OperationPipeline do
             )
 
             result =
-              run_middleware(runtime.server.middleware, operation, fn updated_operation ->
+              Middleware.run(runtime.server.middleware, operation, fn updated_operation ->
                 executor.(runtime.server, updated_operation)
               end)
 
@@ -654,6 +654,7 @@ defmodule FastestMCP.OperationPipeline do
       task_store: Map.get(runtime, :task_store),
       schema_cache: Map.get(runtime, :schema_cache),
       schema_options: runtime.server.schema_options,
+      invocation: Keyword.get(opts, :__fastestmcp_invocation, :local),
       task_request: task_request,
       task_ttl_ms: task_ttl_ms,
       arguments: arguments
@@ -730,14 +731,6 @@ defmodule FastestMCP.OperationPipeline do
 
         raise error
     end
-  end
-
-  defp run_middleware([], operation, executor), do: executor.(operation)
-
-  defp run_middleware([middleware | rest], operation, executor) do
-    Middleware.callable(middleware).(operation, fn updated_operation ->
-      run_middleware(rest, updated_operation, executor)
-    end)
   end
 
   defp validate_post_middleware_result(

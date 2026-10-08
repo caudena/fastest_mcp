@@ -40,16 +40,17 @@ defmodule FastestMCP.HTTPContextTest do
              query_params: %{"demo" => "1"},
              headers: %{"x-demo-header" => "ABC"}
            } ==
-             FastestMCP.call_tool(server_name, "request_tool", %{},
+             FastestMCP.call_tool!(server_name, "request_tool", %{},
                request_metadata: request_metadata
              )
 
     prompt_result =
-      FastestMCP.render_prompt(server_name, "request_prompt", %{},
+      FastestMCP.render_prompt!(server_name, "request_prompt", %{},
         request_metadata: request_metadata
       )
 
-    assert prompt_result.messages |> List.first() |> Map.fetch!(:content) =~ "x-demo-header"
+    assert prompt_result.messages |> List.first() |> Map.fetch!(:content) |> Map.fetch!(:text) =~
+             "x-demo-header"
 
     assert %{
              method: "POST",
@@ -57,7 +58,7 @@ defmodule FastestMCP.HTTPContextTest do
              query_params: %{"demo" => "1"},
              headers: %{"x-demo-header" => "ABC"}
            } ==
-             FastestMCP.read_resource(server_name, "request://snapshot",
+             FastestMCP.read_resource!(server_name, "request://snapshot",
                request_metadata: request_metadata
              )
   end
@@ -83,7 +84,7 @@ defmodule FastestMCP.HTTPContextTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
 
     task =
-      FastestMCP.call_tool(server_name, "headers", %{},
+      FastestMCP.call_tool!(server_name, "headers", %{},
         task: true,
         session_id: "http-task-session",
         request_metadata: %{
@@ -111,7 +112,7 @@ defmodule FastestMCP.HTTPContextTest do
                "host" => "example.test",
                "x-tenant-id" => "tenant-123"
              }
-           } == FastestMCP.await_task(task, 1_000)
+           } == FastestMCP.await_task!(task, 1_000)
   end
 
   test "streamable HTTP transport populates the HTTP request snapshot" do

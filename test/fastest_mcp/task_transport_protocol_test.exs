@@ -16,7 +16,7 @@ defmodule FastestMCP.TaskTransportProtocolTest do
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
 
-    result = FastestMCP.initialize(server_name)
+    result = FastestMCP.initialize!(server_name)
 
     refute Map.has_key?(result["capabilities"], "tasks")
   end
@@ -30,7 +30,7 @@ defmodule FastestMCP.TaskTransportProtocolTest do
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
 
-    result = FastestMCP.initialize(server_name)
+    result = FastestMCP.initialize!(server_name)
 
     assert result["capabilities"]["tasks"] == %{
              "list" => %{},
@@ -40,7 +40,7 @@ defmodule FastestMCP.TaskTransportProtocolTest do
              }
            }
 
-    assert Enum.find(FastestMCP.list_tools(server_name), &(&1.name == "slow")).task == %{
+    assert Enum.find(FastestMCP.list_tools!(server_name), &(&1.name == "slow")).task == %{
              mode: "optional",
              poll_interval_ms: 5_000
            }
@@ -138,7 +138,7 @@ defmodule FastestMCP.TaskTransportProtocolTest do
     assert wrong_session_error.code == :invalid_task_id
 
     send(worker_pid, :release)
-    assert FastestMCP.await_task(server_name, task_id, 1_000, session_id: "session-a") == :done
+    assert FastestMCP.await_task!(server_name, task_id, 1_000, session_id: "session-a") == :done
 
     result =
       Engine.dispatch!(server_name, %Request{
@@ -390,7 +390,7 @@ defmodule FastestMCP.TaskTransportProtocolTest do
 
     error =
       assert_raise Error, fn ->
-        FastestMCP.await_task(server_name, task_id, 1_000, session_id: "jsonrpc-failure-session")
+        FastestMCP.await_task!(server_name, task_id, 1_000, session_id: "jsonrpc-failure-session")
       end
 
     assert error.message == "boom"
@@ -457,7 +457,7 @@ defmodule FastestMCP.TaskTransportProtocolTest do
 
     error =
       assert_raise Error, fn ->
-        FastestMCP.await_task(server_name, task_id, 1_000, session_id: session_id)
+        FastestMCP.await_task!(server_name, task_id, 1_000, session_id: session_id)
       end
 
     assert error.message == "boom"

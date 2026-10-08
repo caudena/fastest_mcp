@@ -93,18 +93,18 @@ defmodule FastestMCP.PackageConsumerSmoke do
             )
 
           try do
-            assert Client.protocol_version(client) == expected
-            assert %{items: [%{"name" => "echo"}], next_cursor: nil} = Client.list_tools(client)
+            assert Client.protocol_version!(client) == expected
+            assert %{items: [%{"name" => "echo"}], next_cursor: nil} = Client.list_tools!(client)
             result =
-              Client.call_tool(client, "echo", %{
+              Client.call_tool!(client, "echo", %{
                 "transport" => "http",
                 "revision" => expected
               })
 
             assert %{"transport" => "http", "revision" => ^expected} =
-                     result["structuredContent"] || result
+                     result.structured_content
           after
-            if Client.connected?(client), do: Client.disconnect(client)
+            if Client.connected?(client), do: Client.disconnect!(client)
           end
         end
       end
@@ -141,18 +141,18 @@ defmodule FastestMCP.PackageConsumerSmoke do
             )
 
           try do
-            assert Client.protocol_version(client) == expected
-            assert %{items: [%{"name" => "echo"}], next_cursor: nil} = Client.list_tools(client)
+            assert Client.protocol_version!(client) == expected
+            assert %{items: [%{"name" => "echo"}], next_cursor: nil} = Client.list_tools!(client)
             result =
-              Client.call_tool(client, "echo", %{
+              Client.call_tool!(client, "echo", %{
                 "transport" => "stdio",
                 "revision" => expected
               })
 
             assert %{"transport" => "stdio", "revision" => ^expected} =
-                     result["structuredContent"] || result
+                     result.structured_content
           after
-            if Client.connected?(client), do: Client.disconnect(client)
+            if Client.connected?(client), do: Client.disconnect!(client)
           end
         end
       end
@@ -236,10 +236,10 @@ defmodule FastestMCP.PackageConsumerSmoke do
         on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
         assert %{"path" => "folder/file.txt"} =
-                 FastestMCP.read_resource(server_name, "safe://folder/file.txt")
+                 FastestMCP.read_resource!(server_name, "safe://folder/file.txt")
 
         assert_raise FastestMCP.Error, fn ->
-          FastestMCP.read_resource(server_name, "safe://../secret")
+          FastestMCP.read_resource!(server_name, "safe://../secret")
         end
 
         bandit =
@@ -265,25 +265,25 @@ defmodule FastestMCP.PackageConsumerSmoke do
             }
           )
 
-        on_exit(fn -> if Client.connected?(client), do: Client.disconnect(client) end)
+        on_exit(fn -> if Client.connected?(client), do: Client.disconnect!(client) end)
 
-        assert Enum.any?(Client.list_all_tools(client), &(&1["name"] == "task_echo"))
-        assert [%{"name" => "package_prompt"}] = Client.list_all_prompts(client)
-        assert [%{"uri" => "package://status"}] = Client.list_all_resources(client)
+        assert Enum.any?(Client.list_all_tools!(client), &(&1["name"] == "task_echo"))
+        assert [%{"name" => "package_prompt"}] = Client.list_all_prompts!(client)
+        assert [%{"uri" => "package://status"}] = Client.list_all_resources!(client)
         assert [%{"uriTemplate" => "safe://{+path}"}] =
-                 Client.list_all_resource_templates(client)
+                 Client.list_all_resource_templates!(client)
 
-        assert %{items: _tools} = Client.list_tools(client, cache: :bypass)
+        assert %{items: _tools} = Client.list_tools!(client, cache: :bypass)
 
         assert %{"echo" => "active", "resultType" => "complete"} =
-                 Client.request(client, "package/echo", %{"value" => "active"})
+                 Client.request!(client, "package/echo", %{"value" => "active"})
 
         assert %{
-                 "structuredContent" => %{"stored" => "stored", "missing" => "missing"}
-               } = Client.call_tool(client, "application_session_round_trip", %{})
+                 structured_content: %{"stored" => "stored", "missing" => "missing"}
+               } = Client.call_tool!(client, "application_session_round_trip", %{})
 
-        assert %{"structuredContent" => %{"ok" => true}} =
-                 Client.call_tool(client, "progress", %{},
+        assert %{structured_content: %{"ok" => true}} =
+                 Client.call_tool!(client, "progress", %{},
                    progress_handler: fn params -> send(test_pid, {:package_progress, params}) end
                  )
 
@@ -291,16 +291,16 @@ defmodule FastestMCP.PackageConsumerSmoke do
                         %{"progress" => 1, "total" => 1, "message" => "done"}},
                        1_000
 
-        task = Client.call_tool_task(client, "task_echo", %{"value" => "task"})
+        task = Client.call_tool_task!(client, "task_echo", %{"value" => "task"})
         assert %RemoteTask{} = task
 
-        assert %{"value" => "task"} = RemoteTask.result(task, timeout_ms: 2_000)
+        assert %{structured_content: %{"value" => "task"}} = RemoteTask.result!(task, timeout_ms: 2_000)
 
         assert %ToolResult{
                  structured_content: %{"value" => "stable"},
                  structured_content_present?: true
                } =
-                 Client.call_tool_result(client, "task_echo", %{"value" => "stable"},
+                 Client.call_tool!(client, "task_echo", %{"value" => "stable"},
                    task_timeout_ms: 2_000
                  )
 
@@ -353,27 +353,27 @@ defmodule FastestMCP.PackageConsumerSmoke do
              protocol_version: "2026-07-28"}
           )
 
-        assert :ok = Client.await_ready(client_name, 1_000)
+        assert :ok = Client.await_ready!(client_name, 1_000)
 
         assert %{
-                 "structuredContent" => %{
+                 structured_content: %{
                    "tools" => [
                      %{"name" => "deploy_status"},
                      %{"name" => "release_report"}
                    ],
                    "truncated" => false
                  }
-               } = Client.call_tool(client_name, "search_tools", %{"query" => "deploy"})
+               } = Client.call_tool!(client_name, "search_tools", %{"query" => "deploy"})
 
         assert %{
-                 "structuredContent" => %{
+                 structured_content: %{
                    "tools" => [%{"name" => "deploy_status"}],
                    "truncated" => false
                  }
-               } = Client.call_tool(client_name, "search_tools", %{"query" => "region"})
+               } = Client.call_tool!(client_name, "search_tools", %{"query" => "region"})
 
-        assert %{"structuredContent" => %{"target" => "production"}} =
-                 Client.call_tool(client_name, "call_tool", %{
+        assert %{structured_content: %{"target" => "production"}} =
+                 Client.call_tool!(client_name, "call_tool", %{
                    "name" => "deploy_status",
                    "arguments" => %{"target" => "production"}
                  })

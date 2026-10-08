@@ -26,11 +26,19 @@ defmodule FastestMCP.ServerExtension do
           }
   end
 
-  defstruct [:identifier, :tool_interceptor, :lifespan, settings: %{}, methods: []]
+  defstruct [
+    :identifier,
+    :tool_interceptor,
+    :lifespan,
+    settings: %{},
+    methods: [],
+    auto_register: false
+  ]
 
   @type t :: %__MODULE__{
           identifier: String.t(),
           settings: map(),
+          auto_register: boolean(),
           methods: [Method.t()],
           tool_interceptor:
             nil
@@ -41,6 +49,8 @@ defmodule FastestMCP.ServerExtension do
   @doc "Builds an executable extension declaration."
   def new(identifier, opts \\ []) when is_list(opts) do
     identifier = to_string(identifier)
+    auto_register = Keyword.get(opts, :auto_register, false)
+    unless is_boolean(auto_register), do: raise(ArgumentError, "auto_register must be a boolean")
 
     settings =
       identifier
@@ -66,6 +76,7 @@ defmodule FastestMCP.ServerExtension do
 
     %__MODULE__{
       identifier: identifier,
+      auto_register: auto_register,
       settings: settings,
       methods: methods,
       tool_interceptor: normalize_interceptor!(Keyword.get(opts, :tool_interceptor)),
@@ -108,6 +119,7 @@ defmodule FastestMCP.ServerExtension do
   def normalize!(%__MODULE__{} = extension, schema_options \\ []) when is_list(schema_options) do
     normalized =
       new(extension.identifier,
+        auto_register: extension.auto_register,
         settings: extension.settings,
         methods: extension.methods,
         tool_interceptor: extension.tool_interceptor,
@@ -116,6 +128,15 @@ defmodule FastestMCP.ServerExtension do
 
     methods = Enum.map(normalized.methods, &compile_method_schema!(&1, schema_options))
     %{normalized | methods: methods}
+  end
+
+  @doc false
+  def declaration(%__MODULE__{} = extension) do
+    %{
+      extension
+      | auto_register: false,
+        methods: Enum.map(extension.methods, &%{&1 | compiled_params_schema: nil})
+    }
   end
 
   @doc false

@@ -16,10 +16,10 @@ defmodule FastestMCP.Runtime.CallIsolationTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
 
     assert_raise Error, ~r/explode/, fn ->
-      FastestMCP.call_tool(server_name, "explode", %{})
+      FastestMCP.call_tool!(server_name, "explode", %{})
     end
 
     assert %{"message" => "still alive"} ==
-             FastestMCP.call_tool(server_name, "echo", %{"message" => "still alive"})
+             FastestMCP.call_tool!(server_name, "echo", %{"message" => "still alive"})
   end
 end

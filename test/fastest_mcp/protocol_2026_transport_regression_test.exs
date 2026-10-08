@@ -343,9 +343,10 @@ defmodule FastestMCP.Protocol2026TransportRegressionTest do
         progress_handler: fn params -> send(parent, {:modern_progress, params}) end
       )
 
-    on_exit(fn -> if Client.connected?(client), do: Client.disconnect(client) end)
+    on_exit(fn -> if Client.connected?(client), do: Client.disconnect!(client) end)
 
-    assert "done" = Client.call_tool(client, "progress", %{}, progress_token: "progress-1")
+    assert %{content: [%{"type" => "text", "text" => "done"}]} =
+             Client.call_tool!(client, "progress", %{}, progress_token: "progress-1")
 
     assert_receive {:modern_progress,
                     %{"progressToken" => "progress-1", "progress" => 0, "total" => 100}},
@@ -381,15 +382,15 @@ defmodule FastestMCP.Protocol2026TransportRegressionTest do
         progress_handler: fn params -> send(parent, {:strict_progress, params}) end
       )
 
-    on_exit(fn -> if Client.connected?(client), do: Client.disconnect(client) end)
+    on_exit(fn -> if Client.connected?(client), do: Client.disconnect!(client) end)
 
     result =
-      Client.call_tool(client, "strict_progress", %{}, progress_token: "strict-progress")
+      Client.call_tool!(client, "strict_progress", %{}, progress_token: "strict-progress")
 
     assert %{
              "duplicate" => "non_increasing_progress",
              "decreasing" => "non_increasing_progress"
-           } = result["structuredContent"]
+           } = result.structured_content
 
     assert_receive {:strict_progress, %{"progress" => 1}}, 1_000
     assert_receive {:strict_progress, %{"progress" => 2}}, 1_000
@@ -417,13 +418,15 @@ defmodule FastestMCP.Protocol2026TransportRegressionTest do
         log_handler: fn params -> send(parent, {:modern_log, params}) end
       )
 
-    on_exit(fn -> if Client.connected?(client), do: Client.disconnect(client) end)
+    on_exit(fn -> if Client.connected?(client), do: Client.disconnect!(client) end)
 
-    assert "logged" = Client.call_tool(client, "logging")
+    assert %{content: [%{"type" => "text", "text" => "logged"}]} =
+             Client.call_tool!(client, "logging")
+
     refute_receive {:modern_log, _params}, 100
 
-    assert "logged" =
-             Client.call_tool(client, "logging", %{},
+    assert %{content: [%{"type" => "text", "text" => "logged"}]} =
+             Client.call_tool!(client, "logging", %{},
                meta: %{"io.modelcontextprotocol/logLevel" => "info"}
              )
 

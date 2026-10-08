@@ -9,7 +9,7 @@ live runtime state.
 ## Adding and Removing Components
 
 ```elixir
-manager = FastestMCP.component_manager(MyApp.MCPServer)
+manager = FastestMCP.component_manager!(MyApp.MCPServer)
 
 {:ok, _tool} =
   FastestMCP.ComponentManager.add_tool(
@@ -18,8 +18,8 @@ manager = FastestMCP.component_manager(MyApp.MCPServer)
     fn %{"value" => value}, _ctx -> %{value: value} end
   )
 
-FastestMCP.list_tools(MyApp.MCPServer)
-FastestMCP.call_tool(MyApp.MCPServer, "dynamic.echo", %{"value" => "hi"})
+FastestMCP.list_tools!(MyApp.MCPServer)
+FastestMCP.call_tool!(MyApp.MCPServer, "dynamic.echo", %{"value" => "hi"})
 
 FastestMCP.ComponentManager.disable_tool(manager, "dynamic.echo")
 FastestMCP.ComponentManager.enable_tool(manager, "dynamic.echo")

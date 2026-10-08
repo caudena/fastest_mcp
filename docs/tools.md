@@ -64,7 +64,7 @@ server =
 FastestMCP validates JSON types exactly and does not coerce submitted values:
 
 ```elixir
-FastestMCP.call_tool("tools", "calculate_sum", %{"a" => 20, "b" => 22})
+FastestMCP.call_tool!("tools", "calculate_sum", %{"a" => 20, "b" => 22})
 # => 42
 ```
 
@@ -167,7 +167,7 @@ server =
 Resolve values through `completion/complete`:
 
 ```elixir
-FastestMCP.complete(
+FastestMCP.complete!(
   "tool-completion",
   %{"type" => "ref/tool", "name" => "deploy"},
   %{"name" => "environment", "value" => "prev"}
@@ -209,7 +209,7 @@ server =
 ```
 
 ```elixir
-FastestMCP.call_tool("tool-injection", "whoami", %{"value" => 7}, session_id: "real-session")
+FastestMCP.call_tool!("tool-injection", "whoami", %{"value" => 7}, session_id: "real-session")
 # => %{"session_id" => "real-session", "value" => 7}
 ```
 
@@ -264,7 +264,7 @@ server =
 
 `annotations` are preserved through:
 
-- direct list APIs such as `FastestMCP.list_tools/2`
+- direct list APIs such as `FastestMCP.list_tools!/2`
 - runtime registry and provider composition
 - MCP transport serialization
 - connected client APIs
@@ -292,7 +292,7 @@ server =
 ```
 
 ```elixir
-tools = FastestMCP.list_tools("tool-transport-meta")
+tools = FastestMCP.list_tools!("tool-transport-meta")
 Enum.map(tools, &{&1.name, &1.tags, &1.version})
 # => [{"echo", ["math", "utility"], "2.0.0"}]
 ```
@@ -383,7 +383,7 @@ server =
 ```
 
 ```elixir
-FastestMCP.call_tool("tool-results", "get_user_data", %{"user_id" => "42"})
+FastestMCP.call_tool!("tool-results", "get_user_data", %{"user_id" => "42"})
 # => %{id: "42", name: "Alice", age: 30, active: true}
 ```
 
@@ -395,7 +395,7 @@ as ranges:
 FastestMCP.server("tool-results")
 |> FastestMCP.add_tool("ids", fn _arguments, _ctx -> 1..3 end)
 
-FastestMCP.call_tool("tool-results", "ids", %{})
+FastestMCP.call_tool!("tool-results", "ids", %{})
 # => [1, 2, 3]
 ```
 
@@ -408,7 +408,8 @@ clients get both a readable representation and machine-readable structure.
 The legacy wire includes `structuredContent` only for object values, matching
 its tagged schema.
 
-This is the normal path for map-like results. You only need an explicit helper
+Plain maps remain application data, including maps with `content` or
+`structuredContent` keys. This is the normal path for map-like results. You only need an explicit helper
 when you want to control the exact MCP envelope.
 
 If you need explicit control over content blocks, structured content, metadata,
@@ -446,7 +447,7 @@ from that structure automatically so transport responses stay complete.
 ## Content Blocks and Media
 
 If the tool needs to return MCP content blocks directly, return explicit block
-maps or build them through `FastestMCP.Tools.Result`:
+maps inside `FastestMCP.Tools.Result`:
 
 ```elixir
 alias FastestMCP.Tools.Result
@@ -533,14 +534,14 @@ Remote callers now get a generic message for unexpected crashes:
 ```elixir
 client = FastestMCP.Client.connect!("http://127.0.0.1:4100/mcp")
 
-FastestMCP.Client.call_tool(client, "explode", %{})
+FastestMCP.Client.call_tool!(client, "explode", %{})
 # => ** (FastestMCP.Error) tool "explode" failed
 ```
 
 Explicit `FastestMCP.Error` values are still delivered as-is:
 
 ```elixir
-FastestMCP.Client.call_tool(client, "safe_fail", %{})
+FastestMCP.Client.call_tool!(client, "safe_fail", %{})
 # => ** (FastestMCP.Error) missing deployment target
 ```
 
@@ -600,7 +601,7 @@ server =
 Foreground calls raise a normalized timeout error:
 
 ```elixir
-FastestMCP.call_tool("tool-timeouts", "slow", %{})
+FastestMCP.call_tool!("tool-timeouts", "slow", %{})
 # => ** (FastestMCP.Error) tool "slow" timed out
 ```
 
@@ -650,7 +651,7 @@ server =
   |> FastestMCP.add_tool("status", fn _arguments, _ctx -> %{source: "first"} end)
   |> FastestMCP.add_tool("status", fn _arguments, _ctx -> %{source: "second"} end)
 
-FastestMCP.call_tool("duplicates", "status", %{})
+FastestMCP.call_tool!("duplicates", "status", %{})
 # => %{source: "second"}
 ```
 
@@ -691,13 +692,13 @@ Global visibility is server-scoped:
 
 ```elixir
 :ok =
-  FastestMCP.disable_components("catalog",
+  FastestMCP.disable_components!("catalog",
     tags: ["internal"],
     components: [:tool]
   )
 
 :ok =
-  FastestMCP.enable_components("catalog",
+  FastestMCP.enable_components!("catalog",
     tags: ["finance"],
     components: [:tool],
     only: true
@@ -748,12 +749,12 @@ prefer the runtime visibility APIs and component manager:
 ```elixir
 {:ok, _pid} = FastestMCP.start_server(server)
 :ok =
-  FastestMCP.enable_components("toggle-tools",
+  FastestMCP.enable_components!("toggle-tools",
     names: ["beta.echo"],
     components: [:tool]
   )
 
-FastestMCP.call_tool("toggle-tools", "beta.echo", %{"value" => "hi"})
+FastestMCP.call_tool!("toggle-tools", "beta.echo", %{"value" => "hi"})
 # => %{value: "hi"}
 ```
 
@@ -824,10 +825,10 @@ Once enabled, `tools/list` exposes only the visible pinned tools plus
 and then delegate a call by exact name:
 
 ```elixir
-FastestMCP.call_tool("large-catalog", "search_tools", %{"query" => "deploy"})
+FastestMCP.call_tool!("large-catalog", "search_tools", %{"query" => "deploy"})
 # => %{"tools" => [...], "truncated" => false}
 
-FastestMCP.call_tool("large-catalog", "call_tool", %{
+FastestMCP.call_tool!("large-catalog", "call_tool", %{
   "name" => "deploy_release",
   "arguments" => %{"environment" => "production"}
 })
@@ -868,7 +869,7 @@ If you need to add, disable, enable, or remove tools after startup, use the
 runtime component manager:
 
 ```elixir
-manager = FastestMCP.component_manager("dynamic-tools")
+manager = FastestMCP.component_manager!("dynamic-tools")
 
 {:ok, _tool} =
   FastestMCP.ComponentManager.add_tool(

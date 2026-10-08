@@ -26,26 +26,26 @@ defmodule FastestMCP.TaskMetaTest do
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
 
-    assert 10 == FastestMCP.call_tool(server_name, "double", %{"value" => 5})
+    assert 10 == FastestMCP.call_tool!(server_name, "double", %{"value" => 5})
 
     assert %{
-             messages: [%{role: "user", content: "topic:tasks"}]
-           } == FastestMCP.render_prompt(server_name, "describe", %{"topic" => "tasks"})
+             messages: [%{role: "user", content: %{type: "text", text: "topic:tasks"}}]
+           } = FastestMCP.render_prompt!(server_name, "describe", %{"topic" => "tasks"})
 
-    assert "ready" == FastestMCP.read_resource(server_name, "data://status")
+    assert "ready" == FastestMCP.read_resource!(server_name, "data://status")
 
     assert %BackgroundTask{} =
-             FastestMCP.call_tool(server_name, "double", %{"value" => 5},
+             FastestMCP.call_tool!(server_name, "double", %{"value" => 5},
                task_meta: TaskMeta.new()
              )
 
     assert %BackgroundTask{} =
-             FastestMCP.render_prompt(server_name, "describe", %{"topic" => "tasks"},
+             FastestMCP.render_prompt!(server_name, "describe", %{"topic" => "tasks"},
                task_meta: TaskMeta.new()
              )
 
     assert %BackgroundTask{} =
-             FastestMCP.read_resource(server_name, "data://status", task_meta: TaskMeta.new())
+             FastestMCP.read_resource!(server_name, "data://status", task_meta: TaskMeta.new())
   end
 
   test "task_meta propagates custom ttl through direct nested tool prompt and resource calls" do
@@ -72,18 +72,18 @@ defmodule FastestMCP.TaskMetaTest do
         task_meta = TaskMeta.new(ttl: ttl_ms)
 
         tool_task =
-          FastestMCP.call_tool(server_name, "inner_tool", %{"value" => 7}, task_meta: task_meta)
+          FastestMCP.call_tool!(server_name, "inner_tool", %{"value" => 7}, task_meta: task_meta)
 
         prompt_task =
-          FastestMCP.render_prompt(server_name, "inner_prompt", %{"topic" => "nested"},
+          FastestMCP.render_prompt!(server_name, "inner_prompt", %{"topic" => "nested"},
             task_meta: task_meta
           )
 
         resource_task =
-          FastestMCP.read_resource(server_name, "data://inner", task_meta: task_meta)
+          FastestMCP.read_resource!(server_name, "data://inner", task_meta: task_meta)
 
         template_task =
-          FastestMCP.read_resource(server_name, "item://42", task_meta: task_meta)
+          FastestMCP.read_resource!(server_name, "item://42", task_meta: task_meta)
 
         %{
           tool: %{task_id: tool_task.task_id, ttl: tool_task.ttl_ms},
@@ -95,36 +95,36 @@ defmodule FastestMCP.TaskMetaTest do
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
 
-    result = FastestMCP.call_tool(server_name, "outer", %{}, session_id: "task-meta-session")
+    result = FastestMCP.call_tool!(server_name, "outer", %{}, session_id: "task-meta-session")
 
     for key <- [:tool, :prompt, :resource, :template] do
       assert result[key].ttl == ttl_ms
 
       assert %{ttl_ms: ^ttl_ms, session_id: "task-meta-session"} =
-               FastestMCP.fetch_task(server_name, result[key].task_id,
+               FastestMCP.fetch_task!(server_name, result[key].task_id,
                  session_id: "task-meta-session"
                )
     end
 
     assert 14 ==
-             FastestMCP.await_task(server_name, result.tool.task_id, 1_000,
+             FastestMCP.await_task!(server_name, result.tool.task_id, 1_000,
                session_id: "task-meta-session"
              )
 
     assert %{
-             messages: [%{role: "user", content: "prompt:nested"}]
+             messages: [%{role: "user", content: %{type: "text", text: "prompt:nested"}}]
            } =
-             FastestMCP.await_task(server_name, result.prompt.task_id, 1_000,
+             FastestMCP.await_task!(server_name, result.prompt.task_id, 1_000,
                session_id: "task-meta-session"
              )
 
     assert "resource:ok" ==
-             FastestMCP.await_task(server_name, result.resource.task_id, 1_000,
+             FastestMCP.await_task!(server_name, result.resource.task_id, 1_000,
                session_id: "task-meta-session"
              )
 
     assert "item:42" ==
-             FastestMCP.await_task(server_name, result.template.task_id, 1_000,
+             FastestMCP.await_task!(server_name, result.template.task_id, 1_000,
                session_id: "task-meta-session"
              )
   end
@@ -145,22 +145,22 @@ defmodule FastestMCP.TaskMetaTest do
 
     tool_error =
       assert_raise Error, fn ->
-        FastestMCP.call_tool(server_name, "sync_tool", %{}, task_meta: TaskMeta.new())
+        FastestMCP.call_tool!(server_name, "sync_tool", %{}, task_meta: TaskMeta.new())
       end
 
     prompt_error =
       assert_raise Error, fn ->
-        FastestMCP.render_prompt(server_name, "sync_prompt", %{}, task_meta: TaskMeta.new())
+        FastestMCP.render_prompt!(server_name, "sync_prompt", %{}, task_meta: TaskMeta.new())
       end
 
     resource_error =
       assert_raise Error, fn ->
-        FastestMCP.read_resource(server_name, "data://sync", task_meta: TaskMeta.new())
+        FastestMCP.read_resource!(server_name, "data://sync", task_meta: TaskMeta.new())
       end
 
     template_error =
       assert_raise Error, fn ->
-        FastestMCP.read_resource(server_name, "item://42", task_meta: TaskMeta.new())
+        FastestMCP.read_resource!(server_name, "item://42", task_meta: TaskMeta.new())
       end
 
     for error <- [tool_error, prompt_error, resource_error, template_error] do
@@ -179,15 +179,15 @@ defmodule FastestMCP.TaskMetaTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
 
     keyword_task =
-      FastestMCP.call_tool(server_name, "echo", %{"value" => "keyword"}, task_meta: [ttl: 120])
+      FastestMCP.call_tool!(server_name, "echo", %{"value" => "keyword"}, task_meta: [ttl: 120])
 
     map_task =
-      FastestMCP.call_tool(server_name, "echo", %{"value" => "map"}, task_meta: %{ttl: 140})
+      FastestMCP.call_tool!(server_name, "echo", %{"value" => "map"}, task_meta: %{ttl: 140})
 
     assert keyword_task.ttl_ms == 120
     assert map_task.ttl_ms == 140
 
-    assert "keyword" == FastestMCP.await_task(keyword_task, 1_000)
-    assert "map" == FastestMCP.await_task(map_task, 1_000)
+    assert "keyword" == FastestMCP.await_task!(keyword_task, 1_000)
+    assert "map" == FastestMCP.await_task!(map_task, 1_000)
   end
 end

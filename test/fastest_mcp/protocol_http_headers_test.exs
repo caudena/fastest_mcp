@@ -272,10 +272,10 @@ defmodule FastestMCP.Protocol.HTTPHeadersTest do
 
     {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
     client = Client.connect!("http://127.0.0.1:#{port}/mcp")
-    on_exit(fn -> if Client.connected?(client), do: Client.disconnect(client) end)
+    on_exit(fn -> if Client.connected?(client), do: Client.disconnect!(client) end)
 
-    assert %{"structuredContent" => %{"routing" => %{"region" => " eu "}}} =
-             Client.call_tool(client, tool_name, %{"routing" => %{"region" => " eu "}})
+    assert %{raw: %{"structuredContent" => %{"routing" => %{"region" => " eu "}}}} =
+             Client.call_tool!(client, tool_name, %{"routing" => %{"region" => " eu "}})
   end
 
   test "modern HTTP excludes tools containing invalid annotated schemas" do

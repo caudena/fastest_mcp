@@ -31,14 +31,14 @@ defmodule FastestMCP.MountedProviderFilteringTest do
     assert {:ok, _pid} = FastestMCP.start_server(parent)
     on_exit(fn -> FastestMCP.stop_server(parent_name) end)
 
-    assert Enum.map(FastestMCP.list_tools(parent_name), & &1.name) == ["allowed_tool"]
-    assert Enum.map(FastestMCP.list_resources(parent_name), & &1.uri) == ["data://allowed"]
-    assert Enum.map(FastestMCP.list_prompts(parent_name), & &1.name) == ["allowed_prompt"]
+    assert Enum.map(FastestMCP.list_tools!(parent_name), & &1.name) == ["allowed_tool"]
+    assert Enum.map(FastestMCP.list_resources!(parent_name), & &1.uri) == ["data://allowed"]
+    assert Enum.map(FastestMCP.list_prompts!(parent_name), & &1.name) == ["allowed_prompt"]
 
-    assert "allowed" == FastestMCP.call_tool(parent_name, "allowed_tool", %{})
+    assert "allowed" == FastestMCP.call_tool!(parent_name, "allowed_tool", %{})
 
     assert_raise Error, ~r/unknown tool "blocked_tool"/, fn ->
-      FastestMCP.call_tool(parent_name, "blocked_tool", %{})
+      FastestMCP.call_tool!(parent_name, "blocked_tool", %{})
     end
   end
 
@@ -58,6 +58,6 @@ defmodule FastestMCP.MountedProviderFilteringTest do
     assert {:ok, _pid} = FastestMCP.start_server(parent)
     on_exit(fn -> FastestMCP.stop_server(parent_name) end)
 
-    assert Enum.map(FastestMCP.list_tools(parent_name), & &1.name) == ["prod_tool"]
+    assert Enum.map(FastestMCP.list_tools!(parent_name), & &1.name) == ["prod_tool"]
   end
 end

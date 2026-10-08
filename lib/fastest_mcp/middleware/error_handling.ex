@@ -3,8 +3,8 @@ defmodule FastestMCP.Middleware.ErrorHandling do
   Stateful middleware that logs failures, tracks counts, and normalizes common exceptions.
 
   Middleware modules in FastestMCP are configured as explicit structs that
-  carry options plus a ready-to-run `middleware` function. That keeps runtime
-  assembly cheap while making the configured value easy to inspect in tests.
+  carry immutable configuration. Dispatch calls the module with that configuration;
+  runtime state is owned separately by the server.
 
   Most applications reach this module through `FastestMCP.Middleware` helper
   functions or by adding the configured struct directly with
@@ -14,16 +14,16 @@ defmodule FastestMCP.Middleware.ErrorHandling do
   require Logger
 
   alias FastestMCP.Error
-  alias FastestMCP.Middleware
+  alias FastestMCP.Middleware.Runtime
+  @behaviour FastestMCP.Middleware
+
   alias FastestMCP.Operation
-  alias FastestMCP.Registry
 
   defstruct [
     :error_callback,
     :instance_id,
     :runtime_id,
     :logger,
-    :middleware,
     :stats,
     include_traceback: false,
     transform_errors: true
@@ -36,7 +36,6 @@ defmodule FastestMCP.Middleware.ErrorHandling do
           instance_id: reference(),
           runtime_id: reference() | nil,
           logger: (Logger.level(), String.t() -> any()),
-          middleware: (Operation.t(), (Operation.t() -> any()) -> any()),
           stats: pid() | nil,
           include_traceback: boolean(),
           transform_errors: boolean()
@@ -56,10 +55,11 @@ defmodule FastestMCP.Middleware.ErrorHandling do
       transform_errors: Keyword.get(opts, :transform_errors, true)
     }
 
-    bind_middleware(middleware)
+    middleware
   end
 
   @doc "Runs the middleware around the next operation."
+  @impl FastestMCP.Middleware
   def call(%__MODULE__{} = middleware, %Operation{} = operation, next)
       when is_function(next, 1) do
     middleware = ensure_runtime(middleware)
@@ -93,33 +93,14 @@ defmodule FastestMCP.Middleware.ErrorHandling do
   def close(%__MODULE__{} = middleware), do: deactivate_runtime(middleware)
 
   @doc false
+  @impl FastestMCP.Middleware
   def activate_runtime(%__MODULE__{} = middleware) do
-    if middleware.runtime_id, do: deactivate_runtime(middleware)
-
-    runtime_id = make_ref()
-    {:ok, stats} = Agent.start(fn -> %{} end)
-
-    runtime =
-      middleware
-      |> Map.put(:runtime_id, runtime_id)
-      |> Map.put(:stats, stats)
-      |> bind_middleware()
-
-    :ok = Registry.register_middleware_runtime(middleware.instance_id, runtime_id, %{pid: stats})
-    runtime
+    Runtime.activate(middleware, fn -> Agent.start(fn -> %{} end) end, :stats)
   end
 
   @doc false
-  def deactivate_runtime(%__MODULE__{} = middleware) do
-    middleware
-    |> runtime_middlewares()
-    |> Enum.each(fn %{runtime_id: runtime_id, stats: pid} ->
-      Registry.unregister_middleware_runtime(runtime_id)
-      Middleware.shutdown_runtime_pid(pid)
-    end)
-
-    :ok
-  end
+  @impl FastestMCP.Middleware
+  def deactivate_runtime(config), do: Runtime.close(config, :stats)
 
   @doc "Transforms an exception or runtime error into a normalized error."
   def transform_error(_middleware, error, operation)
@@ -238,39 +219,6 @@ defmodule FastestMCP.Middleware.ErrorHandling do
     |> String.trim_leading("Elixir.")
   end
 
-  defp ensure_runtime(%__MODULE__{} = middleware) do
-    runtime_middleware(middleware) || activate_runtime(middleware)
-  end
-
-  defp runtime_middleware(%__MODULE__{} = middleware) do
-    case runtime_middlewares(middleware) do
-      [runtime] -> runtime
-      _other -> nil
-    end
-  end
-
-  defp runtime_middlewares(%__MODULE__{runtime_id: runtime_id} = middleware)
-       when is_reference(runtime_id) do
-    case Registry.lookup_middleware_runtime(runtime_id) do
-      {:ok, runtime} -> [hydrate_runtime(middleware, runtime)]
-      {:error, :not_found} -> []
-    end
-  end
-
-  defp runtime_middlewares(%__MODULE__{} = middleware) do
-    middleware.instance_id
-    |> Registry.list_middleware_runtimes()
-    |> Enum.map(&hydrate_runtime(middleware, &1))
-  end
-
-  defp hydrate_runtime(%__MODULE__{} = middleware, %{runtime_id: runtime_id, pid: pid}) do
-    middleware
-    |> Map.put(:runtime_id, runtime_id)
-    |> Map.put(:stats, pid)
-    |> bind_middleware()
-  end
-
-  defp bind_middleware(%__MODULE__{} = middleware) do
-    %{middleware | middleware: fn operation, next -> call(middleware, operation, next) end}
-  end
+  defp ensure_runtime(config), do: Runtime.ensure(config, :stats)
+  defp runtime_middlewares(config), do: Runtime.all(config, :stats)
 end

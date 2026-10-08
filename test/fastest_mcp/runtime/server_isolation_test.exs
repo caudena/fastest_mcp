@@ -30,16 +30,16 @@ defmodule FastestMCP.Runtime.ServerIsolationTest do
              )
 
     assert "alpha" ==
-             FastestMCP.call_tool(server_a, "remember", %{"value" => "alpha"},
+             FastestMCP.call_tool!(server_a, "remember", %{"value" => "alpha"},
                session_id: session_id
              )
 
     assert "beta" ==
-             FastestMCP.call_tool(server_b, "remember", %{"value" => "beta"},
+             FastestMCP.call_tool!(server_b, "remember", %{"value" => "beta"},
                session_id: session_id
              )
 
-    assert "alpha" == FastestMCP.call_tool(server_a, "peek", %{}, session_id: session_id)
-    assert "beta" == FastestMCP.call_tool(server_b, "peek", %{}, session_id: session_id)
+    assert "alpha" == FastestMCP.call_tool!(server_a, "peek", %{}, session_id: session_id)
+    assert "beta" == FastestMCP.call_tool!(server_b, "peek", %{}, session_id: session_id)
   end
 end

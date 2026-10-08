@@ -56,10 +56,10 @@ defmodule FastestMCP.ResourceHelpersTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    resource = Enum.find(FastestMCP.list_resources(server_name), &(&1.uri == "memo://bundle"))
+    resource = Enum.find(FastestMCP.list_resources!(server_name), &(&1.uri == "memo://bundle"))
     assert resource.annotations == %{cacheable: true}
 
-    [template] = FastestMCP.list_resource_templates(server_name)
+    [template] = FastestMCP.list_resource_templates!(server_name)
     assert template.annotations == %{httpMethod: "GET"}
 
     assert %{
@@ -72,7 +72,7 @@ defmodule FastestMCP.ResourceHelpersTest do
                }
              ],
              meta: %{source: "helper"}
-           } = FastestMCP.read_resource(server_name, "memo://bundle")
+           } = FastestMCP.read_resource!(server_name, "memo://bundle")
 
     assert %{
              "contents" => [
@@ -305,7 +305,7 @@ defmodule FastestMCP.ResourceHelpersTest do
     assert %{
              contents: [%{mime_type: "application/json", content: payload}],
              meta: %{count: 1, path: ^root, recursive: false}
-           } = FastestMCP.read_resource(server_name, "dir://notes")
+           } = FastestMCP.read_resource!(server_name, "dir://notes")
 
     assert [%{"relative_path" => "notes.md"}] = JSON.decode!(payload)
   end

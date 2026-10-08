@@ -22,7 +22,7 @@ defmodule FastestMCP.Runtime.TimeoutsTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
 
     assert_raise Error, ~r/timed out/, fn ->
-      FastestMCP.call_tool(server_name, "slow", %{})
+      FastestMCP.call_tool!(server_name, "slow", %{})
     end
   end
 
@@ -44,9 +44,9 @@ defmodule FastestMCP.Runtime.TimeoutsTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    task = FastestMCP.call_tool(server_name, "slow", %{}, task: true)
+    task = FastestMCP.call_tool!(server_name, "slow", %{}, task: true)
     assert %BackgroundTask{} = task
-    assert "done" == FastestMCP.await_task(task, 1_000)
+    assert "done" == FastestMCP.await_task!(task, 1_000)
   end
 
   test "timed-out calls leave no stale results or DOWN messages in the caller mailbox" do

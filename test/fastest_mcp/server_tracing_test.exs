@@ -22,7 +22,7 @@ defmodule FastestMCP.ServerTracingTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    assert "Hello, World!" == FastestMCP.call_tool(server_name, "greet", %{"name" => "World"})
+    assert "Hello, World!" == FastestMCP.call_tool!(server_name, "greet", %{"name" => "World"})
 
     spans = TraceTestHelper.drain_spans()
     span = TraceTestHelper.find_span!(spans, "tools/call greet")
@@ -51,7 +51,7 @@ defmodule FastestMCP.ServerTracingTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    assert "profile for 123" == FastestMCP.read_resource(server_name, "users://123/profile")
+    assert "profile for 123" == FastestMCP.read_resource!(server_name, "users://123/profile")
 
     spans = TraceTestHelper.drain_spans()
     span = TraceTestHelper.find_span!(spans, "resources/read")
@@ -78,7 +78,7 @@ defmodule FastestMCP.ServerTracingTest do
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
     assert_raise Error, fn ->
-      FastestMCP.call_tool(server_name, "explode", %{})
+      FastestMCP.call_tool!(server_name, "explode", %{})
     end
 
     spans = TraceTestHelper.drain_spans()
@@ -108,7 +108,7 @@ defmodule FastestMCP.ServerTracingTest do
       headers = FastestMCP.Telemetry.inject_trace_context()
 
       assert %{"value" => "ok"} ==
-               FastestMCP.call_tool(server_name, "echo", %{"value" => "ok"},
+               FastestMCP.call_tool!(server_name, "echo", %{"value" => "ok"},
                  auth_input: %{"authorization" => "Bearer valid-token"},
                  request_metadata: headers
                )

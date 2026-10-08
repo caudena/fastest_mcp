@@ -35,7 +35,7 @@ session and expose `fetch/2`, `wait/2`, `result/2`, `cancel/2`, and
 The local Elixir API is the third surface and is intentionally broader.
 In-process callers can create
 tool, prompt, resource, and resource-template tasks and can answer local
-interaction waiters with `FastestMCP.send_task_input/5`. Those are runtime APIs,
+interaction waiters with `FastestMCP.send_task_input!/5`. Those are runtime APIs,
 not additional MCP wire methods. Choose behavior from the negotiated protocol
 profile; do not mix method sets or fields between eras.
 
@@ -102,23 +102,40 @@ Component-level `task:` settings override the server default.
 
 ## Local In-Process Task Calls
 
-Task-enabled components do not force every in-process caller into asynchronous
-flow. Local calls stay synchronous until the caller explicitly asks for a task.
+Local calls to an optional task-enabled component stay synchronous until the
+caller explicitly asks for a task. A task-required component rejects an ordinary
+local call; pass `task: true` to create its background task.
+
+The same rule applies inside a tool, prompt, or resource handler, even when the
+outer request carries the modern client's Tasks capability:
+
+```elixir
+# Inside a handler, calling an optional task-enabled tool returns its result.
+result = FastestMCP.call_tool!(ctx.server_name, "slow_report", %{"id" => 42})
+
+# Explicit local submission returns a BackgroundTask handle.
+task = FastestMCP.call_tool!(ctx.server_name, "slow_report", %{"id" => 42}, task: true)
+```
+
+Nested direct calls on the same server retain authorization and request context.
+A connected `FastestMCP.Client` call, including an `{:in_process, server_name}`
+connection, still goes through the protocol boundary and negotiated remote-task
+handling. See [Connected In-Process Server](client.md#connected-in-process-server).
 
 Tool example:
 
 ```elixir
 task =
-  FastestMCP.call_tool(
+  FastestMCP.call_tool!(
     MyApp.MCPServer,
     "slow_report",
     %{"id" => 42},
     task: true
   )
 
-status = FastestMCP.fetch_task(task)
-result = FastestMCP.await_task(task, 5_000)
-final = FastestMCP.task_result(task)
+status = FastestMCP.fetch_task!(task)
+result = FastestMCP.await_task!(task, 5_000)
+final = FastestMCP.task_result!(task)
 ```
 
 For local in-process callers, the same shape works for prompt, resource, and
@@ -126,7 +143,7 @@ resource-template tasks:
 
 ```elixir
 prompt_task =
-  FastestMCP.render_prompt(
+  FastestMCP.render_prompt!(
     MyApp.MCPServer,
     "draft_release",
     %{"title" => "v1.2.3"},
@@ -134,7 +151,7 @@ prompt_task =
   )
 
 resource_task =
-  FastestMCP.read_resource(
+  FastestMCP.read_resource!(
     MyApp.MCPServer,
     "memo://release",
     task: true
@@ -145,7 +162,7 @@ List and cancel tasks from the same runtime:
 
 ```elixir
 %{tasks: tasks, next_cursor: next_cursor} =
-  FastestMCP.list_tasks(MyApp.MCPServer,
+  FastestMCP.list_tasks!(MyApp.MCPServer,
     session_id: "release-session",
     page_size: 20
   )
@@ -155,14 +172,14 @@ Enum.each(tasks, fn task ->
 end)
 
 if next_cursor do
-  FastestMCP.list_tasks(MyApp.MCPServer,
+  FastestMCP.list_tasks!(MyApp.MCPServer,
     session_id: "release-session",
     page_size: 20,
     cursor: next_cursor
   )
 end
 
-FastestMCP.cancel_task(task)
+FastestMCP.cancel_task!(task)
 ```
 
 ## Explicit `task_meta:` and TTL
@@ -174,7 +191,7 @@ without changing the component declaration.
 alias FastestMCP.TaskMeta
 
 task =
-  FastestMCP.call_tool(
+  FastestMCP.call_tool!(
     MyApp.MCPServer,
     "slow_report",
     %{"id" => 42},
@@ -185,7 +202,7 @@ task =
 Keyword and map input are supported too:
 
 ```elixir
-FastestMCP.read_resource(
+FastestMCP.read_resource!(
   MyApp.MCPServer,
   "memo://release",
   task_meta: [ttl: 15_000]
@@ -252,9 +269,9 @@ For connected legacy clients, the flow is:
 FastestMCP exposes an Elixir-only input API for local integrations:
 
 ```elixir
-task = FastestMCP.call_tool(MyApp.MCPServer, "approve_release", %{}, task: true)
+task = FastestMCP.call_tool!(MyApp.MCPServer, "approve_release", %{}, task: true)
 
-FastestMCP.send_task_input(
+FastestMCP.send_task_input!(
   MyApp.MCPServer,
   task.task_id,
   :accept,
@@ -299,7 +316,7 @@ Successful `tasks/result` payloads carry
 to the originating task:
 
 ```elixir
-result = FastestMCP.task_result(task)
+result = FastestMCP.task_result!(task)
 
 %{
   structuredContent: %{id: 42, status: "ready"},
@@ -331,7 +348,7 @@ request identity without a session id. Wrong legacy session, wrong auth
 context, expired tasks, and nonexistent task ids resolve to the same
 invalid-task response shape.
 
-Local `FastestMCP.send_task_input/5` applies the same task ownership checks but
+Local `FastestMCP.send_task_input!/5` applies the same task ownership checks but
 does not cross the MCP transport.
 
 When auth is present, the task auth fingerprint prefers `client_id|sub` so two
@@ -371,7 +388,7 @@ On `2025-11-25`, FastestMCP advertises task capabilities during initialize:
       "tools" => %{"call" => %{}}
     }
   }
-} = FastestMCP.initialize(MyApp.MCPServer)["capabilities"]
+} = FastestMCP.initialize!(MyApp.MCPServer)["capabilities"]
 ```
 
 On `2026-07-28`, the server instead advertises

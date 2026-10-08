@@ -155,31 +155,34 @@ defmodule FastestMCP.ClientToolCatalogTest do
   test "catalog discovery is complete, paginated, single-flight, and isolates bad descriptors" do
     {client, state} = start_client(:single_flight)
 
-    first = Task.async(fn -> Client.call_tool(client, "echo", %{"value" => 1}) end)
-    second = Task.async(fn -> Client.call_tool(client, "echo", %{"value" => 2}) end)
+    first = Task.async(fn -> Client.call_tool!(client, "echo", %{"value" => 1}) end)
+    second = Task.async(fn -> Client.call_tool!(client, "echo", %{"value" => 2}) end)
 
     assert_receive {:catalog_first_page, loader_pid}, 1_000
     Process.sleep(50)
     assert Agent.get(state, & &1.list_requests) == 1
     send(loader_pid, :release_catalog)
 
-    assert %{"value" => 1} = Task.await(first, 1_000)
-    assert %{"value" => 2} = Task.await(second, 1_000)
+    assert %{structured_content: %{"value" => 1}} = Task.await(first, 1_000)
+    assert %{structured_content: %{"value" => 2}} = Task.await(second, 1_000)
     assert Agent.get(state, & &1.list_requests) == 2
     assert length(Agent.get(state, & &1.calls)) == 2
 
-    assert_raise ProtocolError, fn -> Client.call_tool(client, "broken", %{}) end
+    assert_raise ProtocolError, fn -> Client.call_tool!(client, "broken", %{}) end
 
     invalid_arguments =
-      assert_raise Error, fn -> Client.call_tool(client, "echo", %{"value" => "one"}) end
+      assert_raise Error, fn -> Client.call_tool!(client, "echo", %{"value" => "one"}) end
 
     assert invalid_arguments.code == :invalid_params
 
     required_task =
-      assert_raise Error, fn -> Client.call_tool(client, "required-task", %{}) end
+      assert_raise Error, fn -> Client.call_tool!(client, "required-task", %{}) end
 
     assert required_task.code == :method_not_found
-    assert %{"value" => 3} = Client.call_tool(client, "echo", %{"value" => 3}, task: false)
+
+    assert %{structured_content: %{"value" => 3}} =
+             Client.call_tool!(client, "echo", %{"value" => 3}, task: false)
+
     assert length(Agent.get(state, & &1.calls)) == 3
     assert Agent.get(state, & &1.list_requests) == 2
   end
@@ -189,7 +192,7 @@ defmodule FastestMCP.ClientToolCatalogTest do
 
     error =
       assert_raise ProtocolError, fn ->
-        Client.call_tool(client, "echo", %{"value" => 7})
+        Client.call_tool!(client, "echo", %{"value" => 7})
       end
 
     assert error.method == "tools/call"
@@ -201,7 +204,7 @@ defmodule FastestMCP.ClientToolCatalogTest do
 
     error =
       assert_raise Error, fn ->
-        Client.call_tool(client, "echo", %{"value" => 1})
+        Client.call_tool!(client, "echo", %{"value" => 1})
       end
 
     assert error.code == :invalid_request
@@ -211,16 +214,26 @@ defmodule FastestMCP.ClientToolCatalogTest do
   test "catalogs stay fresh without legacy TTL hints and invalidate on auth setters" do
     {client, state} = start_client(:auth_partition, access_token: "alpha")
 
-    assert %{"value" => 1} = Client.call_tool(client, "alpha_tool", %{"value" => 1})
-    assert %{"value" => 2} = Client.call_tool(client, "alpha_tool", %{"value" => 2})
+    assert %{structured_content: %{"value" => 1}} =
+             Client.call_tool!(client, "alpha_tool", %{"value" => 1})
+
+    assert %{structured_content: %{"value" => 2}} =
+             Client.call_tool!(client, "alpha_tool", %{"value" => 2})
+
     assert Agent.get(state, & &1.list_requests) == 1
 
-    assert :ok = Client.set_access_token(client, "beta")
-    assert %{"value" => 3} = Client.call_tool(client, "beta_tool", %{"value" => 3})
+    assert :ok = Client.set_access_token!(client, "beta")
+
+    assert %{structured_content: %{"value" => 3}} =
+             Client.call_tool!(client, "beta_tool", %{"value" => 3})
+
     assert Agent.get(state, & &1.list_requests) == 2
 
-    assert :ok = Client.set_auth_input(client, authorization: "Bearer gamma")
-    assert %{"value" => 4} = Client.call_tool(client, "gamma_tool", %{"value" => 4})
+    assert :ok = Client.set_auth_input!(client, authorization: "Bearer gamma")
+
+    assert %{structured_content: %{"value" => 4}} =
+             Client.call_tool!(client, "gamma_tool", %{"value" => 4})
+
     assert Agent.get(state, & &1.list_requests) == 3
   end
 
@@ -241,7 +254,7 @@ defmodule FastestMCP.ClientToolCatalogTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     {client, state}

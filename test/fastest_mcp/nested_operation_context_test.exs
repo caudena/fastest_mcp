@@ -3,6 +3,55 @@ defmodule FastestMCP.NestedOperationContextTest do
 
   alias FastestMCP.Context
 
+  test "modern nested task tools execute inline while explicit and wire tasks keep their handles" do
+    alias FastestMCP.{BackgroundTask, Client}
+    name = "nested-modern-#{System.unique_integer([:positive])}"
+    extensions = %{FastestMCP.Protocol.Extensions.tasks() => %{}}
+
+    server =
+      FastestMCP.server(name,
+        extensions: extensions,
+        tool_search: [pinned: ["outer", "explicit", "implicit_required"]]
+      )
+      |> FastestMCP.add_tool(
+        "optional",
+        fn _, ctx ->
+          %{"background" => Context.background_task?(ctx)}
+        end,
+        task: [mode: :optional]
+      )
+      |> FastestMCP.add_tool("required", fn _, _ -> %{"value" => 42} end, task: [mode: :required])
+      |> FastestMCP.add_tool("outer", fn _, _ -> FastestMCP.call_tool!(name, "optional") end)
+      |> FastestMCP.add_tool("explicit", fn _, _ ->
+        task = FastestMCP.call_tool!(name, "required", %{}, task: true)
+        assert %BackgroundTask{} = task
+        FastestMCP.await_task!(task, 1_000)
+      end)
+      |> FastestMCP.add_tool("implicit_required", fn _, _ ->
+        FastestMCP.call_tool!(name, "required")
+      end)
+
+    assert {:ok, _} = FastestMCP.start_server(server)
+
+    client =
+      Client.connect!({:in_process, name}, protocol_version: "2026-07-28", extensions: extensions)
+
+    on_exit(fn ->
+      if Client.connected?(client), do: Client.disconnect!(client)
+      FastestMCP.stop_server(name)
+    end)
+
+    assert %{structured_content: %{"background" => false}} =
+             Client.call_tool!(client, "outer")
+
+    assert %{structured_content: %{"value" => 42}} = Client.call_tool!(client, "explicit")
+
+    assert %{structured_content: %{"background" => true}} =
+             Client.call_tool!(client, "call_tool", %{"name" => "optional"})
+
+    assert_raise FastestMCP.Error, fn -> Client.call_tool!(client, "implicit_required") end
+  end
+
   test "nested synchronous calls inherit the caller session context" do
     server_name = "nested-sync-" <> Integer.to_string(System.unique_integer([:positive]))
 
@@ -16,13 +65,13 @@ defmodule FastestMCP.NestedOperationContextTest do
       end)
       |> FastestMCP.add_tool("outer", fn _args, ctx ->
         :ok = Context.put_session_state(ctx, :shared, true)
-        FastestMCP.call_tool(server_name, "inner", %{})
+        FastestMCP.call_tool!(server_name, "inner", %{})
       end)
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
 
     assert %{session_id: "nested-session", shared: true} ==
-             FastestMCP.call_tool(server_name, "outer", %{}, session_id: "nested-session")
+             FastestMCP.call_tool!(server_name, "outer", %{}, session_id: "nested-session")
   end
 
   test "nested task submissions inherit caller session but not the transport credential" do
@@ -41,14 +90,14 @@ defmodule FastestMCP.NestedOperationContextTest do
         task: true
       )
       |> FastestMCP.add_tool("outer", fn _args, _ctx ->
-        task = FastestMCP.call_tool(server_name, "inner", %{}, task: true)
+        task = FastestMCP.call_tool!(server_name, "inner", %{}, task: true)
         %{task_id: task.task_id}
       end)
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
 
     result =
-      FastestMCP.call_tool(
+      FastestMCP.call_tool!(
         server_name,
         "outer",
         %{},
@@ -58,11 +107,11 @@ defmodule FastestMCP.NestedOperationContextTest do
 
     task_id = result.task_id
 
-    assert FastestMCP.fetch_task(server_name, task_id, session_id: "nested-session").session_id ==
+    assert FastestMCP.fetch_task!(server_name, task_id, session_id: "nested-session").session_id ==
              "nested-session"
 
     assert %{session_id: "nested-session", access_token: nil} ==
-             FastestMCP.await_task(server_name, task_id, 1_000, session_id: "nested-session")
+             FastestMCP.await_task!(server_name, task_id, 1_000, session_id: "nested-session")
   end
 
   test "nested calls preserve request scope and negotiated client context" do
@@ -79,7 +128,7 @@ defmodule FastestMCP.NestedOperationContextTest do
         }
       end)
       |> FastestMCP.add_tool("outer", fn _args, _ctx ->
-        FastestMCP.call_tool(server_name, "inner", %{})
+        FastestMCP.call_tool!(server_name, "inner", %{})
       end)
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
@@ -90,7 +139,7 @@ defmodule FastestMCP.NestedOperationContextTest do
              protocol_version: "2025-11-25",
              client_capabilities: %{"sampling" => %{}}
            } ==
-             FastestMCP.call_tool(server_name, "outer", %{},
+             FastestMCP.call_tool!(server_name, "outer", %{},
                state_scope: :request,
                negotiated_protocol_version: "2025-11-25",
                client_capabilities: %{"sampling" => %{}}

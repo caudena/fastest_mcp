@@ -61,7 +61,7 @@ defmodule FastestMCP.ActiveServerExtensionsTest do
     end
   end
 
-  test "mounted children cannot install active extensions" do
+  test "mounted children require an explicit root declaration unless opted into auto-registration" do
     child =
       FastestMCP.server("active-child",
         active_extensions: [ServerExtension.new(@extension_id)]
@@ -69,9 +69,16 @@ defmodule FastestMCP.ActiveServerExtensionsTest do
 
     root = FastestMCP.server("active-root")
 
-    assert_raise ArgumentError, ~r/mounted child servers cannot declare active_extensions/, fn ->
-      FastestMCP.mount(root, child)
-    end
+    server = FastestMCP.mount(root, child)
+    assert {:error, %ArgumentError{message: message}} = FastestMCP.start_server(server)
+    assert message =~ "requires an explicit root declaration"
+
+    assert {:ok, _} =
+             server
+             |> FastestMCP.add_extension(ServerExtension.new(@extension_id))
+             |> FastestMCP.start_server()
+
+    FastestMCP.stop_server(root.name)
   end
 
   test "discovery merges active settings without mutating passive extensions" do
@@ -405,7 +412,7 @@ defmodule FastestMCP.ActiveServerExtensionsTest do
 
     on_exit(fn ->
       for connected_client <- [client, unnegotiated, legacy] do
-        if Client.connected?(connected_client), do: Client.disconnect(connected_client)
+        if Client.connected?(connected_client), do: Client.disconnect!(connected_client)
       end
     end)
 
@@ -413,21 +420,21 @@ defmodule FastestMCP.ActiveServerExtensionsTest do
              "params" => %{"value" => 11},
              "clientSettings" => %{"client" => true},
              "resultType" => "complete"
-           } = Client.request(client, "example/run", %{"value" => 11})
+           } = Client.request!(client, "example/run", %{"value" => 11})
 
-    request = Client.request_async(client, "example/run", %{"value" => 12})
-    assert get_in(Client.await(request), ["params", "value"]) == 12
+    request = Client.request_async!(client, "example/run", %{"value" => 12})
+    assert get_in(Client.await!(request), ["params", "value"]) == 12
 
     negotiation_error =
       assert_raise Error, fn ->
-        Client.request(unnegotiated, "example/run", %{"value" => 13})
+        Client.request!(unnegotiated, "example/run", %{"value" => 13})
       end
 
     assert negotiation_error.code == :missing_required_client_capability
 
     legacy_error =
       assert_raise Error, fn ->
-        Client.request(legacy, "example/run", %{"value" => 14})
+        Client.request!(legacy, "example/run", %{"value" => 14})
       end
 
     assert legacy_error.code == :method_not_found

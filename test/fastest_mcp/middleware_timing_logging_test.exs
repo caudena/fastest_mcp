@@ -158,10 +158,10 @@ defmodule FastestMCP.MiddlewareTimingLoggingTest do
     log =
       capture_log(fn ->
         assert %{"message" => "hi"} ==
-                 FastestMCP.call_tool(server_name, "ok", %{"message" => "hi"})
+                 FastestMCP.call_tool!(server_name, "ok", %{"message" => "hi"})
 
         assert_raise FastestMCP.Error, fn ->
-          FastestMCP.call_tool(server_name, "fail", %{})
+          FastestMCP.call_tool!(server_name, "fail", %{})
         end
       end)
 
@@ -185,10 +185,10 @@ defmodule FastestMCP.MiddlewareTimingLoggingTest do
 
     log =
       capture_log(fn ->
-        _ = FastestMCP.call_tool(server_name, "echo", %{"message" => "hi"})
-        _ = FastestMCP.read_resource(server_name, "config://app")
-        _ = FastestMCP.render_prompt(server_name, "greet", %{})
-        _ = FastestMCP.list_tools(server_name)
+        _ = FastestMCP.call_tool!(server_name, "echo", %{"message" => "hi"})
+        _ = FastestMCP.read_resource!(server_name, "config://app")
+        _ = FastestMCP.render_prompt!(server_name, "greet", %{})
+        _ = FastestMCP.list_tools!(server_name)
       end)
 
     assert log =~ "Tool 'echo' completed in"

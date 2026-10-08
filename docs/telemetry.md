@@ -128,7 +128,7 @@ Telemetry is straightforward to verify in ExUnit:
   self()
 )
 
-assert %{status: "ok"} == FastestMCP.call_tool(server_name, "ok", %{})
+assert %{status: "ok"} == FastestMCP.call_tool!(server_name, "ok", %{})
 assert_receive {:telemetry, [:fastest_mcp, :operation, :start], _, _}
 assert_receive {:telemetry, [:fastest_mcp, :operation, :stop], %{duration: duration}, _}
 assert duration > 0

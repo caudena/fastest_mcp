@@ -5,8 +5,8 @@ defmodule FastestMCP.Middleware.ToolInjection do
   normal registry lookup, so they can override base tools when names collide.
 
   Middleware modules in FastestMCP are configured as explicit structs that
-  carry options plus a ready-to-run `middleware` function. That keeps runtime
-  assembly cheap while making the configured value easy to inspect in tests.
+  carry immutable configuration. Dispatch calls the module with that configuration;
+  runtime state is owned separately by the server.
 
   Most applications reach this module through `FastestMCP.Middleware` helper
   functions or by adding the configured struct directly with
@@ -17,6 +17,8 @@ defmodule FastestMCP.Middleware.ToolInjection do
   alias FastestMCP.ComponentCompiler
   alias FastestMCP.ComponentPolicy
   alias FastestMCP.Error
+  @behaviour FastestMCP.Middleware
+
   alias FastestMCP.Operation
   alias FastestMCP.OperationPipeline
 
@@ -28,7 +30,6 @@ defmodule FastestMCP.Middleware.ToolInjection do
           | {String.t() | atom(), function(), keyword()}
 
   @type t :: %__MODULE__{
-          middleware: (Operation.t(), (Operation.t() -> any()) -> any()),
           tools: [FastestMCP.Components.Tool.t()],
           tools_by_name: %{optional(String.t()) => FastestMCP.Components.Tool.t()}
         }
@@ -46,7 +47,7 @@ defmodule FastestMCP.Middleware.ToolInjection do
       tools_by_name: Map.new(normalized, fn tool -> {tool.name, tool} end)
     }
 
-    %{middleware | middleware: fn operation, next -> call(middleware, operation, next) end}
+    middleware
   end
 
   @doc "Builds the synthetic prompt-tool set used by tool injection."
@@ -76,6 +77,7 @@ defmodule FastestMCP.Middleware.ToolInjection do
   end
 
   @doc "Runs the middleware around the next operation."
+  @impl FastestMCP.Middleware
   def call(%__MODULE__{} = middleware, %Operation{method: "tools/list"} = operation, next)
       when is_function(next, 1) do
     visible_tools = visible_tools(middleware, operation)
@@ -203,33 +205,34 @@ defmodule FastestMCP.Middleware.ToolInjection do
   end
 
   defp list_prompts_tool(_arguments, context) do
-    %{"prompts" => FastestMCP.list_prompts(context.server_name, inherited_opts(context))}
+    %{"prompts" => FastestMCP.list_prompts!(context.server_name, inherited_opts(context))}
   end
 
   defp get_prompt_tool(arguments, context) do
     %{
       "result" =>
-        FastestMCP.render_prompt(
+        FastestMCP.render_prompt!(
           context.server_name,
           Map.fetch!(arguments, "name"),
           Map.get(arguments, "arguments", %{}),
           inherited_opts(context)
         )
+        |> FastestMCP.Prompts.Result.to_map()
     }
   end
 
   defp list_resources_tool(_arguments, context) do
     %{
-      "resources" => FastestMCP.list_resources(context.server_name, inherited_opts(context)),
+      "resources" => FastestMCP.list_resources!(context.server_name, inherited_opts(context)),
       "resource_templates" =>
-        FastestMCP.list_resource_templates(context.server_name, inherited_opts(context))
+        FastestMCP.list_resource_templates!(context.server_name, inherited_opts(context))
     }
   end
 
   defp read_resource_tool(arguments, context) do
     %{
       "result" =>
-        FastestMCP.read_resource(
+        FastestMCP.read_resource!(
           context.server_name,
           Map.fetch!(arguments, "uri"),
           inherited_opts(context)

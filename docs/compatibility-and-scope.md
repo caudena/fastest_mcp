@@ -114,7 +114,12 @@ The following are intentionally outside the current milestone:
   authorization UI, and authorization-server operation stay host-owned or
   external.
 
-## Reference Boundary
+## Runtime and Protocol Boundaries
+
+Nested local calls keep local execution semantics even when they inherit a
+modern client's Tasks capability. Use explicit `task: true` for a local
+background submission. An ordinary call to a task-required tool fails rather
+than creating an implicit background handle.
 
 The compatibility target covers both the advertised server and connected-client
 surfaces. Server behavior is exercised directly against the production Plug;

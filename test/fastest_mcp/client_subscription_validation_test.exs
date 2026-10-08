@@ -127,7 +127,7 @@ defmodule FastestMCP.ClientSubscriptionValidationTest do
     client = start_client!(:subset)
 
     listener =
-      Client.listen(
+      Client.listen!(
         client,
         %{
           "resourceSubscriptions" => ["status://allowed", "status://optional"],
@@ -152,14 +152,14 @@ defmodule FastestMCP.ClientSubscriptionValidationTest do
                       "params" => %{"uri" => "status://allowed"}
                     }}
 
-    assert %{"resultType" => "complete"} = Client.await(listener, 1_000)
+    assert %{"resultType" => "complete"} = Client.await!(listener, 1_000)
   end
 
   test "rejects acknowledgements that exceed the requested filter" do
     client = start_client!(:ack_extra)
     listener = listen(client)
 
-    error = assert_raise Error, fn -> Client.await(listener, 1_000) end
+    error = assert_raise Error, fn -> Client.await!(listener, 1_000) end
     assert error.code == :invalid_request
     assert error.details.reason =~ "exceeds"
     refute_receive {:subscription_message, _message}
@@ -170,12 +170,12 @@ defmodule FastestMCP.ClientSubscriptionValidationTest do
       client = start_client!(mode)
       listener = listen(client)
 
-      error = assert_raise Error, fn -> Client.await(listener, 1_000) end
+      error = assert_raise Error, fn -> Client.await!(listener, 1_000) end
       assert error.code == :invalid_request
 
       refute_receive {:subscription_message, %{"method" => "notifications/resources/updated"}}
 
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end
   end
 
@@ -186,7 +186,7 @@ defmodule FastestMCP.ClientSubscriptionValidationTest do
     assert_receive {:subscription_message,
                     %{"method" => "notifications/subscriptions/acknowledged"}}
 
-    assert %{"resultType" => "complete"} = Client.await(listener, 1_000)
+    assert %{"resultType" => "complete"} = Client.await!(listener, 1_000)
 
     refute_receive {:subscription_message,
                     %{
@@ -198,7 +198,7 @@ defmodule FastestMCP.ClientSubscriptionValidationTest do
   defp listen(client) do
     parent = self()
 
-    Client.listen(client, %{"resourceSubscriptions" => ["status://allowed"]},
+    Client.listen!(client, %{"resourceSubscriptions" => ["status://allowed"]},
       on_notification: fn message -> send(parent, {:subscription_message, message}) end
     )
   end
@@ -221,7 +221,7 @@ defmodule FastestMCP.ClientSubscriptionValidationTest do
         client_info: %{"name" => "subscription-validation-test", "version" => "1.0.0"}
       )
 
-    on_exit(fn -> if Client.connected?(client), do: Client.disconnect(client) end)
+    on_exit(fn -> if Client.connected?(client), do: Client.disconnect!(client) end)
     client
   end
 end

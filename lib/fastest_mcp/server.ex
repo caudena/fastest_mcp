@@ -64,6 +64,7 @@ defmodule FastestMCP.Server do
   alias FastestMCP.Auth
   alias FastestMCP.Auth.ProtectedResource
   alias FastestMCP.Component
+  alias FastestMCP.Middleware
   alias FastestMCP.ComponentCompiler
   alias FastestMCP.Elicitation.URL, as: URLElicitation
   alias FastestMCP.Middleware.ToolInjection
@@ -108,7 +109,7 @@ defmodule FastestMCP.Server do
   @type middleware ::
           (FastestMCP.Operation.t(), (FastestMCP.Operation.t() -> any()) -> any())
 
-  @type middleware_entry :: middleware() | %{middleware: middleware()}
+  @type middleware_entry :: middleware() | struct()
 
   @type t :: %__MODULE__{
           name: String.t(),
@@ -260,8 +261,8 @@ defmodule FastestMCP.Server do
     %{server | middleware: server.middleware ++ [middleware]}
   end
 
-  def add_middleware(%__MODULE__{} = server, %{middleware: middleware} = entry)
-      when is_function(middleware, 2) do
+  def add_middleware(%__MODULE__{} = server, %_{} = entry) do
+    entry = Middleware.validate!(entry)
     validate_tool_search_middleware_collisions!([entry], server.tool_search)
     %{server | middleware: server.middleware ++ [entry]}
   end
@@ -294,9 +295,76 @@ defmodule FastestMCP.Server do
   @doc "Adds a provider to the current definition."
   def add_provider(%__MODULE__{} = server, provider) do
     provider = Provider.new(provider)
-    validate_mounted_active_extensions!(provider)
     validate_tool_search_provider!(server.tool_search, provider)
     %{server | providers: server.providers ++ [provider]}
+  end
+
+  @doc "Adds an explicit root extension; it overrides any provider bundle with the same identifier."
+  def add_extension(%__MODULE__{} = server, %ServerExtension{} = extension) do
+    extensions =
+      server.active_extensions ++ [ServerExtension.normalize!(extension, server.schema_options)]
+
+    validate_active_extensions!(server.extensions, extensions)
+    %{server | active_extensions: extensions}
+  end
+
+  @doc false
+  def prepare_for_runtime(%__MODULE__{} = server) do
+    explicit = Map.new(server.active_extensions, &{&1.identifier, &1})
+    {providers, requirements} = prepare_provider_extensions(server.providers)
+
+    {_, bundled} =
+      Enum.reduce(requirements, {%{}, []}, fn extension, {seen, ordered} ->
+        id = extension.identifier
+
+        cond do
+          Map.has_key?(explicit, id) ->
+            {seen, ordered}
+
+          not extension.auto_register ->
+            raise ArgumentError, "extension #{inspect(id)} requires an explicit root declaration"
+
+          Map.has_key?(seen, id) ->
+            unless ServerExtension.declaration(seen[id]) == ServerExtension.declaration(extension) do
+              raise ArgumentError,
+                    "conflicting provider extension #{inspect(id)}; declare it explicitly on the root"
+            end
+
+            {seen, ordered}
+
+          true ->
+            {Map.put(seen, id, extension), [extension | ordered]}
+        end
+      end)
+
+    extensions =
+      server.active_extensions ++
+        Enum.map(Enum.reverse(bundled), &ServerExtension.normalize!(&1, server.schema_options))
+
+    validate_active_extensions!(server.extensions, extensions)
+
+    %{
+      server
+      | active_extensions: extensions,
+        providers: providers
+    }
+  end
+
+  defp prepare_provider_extensions(providers) do
+    {providers, requirements} =
+      Enum.map_reduce(providers, [], fn
+        %Provider{inner: %MountedServerProvider{} = mount} = provider, acc ->
+          {children, nested} = prepare_provider_extensions(mount.server.providers)
+          required = mount.server.active_extensions ++ nested
+          child = %{mount.server | active_extensions: [], providers: children}
+          ids = required |> Enum.map(& &1.identifier) |> Enum.uniq()
+          {%{provider | inner: %{mount | server: child, extension_ids: ids}}, [required | acc]}
+
+        provider, acc ->
+          {provider, [Provider.required_extensions(provider) | acc]}
+      end)
+
+    {providers, requirements |> Enum.reverse() |> List.flatten()}
   end
 
   @doc "Mounts another server or provider-backed definition."
@@ -544,15 +612,6 @@ defmodule FastestMCP.Server do
     |> Enum.sort()
   end
 
-  defp validate_mounted_active_extensions!(%Provider{
-         inner: %MountedServerProvider{server: %__MODULE__{active_extensions: [_ | _]}}
-       }) do
-    raise ArgumentError,
-          "mounted child servers cannot declare active_extensions; configure executable extensions on the root server"
-  end
-
-  defp validate_mounted_active_extensions!(%Provider{}), do: :ok
-
   defp normalize_resource_security(nil), do: nil
   defp normalize_resource_security(policy), do: ResourceSecurity.new(policy)
 
@@ -652,9 +711,7 @@ defmodule FastestMCP.Server do
 
   defp normalize_middleware_entry(middleware) when is_function(middleware, 2), do: middleware
 
-  defp normalize_middleware_entry(%{middleware: middleware} = entry)
-       when is_function(middleware, 2),
-       do: entry
+  defp normalize_middleware_entry(%_{} = entry), do: Middleware.validate!(entry)
 
   defp normalize_middleware_entry(other) do
     raise ArgumentError,

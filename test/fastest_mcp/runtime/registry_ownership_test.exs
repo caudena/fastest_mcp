@@ -128,8 +128,8 @@ defmodule FastestMCP.Runtime.RegistryOwnershipTest do
       end
     end)
 
-    assert [%{name: "echo"}] = FastestMCP.list_tools(server_name)
-    assert %{"value" => 42} = FastestMCP.call_tool(server_name, "echo", %{"value" => 42})
+    assert [%{name: "echo"}] = FastestMCP.list_tools!(server_name)
+    assert %{"value" => 42} = FastestMCP.call_tool!(server_name, "echo", %{"value" => 42})
     assert :ok = FastestMCP.stop_server(server_name)
   end
 

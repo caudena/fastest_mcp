@@ -1,9 +1,10 @@
 defmodule FastestMCP.Transport.StreamableHTTPAdapter do
   @moduledoc """
-  Adapter for MCP 2025-11-25 Streamable HTTP.
+  Adapter for both supported MCP Streamable HTTP profiles.
 
   Only the configured MCP endpoint is decoded. Every POST carries exactly one
-  JSON-RPC 2.0 message; GET and DELETE operate on an established HTTP session.
+  JSON-RPC 2.0 message. Legacy GET and DELETE operate on an established HTTP
+  session; the modern profile is POST-only.
   """
 
   @behaviour FastestMCP.Transport.Adapter
@@ -20,8 +21,11 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
   @impl true
   def decode(%Plug.Conn{} = conn), do: decode(conn, [])
 
-  @doc "Decodes one Streamable HTTP request."
-  def decode(%Plug.Conn{} = conn, opts) do
+  @doc "Decodes one Streamable HTTP request. Plug callers should use decode_with_conn/2."
+  def decode(%Plug.Conn{} = conn, opts), do: conn |> decode_with_conn(opts) |> elem(0)
+
+  @doc "Decodes a request and retains the connection updated while reading its body."
+  def decode_with_conn(%Plug.Conn{} = conn, opts) do
     conn = fetch_query_params(conn)
 
     base_path =
@@ -31,44 +35,60 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
 
     case route(conn.method, conn.request_path, base_path) do
       :post ->
-        with :ok <- validate_post_headers(conn),
-             {:ok, payload} <- read_json(conn),
-             {:ok, decoded} <- JSONRPC.decode(payload) do
-          build_jsonrpc_message(
-            conn,
-            decoded,
-            Keyword.put(request_opts, :jsonrpc_envelope, payload)
-          )
+        case validate_post_headers(conn) do
+          :ok ->
+            {body_result, conn} = read_json(conn)
+
+            result =
+              with {:ok, payload} <- body_result,
+                   {:ok, decoded} <- JSONRPC.decode(payload) do
+                build_jsonrpc_message(
+                  conn,
+                  decoded,
+                  Keyword.put(request_opts, :jsonrpc_envelope, payload)
+                )
+              end
+
+            {result, conn}
+
+          error ->
+            {error, conn}
         end
 
       :get ->
-        if modern_protocol_header?(conn) do
-          {:response, 405,
-           %{error: %{code: :method_not_allowed, message: "MCP 2026 HTTP is POST-only"}},
-           [{"allow", "POST"}]}
-        else
-          if Keyword.get(opts, :enable_get_streaming, true) do
-            with :ok <- require_event_stream_accept(conn) do
-              {:ok, build_get_request(conn, request_opts)}
-            end
-          else
-            {:response, 405,
-             %{error: %{code: :method_not_allowed, message: "GET streaming is disabled"}},
-             [{"allow", "POST, DELETE"}]}
+        result =
+          cond do
+            modern_protocol_header?(conn) ->
+              {:response, 405,
+               %{error: %{code: :method_not_allowed, message: "MCP 2026 HTTP is POST-only"}},
+               [{"allow", "POST"}]}
+
+            Keyword.get(opts, :enable_get_streaming, true) ->
+              with :ok <- require_event_stream_accept(conn),
+                   do: {:ok, build_get_request(conn, request_opts)}
+
+            true ->
+              {:response, 405,
+               %{error: %{code: :method_not_allowed, message: "GET streaming is disabled"}},
+               [{"allow", "POST, DELETE"}]}
           end
-        end
+
+        {result, conn}
 
       :delete ->
-        if modern_protocol_header?(conn) do
-          {:response, 405,
-           %{error: %{code: :method_not_allowed, message: "MCP 2026 HTTP is POST-only"}},
-           [{"allow", "POST"}]}
-        else
-          {:ok, build_delete_request(conn, request_opts)}
-        end
+        result =
+          if modern_protocol_header?(conn) do
+            {:response, 405,
+             %{error: %{code: :method_not_allowed, message: "MCP 2026 HTTP is POST-only"}},
+             [{"allow", "POST"}]}
+          else
+            {:ok, build_delete_request(conn, request_opts)}
+          end
+
+        {result, conn}
 
       {:response, status, payload} ->
-        {:response, status, payload}
+        {{:response, status, payload}, conn}
     end
   end
 
@@ -430,24 +450,33 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
   defp read_json(conn) do
     case parsed_body_params(conn) do
       {:ok, payload} ->
-        {:ok, payload}
+        {{:ok, payload}, conn}
 
       :unavailable ->
         case read_body(conn) do
-          {:ok, "", _conn} ->
-            {:error, JSONRPC.parse_error("empty request body")}
+          {:ok, "", conn} ->
+            {{:error, JSONRPC.parse_error("empty request body")}, conn}
 
-          {:ok, body, _conn} ->
-            case JSON.decode(body) do
-              {:ok, decoded} ->
-                {:ok, decoded}
+          {:ok, body, conn} ->
+            result =
+              case JSON.decode(body) do
+                {:ok, decoded} ->
+                  {:ok, decoded}
 
-              {:error, reason} ->
-                {:error, JSONRPC.parse_error("invalid JSON", %{reason: inspect(reason)})}
-            end
+                {:error, reason} ->
+                  {:error, JSONRPC.parse_error("invalid JSON", %{reason: inspect(reason)})}
+              end
 
-          {:more, _body, _conn} ->
-            {:error, JSONRPC.parse_error("request body too large")}
+            {result, conn}
+
+          {:more, _body, conn} ->
+            {{:error, JSONRPC.parse_error("request body too large")}, conn}
+
+          {:error, reason} ->
+            # The adapter cannot return its partially consumed state on read failure.
+            {{:error,
+              JSONRPC.parse_error("request body read failed", %{reason: inspect(reason)})},
+             put_resp_header(conn, "connection", "close")}
         end
     end
   end

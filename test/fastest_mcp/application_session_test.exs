@@ -147,7 +147,7 @@ defmodule FastestMCP.ApplicationSessionTest do
     start_session_server!(server_name)
 
     task =
-      FastestMCP.call_tool(
+      FastestMCP.call_tool!(
         server_name,
         "background_current_put",
         %{"value" => "from-task"},
@@ -156,7 +156,7 @@ defmodule FastestMCP.ApplicationSessionTest do
       )
 
     assert %BackgroundTask{} = task
-    assert %{"value" => "from-task"} = FastestMCP.await_task(task, 1_000)
+    assert %{"value" => "from-task"} = FastestMCP.await_task!(task, 1_000)
     assert %{"value" => "from-task"} = call(server_name, "current_get", %{}, "alice-token")
   end
 
@@ -223,7 +223,7 @@ defmodule FastestMCP.ApplicationSessionTest do
 
     error =
       assert_raise Error, fn ->
-        FastestMCP.call_tool(disabled_name, "explicit_create", %{})
+        FastestMCP.call_tool!(disabled_name, "explicit_create", %{})
       end
 
     assert error.code == :unauthorized
@@ -238,10 +238,10 @@ defmodule FastestMCP.ApplicationSessionTest do
     on_exit(fn -> FastestMCP.stop_server(enabled_name) end)
 
     assert %{"sessionId" => session_id} =
-             FastestMCP.call_tool(enabled_name, "explicit_create", %{})
+             FastestMCP.call_tool!(enabled_name, "explicit_create", %{})
 
     assert %{"value" => "bearer"} =
-             FastestMCP.call_tool(enabled_name, "explicit_put", %{
+             FastestMCP.call_tool!(enabled_name, "explicit_put", %{
                "sessionId" => session_id,
                "value" => "bearer"
              })
@@ -263,7 +263,7 @@ defmodule FastestMCP.ApplicationSessionTest do
 
     current_error =
       assert_raise Error, fn ->
-        FastestMCP.call_tool(enabled_name, "current_get", %{})
+        FastestMCP.call_tool!(enabled_name, "current_get", %{})
       end
 
     assert current_error.code == :unauthorized
@@ -315,7 +315,7 @@ defmodule FastestMCP.ApplicationSessionTest do
 
     names =
       server_name
-      |> FastestMCP.list_tools(auth_input: auth_input("alice-token"))
+      |> FastestMCP.list_tools!(auth_input: auth_input("alice-token"))
       |> Enum.map(& &1.name)
 
     assert "application_session_create" in names
@@ -426,7 +426,7 @@ defmodule FastestMCP.ApplicationSessionTest do
   end
 
   defp call(server_name, tool_name, arguments, token) do
-    FastestMCP.call_tool(server_name, tool_name, arguments, auth_input: auth_input(token))
+    FastestMCP.call_tool!(server_name, tool_name, arguments, auth_input: auth_input(token))
   end
 
   defp auth_input(token), do: %{"authorization" => "Bearer " <> token}

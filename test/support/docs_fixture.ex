@@ -43,7 +43,7 @@ defmodule FastestMCP.TestSupport.DocsFixture do
   end
 
   defp do_wait_for_input_required(server_name, task_id, deadline) do
-    task = FastestMCP.fetch_task(server_name, task_id)
+    task = FastestMCP.fetch_task!(server_name, task_id)
 
     cond do
       task.status == :input_required ->
@@ -79,14 +79,14 @@ defmodule FastestMCP.TestSupport.DocsFixture.OnboardingServer do
       %{name: "fastest_mcp", version: "0.1.0"}
     end)
     |> FastestMCP.add_prompt("welcome", fn %{"name" => name}, _ctx ->
-      %{
+      FastestMCP.Prompts.Result.from(%{
         messages: [
           %{
             role: "user",
             content: %{type: "text", text: "Welcome #{name}"}
           }
         ]
-      }
+      })
     end)
   end
 end

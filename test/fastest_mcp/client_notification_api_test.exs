@@ -40,7 +40,9 @@ defmodule FastestMCP.ClientNotificationAPITest do
     {client, cleanup} = start_http_client(server_name, server, parent)
 
     try do
-      assert %{"ok" => true} = Client.call_tool(client, "trigger_notification", %{})
+      assert %{structured_content: %{"ok" => true}} =
+               Client.call_tool!(client, "trigger_notification", %{})
+
       assert receive_notification_methods(1) == ["com.example/notification"]
     after
       cleanup.()
@@ -65,7 +67,8 @@ defmodule FastestMCP.ClientNotificationAPITest do
     {client, cleanup} = start_http_client(server_name, server, parent)
 
     try do
-      assert %{"ok" => true} = Client.call_tool(client, "trigger_all_notifications", %{})
+      assert %{structured_content: %{"ok" => true}} =
+               Client.call_tool!(client, "trigger_all_notifications", %{})
 
       assert receive_notification_methods(3) == [
                "com.example/notification/first",
@@ -107,7 +110,7 @@ defmodule FastestMCP.ClientNotificationAPITest do
     assert wait_for_session_stream(client) == :ok
 
     cleanup = fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
       Supervisor.stop(bandit)
       FastestMCP.stop_server(server_name)
     end

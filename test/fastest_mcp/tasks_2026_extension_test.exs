@@ -194,7 +194,7 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
 
     assert disabled_error.code == :method_not_found
 
-    legacy_initialize = FastestMCP.initialize(disabled, %{}, transport: :in_process)
+    legacy_initialize = FastestMCP.initialize!(disabled, %{}, transport: :in_process)
     assert get_in(legacy_initialize, ["capabilities", "tasks", "requests", "tools", "call"])
 
     enabled = unique_name("tasks-enabled")
@@ -299,7 +299,10 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
       |> FastestMCP.add_tool(
         "tool_error",
         fn _arguments, _context ->
-          %{isError: true, content: [%{type: "text", text: "tool rejected input"}]}
+          FastestMCP.Tools.Result.from(%{
+            isError: true,
+            content: [%{type: "text", text: "tool rejected input"}]
+          })
         end,
         task: [mode: :optional, poll_interval_ms: 10]
       )
@@ -398,16 +401,19 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
       |> FastestMCP.add_tool(
         "reject",
         fn _arguments, _context ->
-          %{isError: true, content: [%{type: "text", text: "rejected"}]}
+          FastestMCP.Tools.Result.from(%{
+            isError: true,
+            content: [%{type: "text", text: "rejected"}]
+          })
         end,
         task: [mode: :optional, poll_interval_ms: 10]
       )
       |> FastestMCP.add_tool(
         "large",
         fn _arguments, _context ->
-          %{
+          FastestMCP.Tools.Result.from(%{
             content: [%{type: "text", text: String.duplicate("x", 32_768)}]
-          }
+          })
         end,
         task: [mode: :required, poll_interval_ms: 10]
       )
@@ -438,14 +444,14 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
-      if Client.connected?(bounded_client), do: Client.disconnect(bounded_client)
-      if Client.connected?(direct_client), do: Client.disconnect(direct_client)
+      if Client.connected?(client), do: Client.disconnect!(client)
+      if Client.connected?(bounded_client), do: Client.disconnect!(bounded_client)
+      if Client.connected?(direct_client), do: Client.disconnect!(direct_client)
     end)
 
     call =
       Task.async(fn ->
-        Client.call_tool(client, "echo", %{"value" => "modern"},
+        Client.call_tool!(client, "echo", %{"value" => "modern"},
           task: false,
           task_timeout_ms: 2_000
         )
@@ -453,12 +459,12 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
 
     assert_receive {:task_worker, worker}, 1_000
     send(worker, :release)
-    assert %{"value" => "modern"} = Task.await(call, 3_000)
+    assert %{structured_content: %{"value" => "modern"}} = Task.await(call, 3_000)
     refute Client.session_stream_open?(client)
 
     stable_call =
       Task.async(fn ->
-        Client.call_tool_result(client, "echo", %{"value" => "stable"}, task_timeout_ms: 2_000)
+        Client.call_tool!(client, "echo", %{"value" => "stable"}, task_timeout_ms: 2_000)
       end)
 
     assert_receive {:task_worker, stable_worker}, 1_000
@@ -471,28 +477,28 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
            } = Task.await(stable_call, 3_000)
 
     cancellable =
-      Client.start_tool_result(client, "echo", %{"value" => "cancelled"}, task_timeout_ms: 2_000)
+      Client.start_tool_result!(client, "echo", %{"value" => "cancelled"}, task_timeout_ms: 2_000)
 
     assert_receive {:task_worker, cancellable_worker}, 1_000
-    assert :ok = Client.cancel_tool_result(cancellable, "test cancellation")
+    assert :ok = Client.cancel_tool_result!(cancellable, "test cancellation")
 
     cancellation =
-      assert_raise Error, fn -> Client.await_tool_result(cancellable, 2_000) end
+      assert_raise Error, fn -> Client.await_tool_result!(cancellable, 2_000) end
 
     assert cancellation.code == :cancelled
     monitor = Process.monitor(cancellable_worker)
     assert_receive {:DOWN, ^monitor, :process, ^cancellable_worker, _reason}, 1_000
 
     direct =
-      Client.start_tool_result(direct_client, "echo", %{"value" => "cancelled-direct"},
+      Client.start_tool_result!(direct_client, "echo", %{"value" => "cancelled-direct"},
         task_timeout_ms: 2_000
       )
 
     assert_receive {:task_worker, direct_worker}, 1_000
-    assert :ok = Client.cancel_tool_result(direct, "test direct cancellation")
+    assert :ok = Client.cancel_tool_result!(direct, "test direct cancellation")
 
     direct_cancellation =
-      assert_raise Error, fn -> Client.await_tool_result(direct, 2_000) end
+      assert_raise Error, fn -> Client.await_tool_result!(direct, 2_000) end
 
     assert direct_cancellation.code == :cancelled
     direct_monitor = Process.monitor(direct_worker)
@@ -501,11 +507,11 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
     assert %ToolResult{
              content: [%{"type" => "text", "text" => "rejected"}],
              is_error: true
-           } = Client.call_tool_result(client, "reject", %{}, task_timeout_ms: 2_000)
+           } = Client.call_tool!(client, "reject", %{}, task_timeout_ms: 2_000)
 
     oversized =
       assert_raise Error, fn ->
-        Client.call_tool_result(bounded_client, "large", %{}, task_timeout_ms: 2_000)
+        Client.call_tool!(bounded_client, "large", %{}, task_timeout_ms: 2_000)
       end
 
     assert oversized.code == :bad_request
@@ -516,12 +522,12 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
     assert oversized.details.terminal_response_observed == false
 
     assert %RemoteTask{task_id: task_id} =
-             task = Client.call_tool_task(client, "echo", %{"value" => "handle"})
+             task = Client.call_tool_task!(client, "echo", %{"value" => "handle"})
 
     assert_receive {:task_worker, handle_worker}, 1_000
 
     listener =
-      Client.listen(client, %{"taskIds" => [task_id]},
+      Client.listen!(client, %{"taskIds" => [task_id]},
         on_notification: fn message -> send(parent, {:task_notification, message}) end
       )
 
@@ -529,7 +535,7 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
                     %{"method" => "notifications/subscriptions/acknowledged"}},
                    1_000
 
-    result_waiter = Task.async(fn -> RemoteTask.result(task, timeout_ms: 2_000) end)
+    result_waiter = Task.async(fn -> RemoteTask.result!(task, timeout_ms: 2_000) end)
     send(handle_worker, :release)
 
     assert_receive {:task_notification,
@@ -539,19 +545,19 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
                     }},
                    1_000
 
-    assert %{"value" => "handle"} = Task.await(result_waiter, 3_000)
-    assert %{"taskId" => ^task_id, "status" => "completed"} = RemoteTask.status(task)
-    assert :ok = Client.cancel(listener, "test complete")
+    assert %{structured_content: %{"value" => "handle"}} = Task.await(result_waiter, 3_000)
+    assert %{"taskId" => ^task_id, "status" => "completed"} = RemoteTask.status!(task)
+    assert :ok = Client.cancel!(listener, "test complete")
 
     assert %RemoteTask{} =
              compatibility_task =
-             Client.call_tool(client, "echo", %{"value" => "compatibility"}, task: true)
+             Client.call_tool_task!(client, "echo", %{"value" => "compatibility"}, task: true)
 
     assert_receive {:task_worker, compatibility_worker}, 1_000
     send(compatibility_worker, :release)
 
-    assert %{"value" => "compatibility"} =
-             RemoteTask.result(compatibility_task, timeout_ms: 2_000)
+    assert %{structured_content: %{"value" => "compatibility"}} =
+             RemoteTask.result!(compatibility_task, timeout_ms: 2_000)
 
     refute Client.session_stream_open?(client)
   end
@@ -599,10 +605,14 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
         end
       )
 
-    on_exit(fn -> if Client.connected?(client), do: Client.disconnect(client) end)
+    on_exit(fn -> if Client.connected?(client), do: Client.disconnect!(client) end)
 
-    assert %{"answer" => %{"action" => "accept", "content" => %{"answer" => "yes"}}} =
-             Client.call_tool(client, "ask", %{}, task_timeout_ms: 2_000)
+    assert %{
+             structured_content: %{
+               "answer" => %{"action" => "accept", "content" => %{"answer" => "yes"}}
+             }
+           } =
+             Client.call_tool!(client, "ask", %{}, task_timeout_ms: 2_000)
 
     assert_receive {:task_callback_context, task_id}, 1_000
     assert is_binary(task_id)
@@ -638,12 +648,12 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
         client_info: @client_info
       )
 
-    on_exit(fn -> if Client.connected?(client), do: Client.disconnect(client) end)
+    on_exit(fn -> if Client.connected?(client), do: Client.disconnect!(client) end)
 
     call =
       Task.async(fn ->
         try do
-          Client.call_tool(client, "block", %{}, task_timeout_ms: 50)
+          Client.call_tool!(client, "block", %{}, task_timeout_ms: 50)
         rescue
           error in Error -> {:error, error}
         end

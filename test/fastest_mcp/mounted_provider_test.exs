@@ -24,18 +24,18 @@ defmodule FastestMCP.MountedProviderTest do
     assert {:ok, _pid} = FastestMCP.start_server(parent)
     on_exit(fn -> FastestMCP.stop_server(parent_name) end)
 
-    assert [%{name: "child_greet"}] = FastestMCP.list_tools(parent_name)
+    assert [%{name: "child_greet"}] = FastestMCP.list_tools!(parent_name)
 
     assert "Hello, World!" ==
-             FastestMCP.call_tool(parent_name, "child_greet", %{"name" => "World"})
+             FastestMCP.call_tool!(parent_name, "child_greet", %{"name" => "World"})
 
     assert_receive {:child_middleware, :before, "tools/call", "greet"}, 1_000
     assert_receive {:child_middleware, :after, "tools/call", "greet"}, 1_000
 
-    assert "config data" == FastestMCP.read_resource(parent_name, "data://child/config")
+    assert "config data" == FastestMCP.read_resource!(parent_name, "data://child/config")
 
-    assert %{messages: [%{role: "user", content: "Hello from child!"}]} ==
-             FastestMCP.render_prompt(parent_name, "child_child_prompt", %{})
+    assert %{messages: [%{role: "user", content: %{type: "text", text: "Hello from child!"}}]} =
+             FastestMCP.render_prompt!(parent_name, "child_child_prompt", %{})
   end
 
   test "middleware runs at parent, child, and grandchild levels for mounted components" do
@@ -75,7 +75,7 @@ defmodule FastestMCP.MountedProviderTest do
     assert {:ok, _pid} = FastestMCP.start_server(parent)
     on_exit(fn -> FastestMCP.stop_server(parent_name) end)
 
-    assert 10 == FastestMCP.call_tool(parent_name, "c_gc_compute", %{"x" => 5})
+    assert 10 == FastestMCP.call_tool!(parent_name, "c_gc_compute", %{"x" => 5})
 
     assert_trace_order([
       "parent:before",
@@ -87,7 +87,7 @@ defmodule FastestMCP.MountedProviderTest do
       "parent:after"
     ])
 
-    assert "result" == FastestMCP.read_resource(parent_name, "data://c/gc/value")
+    assert "result" == FastestMCP.read_resource!(parent_name, "data://c/gc/value")
 
     assert_trace_order([
       "parent:before",
@@ -99,7 +99,7 @@ defmodule FastestMCP.MountedProviderTest do
       "parent:after"
     ])
 
-    assert "item-42" == FastestMCP.read_resource(parent_name, "item://c/gc/42")
+    assert "item-42" == FastestMCP.read_resource!(parent_name, "item://c/gc/42")
 
     assert_trace_order([
       "parent:before",
@@ -111,8 +111,8 @@ defmodule FastestMCP.MountedProviderTest do
       "parent:after"
     ])
 
-    assert %{messages: [%{role: "user", content: "Hello, World!"}]} ==
-             FastestMCP.render_prompt(parent_name, "c_gc_greet", %{"name" => "World"})
+    assert %{messages: [%{role: "user", content: %{type: "text", text: "Hello, World!"}}]} =
+             FastestMCP.render_prompt!(parent_name, "c_gc_greet", %{"name" => "World"})
 
     assert_trace_order([
       "parent:before",
@@ -153,7 +153,7 @@ defmodule FastestMCP.MountedProviderTest do
     assert {:ok, _pid} = FastestMCP.start_server(parent)
     on_exit(fn -> FastestMCP.stop_server(parent_name) end)
 
-    assert "42:json" == FastestMCP.read_resource(parent_name, "item://c/gc/42?format=json")
+    assert "42:json" == FastestMCP.read_resource!(parent_name, "item://c/gc/42?format=json")
 
     assert_trace_order([
       "parent:before",
@@ -184,7 +184,7 @@ defmodule FastestMCP.MountedProviderTest do
     on_exit(fn -> FastestMCP.stop_server(parent_name) end)
 
     assert "file:alpha/beta/gamma.txt" ==
-             FastestMCP.read_resource(parent_name, "files://child/alpha/beta/gamma.txt")
+             FastestMCP.read_resource!(parent_name, "files://child/alpha/beta/gamma.txt")
   end
 
   test "self-mounts are rejected and mounted lifespans are visible to child handlers" do
@@ -216,7 +216,7 @@ defmodule FastestMCP.MountedProviderTest do
     assert_receive :parent_enter, 1_000
     assert_receive :child_enter, 1_000
 
-    assert %{"scope" => "child"} == FastestMCP.call_tool(parent_name, "child_scope", %{})
+    assert %{"scope" => "child"} == FastestMCP.call_tool!(parent_name, "child_scope", %{})
 
     assert :ok = FastestMCP.stop_server(parent_name)
     assert_receive :child_exit, 1_000
@@ -239,10 +239,10 @@ defmodule FastestMCP.MountedProviderTest do
     assert {:ok, _pid} = FastestMCP.start_server(parent)
     on_exit(fn -> FastestMCP.stop_server(parent_name) end)
 
-    assert [%{name: "greet"}, %{name: "greet"}] = FastestMCP.list_tools(parent_name)
+    assert [%{name: "greet"}, %{name: "greet"}] = FastestMCP.list_tools!(parent_name)
 
     assert "Parent override, World" ==
-             FastestMCP.call_tool(parent_name, "greet", %{"name" => "World"})
+             FastestMCP.call_tool!(parent_name, "greet", %{"name" => "World"})
   end
 
   defp trace_middleware(label, pid) do

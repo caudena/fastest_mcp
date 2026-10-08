@@ -3,6 +3,23 @@ defmodule FastestMCP.OpenAPIRequestContractTest do
 
   alias FastestMCP.HTTP
 
+  test "explicit HTTP headers replace case-insensitive defaults rather than duplicating them" do
+    {url, ref} = start_one_shot_http_server()
+
+    assert {:ok, 200, _, _} =
+             HTTP.request(:post, url,
+               json: %{},
+               headers: [
+                 {"Accept", "application/json, text/event-stream"},
+                 {"User-Agent", "test-peer"}
+               ]
+             )
+
+    assert_receive {:raw_http_request, ^ref, request}
+    assert header_values(request, "accept") == ["application/json, text/event-stream"]
+    assert header_values(request, "user-agent") == ["test-peer"]
+  end
+
   test "generated input aliases do not overwrite explicit OpenAPI names" do
     parent = self()
     server_name = unique_name("openapi-input-collision")
@@ -65,7 +82,7 @@ defmodule FastestMCP.OpenAPIRequestContractTest do
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
     assert %{"ok" => true} ==
-             FastestMCP.call_tool(server_name, "update_item", %{
+             FastestMCP.call_tool!(server_name, "update_item", %{
                "id" => "body-id",
                "id__path" => "explicit-query",
                "id__path_1" => "path-id"
@@ -143,14 +160,14 @@ defmodule FastestMCP.OpenAPIRequestContractTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    assert %{"ok" => true} == FastestMCP.call_tool(server_name, "optional_object", %{})
+    assert %{"ok" => true} == FastestMCP.call_tool!(server_name, "optional_object", %{})
 
     assert_receive {:request, :post, "https://body-required.example.com/optional-object",
                     optional_opts}
 
     refute Keyword.has_key?(optional_opts, :json)
 
-    assert %{"ok" => true} == FastestMCP.call_tool(server_name, "required_empty_object", %{})
+    assert %{"ok" => true} == FastestMCP.call_tool!(server_name, "required_empty_object", %{})
 
     assert_receive {:request, :post, "https://body-required.example.com/required-empty-object",
                     required_opts}

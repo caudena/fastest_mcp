@@ -16,85 +16,25 @@ defmodule FastestMCP.ResultNormalizer do
   @content_block_types MapSet.new(["text", "image", "audio", "resource", "resource_link"])
 
   @doc "Normalizes tool output into the transport result shape."
-  def normalize_tool(%ToolResult{} = value) do
-    value
-    |> ToolResult.to_map()
-    |> normalize_tool()
+  def normalize_tool(%ToolResult{} = result) do
+    %{
+      result
+      | content: normalize_content_payload(result.content),
+        structured_content: normalize_json_value(result.structured_content),
+        meta: normalize_json_value(result.meta)
+    }
   end
 
-  def normalize_tool(value) do
-    cond do
-      explicit_tool_result?(value) ->
-        normalize_explicit_tool_result(value)
+  def normalize_tool(value), do: normalize_json_value(value)
 
-      content_block?(value) ->
-        %{content: [normalize_content_block(value)]}
-
-      content_list?(value) ->
-        %{content: Enum.map(value, &normalize_content_item/1)}
-
-      true ->
-        normalize_json_value(value)
-    end
-  end
-
-  @doc "Normalizes a generic value into a transport-safe result."
+  @doc "Normalizes application data into JSON-safe values."
   def normalize_value(value), do: normalize_json_value(value)
-
-  defp explicit_tool_result?(%{} = value) do
-    Enum.any?(
-      [
-        :content,
-        "content",
-        :structuredContent,
-        "structuredContent",
-        :structured_content,
-        "structured_content"
-      ],
-      &Map.has_key?(value, &1)
-    )
-  end
-
-  defp explicit_tool_result?(_value), do: false
-
-  defp normalize_explicit_tool_result(%{} = value) do
-    Enum.into(value, %{}, fn {key, field_value} ->
-      normalized =
-        case key do
-          key when key in [:content, "content"] ->
-            normalize_content_payload(field_value)
-
-          key
-          when key in [
-                 :structuredContent,
-                 "structuredContent",
-                 :structured_content,
-                 "structured_content"
-               ] ->
-            normalize_structured_content!(field_value)
-
-          key when key in [:data, "data"] ->
-            normalize_json_value(field_value)
-
-          _other ->
-            normalize_json_value(field_value)
-        end
-
-      {key, normalized}
-    end)
-  end
 
   defp normalize_content_payload(value) when is_list(value) do
     Enum.map(value, &normalize_content_item/1)
   end
 
   defp normalize_content_payload(value), do: [normalize_content_item(value)]
-
-  defp content_list?(value) when is_list(value) do
-    value != [] and Enum.any?(value, &content_block?/1)
-  end
-
-  defp content_list?(_value), do: false
 
   defp content_block?(%{} = value) do
     value
@@ -151,9 +91,6 @@ defmodule FastestMCP.ResultNormalizer do
   defp normalize_resource_content(value), do: normalize_json_value(value)
 
   defp normalize_json_value(value), do: JSONValue.normalize(value)
-
-  defp normalize_structured_content!(nil), do: nil
-  defp normalize_structured_content!(value), do: normalize_json_value(value)
 
   defp normalize_binary_field(value) when is_binary(value) do
     if String.valid?(value), do: value, else: Base.encode64(value)

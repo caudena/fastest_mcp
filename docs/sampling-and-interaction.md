@@ -49,7 +49,7 @@ end)
 ```
 
 The client automatically performs this bounded retry in
-`FastestMCP.Client.call_tool/4`, `read_resource/3`, and `render_prompt/4`.
+`FastestMCP.Client.call_tool!/4`, `read_resource/3`, and `render_prompt/4`.
 Applications can attach an opaque `request_state:` to bind successive rounds.
 
 The legacy `2025-11-25` session bridge uses `Context.sample/3`; its ergonomic
@@ -328,12 +328,12 @@ That is what allows:
 
 - the original request to return a task handle
 - the task to move into `input_required`
-- the caller to respond later through `FastestMCP.send_task_input/5`
+- the caller to respond later through `FastestMCP.send_task_input!/5`
 
 ```elixir
-task = FastestMCP.call_tool(MyApp.MCPServer, "approve_release", %{}, task: true)
+task = FastestMCP.call_tool!(MyApp.MCPServer, "approve_release", %{}, task: true)
 
-FastestMCP.send_task_input(
+FastestMCP.send_task_input!(
   MyApp.MCPServer,
   task.task_id,
   :accept,

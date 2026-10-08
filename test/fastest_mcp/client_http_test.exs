@@ -47,33 +47,34 @@ defmodule FastestMCP.ClientHTTPTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     assert Client.connected?(client)
-    assert Client.protocol_version(client) == "2025-11-25"
-    assert is_map(Client.initialize_result(client))
-    assert is_map(Client.capabilities(client))
+    assert Client.protocol_version!(client) == "2025-11-25"
+    assert is_map(Client.initialize_result!(client))
+    assert is_map(Client.capabilities!(client))
 
     assert [%{"name" => "echo"}, %{"name" => "slow"}] =
              client
-             |> Client.list_tools()
+             |> Client.list_tools!()
              |> Map.fetch!(:items)
              |> Enum.sort_by(& &1["name"])
 
-    assert %{"message" => "hi"} = Client.call_tool(client, "echo", %{"message" => "hi"})
+    assert %{structured_content: %{"message" => "hi"}} =
+             Client.call_tool!(client, "echo", %{"message" => "hi"})
 
-    task = Task.async(fn -> Client.call_tool(client, "slow", %{}) end)
+    task = Task.async(fn -> Client.call_tool!(client, "slow", %{}) end)
 
     assert_receive :slow_tool_started, 1_000
 
     error =
       assert_raise Error, fn ->
-        Client.call_tool(client, "echo", %{"message" => "blocked"})
+        Client.call_tool!(client, "echo", %{"message" => "blocked"})
       end
 
     assert error.code == :overloaded
-    assert %{"ok" => true} = Task.await(task, 1_000)
+    assert %{structured_content: %{"ok" => true}} = Task.await(task, 1_000)
   end
 
   test "connected client lists and reads resources, templates, and prompts over HTTP" do
@@ -104,12 +105,7 @@ defmodule FastestMCP.ClientHTTPTest do
         }
       )
       |> FastestMCP.add_prompt("welcome", fn %{"name" => name}, _ctx ->
-        [
-          %{
-            role: "user",
-            content: %{type: "text", text: "Welcome #{name}"}
-          }
-        ]
+        FastestMCP.Prompts.Result.new("Welcome #{name}")
       end)
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
@@ -133,10 +129,10 @@ defmodule FastestMCP.ClientHTTPTest do
       Client.connect!("http://127.0.0.1:#{port}/mcp", protocol_version: "2025-11-25")
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
-    assert %{items: [resource], next_cursor: nil} = Client.list_resources(client)
+    assert %{items: [resource], next_cursor: nil} = Client.list_resources!(client)
 
     assert resource == %{
              "uri" => "memo://welcome",
@@ -153,7 +149,7 @@ defmodule FastestMCP.ClientHTTPTest do
              }
            }
 
-    assert %{items: [template], next_cursor: nil} = Client.list_resource_templates(client)
+    assert %{items: [template], next_cursor: nil} = Client.list_resource_templates!(client)
 
     assert template == %{
              "uriTemplate" => "memo://users/{id}",
@@ -172,12 +168,12 @@ defmodule FastestMCP.ClientHTTPTest do
            }
 
     assert %{items: [%{"name" => "welcome"}], next_cursor: nil} =
-             Client.list_prompts(client)
+             Client.list_prompts!(client)
 
-    assert %{"message" => "hello"} = Client.read_resource(client, "memo://welcome")
+    assert %{"message" => "hello"} = Client.read_resource!(client, "memo://welcome")
 
     assert %{"messages" => [%{"content" => %{"text" => "Welcome Nate"}}]} =
-             Client.render_prompt(client, "welcome", %{"name" => "Nate"})
+             Client.render_prompt!(client, "welcome", %{"name" => "Nate"})
   end
 
   test "connected client forwards version selectors for resource reads over HTTP" do
@@ -207,7 +203,7 @@ defmodule FastestMCP.ClientHTTPTest do
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
     :ok =
-      FastestMCP.disable_components(server_name,
+      FastestMCP.disable_components!(server_name,
         version: %{eq: "2.0.0"},
         components: [:resource, :resource_template]
       )
@@ -230,26 +226,26 @@ defmodule FastestMCP.ClientHTTPTest do
       Client.connect!("http://127.0.0.1:#{port}/mcp", protocol_version: "2025-11-25")
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
-    assert %{"version" => "1.0.0"} = Client.read_resource(client, "memo://config")
+    assert %{"version" => "1.0.0"} = Client.read_resource!(client, "memo://config")
 
     assert %{"id" => "42", "version" => "1.0.0"} =
-             Client.read_resource(client, "memo://users/42")
+             Client.read_resource!(client, "memo://users/42")
 
     assert %{"version" => "1.0.0"} =
-             Client.read_resource(client, "memo://config", version: "1.0.0")
+             Client.read_resource!(client, "memo://config", version: "1.0.0")
 
     assert %{"id" => "42", "version" => "1.0.0"} =
-             Client.read_resource(client, "memo://users/42", version: "1.0.0")
+             Client.read_resource!(client, "memo://users/42", version: "1.0.0")
 
     assert_raise Error, ~r/disabled/, fn ->
-      Client.read_resource(client, "memo://config", version: "2.0.0")
+      Client.read_resource!(client, "memo://config", version: "2.0.0")
     end
 
     assert_raise Error, ~r/disabled/, fn ->
-      Client.read_resource(client, "memo://users/42", version: "2.0.0")
+      Client.read_resource!(client, "memo://users/42", version: "2.0.0")
     end
   end
 
@@ -287,11 +283,11 @@ defmodule FastestMCP.ClientHTTPTest do
       Client.connect!("http://127.0.0.1:#{port}/mcp", protocol_version: "2025-11-25")
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
-    task_a = Client.call_tool(client, "echo_1", %{"value" => 1}, task: true)
-    task_b = Client.call_tool(client, "echo_2", %{"value" => 2}, task: true)
+    task_a = Client.call_tool_task!(client, "echo_1", %{"value" => 1}, task: true)
+    task_b = Client.call_tool_task!(client, "echo_2", %{"value" => 2}, task: true)
     task_a_id = task_a.task_id
     task_b_id = task_b.task_id
 
@@ -300,32 +296,32 @@ defmodule FastestMCP.ClientHTTPTest do
              "_meta" => %{
                "io.modelcontextprotocol/related-task" => %{"taskId" => ^task_a_id}
              }
-           } = RemoteTask.result(task_a)
+           } = RemoteTask.result!(task_a).raw
 
     assert %{
              "structuredContent" => %{"value" => 2},
              "_meta" => %{
                "io.modelcontextprotocol/related-task" => %{"taskId" => ^task_b_id}
              }
-           } = RemoteTask.result(task_b)
+           } = RemoteTask.result!(task_b).raw
 
-    assert %{items: tools, next_cursor: nil} = Client.list_tools(client, page_size: 1)
+    assert %{items: tools, next_cursor: nil} = Client.list_tools!(client, page_size: 1)
     assert Enum.map(tools, & &1["name"]) == ["echo_1", "echo_2"]
 
-    assert %{items: prompts, next_cursor: nil} = Client.list_prompts(client, page_size: 1)
+    assert %{items: prompts, next_cursor: nil} = Client.list_prompts!(client, page_size: 1)
     assert Enum.map(prompts, & &1["name"]) == ["prompt_1", "prompt_2"]
 
     assert %{items: resources, next_cursor: nil} =
-             Client.list_resources(client, page_size: 1)
+             Client.list_resources!(client, page_size: 1)
 
     assert Enum.map(resources, & &1["uri"]) == ["memo://1", "memo://2"]
 
-    assert %{items: tasks, next_cursor: nil} = Client.list_tasks(client, page_size: 1)
+    assert %{items: tasks, next_cursor: nil} = Client.list_tasks!(client, page_size: 1)
 
     assert Enum.sort(Enum.map(tasks, & &1["taskId"])) ==
              Enum.sort([task_a.task_id, task_b.task_id])
 
-    assert :ok = Client.disconnect(client)
+    assert :ok = Client.disconnect!(client)
   end
 
   test "connected client forwards log and progress notifications to handlers" do
@@ -368,10 +364,11 @@ defmodule FastestMCP.ClientHTTPTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
-    assert %{"ok" => true} = Client.call_tool(client, "notify", %{}, progress_token: "token-1")
+    assert %{structured_content: %{"ok" => true}} =
+             Client.call_tool!(client, "notify", %{}, progress_token: "token-1")
 
     assert_receive {:log_notification, %{"level" => "info", "data" => "hello from server"}}, 1_000
 
@@ -444,16 +441,18 @@ defmodule FastestMCP.ClientHTTPTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
-    sample_task = Task.async(fn -> Client.call_tool(client, "sample", %{}) end)
+    sample_task = Task.async(fn -> Client.call_tool!(client, "sample", %{}) end)
     assert_receive {:sampling_handler_called, _messages, _params}, 1_000
-    assert "sampled" = Task.await(sample_task, 6_000)
 
-    elicitation_task = Task.async(fn -> Client.call_tool(client, "ask_name", %{}) end)
+    assert %{structured_content: %{"content" => %{"text" => "sampled"}}} =
+             Task.await(sample_task, 6_000)
+
+    elicitation_task = Task.async(fn -> Client.call_tool!(client, "ask_name", %{}) end)
     assert_receive {:elicitation_handler_called, _message, _params}, 1_000
-    assert %{"name" => "Alice"} = Task.await(elicitation_task, 6_000)
+    assert %{structured_content: %{"name" => "Alice"}} = Task.await(elicitation_task, 6_000)
   end
 
   test "session stream handles standalone elicitation and returns primitive defaults" do
@@ -493,7 +492,7 @@ defmodule FastestMCP.ClientHTTPTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     assert wait_for_session_stream(client) == :ok
@@ -515,7 +514,7 @@ defmodule FastestMCP.ClientHTTPTest do
       Task.async(fn ->
         Session.request_peer(
           server_name,
-          Client.session_id(client),
+          Client.session_id!(client),
           "elicitation/create",
           params,
           timeout_ms: 2_000
@@ -534,7 +533,7 @@ defmodule FastestMCP.ClientHTTPTest do
               }
             }} = Task.await(request, 3_000)
 
-    assert :ok = Client.disconnect(client)
+    assert :ok = Client.disconnect!(client)
   end
 
   test "connected client reuses authenticated credentials for protected callbacks" do
@@ -597,20 +596,22 @@ defmodule FastestMCP.ClientHTTPTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     sample_task =
       Task.async(fn ->
-        Client.call_tool(client, "sample", %{})
+        Client.call_tool!(client, "sample", %{})
       end)
 
     assert_receive {:protected_sampling_handler_called, _messages, _params}, 1_000
-    assert "sampled" = Task.await(sample_task, 6_000)
+
+    assert %{structured_content: %{"content" => %{"text" => "sampled"}}} =
+             Task.await(sample_task, 6_000)
 
     elicitation_task =
       Task.async(fn ->
-        Client.call_tool(client, "ask_name", %{})
+        Client.call_tool!(client, "ask_name", %{})
       end)
 
     assert_receive {:protected_elicitation_handler_called, "What is your name?",
@@ -623,7 +624,7 @@ defmodule FastestMCP.ClientHTTPTest do
                     }},
                    1_000
 
-    assert %{"name" => "Alice"} = Task.await(elicitation_task, 6_000)
+    assert %{structured_content: %{"name" => "Alice"}} = Task.await(elicitation_task, 6_000)
   end
 
   test "request-scoped HTTP state still uses a server-issued session stream" do
@@ -659,11 +660,11 @@ defmodule FastestMCP.ClientHTTPTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
-    assert is_binary(Client.session_id(client))
-    assert :ok = Client.open_session_stream(client)
+    assert is_binary(Client.session_id!(client))
+    assert :ok = Client.open_session_stream!(client)
     assert wait_for_session_stream(client) == :ok
     assert Client.session_stream_open?(client)
   end
@@ -716,29 +717,29 @@ defmodule FastestMCP.ClientHTTPTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     assert %RemoteTask{task_id: task_id, kind: :tool, target: "confirm"} =
-             task = Client.call_tool(client, "confirm", %{}, task: true)
+             task = Client.call_tool_task!(client, "confirm", %{}, task: true)
 
-    assert %{items: [%{"taskId" => ^task_id}], next_cursor: nil} = Client.list_tasks(client)
-    assert %{"taskId" => ^task_id} = Client.fetch_task(client, task_id)
-    assert %{"taskId" => ^task_id} = RemoteTask.fetch(task)
-    assert %{"taskId" => ^task_id} = RemoteTask.status(task)
+    assert %{items: [%{"taskId" => ^task_id}], next_cursor: nil} = Client.list_tasks!(client)
+    assert %{"taskId" => ^task_id} = Client.fetch_task!(client, task_id)
+    assert %{"taskId" => ^task_id} = RemoteTask.fetch!(task)
+    assert %{"taskId" => ^task_id} = RemoteTask.status!(task)
 
     assert wait_for_task_status(client, task_id, "completed") == :ok
-    assert %{"taskId" => ^task_id, "status" => "completed"} = RemoteTask.wait(task)
+    assert %{"taskId" => ^task_id, "status" => "completed"} = RemoteTask.wait!(task)
 
     assert %{
              "structuredContent" => %{"approved" => true},
              "_meta" => %{
                "io.modelcontextprotocol/related-task" => %{"taskId" => ^task_id}
              }
-           } = result = RemoteTask.result(task)
+           } = result = RemoteTask.result!(task).raw
 
-    assert ^result = RemoteTask.result(task)
-    assert :ok = Client.disconnect(client)
+    assert ^result = RemoteTask.result!(task).raw
+    assert :ok = Client.disconnect!(client)
   end
 
   test "connected client receives task notifications over the session event stream" do
@@ -791,16 +792,16 @@ defmodule FastestMCP.ClientHTTPTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     assert wait_for_session_stream(client) == :ok
     assert Client.session_stream_open?(client)
 
-    session_id = Client.session_id(client)
+    session_id = Client.session_id!(client)
 
     assert %RemoteTask{task_id: task_id, kind: :tool, target: "wait"} =
-             task = Client.call_tool(client, "wait", %{}, task: true)
+             task = Client.call_tool_task!(client, "wait", %{}, task: true)
 
     assert_receive {:session_stream_task_started, ^session_id, task_pid}, 1_000
 
@@ -820,9 +821,9 @@ defmodule FastestMCP.ClientHTTPTest do
                     }},
                    1_000
 
-    assert %{"taskId" => ^task_id, "status" => "completed"} = RemoteTask.wait(task)
+    assert %{"taskId" => ^task_id, "status" => "completed"} = RemoteTask.wait!(task)
     assert wait_for_task_status(client, task_id, "completed") == :ok
-    assert :ok = Client.disconnect(client)
+    assert :ok = Client.disconnect!(client)
   end
 
   test "notification handler failures do not fail tool calls" do
@@ -864,10 +865,12 @@ defmodule FastestMCP.ClientHTTPTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
-    assert %{"ok" => true} = Client.call_tool(client, "notify", %{}, progress_token: "token-1")
+    assert %{structured_content: %{"ok" => true}} =
+             Client.call_tool!(client, "notify", %{}, progress_token: "token-1")
+
     assert Client.connected?(client)
   end
 
@@ -926,31 +929,33 @@ defmodule FastestMCP.ClientHTTPTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
-    :ok = Client.set_auth_input(client, headers: [{"x-trace-id", "trace-123"}])
-    Client.set_access_token(client, "dev-token")
-    Client.set_log_handler(client, fn payload -> send(parent, {:runtime_log, payload}) end)
+    :ok = Client.set_auth_input!(client, headers: [{"x-trace-id", "trace-123"}])
+    Client.set_access_token!(client, "dev-token")
+    Client.set_log_handler!(client, fn payload -> send(parent, {:runtime_log, payload}) end)
 
-    Client.set_progress_handler(client, fn payload ->
+    Client.set_progress_handler!(client, fn payload ->
       send(parent, {:runtime_progress, payload})
     end)
 
-    Client.set_notification_handler(client, fn payload ->
+    Client.set_notification_handler!(client, fn payload ->
       send(parent, {:runtime_notification, payload})
     end)
 
-    Client.set_sampling_handler(client, fn messages, _params ->
+    Client.set_sampling_handler!(client, fn messages, _params ->
       send(parent, {:runtime_sampling, messages})
       sampling_result("runtime sampled")
     end)
 
-    assert is_map(Client.initialize(client))
+    assert is_map(Client.initialize!(client))
 
-    assert %{"x-trace-id" => "trace-123"} = Client.call_tool(client, "headers", %{})
+    assert %{structured_content: %{"x-trace-id" => "trace-123"}} =
+             Client.call_tool!(client, "headers", %{})
 
-    assert %{"ok" => true} = Client.call_tool(client, "notify", %{}, progress_token: "token-2")
+    assert %{structured_content: %{"ok" => true}} =
+             Client.call_tool!(client, "notify", %{}, progress_token: "token-2")
 
     assert_receive {:runtime_log, %{"level" => "info", "data" => "runtime hello"}}, 1_000
 
@@ -970,7 +975,8 @@ defmodule FastestMCP.ClientHTTPTest do
                     %{"method" => "notifications/progress", "params" => _}},
                    1_000
 
-    assert "runtime sampled" = Client.call_tool(client, "sample", %{})
+    assert %{structured_content: %{"content" => %{"text" => "runtime sampled"}}} =
+             Client.call_tool!(client, "sample", %{})
 
     assert_receive {:runtime_sampling,
                     [%{"content" => %{"text" => "Reply with runtime sampled"}}]},
@@ -996,7 +1002,7 @@ defmodule FastestMCP.ClientHTTPTest do
   end
 
   defp do_wait_for_task_status(client, task_id, expected_status, deadline) do
-    task = Client.fetch_task(client, task_id)
+    task = Client.fetch_task!(client, task_id)
 
     cond do
       task["status"] == expected_status ->

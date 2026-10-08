@@ -3,8 +3,8 @@ defmodule FastestMCP.Middleware.RateLimiting do
   Token-bucket rate limiting middleware for sustained traffic plus bursts.
 
   Middleware modules in FastestMCP are configured as explicit structs that
-  carry options plus a ready-to-run `middleware` function. That keeps runtime
-  assembly cheap while making the configured value easy to inspect in tests.
+  carry immutable configuration. Dispatch calls the module with that configuration;
+  runtime state is owned separately by the server.
 
   Most applications reach this module through `FastestMCP.Middleware` helper
   functions or by adding the configured struct directly with
@@ -12,15 +12,15 @@ defmodule FastestMCP.Middleware.RateLimiting do
   """
 
   alias FastestMCP.Error
-  alias FastestMCP.Middleware
+  alias FastestMCP.Middleware.Runtime
+  @behaviour FastestMCP.Middleware
+
   alias FastestMCP.Operation
-  alias FastestMCP.Registry
 
   defstruct [
     :get_client_id,
     :instance_id,
     :runtime_id,
-    :middleware,
     :state,
     max_requests_per_second: 10.0,
     burst_capacity: 20,
@@ -32,7 +32,6 @@ defmodule FastestMCP.Middleware.RateLimiting do
           get_client_id: (Operation.t() -> String.t()) | nil,
           instance_id: reference(),
           runtime_id: reference() | nil,
-          middleware: (Operation.t(), (Operation.t() -> any()) -> any()),
           state: pid() | nil,
           max_requests_per_second: float(),
           burst_capacity: pos_integer(),
@@ -63,10 +62,11 @@ defmodule FastestMCP.Middleware.RateLimiting do
       global_limit: global_limit
     }
 
-    bind_middleware(middleware)
+    middleware
   end
 
   @doc "Runs the middleware around the next operation."
+  @impl FastestMCP.Middleware
   def call(%__MODULE__{} = middleware, %Operation{} = operation, next)
       when is_function(next, 1) do
     middleware = ensure_runtime(middleware)
@@ -94,39 +94,24 @@ defmodule FastestMCP.Middleware.RateLimiting do
   def close(%__MODULE__{} = middleware), do: deactivate_runtime(middleware)
 
   @doc false
+  @impl FastestMCP.Middleware
   def activate_runtime(%__MODULE__{} = middleware) do
-    if middleware.runtime_id, do: deactivate_runtime(middleware)
-
-    runtime_id = make_ref()
-
-    {:ok, state} =
-      __MODULE__.State.start_link(
-        burst_capacity: middleware.burst_capacity,
-        refill_rate: middleware.max_requests_per_second,
-        max_clients: middleware.max_clients
-      )
-
-    runtime =
-      middleware
-      |> Map.put(:runtime_id, runtime_id)
-      |> Map.put(:state, state)
-      |> bind_middleware()
-
-    :ok = Registry.register_middleware_runtime(middleware.instance_id, runtime_id, %{pid: state})
-    runtime
+    Runtime.activate(
+      middleware,
+      fn ->
+        __MODULE__.State.start_link(
+          burst_capacity: middleware.burst_capacity,
+          refill_rate: middleware.max_requests_per_second,
+          max_clients: middleware.max_clients
+        )
+      end,
+      :state
+    )
   end
 
   @doc false
-  def deactivate_runtime(%__MODULE__{} = middleware) do
-    middleware
-    |> runtime_middlewares()
-    |> Enum.each(fn %{runtime_id: runtime_id, state: pid} ->
-      Registry.unregister_middleware_runtime(runtime_id)
-      Middleware.shutdown_runtime_pid(pid)
-    end)
-
-    :ok
-  end
+  @impl FastestMCP.Middleware
+  def deactivate_runtime(config), do: Runtime.close(config, :state)
 
   @doc false
   def state_pid(%__MODULE__{} = middleware) do
@@ -153,41 +138,8 @@ defmodule FastestMCP.Middleware.RateLimiting do
   defp rate_limit_message(_middleware, client_id),
     do: "rate limit exceeded for client: #{client_id}"
 
-  defp ensure_runtime(%__MODULE__{} = middleware) do
-    runtime_middleware(middleware) || activate_runtime(middleware)
-  end
-
-  defp runtime_middleware(%__MODULE__{} = middleware) do
-    case runtime_middlewares(middleware) do
-      [runtime] -> runtime
-      _other -> nil
-    end
-  end
-
-  defp runtime_middlewares(%__MODULE__{runtime_id: runtime_id} = middleware)
-       when is_reference(runtime_id) do
-    case Registry.lookup_middleware_runtime(runtime_id) do
-      {:ok, runtime} -> [hydrate_runtime(middleware, runtime)]
-      {:error, :not_found} -> []
-    end
-  end
-
-  defp runtime_middlewares(%__MODULE__{} = middleware) do
-    middleware.instance_id
-    |> Registry.list_middleware_runtimes()
-    |> Enum.map(&hydrate_runtime(middleware, &1))
-  end
-
-  defp hydrate_runtime(%__MODULE__{} = middleware, %{runtime_id: runtime_id, pid: pid}) do
-    middleware
-    |> Map.put(:runtime_id, runtime_id)
-    |> Map.put(:state, pid)
-    |> bind_middleware()
-  end
-
-  defp bind_middleware(%__MODULE__{} = middleware) do
-    %{middleware | middleware: fn operation, next -> call(middleware, operation, next) end}
-  end
+  defp ensure_runtime(config), do: Runtime.ensure(config, :state)
+  defp runtime_middleware(config), do: Runtime.fetch(config, :state)
 
   defp validate!(max_requests_per_second, burst_capacity, max_clients)
        when is_number(max_requests_per_second) and max_requests_per_second > 0 and

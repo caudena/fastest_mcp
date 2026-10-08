@@ -60,7 +60,7 @@ defmodule FastestMCP.MiddlewareRetryTest do
       end)
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
-    assert %{status: "ok"} == FastestMCP.call_tool(server_name, "flaky", %{})
+    assert %{status: "ok"} == FastestMCP.call_tool!(server_name, "flaky", %{})
   end
 
   test "retries timeout-coded FastestMCP errors by default" do

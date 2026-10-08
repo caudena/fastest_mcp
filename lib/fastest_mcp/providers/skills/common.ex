@@ -28,7 +28,7 @@ defmodule FastestMCP.Providers.Skills.Common do
     defstruct [:name, :description, :path, :real_path, :main_file, files: [], frontmatter: %{}]
   end
 
-  @frontmatter_end ~r/\n---\s*\n/
+  @frontmatter ~r/\A---[\t ]*\r?\n(.*?)^---[\t ]*(?:\r?\n|\z)/ms
 
   @doc "Parses optional frontmatter from the given content."
   def parse_frontmatter(content) when is_binary(content) do
@@ -148,18 +148,28 @@ defmodule FastestMCP.Providers.Skills.Common do
   end
 
   defp parse_frontmatter_block(content) do
-    case Regex.run(@frontmatter_end, binary_part(content, 3, byte_size(content) - 3),
-           return: :index
-         ) do
-      [{start, length}] ->
-        frontmatter_text = binary_part(content, 3, start)
-        body_offset = 3 + start + length
+    case Regex.run(@frontmatter, content, return: :index) do
+      [{0, body_offset}, {start, length}] ->
+        frontmatter_text = binary_part(content, start, length)
         body = binary_part(content, body_offset, byte_size(content) - body_offset)
-        {parse_frontmatter_lines(frontmatter_text), body}
+        {parse_frontmatter_yaml(frontmatter_text), body}
 
       nil ->
         {%{}, content}
     end
+  end
+
+  defp parse_frontmatter_yaml(text) do
+    case :yamerl_constr.string(text,
+           schema: :failsafe,
+           str_node_as_binary: true,
+           map_node_format: :map
+         ) do
+      [%{} = metadata] -> metadata
+      _other -> parse_frontmatter_lines(text)
+    end
+  catch
+    :throw, {:yamerl_exception, _errors} -> parse_frontmatter_lines(text)
   end
 
   defp parse_frontmatter_lines(text) do

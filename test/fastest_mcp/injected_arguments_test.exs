@@ -26,11 +26,11 @@ defmodule FastestMCP.InjectedArgumentsTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    [tool] = FastestMCP.list_tools(server_name)
+    [tool] = FastestMCP.list_tools!(server_name)
     refute Map.has_key?(tool.input_schema["properties"], "session_id")
 
     assert %{"session_id" => "real-session", "value" => 7} ==
-             FastestMCP.call_tool(
+             FastestMCP.call_tool!(
                server_name,
                "whoami",
                %{"value" => 7, "session_id" => "spoofed"},
@@ -51,7 +51,9 @@ defmodule FastestMCP.InjectedArgumentsTest do
       |> FastestMCP.add_prompt(
         "session_prompt",
         fn arguments, _ctx ->
-          %{messages: [%{role: "user", content: arguments["session_id"]}]}
+          FastestMCP.Prompts.Result.from(%{
+            messages: [%{role: "user", content: arguments["session_id"]}]
+          })
         end,
         inject: [session_id: fn ctx -> ctx.session_id end]
       )
@@ -60,10 +62,12 @@ defmodule FastestMCP.InjectedArgumentsTest do
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
     assert %{"session_id" => "inject-session"} ==
-             FastestMCP.read_resource(server_name, "memo://session", session_id: "inject-session")
+             FastestMCP.read_resource!(server_name, "memo://session",
+               session_id: "inject-session"
+             )
 
     assert %{messages: [%{role: "user", content: %{type: "text", text: "inject-session"}}]} =
-             FastestMCP.render_prompt(server_name, "session_prompt", %{},
+             FastestMCP.render_prompt!(server_name, "session_prompt", %{},
                session_id: "inject-session"
              )
   end

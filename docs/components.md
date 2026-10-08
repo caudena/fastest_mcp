@@ -145,14 +145,14 @@ These surfaces stay explicit in the server definition and handler code.
 ## Listing and Calling
 
 ```elixir
-FastestMCP.list_tools(MyApp.MCPServer)
-FastestMCP.list_resources(MyApp.MCPServer)
-FastestMCP.list_resource_templates(MyApp.MCPServer)
-FastestMCP.list_prompts(MyApp.MCPServer)
+FastestMCP.list_tools!(MyApp.MCPServer)
+FastestMCP.list_resources!(MyApp.MCPServer)
+FastestMCP.list_resource_templates!(MyApp.MCPServer)
+FastestMCP.list_prompts!(MyApp.MCPServer)
 
-FastestMCP.call_tool(MyApp.MCPServer, "sum", %{"a" => 20, "b" => 22})
-FastestMCP.read_resource(MyApp.MCPServer, "users://42")
-FastestMCP.render_prompt(MyApp.MCPServer, "welcome", %{"name" => "Nate"})
+FastestMCP.call_tool!(MyApp.MCPServer, "sum", %{"a" => 20, "b" => 22})
+FastestMCP.read_resource!(MyApp.MCPServer, "users://42")
+FastestMCP.render_prompt!(MyApp.MCPServer, "welcome", %{"name" => "Nate"})
 ```
 
 These operations stay aligned whether the component came from:

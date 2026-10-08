@@ -3,8 +3,8 @@ defmodule FastestMCP.Middleware.Logging do
   Request logging middleware with optional structured output and payload details.
 
   Middleware modules in FastestMCP are configured as explicit structs that
-  carry options plus a ready-to-run `middleware` function. That keeps runtime
-  assembly cheap while making the configured value easy to inspect in tests.
+  carry immutable configuration. Dispatch calls the module with that configuration;
+  runtime state is owned separately by the server.
 
   Most applications reach this module through `FastestMCP.Middleware` helper
   functions or by adding the configured struct directly with
@@ -13,11 +13,12 @@ defmodule FastestMCP.Middleware.Logging do
 
   require Logger
 
+  @behaviour FastestMCP.Middleware
+
   alias FastestMCP.Operation
 
   defstruct [
     :log_fn,
-    :middleware,
     :payload_serializer,
     log_level: :info,
     include_payloads: false,
@@ -30,7 +31,6 @@ defmodule FastestMCP.Middleware.Logging do
 
   @type t :: %__MODULE__{
           log_fn: (atom(), String.t() -> any()),
-          middleware: (Operation.t(), (Operation.t() -> any()) -> any()),
           payload_serializer: (any() -> String.t()) | nil,
           log_level: atom(),
           include_payloads: boolean(),
@@ -55,10 +55,11 @@ defmodule FastestMCP.Middleware.Logging do
       structured_logging: Keyword.get(opts, :structured_logging, false)
     }
 
-    %{middleware | middleware: fn operation, next -> call(middleware, operation, next) end}
+    middleware
   end
 
   @doc "Runs the middleware around the next operation."
+  @impl FastestMCP.Middleware
   def call(%__MODULE__{} = middleware, %Operation{} = operation, next)
       when is_function(next, 1) do
     if log_method?(middleware, operation.method) do

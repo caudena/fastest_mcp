@@ -43,27 +43,27 @@ defmodule FastestMCP.MountedProviderTaskTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
 
     tool_task =
-      FastestMCP.call_tool(parent_name, "child_multiply", %{"a" => 6, "b" => 7}, task: true)
+      FastestMCP.call_tool!(parent_name, "child_multiply", %{"a" => 6, "b" => 7}, task: true)
 
     assert %BackgroundTask{} = tool_task
-    assert FastestMCP.await_task(tool_task, 1_000) == 42
+    assert FastestMCP.await_task!(tool_task, 1_000) == 42
 
     assert_receive {:child_task_ctx, "child-task-server", true, task_id, origin_request_id}, 1_000
     assert task_id == tool_task.task_id
     assert is_binary(origin_request_id)
 
     prompt_task =
-      FastestMCP.render_prompt(parent_name, "child_describe", %{"topic" => "tasks"}, task: true)
+      FastestMCP.render_prompt!(parent_name, "child_describe", %{"topic" => "tasks"}, task: true)
 
     assert %BackgroundTask{} = prompt_task
 
-    assert FastestMCP.await_task(prompt_task, 1_000) == %{
-             messages: [%{role: "user", content: "child prompt for tasks"}]
-           }
+    assert %{
+             messages: [%{role: "user", content: %{type: "text", text: "child prompt for tasks"}}]
+           } = FastestMCP.await_task!(prompt_task, 1000)
 
-    resource_task = FastestMCP.read_resource(parent_name, "child://child/data.txt", task: true)
+    resource_task = FastestMCP.read_resource!(parent_name, "child://child/data.txt", task: true)
     assert %BackgroundTask{} = resource_task
-    assert FastestMCP.await_task(resource_task, 1_000) == "child resource"
+    assert FastestMCP.await_task!(resource_task, 1_000) == "child resource"
   end
 
   test "mounted child tasks work through the task protocol on the parent server" do
@@ -124,7 +124,7 @@ defmodule FastestMCP.MountedProviderTaskTest do
 
     send(worker_pid, :release)
 
-    assert FastestMCP.await_task(parent_name, task_id, 1_000, session_id: "mounted-session") ==
+    assert FastestMCP.await_task!(parent_name, task_id, 1_000, session_id: "mounted-session") ==
              :done
 
     result =

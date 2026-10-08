@@ -1,4 +1,5 @@
 defmodule FastestMCP.ProviderTransforms.Namespace do
+  @behaviour FastestMCP.ProviderTransform
   @moduledoc """
   Prefixes tool and prompt names and inserts a namespace into resource URIs.
 
@@ -24,6 +25,7 @@ defmodule FastestMCP.ProviderTransforms.Namespace do
   end
 
   @doc "Transforms a component before it is exposed."
+  @impl FastestMCP.ProviderTransform
   def transform_component(%__MODULE__{namespace: namespace}, %Tool{} = component, _operation) do
     %Tool{component | name: namespaced_name(namespace, component.name)}
   end
@@ -54,6 +56,7 @@ defmodule FastestMCP.ProviderTransforms.Namespace do
   end
 
   @doc "Maps an exposed identifier back to the source identifier."
+  @impl FastestMCP.ProviderTransform
   def reverse_identifier(
         %__MODULE__{namespace: namespace},
         component_type,

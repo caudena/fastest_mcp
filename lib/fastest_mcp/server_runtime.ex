@@ -92,7 +92,10 @@ defmodule FastestMCP.ServerRuntime do
 
   @doc "Starts the process owned by this module."
   def start_link({%Server{} = server, opts}) do
+    server = Server.prepare_for_runtime(server)
     GenServer.start_link(__MODULE__, {server, opts})
+  rescue
+    error -> {:error, error}
   end
 
   @impl true
@@ -554,30 +557,9 @@ defmodule FastestMCP.ServerRuntime do
     end
   end
 
-  defp max_sessions(opts) do
-    case Keyword.get(opts, :max_sessions, 10_000) do
-      value when is_integer(value) and value > 0 ->
-        value
+  defp max_sessions(opts), do: FastestMCP.Session.Config.max_sessions(opts)
 
-      :infinity ->
-        :infinity
-
-      other ->
-        raise ArgumentError,
-              "max_sessions must be a positive integer or :infinity, got: #{inspect(other)}"
-    end
-  end
-
-  defp max_request_ids(opts) do
-    case Keyword.get(opts, :max_request_ids, 100_000) do
-      value when is_integer(value) and value > 0 ->
-        value
-
-      other ->
-        raise ArgumentError,
-              "max_request_ids must be a positive integer, got: #{inspect(other)}"
-    end
-  end
+  defp max_request_ids(opts), do: FastestMCP.Session.Config.max_request_ids(opts)
 
   # Whether a `2025-11-25` session rejects a client request id that was already
   # used earlier in the same session. Off by default: some production clients
@@ -653,19 +635,7 @@ defmodule FastestMCP.ServerRuntime do
     end
   end
 
-  defp session_idle_ttl(opts) do
-    case Keyword.get(opts, :session_idle_ttl, 15 * 60_000) do
-      value when is_integer(value) and value > 0 ->
-        value
-
-      :infinity ->
-        :infinity
-
-      other ->
-        raise ArgumentError,
-              "session_idle_ttl must be a positive integer or :infinity, got: #{inspect(other)}"
-    end
-  end
+  defp session_idle_ttl(opts), do: FastestMCP.Session.Config.session_idle_ttl(opts)
 
   defp terminated_session_ttl(opts) do
     case Keyword.get(opts, :terminated_session_ttl, 15 * 60_000) do

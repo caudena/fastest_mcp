@@ -50,20 +50,20 @@ defmodule FastestMCP.ProviderParityTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    assert FastestMCP.list_tools(server_name)
+    assert FastestMCP.list_tools!(server_name)
            |> Enum.map(& &1.name)
            |> Enum.sort() == ["dynamic_echo", "local_echo"]
 
     assert_receive :list_tools_called, 1_000
 
     assert %{source: "provider", value: "hello"} ==
-             FastestMCP.call_tool(server_name, "dynamic_echo", %{"value" => "hello"})
+             FastestMCP.call_tool!(server_name, "dynamic_echo", %{"value" => "hello"})
 
     assert_receive :get_tool_called, 1_000
     refute_receive :list_tools_called, 50
 
     assert %{source: "local", value: "world"} ==
-             FastestMCP.call_tool(server_name, "local_echo", %{"value" => "world"})
+             FastestMCP.call_tool!(server_name, "local_echo", %{"value" => "world"})
   end
 
   test "mounted servers expose child dynamic providers" do
@@ -92,11 +92,11 @@ defmodule FastestMCP.ProviderParityTest do
     assert {:ok, _pid} = FastestMCP.start_server(parent)
     on_exit(fn -> FastestMCP.stop_server(parent_name) end)
 
-    assert [%{name: "child_dynamic_echo"}] = FastestMCP.list_tools(parent_name)
+    assert [%{name: "child_dynamic_echo"}] = FastestMCP.list_tools!(parent_name)
     assert_receive :list_tools_called, 1_000
 
     assert %{source: "provider", value: "hello"} ==
-             FastestMCP.call_tool(parent_name, "child_dynamic_echo", %{"value" => "hello"})
+             FastestMCP.call_tool!(parent_name, "child_dynamic_echo", %{"value" => "hello"})
 
     assert_receive :get_tool_called, 1_000
     refute_receive :list_tools_called, 50

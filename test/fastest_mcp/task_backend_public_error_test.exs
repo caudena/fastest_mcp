@@ -105,15 +105,15 @@ defmodule FastestMCP.TaskBackendPublicErrorTest do
 
   test "public task APIs normalize arbitrary backend failures", context do
     operations = [
-      {:fetch, &FastestMCP.fetch_task(context.server_name, &1)},
-      {:await, &FastestMCP.await_task(context.server_name, &1, 100)},
-      {:result, &FastestMCP.task_result(context.server_name, &1)},
-      {:cancel, &FastestMCP.cancel_task(context.server_name, &1)},
-      {:send_input, &FastestMCP.send_task_input(context.server_name, &1, :accept)}
+      {:fetch, &FastestMCP.fetch_task!(context.server_name, &1)},
+      {:await, &FastestMCP.await_task!(context.server_name, &1, 100)},
+      {:result, &FastestMCP.task_result!(context.server_name, &1)},
+      {:cancel, &FastestMCP.cancel_task!(context.server_name, &1)},
+      {:send_input, &FastestMCP.send_task_input!(context.server_name, &1, :accept)}
     ]
 
     Enum.each(operations, fn {operation, invoke} ->
-      task = FastestMCP.call_tool(context.server_name, "done", %{}, task: true)
+      task = FastestMCP.call_tool!(context.server_name, "done", %{}, task: true)
       Backend.fail(context.backend, :fetch_task, {:storage_unavailable, operation})
 
       error = assert_raise Error, fn -> invoke.(task.task_id) end
@@ -126,7 +126,7 @@ defmodule FastestMCP.TaskBackendPublicErrorTest do
     end)
 
     Backend.fail(context.backend, :list_tasks, :storage_unavailable)
-    error = assert_raise Error, fn -> FastestMCP.list_tasks(context.server_name) end
+    error = assert_raise Error, fn -> FastestMCP.list_tasks!(context.server_name) end
 
     assert error.code == :internal_error
     assert error.message == "background task storage list failed"
@@ -134,7 +134,7 @@ defmodule FastestMCP.TaskBackendPublicErrorTest do
   end
 
   test "stdio converts backend failures into an internal JSON-RPC error", context do
-    task = FastestMCP.call_tool(context.server_name, "done", %{}, task: true)
+    task = FastestMCP.call_tool!(context.server_name, "done", %{}, task: true)
     {connection_id, _initialize_response} = ProtocolTest.initialize_stdio(context.server_name)
 
     Backend.fail(context.backend, :fetch_task, :storage_unavailable)

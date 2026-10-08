@@ -37,8 +37,8 @@ defmodule FastestMCP.Registry do
   @doc "Initializes the state used by this module before it starts processing work."
   def init(:ok) do
     create_table(@servers_table, :set)
-    create_table(@components_table, :bag)
-    create_table(@templates_table, :bag)
+    create_table(@components_table, :ordered_set)
+    create_table(@templates_table, :ordered_set)
     create_table(@sessions_table, :set)
     create_table(@url_elicitations_table, :set)
     create_table(@server_owners_table, :set)

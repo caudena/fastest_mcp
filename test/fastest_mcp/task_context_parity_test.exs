@@ -28,13 +28,13 @@ defmodule FastestMCP.TaskContextParityTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
 
     task =
-      FastestMCP.call_tool(server_name, "inspect_context", %{},
+      FastestMCP.call_tool!(server_name, "inspect_context", %{},
         task: true,
         session_id: "task-context-session",
         request_metadata: %{headers: %{"authorization" => "Bearer submit-token"}}
       )
 
-    assert FastestMCP.await_task(task, 1_000) == :ok
+    assert FastestMCP.await_task!(task, 1_000) == :ok
 
     assert_receive {:task_context_snapshot, nil, %{"cache" => "warm", "db" => "connected"},
                     "task-context-session", origin_request_id},
@@ -82,16 +82,16 @@ defmodule FastestMCP.TaskContextParityTest do
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
     task =
-      FastestMCP.call_tool(server_name, "echo", %{},
+      FastestMCP.call_tool!(server_name, "echo", %{},
         task: true,
         auth_input: %{"authorization" => "Bearer alpha"}
       )
 
     assert %BackgroundTask{owner_fingerprint: owner_fingerprint} = task
     assert is_binary(owner_fingerprint)
-    assert :ok == FastestMCP.await_task(task, 1_000)
+    assert :ok == FastestMCP.await_task!(task, 1_000)
     assert_receive {:background_auth_evidence, true, ["https://mcp.example/mcp"], ["tasks:run"]}
-    assert %{status: :completed} = FastestMCP.fetch_task(task)
-    assert :ok == FastestMCP.task_result(task)
+    assert %{status: :completed} = FastestMCP.fetch_task!(task)
+    assert :ok == FastestMCP.task_result!(task)
   end
 end

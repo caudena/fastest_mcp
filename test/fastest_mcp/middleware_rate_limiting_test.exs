@@ -251,14 +251,14 @@ defmodule FastestMCP.MiddlewareRateLimitingTest do
     assert {:ok, _pid} = FastestMCP.start_server(server_a_def)
     assert {:ok, _pid} = FastestMCP.start_server(server_b_def)
 
-    assert %{"message" => "a-1"} = FastestMCP.call_tool(server_a, "echo", %{"message" => "a-1"})
-    assert %{"message" => "b-1"} = FastestMCP.call_tool(server_b, "echo", %{"message" => "b-1"})
+    assert %{"message" => "a-1"} = FastestMCP.call_tool!(server_a, "echo", %{"message" => "a-1"})
+    assert %{"message" => "b-1"} = FastestMCP.call_tool!(server_b, "echo", %{"message" => "b-1"})
 
     assert :ok = FastestMCP.stop_server(server_a)
 
     error =
       assert_raise Error, fn ->
-        FastestMCP.call_tool(server_b, "echo", %{"message" => "b-2"})
+        FastestMCP.call_tool!(server_b, "echo", %{"message" => "b-2"})
       end
 
     assert error.code == :rate_limited

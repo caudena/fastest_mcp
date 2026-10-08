@@ -80,7 +80,7 @@ defmodule FastestMCP.MiddlewarePingTest do
     assert :ok = EventBus.subscribe(runtime.event_bus, server_name)
 
     assert %{"message" => "in-process"} ==
-             FastestMCP.call_tool(server_name, "echo", %{"message" => "in-process"},
+             FastestMCP.call_tool!(server_name, "echo", %{"message" => "in-process"},
                session_id: "ignored"
              )
 

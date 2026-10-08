@@ -1,5 +1,51 @@
 # Changelog
 
+## Unreleased
+
+### 0.4.0 breaking Elixir API changes
+
+- return tagged results from client and local operations, with raising bang
+  variants; commands return `:ok` or `{:error, error}`
+- always return the complete `Client.ToolResult` from connected tool calls;
+  deprecate `call_tool_result`, remove automatic JSON-text decoding and result
+  projection, and reserve explicit task handles for `call_tool_task`
+- treat plain handler maps as application data; explicit tool, resource, and
+  prompt result structs select MCP envelopes
+- dispatch immutable middleware configurations through module callbacks, share
+  activation/cleanup and mounted chains, and unify timing implementations
+- retain updated Plug connections after reading request bodies, including error
+  and authentication paths, so HTTP keep-alive framing survives split bodies
+- split client request ownership, protocol, callbacks, discovery, and execution
+  responsibilities; supervise terminal calls and monitor request handles
+- index component versions and preferred client descriptors once, share complete
+  catalog loads, and compile OpenAPI request binding plans before execution
+- share schema policy, session validation, request-state scopes, and deadline
+  handling; expire queued recovery calls before dispatch and address ClientGroup
+  coordinators directly through names or handles
+
+See [Migrating to 0.4](docs/migrating-to-0.4.md) for source changes.
+
+### OpenAPI, task, and composition improvements
+
+- preserve OpenAPI schema references and literal annotation data, validate
+  complete request bodies, preserve raw media and parameter examples, and send
+  repeated multipart fields
+- fix nested task-enabled tool calls receiving background handles implicitly;
+  explicit local tasks and top-level protocol tasks retain their existing APIs
+- parse multiline and nested skill YAML without scalar coercion, normalize
+  Unicode search terms, and match URI literal percent triplets regardless of hex case
+- add `FastestMCP.ClientGroup` for supervised, independently negotiated clients,
+  complete namespaced discovery, shared client catalogs, and cancellable routing
+- add opt-in provider-bundled extensions with root conflict resolution and
+  isolated, exactly-once root lifecycle execution across mounted providers
+- avoid duplicate default HTTP headers when an explicit header is supplied
+- add HTTP/stdio interoperability tests for both client and server roles
+
+OpenAPI bodies with dynamic keys, schema-local definitions, or constraints that
+cannot be flattened now use a whole `body` argument (collision aliases still
+apply). Missing optional bodies are distinct from supplied partial bodies,
+which must satisfy the original schema before an HTTP request is sent.
+
 ## 0.3.2 - 2026-08-28
 
 ### Connected client cancellation

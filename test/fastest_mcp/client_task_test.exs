@@ -22,19 +22,19 @@ defmodule FastestMCP.ClientTaskTest do
     client = connect_client!(bandit)
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     assert %RemoteTask{task_id: task_id, kind: :tool, target: "echo"} =
-             task = Client.call_tool_task(client, "echo", %{"value" => "cached"})
+             task = Client.call_tool_task!(client, "echo", %{"value" => "cached"})
 
-    assert %{"taskId" => ^task_id, "status" => "completed"} = RemoteTask.wait(task)
-    assert %{"taskId" => ^task_id, "status" => "completed"} = RemoteTask.status(task)
-    assert_tool_result(RemoteTask.result(task), task_id, %{"value" => "cached"})
+    assert %{"taskId" => ^task_id, "status" => "completed"} = RemoteTask.wait!(task)
+    assert %{"taskId" => ^task_id, "status" => "completed"} = RemoteTask.status!(task)
+    assert_tool_result(RemoteTask.result!(task), task_id, %{"value" => "cached"})
 
     assert :ok = FastestMCP.stop_server(server_name)
-    assert %{"taskId" => ^task_id, "status" => "completed"} = RemoteTask.wait(task)
-    assert_tool_result(RemoteTask.result(task), task_id, %{"value" => "cached"})
+    assert %{"taskId" => ^task_id, "status" => "completed"} = RemoteTask.wait!(task)
+    assert_tool_result(RemoteTask.result!(task), task_id, %{"value" => "cached"})
   end
 
   test "remote task handles retry tasks/result after transient request failures" do
@@ -58,22 +58,22 @@ defmodule FastestMCP.ClientTaskTest do
     client = connect_client!(bandit)
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     assert %RemoteTask{task_id: task_id} =
-             task = Client.call_tool(client, "slow", %{}, task: true)
+             task = Client.call_tool_task!(client, "slow", %{}, task: true)
 
     timeout_error =
       assert_raise FastestMCP.Error, fn ->
-        RemoteTask.result(task, timeout_ms: 1)
+        RemoteTask.result!(task, timeout_ms: 1)
       end
 
     assert timeout_error.code == :timeout
-    assert %{"taskId" => _, "status" => "completed"} = RemoteTask.wait(task, timeout_ms: 2_000)
+    assert %{"taskId" => _, "status" => "completed"} = RemoteTask.wait!(task, timeout_ms: 2_000)
 
     assert_tool_result(
-      RemoteTask.result(task, timeout_ms: 2_000),
+      RemoteTask.result!(task, timeout_ms: 2_000),
       task_id,
       %{"ok" => true}
     )
@@ -112,27 +112,27 @@ defmodule FastestMCP.ClientTaskTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     assert %RemoteTask{task_id: task_one_id} =
-             task_one = Client.call_tool(client, "wait", %{"label" => "one"}, task: true)
+             task_one = Client.call_tool_task!(client, "wait", %{"label" => "one"}, task: true)
 
     assert %RemoteTask{task_id: task_two_id} =
-             task_two = Client.call_tool(client, "wait", %{"label" => "two"}, task: true)
+             task_two = Client.call_tool_task!(client, "wait", %{"label" => "two"}, task: true)
 
     assert_receive {:entered_task, "one", pid_one}, 1_000
     assert_receive {:entered_task, "two", _pid_two}, 1_000
 
-    RemoteTask.on_status_change(task_one, fn _status ->
+    RemoteTask.on_status_change!(task_one, fn _status ->
       raise "callback exploded"
     end)
 
-    RemoteTask.on_status_change(task_one, fn status ->
+    RemoteTask.on_status_change!(task_one, fn status ->
       send(parent, {:task_callback, "one", status["taskId"], status["status"]})
     end)
 
-    RemoteTask.on_status_change(task_two, fn status ->
+    RemoteTask.on_status_change!(task_two, fn status ->
       send(parent, {:task_callback, "two", status["taskId"], status["status"]})
     end)
 
@@ -142,11 +142,11 @@ defmodule FastestMCP.ClientTaskTest do
     refute_receive {:task_callback, "two", ^task_one_id, _}, 250
     refute_receive {:task_callback, "two", ^task_two_id, "completed"}, 250
 
-    assert %{"taskId" => ^task_two_id, "status" => "cancelled"} = RemoteTask.cancel(task_two)
+    assert %{"taskId" => ^task_two_id, "status" => "cancelled"} = RemoteTask.cancel!(task_two)
     assert_receive {:task_callback, "two", ^task_two_id, "cancelled"}, 2_000
 
-    assert %{"taskId" => ^task_one_id, "status" => "completed"} = RemoteTask.wait(task_one)
-    assert %{"taskId" => ^task_two_id, "status" => "cancelled"} = RemoteTask.wait(task_two)
+    assert %{"taskId" => ^task_one_id, "status" => "completed"} = RemoteTask.wait!(task_one)
+    assert %{"taskId" => ^task_two_id, "status" => "cancelled"} = RemoteTask.wait!(task_two)
   end
 
   test "remote task augmentation is limited to tools/call" do
@@ -167,14 +167,14 @@ defmodule FastestMCP.ClientTaskTest do
     client = connect_client!(bandit)
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     assert %RemoteTask{kind: :tool, task_id: task_id} =
              tool_task =
-             Client.call_tool(client, "echo", %{"value" => "hi"}, task: true)
+             Client.call_tool_task!(client, "echo", %{"value" => "hi"}, task: true)
 
-    assert_tool_result(RemoteTask.result(tool_task), task_id, %{"value" => "hi"})
+    assert_tool_result(RemoteTask.result!(tool_task), task_id, %{"value" => "hi"})
 
     assert %{
              "messages" => [
@@ -183,9 +183,9 @@ defmodule FastestMCP.ClientTaskTest do
                  "content" => %{"type" => "text", "text" => "hello from prompt"}
                }
              ]
-           } = Client.render_prompt(client, "draft", %{})
+           } = Client.render_prompt!(client, "draft", %{})
 
-    assert %{"env" => "dev"} = Client.read_resource(client, "memo://config")
+    assert %{"env" => "dev"} = Client.read_resource!(client, "memo://config")
   end
 
   test "tasks/result relays elicitation over HTTP without the sendInput shortcut" do
@@ -219,19 +219,19 @@ defmodule FastestMCP.ClientTaskTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     assert %RemoteTask{task_id: task_id} =
-             task = Client.call_tool(client, "ask_name", %{}, task: true)
+             task = Client.call_tool_task!(client, "ask_name", %{}, task: true)
 
-    result_task = Task.async(fn -> RemoteTask.result(task) end)
+    result_task = Task.async(fn -> RemoteTask.result!(task) end)
 
     assert_receive {:elicitation_handler_called, "What is your name?", _params}, 2_000
     assert Client.session_stream_open?(client)
 
     assert_tool_result(Task.await(result_task, 6_000), task_id, %{"name" => "Alice"})
-    assert_tool_result(RemoteTask.result(task), task_id, %{"name" => "Alice"})
+    assert_tool_result(RemoteTask.result!(task), task_id, %{"name" => "Alice"})
   end
 
   defp assert_tool_result(result, task_id, structured_content) do
@@ -241,7 +241,7 @@ defmodule FastestMCP.ClientTaskTest do
              "_meta" => %{
                "io.modelcontextprotocol/related-task" => %{"taskId" => ^task_id}
              }
-           } = result
+           } = result.raw
 
     assert JSON.decode!(text) == structured_content
   end

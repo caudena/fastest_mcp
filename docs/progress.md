@@ -105,7 +105,7 @@ local tooling.
 For one operation, pass `progress_handler:` directly to the client helper:
 
 ```elixir
-FastestMCP.Client.call_tool(client, "build_report", %{},
+FastestMCP.Client.call_tool!(client, "build_report", %{},
   progress_handler: fn params -> IO.inspect(params, label: "report progress") end
 )
 ```
@@ -121,8 +121,8 @@ progress update once.
 When progress is reported from a background task, FastestMCP stores it on the
 task itself. That means you can:
 
-- inspect the latest progress through `FastestMCP.fetch_task/1`
-- await the final result with `FastestMCP.await_task/2`
+- inspect the latest progress through `FastestMCP.fetch_task!/1`
+- await the final result with `FastestMCP.await_task!/2`
 - forward progress updates to subscribed clients
 
 The stored progress includes:

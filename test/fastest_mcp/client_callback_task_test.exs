@@ -180,7 +180,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     assert_receive {:fake_callback_server_post,
@@ -207,7 +207,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     assert_receive {:fake_callback_server_post,
@@ -247,13 +247,13 @@ defmodule FastestMCP.ClientCallbackTaskTest do
                     }},
                    2_000
 
-    :ok = Client.set_roots(client, [FastestMCP.Root.new("file:///workspace-2")])
+    :ok = Client.set_roots!(client, [FastestMCP.Root.new("file:///workspace-2")])
 
     assert_receive {:fake_callback_server_post,
                     %{"method" => "notifications/roots/list_changed"}},
                    2_000
 
-    :ok = Client.set_roots(client, [FastestMCP.Root.new("file:///workspace-2")])
+    :ok = Client.set_roots!(client, [FastestMCP.Root.new("file:///workspace-2")])
 
     refute_receive {:fake_callback_server_post,
                     %{"method" => "notifications/roots/list_changed"}},
@@ -278,7 +278,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     wait_for_post("initialize")
@@ -298,7 +298,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
     assert_receive {:reused_id_sampling_started, callback_pid}, 2_000
 
     assert %{direction: :server_to_client, method: "sampling/createMessage"} =
-             :sys.get_state(client.pid).callback_requests["server-reused-id"]
+             :sys.get_state(client.pid).callbacks.callback_requests["server-reused-id"]
 
     FakeCallbackServer.push(state, %{
       "jsonrpc" => "2.0",
@@ -314,7 +314,8 @@ defmodule FastestMCP.ClientCallbackTaskTest do
                     }},
                    2_000
 
-    assert :sys.get_state(client.pid).callback_requests["server-reused-id"].pid == callback_pid
+    assert :sys.get_state(client.pid).callbacks.callback_requests["server-reused-id"].pid ==
+             callback_pid
 
     send(callback_pid, :release)
 
@@ -341,7 +342,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     wait_for_post("initialize")
@@ -393,13 +394,13 @@ defmodule FastestMCP.ClientCallbackTaskTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     wait_for_post("initialize")
 
     assert %FastestMCP.Client.Task{task_id: "http-progress-task"} =
-             Client.call_tool(client, "background", %{},
+             Client.call_tool_task!(client, "background", %{},
                task: true,
                progress_token: "http-retained-progress"
              )
@@ -424,7 +425,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
 
     error =
       assert_raise Error, fn ->
-        Client.request_async(client, "ping", %{
+        Client.request_async!(client, "ping", %{
           "_meta" => %{"progressToken" => "http-retained-progress"}
         })
       end
@@ -445,11 +446,11 @@ defmodule FastestMCP.ClientCallbackTaskTest do
                    2_000
 
     request =
-      Client.request_async(client, "ping", %{
+      Client.request_async!(client, "ping", %{
         "_meta" => %{"progressToken" => "http-retained-progress"}
       })
 
-    assert %{} = Client.await(request)
+    assert %{} = Client.await!(request)
   end
 
   test "form elicitation applies property defaults while preserving explicit values" do
@@ -465,7 +466,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     wait_for_post("initialize")
@@ -517,7 +518,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     assert_receive {:fake_callback_server_post,
@@ -575,7 +576,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
              })
 
     :ok =
-      Client.set_url_elicitation_handler(client, fn _request, _context ->
+      Client.set_url_elicitation_handler!(client, fn _request, _context ->
         {:accept, %{"must" => "not be returned"}}
       end)
 
@@ -618,7 +619,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     wait_for_post("initialize")
@@ -706,7 +707,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
     client = connect_client!(bandit, session_stream: true)
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     wait_for_post("initialize")
@@ -744,7 +745,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     wait_for_post("initialize")
@@ -787,7 +788,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     wait_for_post("initialize")
@@ -834,7 +835,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     wait_for_post("initialize")
@@ -929,7 +930,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     wait_for_post("initialize")
@@ -1004,7 +1005,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     wait_for_post("initialize")
@@ -1106,7 +1107,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     wait_for_post("initialize")
@@ -1178,7 +1179,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     wait_for_post("initialize")
@@ -1282,7 +1283,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     wait_for_post("initialize")
@@ -1353,7 +1354,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     wait_for_post("initialize")
@@ -1418,7 +1419,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     wait_for_post("initialize")

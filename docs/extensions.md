@@ -81,12 +81,58 @@ interceptor has the same two-arity contract as middleware and runs only for a
 modern `tools/call` request that advertises that extension. Because it is
 installed on the root server, it also wraps mounted tools.
 
-FastestMCP rejects duplicate extension identifiers, passive/active identifier
+FastestMCP rejects duplicate explicit extension identifiers, passive/active identifier
 collisions, duplicate method ownership, and attempts to shadow core, Tasks, or
-other built-in methods. Mounted child servers cannot own active extensions;
-configure them on the consuming root server so negotiation has one boundary.
+other built-in methods. Mounted extensions execute on the consuming root server
+so negotiation has one boundary.
 Apps and Tasks remain specialized implementations rather than generic active
 extensions.
+
+### Provider-bundled extensions
+
+A provider may implement `required_extensions/1`, returning `ServerExtension`
+declarations. Set `auto_register: true` on a declaration to opt into automatic
+registration by the consuming root. Without that opt-in, the root must explicitly
+provide the identifier through `active_extensions:` or `FastestMCP.add_extension/2`.
+Provider transforms preserve these requirements, and mounted servers contribute
+their active declarations and their providers' requirements recursively.
+
+For example, a mounted child can carry an extension with its definition:
+
+```elixir
+extension =
+  FastestMCP.ServerExtension.new("com.example/catalog",
+    auto_register: true,
+    methods: [
+      {"catalog/info", fn _params, _ctx -> %{"revision" => 1} end}
+    ]
+  )
+
+child = FastestMCP.server("catalog-child", active_extensions: [extension])
+
+root =
+  FastestMCP.server("catalog-root")
+  |> FastestMCP.mount(child, namespace: "catalog")
+
+{:ok, _pid} = FastestMCP.start_server(root)
+```
+
+The extension identifier and `catalog/info` method keep their names; the mount
+namespace changes component names, not extension method names. A client must
+advertise `"com.example/catalog"` in its `extensions:` map before calling the
+method. A custom provider returns the same declaration from
+`required_extensions/1` instead of attaching it to a child server.
+
+Requirements are resolved once before runtime startup. An explicit root declaration
+wins regardless of builder order. Identical bundles deduplicate; conflicting
+bundles fail startup unless the root explicitly resolves the identifier. The root
+retains normal method, schema, capability, and authentication checks.
+
+Each root owns one lifespan and interceptor per selected extension. Mounted
+handlers see the namespaces they require alongside their own lifespan state; unrelated
+parent lifespan data stays private. Reusing a definition in multiple roots creates
+independent runtime state. Startup failure cleans up earlier lifespans. Provider
+composition remains an immutable, pre-start operation.
 
 Clients advertise configured extension settings on every modern request. Use
 the low-level request API for an extension method whose result has no dedicated
@@ -98,7 +144,7 @@ client =
     extensions: %{"com.example/reports" => %{"revision" => 1}}
   )
 
-result = FastestMCP.Client.request(client, "reports/run", %{"name" => "daily"})
+result = FastestMCP.Client.request!(client, "reports/run", %{"name" => "daily"})
 ```
 
 Active extension notifications, subscription types, generic output schemas,

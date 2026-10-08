@@ -46,4 +46,9 @@ defmodule FastestMCP.BackgroundTask do
   def fetch(%__MODULE__{} = task) do
     FastestMCP.fetch_task(task)
   end
+
+  @doc "Waits for completion, raising on failure."
+  def await!(task, timeout \\ 5_000), do: FastestMCP.await_task!(task, timeout)
+  @doc "Fetches task state, raising on failure."
+  def fetch!(task), do: FastestMCP.fetch_task!(task)
 end

@@ -95,7 +95,7 @@ defmodule FastestMCP.ResourceSecurityTest do
 
     error =
       assert_raise Error, fn ->
-        FastestMCP.read_resource(server_name, "docs://value")
+        FastestMCP.read_resource!(server_name, "docs://value")
       end
 
     assert error.code == :not_found
@@ -120,7 +120,7 @@ defmodule FastestMCP.ResourceSecurityTest do
 
     error =
       assert_raise Error, fn ->
-        FastestMCP.read_resource(server_name, "files://../secret")
+        FastestMCP.read_resource!(server_name, "files://../secret")
       end
 
     assert error.code == :not_found
@@ -145,7 +145,7 @@ defmodule FastestMCP.ResourceSecurityTest do
 
     error =
       assert_raise Error, fn ->
-        FastestMCP.read_resource(server_name, "files://../secret")
+        FastestMCP.read_resource!(server_name, "files://../secret")
       end
 
     assert error.code == :not_found

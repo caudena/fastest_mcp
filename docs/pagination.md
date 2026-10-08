@@ -5,10 +5,10 @@ default return shape.
 
 By default:
 
-- `FastestMCP.list_tools/2` returns a plain list
-- `FastestMCP.list_resources/2` returns a plain list
-- `FastestMCP.list_resource_templates/2` returns a plain list
-- `FastestMCP.list_prompts/2` returns a plain list
+- `FastestMCP.list_tools!/2` returns a plain list
+- `FastestMCP.list_resources!/2` returns a plain list
+- `FastestMCP.list_resource_templates!/2` returns a plain list
+- `FastestMCP.list_prompts!/2` returns a plain list
 
 When you opt into pagination with `page_size:`, the return value becomes a page
 map with `:items` and `:next_cursor`.
@@ -25,18 +25,18 @@ site to unwrap a paging object when it is not needed.
 ```elixir
 server_name = "pagination"
 
-FastestMCP.list_tools(server_name)
+FastestMCP.list_tools!(server_name)
 #=> [%Tool{}, %Tool{}, ...]
 
 %{items: tools, next_cursor: cursor} =
-  FastestMCP.list_tools(server_name, page_size: 20)
+  FastestMCP.list_tools!(server_name, page_size: 20)
 ```
 
 Fetch the next page by reusing the returned cursor:
 
 ```elixir
 %{items: next_page, next_cursor: next_cursor} =
-  FastestMCP.list_tools(server_name, page_size: 20, cursor: cursor)
+  FastestMCP.list_tools!(server_name, page_size: 20, cursor: cursor)
 ```
 
 The cursor is opaque. Treat it as a token to pass back to the runtime, not as a
@@ -88,10 +88,10 @@ server =
 {:ok, _pid} = FastestMCP.start_server(server)
 
 %{items: tools_page_1, next_cursor: cursor} =
-  FastestMCP.list_tools("pagination", page_size: 2)
+  FastestMCP.list_tools!("pagination", page_size: 2)
 
 %{items: tools_page_2, next_cursor: nil} =
-  FastestMCP.list_tools("pagination", page_size: 3, cursor: cursor)
+  FastestMCP.list_tools!("pagination", page_size: 3, cursor: cursor)
 ```
 
 ## Invalid Input

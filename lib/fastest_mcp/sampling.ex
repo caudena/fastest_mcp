@@ -99,7 +99,7 @@ defmodule FastestMCP.Sampling do
   def prepare_tools(server_name, opts)
       when (is_binary(server_name) or is_atom(server_name)) and is_list(opts) do
     server_name
-    |> FastestMCP.list_tools(opts)
+    |> FastestMCP.list_tools!(opts)
     |> prepare_tools(Keyword.put(opts, :server_name, server_name))
   end
 

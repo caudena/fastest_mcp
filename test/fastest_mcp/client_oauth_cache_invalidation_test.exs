@@ -161,25 +161,32 @@ defmodule FastestMCP.ClientOAuthCacheInvalidationTest do
         ]
       )
 
-    on_exit(fn -> if Client.connected?(client), do: Client.disconnect(client) end)
+    on_exit(fn -> if Client.connected?(client), do: Client.disconnect!(client) end)
 
     client_state = :sys.get_state(client.pid)
     assert {:ok, "Bearer token-one"} = OAuth.authorize(client_state.oauth.pid, resource)
     wait_for_auth_generation(client, 1)
 
-    assert %{"tool" => "first_tool"} = Client.call_tool(client, "first_tool", %{})
-    assert %{"credential" => "token-one"} = Client.read_resource(client, "memory://auth")
-    assert %{"credential" => "token-one"} = Client.read_resource(client, "memory://auth")
+    assert %{structured_content: %{"tool" => "first_tool"}} =
+             Client.call_tool!(client, "first_tool", %{})
+
+    assert %{"credential" => "token-one"} = Client.read_resource!(client, "memory://auth")
+    assert %{"credential" => "token-one"} = Client.read_resource!(client, "memory://auth")
 
     assert Agent.get(state, & &1.tool_lists) == 1
     assert Agent.get(state, & &1.resource_reads) == 1
 
     Process.sleep(1_100)
-    assert %{"tool" => "first_tool"} = Client.call_tool(client, "first_tool", %{})
+
+    assert %{structured_content: %{"tool" => "first_tool"}} =
+             Client.call_tool!(client, "first_tool", %{})
+
     wait_for_auth_generation(client, 2)
 
-    assert %{"tool" => "second_tool"} = Client.call_tool(client, "second_tool", %{})
-    assert %{"credential" => "token-two"} = Client.read_resource(client, "memory://auth")
+    assert %{structured_content: %{"tool" => "second_tool"}} =
+             Client.call_tool!(client, "second_tool", %{})
+
+    assert %{"credential" => "token-two"} = Client.read_resource!(client, "memory://auth")
 
     snapshot = Agent.get(state, & &1)
     assert snapshot.token_requests == 2
@@ -194,7 +201,7 @@ defmodule FastestMCP.ClientOAuthCacheInvalidationTest do
     do: flunk("OAuth credential change was not applied to the client")
 
   defp wait_for_auth_generation(client, expected, attempts) do
-    if :sys.get_state(client.pid).auth_generation >= expected do
+    if :sys.get_state(client.pid).lifecycle.auth_generation >= expected do
       :ok
     else
       Process.sleep(10)

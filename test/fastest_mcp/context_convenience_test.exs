@@ -42,7 +42,7 @@ defmodule FastestMCP.ContextConvenienceTest do
              request_path: "/mcp",
              request_meta: %{"custom" => "value", "method" => "POST"}
            } =
-             FastestMCP.call_tool(server_name, "nested", %{},
+             FastestMCP.call_tool!(server_name, "nested", %{},
                session_id: "ctx-session",
                request_metadata: %{
                  method: "POST",
@@ -137,7 +137,7 @@ defmodule FastestMCP.ContextConvenienceTest do
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
     assert is_map(
-             FastestMCP.initialize(
+             FastestMCP.initialize!(
                server_name,
                %{"clientInfo" => %{"name" => "docs-client", "version" => "1.0.0"}},
                session_id: "ctx-client-info-session"
@@ -148,7 +148,7 @@ defmodule FastestMCP.ContextConvenienceTest do
              client_id: "docs-client",
              client_info: %{"name" => "docs-client", "version" => "1.0.0"}
            } =
-             FastestMCP.call_tool(server_name, "whoami", %{},
+             FastestMCP.call_tool!(server_name, "whoami", %{},
                session_id: "ctx-client-info-session"
              )
   end

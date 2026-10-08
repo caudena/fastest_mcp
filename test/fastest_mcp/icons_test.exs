@@ -34,11 +34,11 @@ defmodule FastestMCP.IconsTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    [tool] = FastestMCP.list_tools(server_name)
-    [resource] = FastestMCP.list_resources(server_name)
-    [template] = FastestMCP.list_resource_templates(server_name)
-    [prompt] = FastestMCP.list_prompts(server_name)
-    initialize = FastestMCP.initialize(server_name)
+    [tool] = FastestMCP.list_tools!(server_name)
+    [resource] = FastestMCP.list_resources!(server_name)
+    [template] = FastestMCP.list_resource_templates!(server_name)
+    [prompt] = FastestMCP.list_prompts!(server_name)
+    initialize = FastestMCP.initialize!(server_name)
 
     assert tool.icons == Enum.map(icons, &Map.new/1)
     assert resource.icons == Enum.map(icons, &Map.new/1)

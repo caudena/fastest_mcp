@@ -24,20 +24,20 @@ defmodule FastestMCP.DocsExamplesTest do
   test "onboarding guide examples work in process" do
     assert {:ok, _pid} = start_supervised(OnboardingServer)
 
-    assert 42 == FastestMCP.call_tool(OnboardingServer, "sum", %{"a" => 20, "b" => 22})
+    assert 42 == FastestMCP.call_tool!(OnboardingServer, "sum", %{"a" => 20, "b" => 22})
 
     assert %{visits: 1, server: server_name} =
-             FastestMCP.call_tool(OnboardingServer, "visit", %{}, session_id: "docs-session")
+             FastestMCP.call_tool!(OnboardingServer, "visit", %{}, session_id: "docs-session")
 
     assert server_name == to_string(OnboardingServer)
 
     assert %{visits: 2} =
-             FastestMCP.call_tool(OnboardingServer, "visit", %{}, session_id: "docs-session")
+             FastestMCP.call_tool!(OnboardingServer, "visit", %{}, session_id: "docs-session")
 
     assert %{name: "fastest_mcp", version: "0.1.0"} ==
-             FastestMCP.read_resource(OnboardingServer, "config://release")
+             FastestMCP.read_resource!(OnboardingServer, "config://release")
 
-    rendered = FastestMCP.render_prompt(OnboardingServer, "welcome", %{"name" => "Nate"})
+    rendered = FastestMCP.render_prompt!(OnboardingServer, "welcome", %{"name" => "Nate"})
 
     prompt_text =
       DocsFixture.nested_fetch(rendered, [:messages, 0, :content, :text]) ||
@@ -57,20 +57,20 @@ defmodule FastestMCP.DocsExamplesTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     assert ["sum", "visit"] ==
              client
-             |> Client.list_tools()
+             |> Client.list_tools!()
              |> Map.fetch!(:items)
              |> Enum.map(& &1["name"])
              |> Enum.sort()
 
-    assert %{items: [%{"name" => "welcome"}], next_cursor: nil} = Client.list_prompts(client)
+    assert %{items: [%{"name" => "welcome"}], next_cursor: nil} = Client.list_prompts!(client)
 
-    assert %{"resultType" => "complete", "structuredContent" => 42} =
-             Client.call_tool(client, "sum", %{"a" => 20, "b" => 22})
+    assert %{raw: %{"resultType" => "complete", "structuredContent" => 42}} =
+             Client.call_tool!(client, "sum", %{"a" => 20, "b" => 22})
   end
 
   test "sampling, interaction, and background task examples work against the docs fixture" do
@@ -95,31 +95,33 @@ defmodule FastestMCP.DocsExamplesTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     assert %{
-             "resultType" => "complete",
-             "structuredContent" => %{"text" => "short summary"}
-           } = Client.call_tool(client, "summarize", %{})
+             raw: %{
+               "resultType" => "complete",
+               "structuredContent" => %{"text" => "short summary"}
+             }
+           } = Client.call_tool!(client, "summarize", %{})
 
     assert_receive {:sampling_handler_called, _messages, %{"maxTokens" => 64}}, 1_000
 
-    approval = FastestMCP.call_tool(InteractiveServer, "approve_release", %{}, task: true)
+    approval = FastestMCP.call_tool!(InteractiveServer, "approve_release", %{}, task: true)
     :ok = DocsFixture.wait_for_input_required(InteractiveServer, approval.task_id)
 
     _ =
-      FastestMCP.send_task_input(
+      FastestMCP.send_task_input!(
         InteractiveServer,
         approval.task_id,
         :accept,
         %{"confirmed" => true}
       )
 
-    assert %{approved: true} = FastestMCP.await_task(approval, 1_000)
+    assert %{approved: true} = FastestMCP.await_task!(approval, 1_000)
 
-    slow = FastestMCP.call_tool(InteractiveServer, "slow", %{}, task: true)
-    assert :done == FastestMCP.await_task(slow, 1_000)
+    slow = FastestMCP.call_tool!(InteractiveServer, "slow", %{}, task: true)
+    assert :done == FastestMCP.await_task!(slow, 1_000)
   end
 
   test "auth and component manager guide examples work" do
@@ -134,13 +136,13 @@ defmodule FastestMCP.DocsExamplesTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
-    whoami = Client.call_tool(client, "whoami", %{})
+    whoami = Client.call_tool!(client, "whoami", %{})
 
     assert "local-client" ==
-             DocsFixture.nested_fetch(whoami, [:structuredContent, :principal, :sub])
+             DocsFixture.nested_fetch(whoami.structured_content, [:principal, :sub])
 
     server_name =
       "docs-component-manager-" <> Integer.to_string(System.unique_integer([:positive]))
@@ -157,21 +159,21 @@ defmodule FastestMCP.DocsExamplesTest do
 
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    manager = FastestMCP.component_manager(server_name)
+    manager = FastestMCP.component_manager!(server_name)
 
-    refute Enum.any?(FastestMCP.list_tools(server_name), &(&1.name == "beta.echo"))
+    refute Enum.any?(FastestMCP.list_tools!(server_name), &(&1.name == "beta.echo"))
 
     error =
       assert_raise Error, fn ->
-        FastestMCP.call_tool(server_name, "beta.echo", %{"value" => "blocked"})
+        FastestMCP.call_tool!(server_name, "beta.echo", %{"value" => "blocked"})
       end
 
     assert error.code == :disabled
 
-    :ok = FastestMCP.enable_components(server_name, names: ["beta.echo"], components: [:tool])
+    :ok = FastestMCP.enable_components!(server_name, names: ["beta.echo"], components: [:tool])
 
     assert %{value: "live"} ==
-             FastestMCP.call_tool(server_name, "beta.echo", %{"value" => "live"})
+             FastestMCP.call_tool!(server_name, "beta.echo", %{"value" => "live"})
 
     assert {:ok, _tool} =
              ComponentManager.add_tool(
@@ -180,13 +182,14 @@ defmodule FastestMCP.DocsExamplesTest do
                fn %{"value" => value}, _ctx -> %{value: value} end
              )
 
-    assert %{value: "hi"} == FastestMCP.call_tool(server_name, "dynamic.echo", %{"value" => "hi"})
+    assert %{value: "hi"} ==
+             FastestMCP.call_tool!(server_name, "dynamic.echo", %{"value" => "hi"})
 
     assert {:ok, [_]} = ComponentManager.disable_tool(manager, "dynamic.echo")
 
     error =
       assert_raise Error, fn ->
-        FastestMCP.call_tool(server_name, "dynamic.echo", %{"value" => "blocked"})
+        FastestMCP.call_tool!(server_name, "dynamic.echo", %{"value" => "blocked"})
       end
 
     assert error.code == :disabled
@@ -208,7 +211,7 @@ defmodule FastestMCP.DocsExamplesTest do
     on_exit(fn -> FastestMCP.stop_server(parent_name) end)
 
     assert %{"message" => "hi"} ==
-             FastestMCP.call_tool(parent_name, "child_echo", %{"message" => "hi"})
+             FastestMCP.call_tool!(parent_name, "child_echo", %{"message" => "hi"})
   end
 
   test "tools guide examples work in process and over transport" do
@@ -302,12 +305,12 @@ defmodule FastestMCP.DocsExamplesTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
       if Process.alive?(bandit), do: Supervisor.stop(bandit)
       FastestMCP.stop_server(server_name)
     end)
 
-    assert 42 == FastestMCP.call_tool(server_name, "calculate_sum", %{"a" => 20, "b" => 22})
+    assert 42 == FastestMCP.call_tool!(server_name, "calculate_sum", %{"a" => 20, "b" => 22})
 
     assert %{
              "query" => "coffee",
@@ -315,7 +318,7 @@ defmodule FastestMCP.DocsExamplesTest do
              "sort_by" => "relevance",
              "category" => nil
            } =
-             FastestMCP.call_tool(server_name, "search_products", %{
+             FastestMCP.call_tool!(server_name, "search_products", %{
                "query" => "coffee",
                "max_results" => 5,
                "sort_by" => "relevance",
@@ -323,25 +326,27 @@ defmodule FastestMCP.DocsExamplesTest do
              })
 
     assert %{"value" => 7, "session_id" => "docs-session"} ==
-             FastestMCP.call_tool(server_name, "whoami", %{"value" => 7},
+             FastestMCP.call_tool!(server_name, "whoami", %{"value" => 7},
                session_id: "docs-session"
              )
 
-    shipped_tool = Enum.find(FastestMCP.list_tools(server_name), &(&1.name == "ship_order"))
+    shipped_tool = Enum.find(FastestMCP.list_tools!(server_name), &(&1.name == "ship_order"))
     assert shipped_tool.input_schema["$defs"]["address"]["type"] == "object"
     assert shipped_tool.input_schema["properties"]["shipping"]["$ref"] == "#/$defs/address"
 
     assert %{
-             "resultType" => "complete",
-             "structuredContent" => %{"values" => ["alpha", "beta"]}
-           } = Client.call_tool(client, "list_values", %{})
+             raw: %{
+               "resultType" => "complete",
+               "structuredContent" => %{"values" => ["alpha", "beta"]}
+             }
+           } = Client.call_tool!(client, "list_values", %{})
 
-    :ok = FastestMCP.disable_components(server_name, tags: ["private"], components: [:tool])
+    :ok = FastestMCP.disable_components!(server_name, tags: ["private"], components: [:tool])
 
-    refute Enum.any?(FastestMCP.list_tools(server_name), &(&1.name == "private_tool"))
+    refute Enum.any?(FastestMCP.list_tools!(server_name), &(&1.name == "private_tool"))
 
     assert_raise Error, ~r/boom/, fn ->
-      FastestMCP.call_tool(server_name, "explode", %{})
+      FastestMCP.call_tool!(server_name, "explode", %{})
     end
   end
 
@@ -384,29 +389,29 @@ defmodule FastestMCP.DocsExamplesTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
       if Process.alive?(bandit), do: Supervisor.stop(bandit)
       FastestMCP.stop_server(server_name)
     end)
 
     assert %{name: "fastest_mcp", version: "0.1.0"} ==
-             FastestMCP.read_resource(server_name, "config://release")
+             FastestMCP.read_resource!(server_name, "config://release")
 
     assert %{id: "42", format: "json"} ==
-             FastestMCP.read_resource(server_name, "users://42?format=json")
+             FastestMCP.read_resource!(server_name, "users://42?format=json")
 
     assert %{
              contents: [
                %{content: "ready", mime_type: "text/plain", meta: %{slot: "summary"}}
              ],
              meta: %{source: "docs"}
-           } = FastestMCP.read_resource(server_name, "reports://daily")
+           } = FastestMCP.read_resource!(server_name, "reports://daily")
 
     assert %{
              path: "/docs/resources",
              client_info: %{"name" => "docs-client", "version" => "1.0.0"}
            } =
-             FastestMCP.read_resource(server_name, "request://snapshot",
+             FastestMCP.read_resource!(server_name, "request://snapshot",
                session_id: "docs-resources-session",
                request_metadata: %{
                  path: "/docs/resources",
@@ -414,12 +419,12 @@ defmodule FastestMCP.DocsExamplesTest do
                }
              )
 
-    assert %{items: resources, next_cursor: nil} = Client.list_resources(client)
+    assert %{items: resources, next_cursor: nil} = Client.list_resources!(client)
     assert Enum.any?(resources, &(&1["uri"] == "config://release"))
     assert Enum.any?(resources, &(&1["uri"] == "reports://daily"))
 
     assert %{items: [%{"uriTemplate" => "users://{id}{?format}"}], next_cursor: nil} =
-             Client.list_resource_templates(client)
+             Client.list_resource_templates!(client)
 
     assert %{
              "resultType" => "complete",
@@ -430,7 +435,7 @@ defmodule FastestMCP.DocsExamplesTest do
                  "text" => encoded_release
                }
              ]
-           } = Client.read_resource(client, "config://release")
+           } = Client.read_resource!(client, "config://release")
 
     assert %{"name" => "fastest_mcp", "version" => "0.1.0"} = JSON.decode!(encoded_release)
   end
@@ -504,11 +509,11 @@ defmodule FastestMCP.DocsExamplesTest do
         fn %{"path" => path}, _context -> %{"path" => path} end
       )
       |> FastestMCP.add_prompt("docs_prompt", fn _arguments, _context ->
-        %{
+        FastestMCP.Prompts.Result.from(%{
           messages: [
             %{role: "user", content: %{type: "text", text: "docs example"}}
           ]
-        }
+        })
       end)
       |> FastestMCP.add_provider(ApplicationSessions.new())
 
@@ -528,52 +533,55 @@ defmodule FastestMCP.DocsExamplesTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
       if Process.alive?(bandit), do: Supervisor.stop(bandit)
       FastestMCP.stop_server(server_name)
     end)
 
     assert %{"path" => "folder/file.txt"} =
-             FastestMCP.read_resource(server_name, "safe://folder/file.txt")
+             FastestMCP.read_resource!(server_name, "safe://folder/file.txt")
 
     error =
       assert_raise Error, fn ->
-        FastestMCP.read_resource(server_name, "safe://../secret")
+        FastestMCP.read_resource!(server_name, "safe://../secret")
       end
 
     assert error.code == :not_found
 
-    assert Enum.any?(Client.list_all_tools(client), &(&1["name"] == "task_echo"))
-    assert [%{"name" => "docs_prompt"}] = Client.list_all_prompts(client)
-    assert [%{"uri" => "docs://status"}] = Client.list_all_resources(client)
-    assert [%{"uriTemplate" => "safe://{+path}"}] = Client.list_all_resource_templates(client)
-    assert %{items: _tools} = Client.list_tools(client, cache: :bypass)
+    assert Enum.any?(Client.list_all_tools!(client), &(&1["name"] == "task_echo"))
+    assert [%{"name" => "docs_prompt"}] = Client.list_all_prompts!(client)
+    assert [%{"uri" => "docs://status"}] = Client.list_all_resources!(client)
+    assert [%{"uriTemplate" => "safe://{+path}"}] = Client.list_all_resource_templates!(client)
+    assert %{items: _tools} = Client.list_tools!(client, cache: :bypass)
 
     assert %{"echo" => "active", "resultType" => "complete"} =
-             Client.request(client, "docs/echo", %{"value" => "active"})
+             Client.request!(client, "docs/echo", %{"value" => "active"})
 
     assert %{
-             "structuredContent" => %{"stored" => "stored", "missing" => "missing"}
-           } = Client.call_tool(client, "application_session_round_trip", %{})
+             raw: %{
+               "structuredContent" => %{"stored" => "stored", "missing" => "missing"}
+             }
+           } = Client.call_tool!(client, "application_session_round_trip", %{})
 
-    assert %{"structuredContent" => %{"ok" => true}} =
-             Client.call_tool(client, "report_progress", %{},
+    assert %{raw: %{"structuredContent" => %{"ok" => true}}} =
+             Client.call_tool!(client, "report_progress", %{},
                progress_handler: fn params -> send(test_pid, {:docs_progress, params}) end
              )
 
     assert_receive {:docs_progress, %{"progress" => 1, "total" => 1, "message" => "done"}},
                    1_000
 
-    task = Client.call_tool_task(client, "task_echo", %{"value" => "task"})
+    task = Client.call_tool_task!(client, "task_echo", %{"value" => "task"})
     assert %RemoteTask{} = task
 
-    assert %{"value" => "task"} = RemoteTask.result(task, timeout_ms: 2_000)
+    assert %{structured_content: %{"value" => "task"}} =
+             RemoteTask.result!(task, timeout_ms: 2_000)
 
     assert %ToolResult{
              structured_content: %{"value" => "stable"},
              structured_content_present?: true
            } =
-             Client.call_tool_result(client, "task_echo", %{"value" => "stable"},
+             Client.call_tool!(client, "task_echo", %{"value" => "stable"},
                task_timeout_ms: 2_000
              )
 
@@ -625,27 +633,28 @@ defmodule FastestMCP.DocsExamplesTest do
 
     on_exit(fn -> FastestMCP.stop_server(search_server_name) end)
 
-    assert :ok = Client.await_ready(client_name, 1_000)
+    assert :ok = Client.await_ready!(client_name, 1_000)
 
     assert %{
-             "structuredContent" => %{
-               "tools" => [
-                 %{"name" => "deploy_status"},
-                 %{"name" => "release_report"}
-               ],
-               "truncated" => false
+             raw: %{
+               "structuredContent" => %{
+                 "tools" => [%{"name" => "deploy_status"}, %{"name" => "release_report"}],
+                 "truncated" => false
+               }
              }
-           } = Client.call_tool(client_name, "search_tools", %{"query" => "deploy"})
+           } = Client.call_tool!(client_name, "search_tools", %{"query" => "deploy"})
 
     assert %{
-             "structuredContent" => %{
-               "tools" => [%{"name" => "deploy_status"}],
-               "truncated" => false
+             raw: %{
+               "structuredContent" => %{
+                 "tools" => [%{"name" => "deploy_status"}],
+                 "truncated" => false
+               }
              }
-           } = Client.call_tool(client_name, "search_tools", %{"query" => "region"})
+           } = Client.call_tool!(client_name, "search_tools", %{"query" => "region"})
 
-    assert %{"structuredContent" => %{"target" => "production"}} =
-             Client.call_tool(client_name, "call_tool", %{
+    assert %{raw: %{"structuredContent" => %{"target" => "production"}}} =
+             Client.call_tool!(client_name, "call_tool", %{
                "name" => "deploy_status",
                "arguments" => %{"target" => "production"}
              })

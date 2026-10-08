@@ -27,15 +27,15 @@ defmodule FastestMCP.Runtime.ContextLifetimesTest do
     session_b = [session_id: "session-b"]
 
     assert %{count: 1, trace: "one"} ==
-             FastestMCP.call_tool(server_name, "remember", %{"trace" => "one"}, session_a)
+             FastestMCP.call_tool!(server_name, "remember", %{"trace" => "one"}, session_a)
 
     assert %{count: 2, trace: "two"} ==
-             FastestMCP.call_tool(server_name, "remember", %{"trace" => "two"}, session_a)
+             FastestMCP.call_tool!(server_name, "remember", %{"trace" => "two"}, session_a)
 
     assert %{count: 2, trace: :missing} ==
-             FastestMCP.call_tool(server_name, "peek", %{}, session_a)
+             FastestMCP.call_tool!(server_name, "peek", %{}, session_a)
 
     assert %{count: 0, trace: :missing} ==
-             FastestMCP.call_tool(server_name, "peek", %{}, session_b)
+             FastestMCP.call_tool!(server_name, "peek", %{}, session_b)
   end
 end

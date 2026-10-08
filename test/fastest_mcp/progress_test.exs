@@ -39,7 +39,7 @@ defmodule FastestMCP.ProgressTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
 
     assert %{current: 3, total: 10, message: "Testing"} ==
-             FastestMCP.call_tool(server_name, "track", %{})
+             FastestMCP.call_tool!(server_name, "track", %{})
   end
 
   test "background progress helper updates task state and only emits task-status notifications once a message exists" do
@@ -83,7 +83,7 @@ defmodule FastestMCP.ProgressTest do
     assert {:ok, runtime} = ServerRuntime.fetch(server_name)
     :ok = FastestMCP.EventBus.subscribe(runtime.event_bus, server_name)
 
-    handle = FastestMCP.call_tool(server_name, "track", %{}, task: true)
+    handle = FastestMCP.call_tool!(server_name, "track", %{}, task: true)
     assert %BackgroundTask{} = handle
 
     assert_receive {:fastest_mcp_event, ^server_name, [:notifications, :tasks, :status], _,
@@ -96,7 +96,7 @@ defmodule FastestMCP.ProgressTest do
 
     assert_receive {:progress_phase, :incremented, worker_pid}, 1_000
 
-    task = FastestMCP.fetch_task(handle)
+    task = FastestMCP.fetch_task!(handle)
     assert task.progress.current == 1
     assert task.progress.total == 3
     refute Map.has_key?(task.progress, :message)
@@ -119,7 +119,7 @@ defmodule FastestMCP.ProgressTest do
 
     send(worker_pid, :release)
 
-    assert FastestMCP.await_task(handle, 1_000) == %{
+    assert FastestMCP.await_task!(handle, 1_000) == %{
              current: 1,
              total: 3,
              message: "Step 1"

@@ -77,7 +77,7 @@ defmodule FastestMCP.DuplicatePolicyTest do
     assert {:ok, _pid} = FastestMCP.start_server(FastestMCP.server(server_name))
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    manager = FastestMCP.component_manager(server_name)
+    manager = FastestMCP.component_manager!(server_name)
 
     assert {:ok, _tool} =
              ComponentManager.add_tool(
@@ -96,7 +96,7 @@ defmodule FastestMCP.DuplicatePolicyTest do
                on_duplicate: :replace
              )
 
-    assert %{source: :second} == FastestMCP.call_tool(server_name, "echo", %{}, version: "1.0.0")
+    assert %{source: :second} == FastestMCP.call_tool!(server_name, "echo", %{}, version: "1.0.0")
 
     assert {:ok, _tool} =
              ComponentManager.add_tool(
@@ -107,6 +107,6 @@ defmodule FastestMCP.DuplicatePolicyTest do
                on_duplicate: :ignore
              )
 
-    assert %{source: :second} == FastestMCP.call_tool(server_name, "echo", %{}, version: "1.0.0")
+    assert %{source: :second} == FastestMCP.call_tool!(server_name, "echo", %{}, version: "1.0.0")
   end
 end

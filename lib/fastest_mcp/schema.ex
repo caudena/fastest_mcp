@@ -12,15 +12,16 @@ defmodule FastestMCP.Schema do
   alias FastestMCP.Schema.Compiled
   alias FastestMCP.Schema.Error
   alias FastestMCP.Schema.HTTPResolver
+  alias FastestMCP.Schema.Policy
   alias FastestMCP.Schema.Resolver
 
   @draft_2020_12 "https://json-schema.org/draft/2020-12/schema"
   @draft_7 "http://json-schema.org/draft-07/schema"
-  @supported_dialects [@draft_2020_12, @draft_7]
-  @default_max_schema_bytes 1_048_576
-  @default_max_depth 128
-  @default_max_refs 256
-  @default_max_resolved_resources 256
+  @supported_dialects Policy.dialects()
+  @default_max_schema_bytes Policy.default(:max_schema_bytes)
+  @default_max_depth Policy.default(:max_depth)
+  @default_max_refs Policy.default(:max_refs)
+  @default_max_resolved_resources Policy.default(:max_resolved_resources)
   @default_max_violations 20
   @default_compile_timeout_ms 5_000
   @default_validation_timeout_ms 1_000
@@ -1242,91 +1243,25 @@ defmodule FastestMCP.Schema do
   end
 
   defp normalize_dialect(value) do
-    dialect = String.trim_trailing(value, "#")
+    case Policy.normalize_dialect(value) do
+      {:ok, dialect} ->
+        {:ok, dialect}
 
-    if dialect in @supported_dialects do
-      {:ok, dialect}
-    else
-      {:error,
-       compile_error(
-         "unsupported JSON Schema dialect; supported dialects are Draft 2020-12 and Draft 7"
-       )}
+      {:error, _} ->
+        {:error,
+         compile_error(
+           "unsupported JSON Schema dialect; supported dialects are Draft 2020-12 and Draft 7"
+         )}
     end
   end
 
-  defp preflight(schema, opts) do
-    max_schema_bytes = Keyword.get(opts, :max_schema_bytes, @default_max_schema_bytes)
-    max_depth = Keyword.get(opts, :max_depth, @default_max_depth)
-    max_refs = Keyword.get(opts, :max_refs, @default_max_refs)
-
-    max_resolved_resources =
-      Keyword.get(opts, :max_resolved_resources, @default_max_resolved_resources)
-
-    with {:ok, encoded} <- encode_schema(schema),
-         :ok <- within_limit(byte_size(encoded), max_schema_bytes, "encoded bytes"),
-         {:ok, stats} <- schema_stats(schema, max_depth),
-         :ok <- within_limit(stats.refs, max_refs, "references"),
-         :ok <- positive_limit(max_resolved_resources, "resolved resources") do
-      :ok
+  @doc false
+  def preflight(schema, opts) do
+    case Policy.check(schema, opts) do
+      {:ok, _stats} -> :ok
+      {:error, reason} -> {:error, compile_error(Policy.message(reason))}
     end
   end
-
-  defp positive_limit(value, _label) when is_integer(value) and value > 0, do: :ok
-
-  defp positive_limit(value, label) do
-    {:error,
-     compile_error("JSON Schema #{label} limit must be a positive integer, got #{inspect(value)}")}
-  end
-
-  defp encode_schema(schema) do
-    {:ok, JSON.encode!(schema)}
-  rescue
-    _error ->
-      {:error, compile_error("JSON Schema is not JSON-compatible")}
-  end
-
-  defp within_limit(actual, maximum, _label)
-       when is_integer(maximum) and maximum > 0 and actual <= maximum,
-       do: :ok
-
-  defp within_limit(actual, maximum, label) when is_integer(maximum) and maximum > 0 do
-    {:error, compile_error("JSON Schema exceeds the #{maximum} #{label} limit (got #{actual})")}
-  end
-
-  defp within_limit(_actual, maximum, label) do
-    {:error,
-     compile_error(
-       "JSON Schema #{label} limit must be a positive integer, got #{inspect(maximum)}"
-     )}
-  end
-
-  defp schema_stats(schema, max_depth), do: schema_stats(schema, 0, max_depth, 0)
-
-  defp schema_stats(_value, depth, max_depth, _refs) when depth > max_depth do
-    {:error, compile_error("JSON Schema exceeds the maximum nesting depth of #{max_depth}")}
-  end
-
-  defp schema_stats(value, depth, max_depth, refs) when is_map(value) do
-    Enum.reduce_while(value, {:ok, %{refs: refs}}, fn {key, child}, {:ok, stats} ->
-      refs = stats.refs + if(key in ["$ref", "$dynamicRef", "$recursiveRef"], do: 1, else: 0)
-
-      case schema_stats(child, depth + 1, max_depth, refs) do
-        {:ok, child_stats} -> {:cont, {:ok, child_stats}}
-        {:error, %Error{} = error} -> {:halt, {:error, error}}
-      end
-    end)
-  end
-
-  defp schema_stats(value, depth, max_depth, refs) when is_list(value) do
-    Enum.reduce_while(value, {:ok, %{refs: refs}}, fn child, {:ok, stats} ->
-      case schema_stats(child, depth + 1, max_depth, stats.refs) do
-        {:ok, child_stats} -> {:cont, {:ok, child_stats}}
-        {:error, %Error{} = error} -> {:halt, {:error, error}}
-      end
-    end)
-  end
-
-  defp schema_stats(_value, _depth, _max_depth, refs), do: {:ok, %{refs: refs}}
 
   defp build(schema, dialect, opts, digest) do
     remote_limits = [

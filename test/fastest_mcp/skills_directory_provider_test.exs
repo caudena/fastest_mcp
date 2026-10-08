@@ -47,8 +47,8 @@ defmodule FastestMCP.SkillsDirectoryProviderTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    resources = FastestMCP.list_resources(server_name)
-    templates = FastestMCP.list_resource_templates(server_name)
+    resources = FastestMCP.list_resources!(server_name)
+    templates = FastestMCP.list_resource_templates!(server_name)
 
     assert length(resources) == 4
     assert length(templates) == 2
@@ -60,12 +60,12 @@ defmodule FastestMCP.SkillsDirectoryProviderTest do
     assert complex_main.description == "Complex Skill"
 
     assert String.contains?(
-             FastestMCP.read_resource(server_name, "skill://complex-skill/scripts/helper.py"),
+             FastestMCP.read_resource!(server_name, "skill://complex-skill/scripts/helper.py"),
              "Hello from helper"
            )
 
     assert String.contains?(
-             FastestMCP.read_resource(server_name, "skill://complex-skill/reference.md"),
+             FastestMCP.read_resource!(server_name, "skill://complex-skill/reference.md"),
              "# Reference"
            )
   end
@@ -100,7 +100,7 @@ defmodule FastestMCP.SkillsDirectoryProviderTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    initial_resources = FastestMCP.list_resources(server_name)
+    initial_resources = FastestMCP.list_resources!(server_name)
     main = Enum.find(initial_resources, &(&1.uri == "skill://duplicate-skill/SKILL.md"))
     assert main.description == "First occurrence"
 
@@ -108,7 +108,7 @@ defmodule FastestMCP.SkillsDirectoryProviderTest do
     File.mkdir_p!(new_skill)
     File.write!(Path.join(new_skill, "SKILL.md"), "---\ndescription: New skill\n---\n# New")
 
-    reloaded_resources = FastestMCP.list_resources(server_name)
+    reloaded_resources = FastestMCP.list_resources!(server_name)
     assert Enum.any?(reloaded_resources, &(&1.uri == "skill://new-skill/SKILL.md"))
   end
 
@@ -220,12 +220,12 @@ defmodule FastestMCP.SkillsDirectoryProviderTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    resources = FastestMCP.list_resources(server_name)
+    resources = FastestMCP.list_resources!(server_name)
 
     assert length(resources) == 4
     assert Enum.any?(resources, &(&1.uri == "skill://complex-skill/reference.md"))
     assert Enum.any?(resources, &(&1.uri == "skill://complex-skill/scripts/helper.py"))
-    assert [] == FastestMCP.list_resource_templates(server_name)
+    assert [] == FastestMCP.list_resource_templates!(server_name)
   end
 
   defp create_skills_root(name) do

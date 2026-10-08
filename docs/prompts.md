@@ -26,7 +26,7 @@ server =
 Render it in process:
 
 ```elixir
-FastestMCP.render_prompt("prompts", "ask_about_topic", %{"topic" => "OTP supervision"})
+FastestMCP.render_prompt!("prompts", "ask_about_topic", %{"topic" => "OTP supervision"})
 ```
 
 Handlers can have arity 0, 1, or 2, following the same explicit contract as
@@ -107,7 +107,7 @@ server =
 ```
 
 ```elixir
-FastestMCP.complete(
+FastestMCP.complete!(
   "prompt-completion",
   %{"type" => "ref/prompt", "name" => "generate_code_request"},
   %{"name" => "language", "value" => "py"}
@@ -119,11 +119,12 @@ FastestMCP.complete(
 
 Prompts can return:
 
-1. a string
-2. a list of messages
-3. a prompt result map with `messages`, optional `description`, and optional
-   `meta`
-4. `FastestMCP.Prompts.Message` and `FastestMCP.Prompts.Result` helper types
+1. a string, converted to one user-role text message
+2. `FastestMCP.Prompts.Result`, containing explicit message helpers
+3. other JSON-safe application data, encoded into a user-role text message
+
+Wrap message lists in `Prompts.Result.new/2`. Plain maps and lists are data;
+keys such as `messages` do not implicitly select an MCP envelope.
 
 Simple string:
 
@@ -257,7 +258,7 @@ server =
   |> FastestMCP.add_prompt("welcome", fn _arguments, _ctx -> "first" end)
   |> FastestMCP.add_prompt("welcome", fn _arguments, _ctx -> "second" end)
 
-FastestMCP.render_prompt("prompt-duplicates", "welcome", %{})
+FastestMCP.render_prompt!("prompt-duplicates", "welcome", %{})
 # => "second"
 ```
 
@@ -290,7 +291,7 @@ server =
   )
 ```
 
-Call `FastestMCP.render_prompt/4` with `task: true` to create that local task.
+Call `FastestMCP.render_prompt!/4` with `task: true` to create that local task.
 Remote MCP `prompts/get` requests are synchronous in 0.2; task metadata on that
 wire method is rejected because MCP `2025-11-25` task augmentation is
 tool-only.
@@ -300,7 +301,7 @@ tool-only.
 Prompts can be added, disabled, and removed after startup:
 
 ```elixir
-manager = FastestMCP.component_manager("dynamic-prompts")
+manager = FastestMCP.component_manager!("dynamic-prompts")
 
 {:ok, _prompt} =
   FastestMCP.ComponentManager.add_prompt(

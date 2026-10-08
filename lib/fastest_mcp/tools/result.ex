@@ -36,14 +36,16 @@ defmodule FastestMCP.Tools.Result do
             structured_content: nil,
             structured_content_present?: false,
             meta: nil,
-            is_error: nil
+            is_error: nil,
+            extra: %{}
 
   @type t :: %__MODULE__{
           content: any(),
           structured_content: any(),
           structured_content_present?: boolean(),
           meta: map() | nil,
-          is_error: boolean() | nil
+          is_error: boolean() | nil,
+          extra: map()
         }
 
   @doc "Builds a normalized tool result."
@@ -110,6 +112,18 @@ defmodule FastestMCP.Tools.Result do
   end
 
   def from(value), do: new(value)
+
+  @doc "Builds an explicit envelope from a validated, string-keyed MCP result."
+  def from_raw(%{} = raw) do
+    %__MODULE__{
+      content: Map.get(raw, "content", []),
+      structured_content: Map.get(raw, "structuredContent"),
+      structured_content_present?: Map.has_key?(raw, "structuredContent"),
+      meta: Map.get(raw, "_meta"),
+      is_error: Map.get(raw, "isError"),
+      extra: Map.drop(raw, ["content", "structuredContent", "isError"])
+    }
+  end
 
   @doc "Converts the helper struct into the normalized tool-result map used by the runtime."
   def to_map(%__MODULE__{} = result) do

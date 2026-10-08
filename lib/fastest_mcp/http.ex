@@ -158,8 +158,8 @@ defmodule FastestMCP.HTTP do
     path = mint_request_path(uri)
 
     {headers, body} =
-      @default_headers
-      |> Kernel.++(normalize_headers(Keyword.get(opts, :headers, [])))
+      opts
+      |> request_headers()
       |> mint_request_payload(method, opts)
 
     headers = Enum.map(headers, fn {key, value} -> {to_string(key), to_string(value)} end)
@@ -327,8 +327,8 @@ defmodule FastestMCP.HTTP do
       |> then(fn default_url -> Keyword.get(opts, :request_url, default_url) end)
 
     headers =
-      @default_headers
-      |> Kernel.++(normalize_headers(Keyword.get(opts, :headers, [])))
+      opts
+      |> request_headers()
       |> maybe_add_content_type(opts)
 
     timeout = Keyword.get(opts, :timeout_ms, @default_timeout)
@@ -547,8 +547,14 @@ defmodule FastestMCP.HTTP do
 
   defp normalize_headers(headers) do
     Enum.map(headers, fn {key, value} ->
-      {to_charlist(to_string(key)), to_charlist(to_string(value))}
+      {key |> to_string() |> String.downcase() |> to_charlist(), to_charlist(to_string(value))}
     end)
+  end
+
+  defp request_headers(opts) do
+    explicit = normalize_headers(Keyword.get(opts, :headers, []))
+    names = MapSet.new(explicit, &elem(&1, 0))
+    Enum.reject(@default_headers, fn {name, _} -> MapSet.member?(names, name) end) ++ explicit
   end
 
   defp normalize_response_headers(headers) do

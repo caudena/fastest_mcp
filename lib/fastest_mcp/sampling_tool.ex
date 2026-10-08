@@ -55,7 +55,7 @@ defmodule FastestMCP.SamplingTool do
       description: tool.description,
       parameters: normalize_schema(tool.input_schema || empty_schema()),
       runner: fn arguments ->
-        FastestMCP.call_tool(
+        FastestMCP.call_tool!(
           server_name,
           tool.name,
           arguments || %{},
@@ -90,7 +90,7 @@ defmodule FastestMCP.SamplingTool do
       description: description,
       parameters: normalize_schema(schema),
       runner: fn arguments ->
-        FastestMCP.call_tool(
+        FastestMCP.call_tool!(
           server_name,
           name,
           arguments || %{},

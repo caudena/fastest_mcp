@@ -27,12 +27,13 @@ defmodule FastestMCP.Prompts.Result do
 
   alias FastestMCP.Prompts.Message
 
-  defstruct messages: [], description: nil, meta: nil
+  defstruct messages: [], description: nil, meta: nil, extra: %{}
 
   @type t :: %__MODULE__{
           messages: [Message.t()],
           description: String.t() | nil,
-          meta: map() | nil
+          meta: map() | nil,
+          extra: map()
         }
 
   @doc "Builds a normalized prompt result."
@@ -49,7 +50,7 @@ defmodule FastestMCP.Prompts.Result do
 
   def from(%{} = value) when is_map_key(value, :messages) or is_map_key(value, "messages") do
     new(
-      Map.get(value, :messages, Map.get(value, "messages")),
+      value |> Map.get(:messages, Map.get(value, "messages")) |> Enum.map(&Message.from/1),
       description: Map.get(value, :description, Map.get(value, "description")),
       meta:
         Map.get(
@@ -62,6 +63,16 @@ defmodule FastestMCP.Prompts.Result do
 
   def from(value) when is_binary(value), do: new(value)
   def from(value) when is_list(value), do: new(value)
+
+  @doc "Builds an explicit envelope from a validated MCP prompt result."
+  def from_raw(%{} = raw) do
+    %__MODULE__{
+      messages: Map.fetch!(raw, "messages"),
+      description: Map.get(raw, "description"),
+      meta: Map.get(raw, "_meta"),
+      extra: Map.drop(raw, ["messages", "description"])
+    }
+  end
 
   def to_map(%__MODULE__{} = result) do
     %{}

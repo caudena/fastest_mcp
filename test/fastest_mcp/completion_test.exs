@@ -40,7 +40,7 @@ defmodule FastestMCP.CompletionTest do
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
     assert %{values: ["preview"], total: 1} =
-             FastestMCP.complete(
+             FastestMCP.complete!(
                server_name,
                %{"type" => "ref/tool", "name" => "deploy"},
                %{"name" => "environment", "value" => "prev"},
@@ -48,7 +48,7 @@ defmodule FastestMCP.CompletionTest do
              )
 
     assert %{values: ["Nate", "Nadia"], total: 2} =
-             FastestMCP.complete(
+             FastestMCP.complete!(
                server_name,
                %{"type" => "ref/prompt", "name" => "greet"},
                %{"name" => "name", "value" => "Na"},
@@ -56,14 +56,14 @@ defmodule FastestMCP.CompletionTest do
              )
 
     assert %{values: ["100"], total: 1} =
-             FastestMCP.complete(
+             FastestMCP.complete!(
                server_name,
                %{"type" => "ref/resourceTemplate", "uriTemplate" => "users://{id}"},
                %{"name" => "id", "value" => "1"},
                session_id: "completion-session"
              )
 
-    tool = Enum.find(FastestMCP.list_tools(server_name), &(&1.name == "deploy"))
+    tool = Enum.find(FastestMCP.list_tools!(server_name), &(&1.name == "deploy"))
 
     refute Map.has_key?(tool.input_schema["properties"]["environment"], "completion")
   end
@@ -132,11 +132,11 @@ defmodule FastestMCP.CompletionTest do
       Client.connect!("http://127.0.0.1:#{port}/mcp", protocol_version: "2025-11-25")
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     assert %{"values" => ["Nate", "Nadia"], "total" => 2} =
-             Client.complete(
+             Client.complete!(
                client,
                %{"type" => "ref/prompt", "name" => "greet"},
                %{"name" => "name", "value" => "Na"},
@@ -146,14 +146,14 @@ defmodule FastestMCP.CompletionTest do
     assert_receive {:completion_context, %{"tenant" => "acme"}}
 
     assert %{"values" => ["100"], "total" => 1} =
-             Client.complete(
+             Client.complete!(
                client,
                %{"type" => "ref/resource", "uri" => "users://{tenant}/{id}"},
                %{"name" => "id", "value" => "1"}
              )
 
     assert %{"values" => values, "total" => 101, "hasMore" => true} =
-             Client.complete(
+             Client.complete!(
                client,
                %{"type" => "ref/prompt", "name" => "bulk"},
                %{"name" => "value", "value" => ""}
@@ -163,7 +163,7 @@ defmodule FastestMCP.CompletionTest do
 
     tool_error =
       assert_raise Error, fn ->
-        Client.complete(
+        Client.complete!(
           client,
           %{"type" => "ref/tool", "name" => "deploy"},
           %{"name" => "environment", "value" => "prev"}
@@ -174,7 +174,7 @@ defmodule FastestMCP.CompletionTest do
 
     template_error =
       assert_raise Error, fn ->
-        Client.complete(
+        Client.complete!(
           client,
           %{"type" => "ref/resourceTemplate", "uriTemplate" => "users://{tenant}/{id}"},
           %{"name" => "id", "value" => "1"}

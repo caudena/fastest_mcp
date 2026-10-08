@@ -284,7 +284,12 @@ defmodule FastestMCP.Components.ResourceTemplate.Matcher do
   defp take_expressions(rest, _operator), do: {[], rest}
 
   defp compile_part({:lit, literal}, {source, expressions, index}) do
-    {source <> Regex.escape(literal), expressions, index}
+    pattern =
+      Regex.replace(~r/%[0-9A-Fa-f]{2}/, Regex.escape(literal), fn triplet ->
+        "(?i:" <> triplet <> ")"
+      end)
+
+    {source <> pattern, expressions, index}
   end
 
   defp compile_part({:expr, operator, variables}, {source, expressions, index}) do

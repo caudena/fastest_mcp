@@ -2,8 +2,8 @@ defmodule FastestMCP.TaskMeta do
   @moduledoc """
   Explicit background-task request metadata for direct in-process operations.
 
-  Passing `task_meta:` to `FastestMCP.call_tool/4`, `FastestMCP.read_resource/3`,
-  or `FastestMCP.render_prompt/4` requests task execution while keeping the
+  Passing `task_meta:` to `FastestMCP.call_tool!/4`, `FastestMCP.read_resource!/3`,
+  or `FastestMCP.render_prompt!/4` requests task execution while keeping the
   direct API synchronous-by-default.
   """
 

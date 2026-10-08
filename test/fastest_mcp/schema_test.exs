@@ -655,29 +655,32 @@ defmodule FastestMCP.SchemaTest do
       )
       |> FastestMCP.add_tool(
         "missing_structured",
-        fn _args -> %{content: [%{type: "text", text: "only text"}]} end,
+        fn _args ->
+          FastestMCP.Tools.Result.from(%{content: [%{type: "text", text: "only text"}]})
+        end,
         output_schema: @object_schema
       )
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    assert %{count: 2} = FastestMCP.call_tool(server_name, "valid", %{})
+    assert %{count: 2} = FastestMCP.call_tool!(server_name, "valid", %{})
 
-    assert %{structuredContent: "ok"} = FastestMCP.call_tool(server_name, "scalar", %{})
+    assert %ToolResult{structured_content: "ok"} =
+             FastestMCP.call_tool!(server_name, "scalar", %{})
 
     assert_raise Error, ~r/structuredContent.*does not match output_schema/, fn ->
-      FastestMCP.call_tool(server_name, "wrong_type", %{})
+      FastestMCP.call_tool!(server_name, "wrong_type", %{})
     end
 
     try do
-      FastestMCP.call_tool(server_name, "wrong_type", %{})
+      FastestMCP.call_tool!(server_name, "wrong_type", %{})
     rescue
       error in Error -> refute Exception.message(error) =~ "secret-result"
     end
 
     assert_raise Error, ~r/returned no structuredContent/, fn ->
-      FastestMCP.call_tool(server_name, "missing_structured", %{})
+      FastestMCP.call_tool!(server_name, "missing_structured", %{})
     end
   end
 end

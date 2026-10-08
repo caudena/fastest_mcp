@@ -49,7 +49,7 @@ defmodule FastestMCP.StdioWireIntegrityTest do
              "jsonrpc" => "2.0",
              "id" => 1,
              "result" => %{"protocolVersion" => version}
-           } = receive_envelope(port)
+           } = receive_envelope(port, 10_000)
 
     assert version == "2025-11-25"
 

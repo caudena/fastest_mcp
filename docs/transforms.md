@@ -125,8 +125,28 @@ name second.
 
 ## Tool-only Clients
 
-FastestMCP v0.2 does not ship a public tool-search transform, but it does ship
-tool-injection middleware helpers for tool-only clients:
+For a large catalog, enable bounded discovery through the server's tool-search
+middleware:
+
+```elixir
+server =
+  FastestMCP.server("catalog", tool_search: [pinned: ["health"]])
+  |> FastestMCP.add_tool("health", fn _arguments, _ctx -> %{ok: true} end)
+  |> FastestMCP.add_tool("find_report", fn arguments, _ctx -> arguments end,
+    description: "Find a report by its title"
+  )
+```
+
+Clients list the pinned tools plus `search_tools` and `call_tool`. Search queries
+and public metadata use NFKC normalization and Unicode case folding, so composed
+and decomposed accents, full-width letters, and case-folding equivalents match.
+Original tool names remain unchanged. Ranking stays deterministic and bounded;
+the search result's `truncated` field indicates that the scan limit was reached.
+Delegated calls reapply the normal visibility, authorization, and validation
+rules. Request-scoped proxy providers cannot be combined with bounded ToolSearch.
+
+Use tool-injection middleware helpers when a tool-only client also needs prompts
+or resources:
 
 - `FastestMCP.Middleware.prompt_tools/1`
 - `FastestMCP.Middleware.resource_tools/1`

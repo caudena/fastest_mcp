@@ -55,8 +55,8 @@ client =
 ```
 
 `auto_initialize: false` disables automatic negotiation. With an exact legacy
-selection, call `FastestMCP.Client.initialize/3`; with an exact modern
-selection, call `FastestMCP.Client.discover/2`. If it is combined with
+selection, call `FastestMCP.Client.initialize!/3`; with an exact modern
+selection, call `FastestMCP.Client.discover!/2`. If it is combined with
 `protocol_version: :auto`, the application owns the probe and evidence-based
 fallback decision.
 Calling `initialize/3` directly remains the backwards-compatible way to select

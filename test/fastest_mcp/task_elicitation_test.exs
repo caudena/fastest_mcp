@@ -29,7 +29,7 @@ defmodule FastestMCP.TaskElicitationTest do
     assert {:ok, runtime} = ServerRuntime.fetch(server_name)
     :ok = FastestMCP.EventBus.subscribe(runtime.event_bus, server_name)
 
-    handle = FastestMCP.call_tool(server_name, "ask_name", %{}, task: true)
+    handle = FastestMCP.call_tool!(server_name, "ask_name", %{}, task: true)
     notification = wait_for_input_required_notification(server_name, handle.task_id)
 
     assert notification.notification.params.taskId == handle.task_id
@@ -48,15 +48,15 @@ defmodule FastestMCP.TaskElicitationTest do
              }
            } = notification.related_task.elicitation
 
-    task = FastestMCP.fetch_task(handle)
+    task = FastestMCP.fetch_task!(handle)
     assert task.status == :input_required
     assert task.elicitation.request_id == request_id
 
     updated =
-      FastestMCP.send_task_input(server_name, handle.task_id, :accept, %{"value" => "Alice"})
+      FastestMCP.send_task_input!(server_name, handle.task_id, :accept, %{"value" => "Alice"})
 
     assert updated.status == :working
-    assert FastestMCP.await_task(handle, 1_000) == "Hello, Alice!"
+    assert FastestMCP.await_task!(handle, 1_000) == "Hello, Alice!"
   end
 
   test "scalar elicitation schemas wrap input and preserve field metadata" do
@@ -83,7 +83,7 @@ defmodule FastestMCP.TaskElicitationTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    handle = FastestMCP.call_tool(server_name, "ask_name", %{}, task: true)
+    handle = FastestMCP.call_tool!(server_name, "ask_name", %{}, task: true)
     :ok = wait_for_input_required(server_name, handle.task_id)
 
     assert %{
@@ -96,10 +96,10 @@ defmodule FastestMCP.TaskElicitationTest do
                }
              },
              "required" => ["value"]
-           } = FastestMCP.fetch_task(handle).elicitation.requested_schema
+           } = FastestMCP.fetch_task!(handle).elicitation.requested_schema
 
-    _ = FastestMCP.send_task_input(server_name, handle.task_id, :accept, %{"value" => "Alice"})
-    assert FastestMCP.await_task(handle, 1_000) == "Hello, Alice!"
+    _ = FastestMCP.send_task_input!(server_name, handle.task_id, :accept, %{"value" => "Alice"})
+    assert FastestMCP.await_task!(handle, 1_000) == "Hello, Alice!"
   end
 
   test "send_task_input rejects non-waiting tasks and supports decline/cancel outcomes" do
@@ -122,22 +122,22 @@ defmodule FastestMCP.TaskElicitationTest do
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
 
-    declined = FastestMCP.call_tool(server_name, "choose", %{"mode" => "first"}, task: true)
+    declined = FastestMCP.call_tool!(server_name, "choose", %{"mode" => "first"}, task: true)
     :ok = wait_for_input_required(server_name, declined.task_id)
-    _ = FastestMCP.send_task_input(server_name, declined.task_id, :decline, nil)
-    assert FastestMCP.await_task(declined, 1_000) == "first:declined"
+    _ = FastestMCP.send_task_input!(server_name, declined.task_id, :decline, nil)
+    assert FastestMCP.await_task!(declined, 1_000) == "first:declined"
 
-    cancelled = FastestMCP.call_tool(server_name, "choose", %{"mode" => "second"}, task: true)
+    cancelled = FastestMCP.call_tool!(server_name, "choose", %{"mode" => "second"}, task: true)
     :ok = wait_for_input_required(server_name, cancelled.task_id)
-    _ = FastestMCP.send_task_input(server_name, cancelled.task_id, :cancel, nil)
-    assert FastestMCP.await_task(cancelled, 1_000) == "second:cancelled"
+    _ = FastestMCP.send_task_input!(server_name, cancelled.task_id, :cancel, nil)
+    assert FastestMCP.await_task!(cancelled, 1_000) == "second:cancelled"
 
-    completed = FastestMCP.call_tool(server_name, "done", %{}, task: true)
-    assert FastestMCP.await_task(completed, 1_000) == :ok
+    completed = FastestMCP.call_tool!(server_name, "done", %{}, task: true)
+    assert FastestMCP.await_task!(completed, 1_000) == :ok
 
     error =
       assert_raise Error, fn ->
-        FastestMCP.send_task_input(server_name, completed.task_id, :accept, %{"value" => "late"})
+        FastestMCP.send_task_input!(server_name, completed.task_id, :accept, %{"value" => "late"})
       end
 
     assert error.code == :bad_request
@@ -154,7 +154,7 @@ defmodule FastestMCP.TaskElicitationTest do
   end
 
   defp do_wait_for_input_required(server_name, task_id, deadline) do
-    task = FastestMCP.fetch_task(server_name, task_id)
+    task = FastestMCP.fetch_task!(server_name, task_id)
 
     cond do
       task.status == :input_required ->

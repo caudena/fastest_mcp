@@ -176,7 +176,7 @@ server =
   )
 
 {:ok, _pid} = FastestMCP.start_server(server)
-FastestMCP.list_tools("petstore")
+FastestMCP.list_tools!("petstore")
 ```
 
 Under the hood, FastestMCP maps OpenAPI operations to tools, builds schemas
@@ -187,7 +187,8 @@ OpenAPI-backed tools serialize common HTTP request shapes:
 
 - JSON and vendor JSON media types such as `application/problem+json`
 - `application/x-www-form-urlencoded`
-- `multipart/form-data`
+- `multipart/form-data`, including repeated string-array fields
+- raw string bodies with their declared text, XML, or binary media type
 - cookie parameters through the `Cookie` header
 
 Parameter locations are limited to the standard path/query/header/cookie
@@ -198,9 +199,43 @@ request bodies are sent directly rather than wrapped. Responses are decoded
 only when their media type is JSON or ends in `+json`.
 
 Server URL variables are expanded from their declared defaults when a provider
-base URL is derived from the document. Component `$ref` resolution tracks
-visited references, so circular schemas are left as references instead of
-recursing indefinitely.
+base URL is derived from the document. OpenAPI Reference Objects are resolved
+separately from schema references; an unresolved operation reference fails at
+provider construction.
+
+### OpenAPI request fidelity
+
+OpenAPI schemas retain shared and recursive references rather than being expanded
+repeatedly. Defaults, constants, enums, and examples are treated as application
+data. Schema size, depth, and resolved-resource limits use the existing
+`schema_options:` configuration.
+
+Plain named-property bodies retain their existing flattened arguments. Bodies
+with dynamic keys, local definition scopes, or non-flattenable constraints use
+one `body` argument; existing collision-safe aliases still apply. A supplied body
+is checked against its original schema before dispatch. Omitting an optional
+body does not send an empty object.
+
+Raw text/XML/octet-stream inputs send the supplied string bytes with the exact
+declared media type, including parameters. This does not define an implicit
+base64 or file-upload encoding. JSON bodies retain JSON encoding. Multipart
+string arrays use repeated fields for the default encoding. Only declared
+arguments are forwarded; incoming transport credentials are not copied.
+
+For example, if an operation named `set_labels` accepts a string dictionary,
+its generated tool takes the complete dictionary under `body`:
+
+```elixir
+FastestMCP.call_tool!("petstore", "set_labels", %{
+  "body" => %{"owner" => "operations", "region" => "eu"}
+})
+```
+
+Check the generated `inputSchema` for the argument name when the API also has a
+parameter named `body`; the provider may assign a collision alias. For an
+optional body, omitting that argument sends no body, while supplying `%{}` sends
+an empty object and validates it against the original schema. A partially
+supplied object must still include all fields required by that schema.
 
 ## Skills Providers
 
@@ -227,18 +262,26 @@ runtime activates a metadata-keyed cache and re-reads/re-hashes only files whose
 size or modification data changed; unchanged skills reuse their compiled
 component representation.
 
+Skill frontmatter supports folded/literal descriptions and nested YAML while
+keeping scalars as strings. Malformed frontmatter keeps the existing line-parser
+fallback. Discovery, reload caching, and safe path resolution are unchanged.
+
 ## Custom Providers
 
 When components come from somewhere else entirely, write a custom provider.
 
-At minimum, a provider can implement one or more of:
+A provider must implement at least one component listing or lookup callback:
 
 - `list_components/3`
 - `get_component_candidates/4`
 - `get_component/4`
 - `get_resource_target_candidates/3`
 - `get_resource_target/3`
-- `http_routes/1`
+
+Optional `http_routes/1` and `required_extensions/1` callbacks contribute HTTP
+routes and extension declarations. Extension requirements pass through provider
+transforms and mounts. See [Provider-bundled extensions](extensions.md#provider-bundled-extensions)
+for opt-in registration and explicit root conflict resolution.
 
 Candidate callbacks are the preferred exact-lookup interface for versioned
 providers. Return every matching version; FastestMCP applies provider transforms

@@ -26,7 +26,7 @@ defmodule FastestMCP.TaskNotificationSubscriberTest do
       )
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
-    assert FastestMCP.task_notification_subscriber_count(server_name) == 0
+    assert FastestMCP.task_notification_subscriber_count!(server_name) == 0
 
     owner =
       spawn(fn ->
@@ -78,12 +78,12 @@ defmodule FastestMCP.TaskNotificationSubscriberTest do
     send(other_pid, :release)
     send(subscribed_pid, :release)
 
-    assert FastestMCP.await_task(server_name, other.task.taskId, 1_000,
+    assert FastestMCP.await_task!(server_name, other.task.taskId, 1_000,
              session_id: "other-session"
            ) ==
              :done
 
-    assert FastestMCP.await_task(server_name, subscribed.task.taskId, 1_000,
+    assert FastestMCP.await_task!(server_name, subscribed.task.taskId, 1_000,
              session_id: "subscribed-session"
            ) == :done
 
@@ -148,7 +148,7 @@ defmodule FastestMCP.TaskNotificationSubscriberTest do
     assert elicitation_notification.notification.params.status == "input_required"
     assert elicitation_notification.related_task.status == "input_required"
 
-    assert FastestMCP.await_task(server_name, task_id, 1_000, session_id: "relay-session") ==
+    assert FastestMCP.await_task!(server_name, task_id, 1_000, session_id: "relay-session") ==
              "Hello, Alice!"
 
     GenServer.stop(subscriber)
@@ -168,7 +168,7 @@ defmodule FastestMCP.TaskNotificationSubscriberTest do
     assert {:ok, first} =
              FastestMCP.subscribe_task_notifications(server_name, "session-a", owner: self())
 
-    assert {:error, :overloaded} =
+    assert {:error, %FastestMCP.Error{details: %{reason: :overloaded}}} =
              FastestMCP.subscribe_task_notifications(server_name, "session-b", owner: self())
 
     GenServer.stop(first)
@@ -180,7 +180,7 @@ defmodule FastestMCP.TaskNotificationSubscriberTest do
   end
 
   defp do_wait_for_subscriber_count(server_name, expected, deadline) do
-    if FastestMCP.task_notification_subscriber_count(server_name) == expected do
+    if FastestMCP.task_notification_subscriber_count!(server_name) == expected do
       :ok
     else
       if System.monotonic_time(:millisecond) >= deadline do

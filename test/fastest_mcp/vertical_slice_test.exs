@@ -28,19 +28,19 @@ defmodule FastestMCP.VerticalSliceTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    assert [%{name: "echo"}] = FastestMCP.list_tools(server_name)
-    assert [%{uri: "config://app"}] = FastestMCP.list_resources(server_name)
-    assert [%{uri_template: "user://{id}"}] = FastestMCP.list_resource_templates(server_name)
-    assert [%{name: "greet"}] = FastestMCP.list_prompts(server_name)
+    assert [%{name: "echo"}] = FastestMCP.list_tools!(server_name)
+    assert [%{uri: "config://app"}] = FastestMCP.list_resources!(server_name)
+    assert [%{uri_template: "user://{id}"}] = FastestMCP.list_resource_templates!(server_name)
+    assert [%{name: "greet"}] = FastestMCP.list_prompts!(server_name)
 
     assert %{"message" => "hi", "middleware" => true} ==
-             FastestMCP.call_tool(server_name, "echo", %{"message" => "hi"})
+             FastestMCP.call_tool!(server_name, "echo", %{"message" => "hi"})
 
-    assert %{theme: "sunrise"} == FastestMCP.read_resource(server_name, "config://app")
-    assert %{id: "123"} == FastestMCP.read_resource(server_name, "user://123")
+    assert %{theme: "sunrise"} == FastestMCP.read_resource!(server_name, "config://app")
+    assert %{id: "123"} == FastestMCP.read_resource!(server_name, "user://123")
 
-    assert %{messages: [%{role: "user", content: "Hello, Nate!"}]} ==
-             FastestMCP.render_prompt(server_name, "greet", %{"name" => "Nate"})
+    assert %{messages: [%{role: "user", content: %{type: "text", text: "Hello, Nate!"}}]} =
+             FastestMCP.render_prompt!(server_name, "greet", %{"name" => "Nate"})
 
     {connection_id, _initialize_response} = ProtocolTest.initialize_stdio(server_name)
 

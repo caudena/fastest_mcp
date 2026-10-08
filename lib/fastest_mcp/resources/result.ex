@@ -19,11 +19,12 @@ defmodule FastestMCP.Resources.Result do
 
   alias FastestMCP.Resources.Content
 
-  defstruct contents: [], meta: nil
+  defstruct contents: [], meta: nil, extra: %{}
 
   @type t :: %__MODULE__{
           contents: [Content.t()],
-          meta: map() | nil
+          meta: map() | nil,
+          extra: map()
         }
 
   @doc "Builds a normalized resource result."
@@ -36,7 +37,25 @@ defmodule FastestMCP.Resources.Result do
 
   @doc "Normalizes result-like values into `%FastestMCP.Resources.Result{}`."
   def from(%__MODULE__{} = result), do: result
+
+  def from(%{} = envelope)
+      when is_map_key(envelope, :contents) or is_map_key(envelope, "contents") do
+    %__MODULE__{
+      contents: Map.get(envelope, :contents, Map.get(envelope, "contents")),
+      meta: Map.get(envelope, :meta, Map.get(envelope, "_meta", Map.get(envelope, :_meta)))
+    }
+  end
+
   def from(contents), do: new(contents)
+
+  @doc "Builds an explicit envelope from a validated MCP resource result."
+  def from_raw(%{} = raw) do
+    %__MODULE__{
+      contents: Map.fetch!(raw, "contents"),
+      meta: Map.get(raw, "_meta"),
+      extra: Map.delete(raw, "contents")
+    }
+  end
 
   defp normalize_contents(contents) when is_binary(contents), do: [Content.new(contents)]
 

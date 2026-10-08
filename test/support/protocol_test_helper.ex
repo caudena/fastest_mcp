@@ -38,7 +38,7 @@ defmodule FastestMCP.TestSupport.ProtocolTestHelper do
     {:ok, runtime} = ServerRuntime.fetch(server_name)
 
     initialize_result =
-      FastestMCP.initialize(server_name, params,
+      FastestMCP.initialize!(server_name, params,
         transport: :stdio,
         session_id: session_id,
         request_metadata: %{

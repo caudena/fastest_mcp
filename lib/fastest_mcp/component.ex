@@ -24,7 +24,6 @@ defmodule FastestMCP.Component do
   alias FastestMCP.Error
   alias FastestMCP.InputValidator
   alias FastestMCP.JSONValue
-  alias FastestMCP.Prompts.Message, as: PromptMessage
   alias FastestMCP.Prompts.Result, as: PromptResult
   alias FastestMCP.Protocol.Extensions
   alias FastestMCP.Resources.Content, as: ResourceContent
@@ -160,7 +159,11 @@ defmodule FastestMCP.Component do
   @doc "Executes a component for the given operation."
   def execute(component, operation) do
     task_config = Map.get(component, :task, TaskConfig.new(false))
-    modern? = operation.context.negotiated_protocol_version == "2026-07-28"
+    # Capability negotiation belongs to the wire invocation, not to local calls
+    # made by its handler. Local calls retain their explicit `task:` contract.
+    modern? =
+      operation.invocation == :protocol and
+        operation.context.negotiated_protocol_version == "2026-07-28"
 
     server_tasks? =
       case operation.context.server do
@@ -277,7 +280,7 @@ defmodule FastestMCP.Component do
   def normalize_result(_component, %FastestMCP.InputRequiredResult{} = result), do: result
 
   def normalize_result(%Tool{} = tool, %ToolResult{} = value) do
-    normalized = value |> ToolResult.to_map() |> ResultNormalizer.normalize_tool()
+    normalized = ResultNormalizer.normalize_tool(value)
     validate_tool_output!(tool, value, normalized)
   end
 
@@ -363,22 +366,6 @@ defmodule FastestMCP.Component do
 
   defp structured_tool_output(%ToolResult{structured_content: structured}, _normalized),
     do: {:ok, structured}
-
-  defp structured_tool_output(raw, normalized) when is_map(raw) do
-    keys = [:structuredContent, "structuredContent", :structured_content, "structured_content"]
-
-    case Enum.find(keys, &Map.has_key?(raw, &1)) do
-      nil ->
-        if Map.has_key?(raw, :content) or Map.has_key?(raw, "content") do
-          {:error, :missing_structured_content}
-        else
-          {:ok, normalized}
-        end
-
-      key ->
-        {:ok, Map.get(raw, key)}
-    end
-  end
 
   defp structured_tool_output(nil, nil), do: {:ok, nil}
   defp structured_tool_output(_raw, nil), do: {:error, :missing_structured_content}
@@ -520,84 +507,13 @@ defmodule FastestMCP.Component do
     end
   end
 
-  defp normalize_prompt_result(%PromptResult{} = value) do
-    PromptResult.to_map(value)
-  end
+  defp normalize_prompt_result(%PromptResult{} = value), do: value
+  defp normalize_prompt_result(value) when is_binary(value), do: PromptResult.new(value)
+  defp normalize_prompt_result(value), do: PromptResult.new(JSONValue.encode!(value))
 
-  defp normalize_prompt_result(%{} = value) do
-    if Map.has_key?(value, :messages) or Map.has_key?(value, "messages") do
-      %{}
-      |> maybe_put(
-        :messages,
-        normalize_prompt_messages(Map.get(value, :messages, Map.get(value, "messages")))
-      )
-      |> maybe_put(:description, Map.get(value, :description, Map.get(value, "description")))
-      |> maybe_put(
-        :meta,
-        Map.get(
-          value,
-          :_meta,
-          Map.get(value, "_meta", Map.get(value, :meta, Map.get(value, "meta")))
-        )
-      )
-    else
-      %{messages: [%{role: "user", content: inspect(value)}]}
-    end
-  end
-
-  defp normalize_prompt_result(value) when is_binary(value) do
-    %{messages: [%{role: "user", content: value}]}
-  end
-
-  defp normalize_prompt_result(value) when is_list(value) do
-    %{messages: normalize_prompt_messages(value)}
-  end
-
-  defp normalize_prompt_result(value) do
-    %{messages: [%{role: "user", content: inspect(value)}]}
-  end
-
-  defp normalize_prompt_messages(messages) when is_list(messages) do
-    Enum.map(messages, fn
-      %PromptMessage{} = message -> PromptMessage.to_map(message)
-      %{} = message -> normalize_prompt_message(message)
-      text when is_binary(text) -> %{role: "user", content: text}
-    end)
-  end
-
-  defp normalize_prompt_messages(message) when is_binary(message) do
-    [%{role: "user", content: message}]
-  end
-
-  defp normalize_prompt_messages(other) do
-    [%{role: "user", content: inspect(other)}]
-  end
-
-  defp normalize_prompt_message(message) do
-    message
-    |> PromptMessage.from()
-    |> PromptMessage.to_map()
-  end
-
-  defp normalize_resource_result(%ResourceResult{} = value) do
-    %{}
-    |> Map.put(:contents, Enum.map(value.contents, &normalize_resource_content/1))
-    |> maybe_put(:meta, value.meta)
-  end
-
-  defp normalize_resource_result(%ResourceContent{} = value) do
-    %{contents: [normalize_resource_content(value)]}
-  end
-
+  defp normalize_resource_result(%ResourceResult{} = value), do: value
+  defp normalize_resource_result(%ResourceContent{} = value), do: ResourceResult.new([value])
   defp normalize_resource_result(value), do: ResultNormalizer.normalize_value(value)
-
-  defp normalize_resource_content(%ResourceContent{} = content) do
-    %{}
-    |> maybe_put(:uri, content.uri)
-    |> Map.put(:content, content.content)
-    |> Map.put(:mime_type, content.mime_type)
-    |> maybe_put(:meta, content.meta)
-  end
 
   defp public_parameters(nil), do: nil
 

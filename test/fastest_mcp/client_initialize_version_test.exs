@@ -66,7 +66,7 @@ defmodule FastestMCP.ClientInitializeVersionTest do
           protocol_version: @legacy_version
         )
 
-      assert %{"protocolVersion" => ^current_version} = Client.initialize(client, params)
+      assert %{"protocolVersion" => ^current_version} = Client.initialize!(client, params)
 
       assert_receive {:http_initialize_request, raw_body,
                       %{"params" => %{"protocolVersion" => ^current_version}} = request},
@@ -77,7 +77,7 @@ defmodule FastestMCP.ClientInitializeVersionTest do
              "expected one HTTP protocolVersion field for #{case_name}: #{raw_body}"
 
       assert Enum.count(Map.keys(request["params"]), &(&1 == "protocolVersion")) == 1
-      Client.disconnect(client)
+      Client.disconnect!(client)
     end
   end
 
@@ -95,12 +95,12 @@ defmodule FastestMCP.ClientInitializeVersionTest do
       assert %{
                "protocolVersion" => ^current_version,
                "serverInfo" => %{"name" => "wire-1-" <> version}
-             } = Client.initialize(client, params)
+             } = Client.initialize!(client, params)
 
       assert version == current_version,
              "unexpected stdio protocolVersion for #{case_name}"
 
-      Client.disconnect(client)
+      Client.disconnect!(client)
     end
   end
 
@@ -113,10 +113,10 @@ defmodule FastestMCP.ClientInitializeVersionTest do
         protocol_version: "2026-07-28"
       )
 
-    on_exit(fn -> if Client.connected?(client), do: Client.disconnect(client) end)
+    on_exit(fn -> if Client.connected?(client), do: Client.disconnect!(client) end)
 
-    assert_raise FastestMCP.Error, ~r/legacy-only API/, fn -> Client.initialize(client) end
-    assert Client.protocol_version(client) == nil
+    assert_raise FastestMCP.Error, ~r/legacy-only API/, fn -> Client.initialize!(client) end
+    assert Client.protocol_version!(client) == nil
   end
 
   test "an explicit legacy pin cannot enter modern discovery" do
@@ -128,10 +128,10 @@ defmodule FastestMCP.ClientInitializeVersionTest do
         protocol_version: @legacy_version
       )
 
-    on_exit(fn -> if Client.connected?(client), do: Client.disconnect(client) end)
+    on_exit(fn -> if Client.connected?(client), do: Client.disconnect!(client) end)
 
-    assert_raise FastestMCP.Error, ~r/modern-only API/, fn -> Client.discover(client) end
-    assert Client.protocol_version(client) == nil
+    assert_raise FastestMCP.Error, ~r/modern-only API/, fn -> Client.discover!(client) end
+    assert Client.protocol_version!(client) == nil
   end
 
   defp protocol_version_field_count(body) do

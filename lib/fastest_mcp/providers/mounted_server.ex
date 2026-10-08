@@ -1,4 +1,5 @@
 defmodule FastestMCP.Providers.MountedServer do
+  @behaviour FastestMCP.Provider
   @moduledoc """
   Mounted-server provider that exposes one FastestMCP server through another.
 
@@ -28,17 +29,13 @@ defmodule FastestMCP.Providers.MountedServer do
     :namespace,
     lifespan_context: %{},
     lifespan_cleanups: [],
+    extension_ids: [],
     include_tags: MapSet.new(),
     exclude_tags: MapSet.new()
   ]
 
   @doc "Builds a new value for this module from the supplied options."
   def new(%Server{} = server, opts \\ []) do
-    if server.active_extensions != [] do
-      raise ArgumentError,
-            "mounted child servers cannot declare active_extensions; configure executable extensions on the root server"
-    end
-
     %__MODULE__{
       server: server,
       namespace: normalize_namespace(Keyword.get(opts, :namespace)),
@@ -48,15 +45,24 @@ defmodule FastestMCP.Providers.MountedServer do
   end
 
   @doc "Returns the provider type label."
+  @impl FastestMCP.Provider
   def provider_type(%__MODULE__{}), do: "MountedServerProvider"
 
+  @doc "Returns the mounted definition's extension requirements in declaration order."
+  @impl FastestMCP.Provider
+  def required_extensions(%__MODULE__{server: server}) do
+    server.active_extensions ++ Enum.flat_map(server.providers, &Provider.required_extensions/1)
+  end
+
   @doc "Returns the extra HTTP routes exposed by the mounted provider."
+  @impl FastestMCP.Provider
   def http_routes(%__MODULE__{} = provider) do
     provider.server.http_routes ++
       Enum.flat_map(provider.server.providers, &Provider.http_routes/1)
   end
 
   @doc "Lists the components exposed by this module."
+  @impl FastestMCP.Provider
   def list_components(%__MODULE__{} = provider, component_type, %Operation{} = operation) do
     provider
     |> child_components_for(component_type, operation)
@@ -80,6 +86,7 @@ defmodule FastestMCP.Providers.MountedServer do
   end
 
   @doc "Resolves one component by type and identifier."
+  @impl FastestMCP.Provider
   def get_component(
         %__MODULE__{} = provider,
         component_type,
@@ -92,6 +99,7 @@ defmodule FastestMCP.Providers.MountedServer do
   end
 
   @doc false
+  @impl FastestMCP.Provider
   def get_component_candidates(
         %__MODULE__{} = provider,
         component_type,
@@ -134,6 +142,7 @@ defmodule FastestMCP.Providers.MountedServer do
   end
 
   @doc "Resolves the backing resource target for a concrete URI."
+  @impl FastestMCP.Provider
   def get_resource_target(%__MODULE__{} = provider, uri, %Operation{} = operation) do
     provider
     |> get_resource_target_candidates(uri, operation)
@@ -141,6 +150,7 @@ defmodule FastestMCP.Providers.MountedServer do
   end
 
   @doc false
+  @impl FastestMCP.Provider
   def get_resource_target_candidates(%__MODULE__{} = provider, uri, %Operation{} = operation) do
     case child_resource_uri(provider, uri) do
       {:ok, child_uri} ->
@@ -349,7 +359,7 @@ defmodule FastestMCP.Providers.MountedServer do
             fn ->
               Telemetry.annotate_span(child_operation)
 
-              run_middleware(provider.server.middleware, child_operation, fn updated_operation ->
+              Middleware.run(provider.server.middleware, child_operation, fn updated_operation ->
                 Component.invoke(
                   component,
                   updated_operation.arguments,
@@ -375,14 +385,6 @@ defmodule FastestMCP.Providers.MountedServer do
     end
   end
 
-  defp run_middleware([], operation, executor), do: executor.(operation)
-
-  defp run_middleware([middleware | rest], operation, executor) do
-    Middleware.callable(middleware).(operation, fn updated_operation ->
-      run_middleware(rest, updated_operation, executor)
-    end)
-  end
-
   defp child_operation(
          provider,
          %Operation{} = parent_operation,
@@ -402,6 +404,7 @@ defmodule FastestMCP.Providers.MountedServer do
       version: Component.version(component),
       audience: parent_operation.audience,
       component: component,
+      invocation: parent_operation.invocation,
       context: context,
       transport: context.transport,
       call_supervisor: parent_operation.call_supervisor,
@@ -414,7 +417,11 @@ defmodule FastestMCP.Providers.MountedServer do
     %{
       context
       | server_name: provider.server.name,
-        lifespan_context: provider.lifespan_context || %{}
+        lifespan_context:
+          Map.merge(
+            provider.lifespan_context || %{},
+            Map.take(context.lifespan_context, provider.extension_ids)
+          )
     }
   end
 

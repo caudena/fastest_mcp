@@ -22,15 +22,15 @@ defmodule FastestMCP.MiddlewareToolInjectionTest do
 
     tool_names =
       server_name
-      |> FastestMCP.list_tools()
+      |> FastestMCP.list_tools!()
       |> Enum.map(& &1.name)
 
     assert tool_names == ["multiply", "add"]
 
     assert %{"result" => 42} =
-             FastestMCP.call_tool(server_name, "multiply", %{"a" => 7, "b" => 6})
+             FastestMCP.call_tool!(server_name, "multiply", %{"a" => 7, "b" => 6})
 
-    assert %{"result" => 9} = FastestMCP.call_tool(server_name, "add", %{"a" => 4, "b" => 5})
+    assert %{"result" => 9} = FastestMCP.call_tool!(server_name, "add", %{"a" => 4, "b" => 5})
   end
 
   test "injected tools override base tools with the same name" do
@@ -51,11 +51,11 @@ defmodule FastestMCP.MiddlewareToolInjectionTest do
 
     assert ["echo"] ==
              server_name
-             |> FastestMCP.list_tools()
+             |> FastestMCP.list_tools!()
              |> Enum.map(& &1.name)
 
     assert %{"message" => "HELLO"} =
-             FastestMCP.call_tool(server_name, "echo", %{"message" => "hello"})
+             FastestMCP.call_tool!(server_name, "echo", %{"message" => "hello"})
   end
 
   test "duplicate injected identities keep one list entry and execute the replacement" do
@@ -77,11 +77,11 @@ defmodule FastestMCP.MiddlewareToolInjectionTest do
 
     assert ["echo", "other"] ==
              server_name
-             |> FastestMCP.list_tools()
+             |> FastestMCP.list_tools!()
              |> Enum.map(& &1.name)
 
     assert %{"source" => "replacement"} ==
-             FastestMCP.call_tool(server_name, "echo", %{})
+             FastestMCP.call_tool!(server_name, "echo", %{})
   end
 
   test "filtered injected tools fall back to a visible base tool with the same identity" do
@@ -100,8 +100,8 @@ defmodule FastestMCP.MiddlewareToolInjectionTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    assert [%{name: "echo"}] = FastestMCP.list_tools(server_name)
-    assert %{"source" => "base"} = FastestMCP.call_tool(server_name, "echo", %{})
+    assert [%{name: "echo"}] = FastestMCP.list_tools!(server_name)
+    assert %{"source" => "base"} = FastestMCP.call_tool!(server_name, "echo", %{})
   end
 
   test "injected tools use server transforms and component authorization exactly once" do
@@ -132,19 +132,19 @@ defmodule FastestMCP.MiddlewareToolInjectionTest do
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
     assert [%{name: "visible", description: "transformed"}] =
-             FastestMCP.list_tools(server_name)
+             FastestMCP.list_tools!(server_name)
 
     assert_receive {:injected_transform, "visible", "tools/list"}
     assert_receive {:injected_transform, "secret", "tools/list"}
     refute_receive {:injected_transform, _name, "tools/list"}, 20
 
-    assert "visible" = FastestMCP.call_tool(server_name, "visible", %{})
+    assert "visible" = FastestMCP.call_tool!(server_name, "visible", %{})
     assert_receive {:injected_transform, "visible", "tools/call"}
     refute_receive {:injected_transform, "visible", "tools/call"}, 20
 
     error =
       assert_raise Error, fn ->
-        FastestMCP.call_tool(server_name, "secret", %{})
+        FastestMCP.call_tool!(server_name, "secret", %{})
       end
 
     assert error.code == :forbidden
@@ -158,13 +158,13 @@ defmodule FastestMCP.MiddlewareToolInjectionTest do
     server =
       FastestMCP.server(server_name)
       |> FastestMCP.add_prompt("greet", fn %{"name" => name}, _ctx ->
-        [%{role: "user", content: "Hello #{name}"}]
+        FastestMCP.Prompts.Result.new("Hello #{name}")
       end)
       |> FastestMCP.add_middleware(Middleware.prompt_tools())
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
 
-    assert %{"prompts" => prompts} = FastestMCP.call_tool(server_name, "list_prompts", %{})
+    assert %{"prompts" => prompts} = FastestMCP.call_tool!(server_name, "list_prompts", %{})
     assert Enum.any?(prompts, &(&1.name == "greet"))
 
     assert %{
@@ -172,7 +172,7 @@ defmodule FastestMCP.MiddlewareToolInjectionTest do
                messages: [%{role: "user", content: %{type: "text", text: "Hello Nate"}}]
              }
            } =
-             FastestMCP.call_tool(server_name, "get_prompt", %{
+             FastestMCP.call_tool!(server_name, "get_prompt", %{
                "name" => "greet",
                "arguments" => %{"name" => "Nate"}
              })
@@ -194,13 +194,13 @@ defmodule FastestMCP.MiddlewareToolInjectionTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
 
     assert %{"resources" => resources, "resource_templates" => templates} =
-             FastestMCP.call_tool(server_name, "list_resources", %{})
+             FastestMCP.call_tool!(server_name, "list_resources", %{})
 
     assert Enum.any?(resources, &(&1.uri == "config://app"))
     assert Enum.any?(templates, &(&1.uri_template == "docs://{slug}"))
 
     assert %{"result" => %{"theme" => "sunrise"}} =
-             FastestMCP.call_tool(server_name, "read_resource", %{"uri" => "config://app"})
+             FastestMCP.call_tool!(server_name, "read_resource", %{"uri" => "config://app"})
   end
 
   test "resource helper tools preserve verified authorization evidence in nested calls" do
@@ -218,7 +218,7 @@ defmodule FastestMCP.MiddlewareToolInjectionTest do
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
     assert %{"result" => "authorized"} ==
-             FastestMCP.call_tool(
+             FastestMCP.call_tool!(
                server_name,
                "read_resource",
                %{"uri" => "config://private"},
@@ -252,10 +252,10 @@ defmodule FastestMCP.MiddlewareToolInjectionTest do
 
     assert ["power", "modulo", "subtract"] ==
              server_name
-             |> FastestMCP.list_tools()
+             |> FastestMCP.list_tools!()
              |> Enum.map(& &1.name)
 
-    assert %{"result" => 8} = FastestMCP.call_tool(server_name, "power", %{"a" => 2, "b" => 3})
-    assert %{"result" => 1} = FastestMCP.call_tool(server_name, "modulo", %{"a" => 10, "b" => 3})
+    assert %{"result" => 8} = FastestMCP.call_tool!(server_name, "power", %{"a" => 2, "b" => 3})
+    assert %{"result" => 1} = FastestMCP.call_tool!(server_name, "modulo", %{"a" => 10, "b" => 3})
   end
 end

@@ -104,13 +104,13 @@ defmodule FastestMCP.AuthContractTest do
              auth: %{provider: :static, token: "secret-token"},
              capabilities: ["tools:call", "resources:read"]
            } ==
-             FastestMCP.call_tool(server_name, "whoami", %{},
+             FastestMCP.call_tool!(server_name, "whoami", %{},
                auth_input: %{"token" => "secret-token"}
              )
 
     error =
       assert_raise Error, fn ->
-        FastestMCP.call_tool(server_name, "whoami", %{}, auth_input: %{"token" => "wrong"})
+        FastestMCP.call_tool!(server_name, "whoami", %{}, auth_input: %{"token" => "wrong"})
       end
 
     assert error.code == :unauthorized
@@ -148,7 +148,7 @@ defmodule FastestMCP.AuthContractTest do
              auth: %{provider: :function},
              capabilities: ["tools:call"]
            } ==
-             FastestMCP.call_tool(server_name, "whoami", %{},
+             FastestMCP.call_tool!(server_name, "whoami", %{},
                auth_input: %{"token" => "function-token"}
              )
   end
@@ -183,7 +183,7 @@ defmodule FastestMCP.AuthContractTest do
              },
              capabilities: ["tools:call", "resources:read"]
            } =
-             FastestMCP.call_tool(server_name, "whoami", %{},
+             FastestMCP.call_tool!(server_name, "whoami", %{},
                auth_input: %{"authorization" => "Bearer valid-token"}
              )
 
@@ -378,7 +378,7 @@ defmodule FastestMCP.AuthContractTest do
              verified_scopes: ["tools:call"],
              verified_audiences: ["https://mcp.example/mcp"]
            } ==
-             FastestMCP.call_tool(server_name, "whoami", %{},
+             FastestMCP.call_tool!(server_name, "whoami", %{},
                auth_input: %{
                  "assigns" => %{
                    "current_user" => %{

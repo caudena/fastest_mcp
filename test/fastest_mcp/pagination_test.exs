@@ -171,23 +171,23 @@ defmodule FastestMCP.PaginationTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    assert 5 = length(FastestMCP.list_tools(server_name))
+    assert 5 = length(FastestMCP.list_tools!(server_name))
 
     %{items: tools_page_1, next_cursor: tools_cursor} =
-      FastestMCP.list_tools(server_name, page_size: 2)
+      FastestMCP.list_tools!(server_name, page_size: 2)
 
     %{items: tools_page_2, next_cursor: nil} =
-      FastestMCP.list_tools(server_name, page_size: 3, cursor: Pagination.encode_cursor(2))
+      FastestMCP.list_tools!(server_name, page_size: 3, cursor: Pagination.encode_cursor(2))
 
     assert Enum.map(tools_page_1, & &1.name) == ["tool_1", "tool_2"]
     assert is_binary(tools_cursor)
     assert Enum.map(tools_page_2, & &1.name) == ["tool_3", "tool_4", "tool_5"]
 
     %{items: resources_page, next_cursor: resources_cursor} =
-      FastestMCP.list_resources(server_name, page_size: 2)
+      FastestMCP.list_resources!(server_name, page_size: 2)
 
     %{items: prompts_page, next_cursor: prompts_cursor} =
-      FastestMCP.list_prompts(server_name, page_size: 2)
+      FastestMCP.list_prompts!(server_name, page_size: 2)
 
     assert Enum.map(resources_page, & &1.uri) == ["data://resource/1", "data://resource/2"]
     assert Enum.map(prompts_page, & &1.name) == ["prompt_1", "prompt_2"]
@@ -401,7 +401,7 @@ defmodule FastestMCP.PaginationTest do
 
     refute_receive {:bounded_page, _after_key, _limit, _count}, 20
 
-    :ok = FastestMCP.disable_components(server_name, names: ["tool_150"])
+    :ok = FastestMCP.disable_components!(server_name, names: ["tool_150"])
 
     assert_raise Error, ~r/invalid cursor/, fn ->
       Engine.dispatch!(server_name, %Request{

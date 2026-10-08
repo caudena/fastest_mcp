@@ -47,7 +47,7 @@ defmodule FastestMCP.TestSupport.ConformanceClientHarness do
         protocol_version: protocol_version!()
       )
 
-    Client.disconnect(client)
+    Client.disconnect!(client)
   end
 
   defp run_tools_call(server_url) do
@@ -58,15 +58,15 @@ defmodule FastestMCP.TestSupport.ConformanceClientHarness do
       )
 
     try do
-      page = Client.list_tools(client)
+      page = Client.list_tools!(client)
 
       unless Enum.any?(page.items, &(&1["name"] == "add_numbers")) do
         raise "conformance server did not advertise add_numbers"
       end
 
-      _result = Client.call_tool(client, "add_numbers", %{"a" => 20, "b" => 22})
+      _result = Client.call_tool!(client, "add_numbers", %{"a" => 20, "b" => 22})
     after
-      Client.disconnect(client)
+      Client.disconnect!(client)
     end
   end
 
@@ -87,9 +87,9 @@ defmodule FastestMCP.TestSupport.ConformanceClientHarness do
       )
 
     try do
-      _tools = Client.list_tools(client)
+      _tools = Client.list_tools!(client)
     after
-      Client.disconnect(client)
+      Client.disconnect!(client)
     end
   end
 
@@ -103,16 +103,16 @@ defmodule FastestMCP.TestSupport.ConformanceClientHarness do
       )
 
     try do
-      page = Client.list_tools(client)
+      page = Client.list_tools!(client)
 
       unless Enum.any?(page.items, &(&1["name"] == "test_client_elicitation_defaults")) do
         raise "conformance server did not advertise the elicitation defaults tool"
       end
 
       _result =
-        Client.call_tool(client, "test_client_elicitation_defaults", %{}, timeout_ms: 15_000)
+        Client.call_tool!(client, "test_client_elicitation_defaults", %{}, timeout_ms: 15_000)
     after
-      Client.disconnect(client)
+      Client.disconnect!(client)
     end
   end
 
@@ -127,9 +127,9 @@ defmodule FastestMCP.TestSupport.ConformanceClientHarness do
       )
 
     try do
-      _result = Client.call_tool(client, "test_reconnection", %{}, timeout_ms: 15_000)
+      _result = Client.call_tool!(client, "test_reconnection", %{}, timeout_ms: 15_000)
     after
-      Client.disconnect(client)
+      Client.disconnect!(client)
       if proxy, do: PinnedConformanceSSEProxy.stop(proxy)
     end
   end
@@ -152,13 +152,13 @@ defmodule FastestMCP.TestSupport.ConformanceClientHarness do
       )
 
     try do
-      _ = Client.list_tools(client)
-      _ = Client.call_tool(client, "test_mrtr_unrelated", %{})
-      _ = Client.call_tool(client, "test_mrtr_echo_state", %{})
-      _ = Client.call_tool(client, "test_mrtr_no_state", %{})
-      _ = Client.call_tool(client, "test_mrtr_no_result_type", %{})
+      _ = Client.list_tools!(client)
+      _ = Client.call_tool!(client, "test_mrtr_unrelated", %{})
+      _ = Client.call_tool!(client, "test_mrtr_echo_state", %{})
+      _ = Client.call_tool!(client, "test_mrtr_no_state", %{})
+      _ = Client.call_tool!(client, "test_mrtr_no_result_type", %{})
     after
-      Client.disconnect(client)
+      Client.disconnect!(client)
     end
   end
 
@@ -170,16 +170,16 @@ defmodule FastestMCP.TestSupport.ConformanceClientHarness do
       )
 
     try do
-      %{items: [tool | _]} = Client.list_tools(client)
-      _ = Client.call_tool(client, tool["name"], %{})
+      %{items: [tool | _]} = Client.list_tools!(client)
+      _ = Client.call_tool!(client, tool["name"], %{})
 
-      %{items: [resource | _]} = Client.list_resources(client)
-      _ = Client.read_resource(client, resource["uri"])
+      %{items: [resource | _]} = Client.list_resources!(client)
+      _ = Client.read_resource!(client, resource["uri"])
 
-      %{items: [prompt | _]} = Client.list_prompts(client)
-      _ = Client.render_prompt(client, prompt["name"], %{})
+      %{items: [prompt | _]} = Client.list_prompts!(client)
+      _ = Client.render_prompt!(client, prompt["name"], %{})
     after
-      Client.disconnect(client)
+      Client.disconnect!(client)
     end
   end
 
@@ -193,7 +193,7 @@ defmodule FastestMCP.TestSupport.ConformanceClientHarness do
       )
 
     try do
-      _ = Client.list_tools(client)
+      _ = Client.list_tools!(client)
 
       Enum.each(Map.fetch!(context, "toolCalls"), fn %{
                                                        "name" => name,
@@ -203,10 +203,10 @@ defmodule FastestMCP.TestSupport.ConformanceClientHarness do
         # advertised boolean schema. Omitting it is the schema-valid form and
         # exercises the same rule: no Mcp-Param header may be emitted.
         arguments = Map.reject(arguments, fn {_name, value} -> is_nil(value) end)
-        _ = Client.call_tool(client, name, arguments)
+        _ = Client.call_tool!(client, name, arguments)
       end)
     after
-      Client.disconnect(client)
+      Client.disconnect!(client)
     end
   end
 
@@ -218,15 +218,15 @@ defmodule FastestMCP.TestSupport.ConformanceClientHarness do
       )
 
     try do
-      page = Client.list_tools(client)
+      page = Client.list_tools!(client)
 
       unless Enum.any?(page.items, &(&1["name"] == "valid_tool")) do
         raise "client discarded the valid tool while filtering invalid x-mcp-header annotations"
       end
 
-      _ = Client.call_tool(client, "valid_tool", %{"region" => "us-west1"})
+      _ = Client.call_tool!(client, "valid_tool", %{"region" => "us-west1"})
     after
-      Client.disconnect(client)
+      Client.disconnect!(client)
     end
   end
 
@@ -238,9 +238,9 @@ defmodule FastestMCP.TestSupport.ConformanceClientHarness do
       )
 
     try do
-      _ = Client.list_tools(client)
+      _ = Client.list_tools!(client)
     after
-      Client.disconnect(client)
+      Client.disconnect!(client)
     end
   end
 
@@ -262,10 +262,10 @@ defmodule FastestMCP.TestSupport.ConformanceClientHarness do
       )
 
     try do
-      _tools = Client.list_tools(client, timeout_ms: 15_000)
-      _result = Client.call_tool(client, "test-tool", %{}, timeout_ms: 15_000)
+      _tools = Client.list_tools!(client, timeout_ms: 15_000)
+      _result = Client.call_tool!(client, "test-tool", %{}, timeout_ms: 15_000)
     after
-      Client.disconnect(client)
+      Client.disconnect!(client)
     end
   end
 
@@ -304,10 +304,10 @@ defmodule FastestMCP.TestSupport.ConformanceClientHarness do
       )
 
     try do
-      _tools = Client.list_tools(client, timeout_ms: 15_000)
-      _result = Client.call_tool(client, "test-tool", %{}, timeout_ms: 15_000)
+      _tools = Client.list_tools!(client, timeout_ms: 15_000)
+      _result = Client.call_tool!(client, "test-tool", %{}, timeout_ms: 15_000)
     after
-      Client.disconnect(client)
+      Client.disconnect!(client)
     end
   end
 
@@ -347,10 +347,10 @@ defmodule FastestMCP.TestSupport.ConformanceClientHarness do
       )
 
     try do
-      _tools = Client.list_tools(client, timeout_ms: 15_000)
-      _result = Client.call_tool(client, "test-tool", %{}, timeout_ms: 15_000)
+      _tools = Client.list_tools!(client, timeout_ms: 15_000)
+      _result = Client.call_tool!(client, "test-tool", %{}, timeout_ms: 15_000)
     after
-      Client.disconnect(client)
+      Client.disconnect!(client)
     end
   end
 

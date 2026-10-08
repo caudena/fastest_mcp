@@ -1037,10 +1037,7 @@ defmodule FastestMCP.BackgroundTaskStore do
     |> maybe_put(:mime_type, Map.get(component, :mime_type))
   end
 
-  defp tool_error_result?(%{} = result) do
-    Map.get(result, :isError, Map.get(result, "isError", Map.get(result, :is_error, false))) ==
-      true
-  end
+  defp tool_error_result?(%FastestMCP.Tools.Result{is_error: true}), do: true
 
   defp tool_error_result?(_result), do: false
 

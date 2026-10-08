@@ -9,6 +9,8 @@
 
 # Node dependencies installed for the pinned MCP conformance runner.
 /test/conformance/node_modules/
+/test/interop/.venv/
+/test/interop/__pycache__/
 
 # Where third-party dependencies like ExDoc output generated docs.
 /doc/

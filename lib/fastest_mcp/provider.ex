@@ -33,21 +33,50 @@ defmodule FastestMCP.Provider do
   alias FastestMCP.Pagination
   alias FastestMCP.ProviderTransform
 
-  defstruct [:inner, transforms: []]
+  defstruct [:inner, :callbacks, transforms: []]
+
+  @callback list_components(struct(), atom(), FastestMCP.Operation.t()) :: [struct()]
+  @callback list_component_page(struct(), atom(), term(), pos_integer(), FastestMCP.Operation.t()) ::
+              map() | {:ok, map()}
+  @callback get_component(struct(), atom(), String.t(), FastestMCP.Operation.t()) ::
+              struct() | nil
+  @callback get_component_candidates(struct(), atom(), String.t(), FastestMCP.Operation.t()) :: [
+              struct()
+            ]
+  @callback get_resource_target(struct(), String.t(), FastestMCP.Operation.t()) :: tuple() | nil
+  @callback get_resource_target_candidates(struct(), String.t(), FastestMCP.Operation.t()) :: [
+              tuple()
+            ]
+  @callback provider_type(struct()) :: String.t()
+  @callback http_routes(struct()) :: list()
+  @callback required_extensions(struct()) :: [FastestMCP.ServerExtension.t()]
+  @optional_callbacks list_components: 3,
+                      list_component_page: 5,
+                      get_component: 4,
+                      get_component_candidates: 4,
+                      get_resource_target: 3,
+                      get_resource_target_candidates: 3,
+                      provider_type: 1,
+                      http_routes: 1,
+                      required_extensions: 1
 
   @type inner :: struct()
 
   @type t :: %__MODULE__{
           inner: inner(),
+          callbacks: MapSet.t(),
           transforms: [struct()]
         }
 
   @doc "Builds a new value for this module from the supplied options."
+  def new(%__MODULE__{callbacks: nil} = provider),
+    do: %{new(provider.inner) | transforms: provider.transforms}
+
   def new(%__MODULE__{} = provider), do: provider
 
   def new(%module{} = provider) do
     validate!(provider, module)
-    %__MODULE__{inner: provider}
+    %__MODULE__{inner: provider, callbacks: MapSet.new(module.__info__(:functions))}
   end
 
   @doc "Adds a transform to the current definition."
@@ -61,16 +90,34 @@ defmodule FastestMCP.Provider do
     |> add_transform(transform)
   end
 
+  @doc "Returns executable extensions required by this provider, including through transforms."
+  def required_extensions(%__MODULE__{inner: %module{} = inner} = provider) do
+    extensions =
+      if supports?(provider, :required_extensions, 1),
+        do: module.required_extensions(inner),
+        else: []
+
+    unless is_list(extensions) and
+             Enum.all?(extensions, &match?(%FastestMCP.ServerExtension{}, &1)) do
+      raise ArgumentError,
+            "provider required_extensions/1 must return a list of ServerExtension declarations"
+    end
+
+    extensions
+  end
+
+  def required_extensions(%_{} = provider), do: provider |> new() |> required_extensions()
+
   @doc "Lists the components exposed by this module."
   def list_components(%__MODULE__{} = provider, component_type, operation) do
-    provider.inner
+    provider
     |> do_list_components(component_type, operation)
     |> apply_transforms(provider.transforms, operation)
   end
 
   @doc "Returns whether this provider can perform a bounded source-level component page lookup."
-  def component_page_callback?(%__MODULE__{inner: %module{}, transforms: transforms}) do
-    transforms == [] and function_exported?(module, :list_component_page, 5)
+  def component_page_callback?(%__MODULE__{transforms: transforms} = provider) do
+    transforms == [] and supports?(provider, :list_component_page, 5)
   end
 
   @doc """
@@ -135,7 +182,7 @@ defmodule FastestMCP.Provider do
            ),
          candidates <-
            do_get_component_candidates(
-             provider.inner,
+             provider,
              component_type,
              raw_identifier,
              operation
@@ -163,7 +210,7 @@ defmodule FastestMCP.Provider do
   def get_resource_target_candidates(%__MODULE__{} = provider, uri, operation) do
     case reverse_identifier(provider.transforms, :resource, to_string(uri), operation) do
       {:ok, raw_uri} ->
-        provider.inner
+        provider
         |> do_get_resource_target_candidates(raw_uri, operation)
         |> Enum.reduce([], fn target, transformed ->
           case transform_resource_target(target, provider.transforms, uri, operation) do
@@ -179,48 +226,51 @@ defmodule FastestMCP.Provider do
   end
 
   @doc "Returns the component or provider type."
-  def type(%__MODULE__{inner: inner}), do: type(inner)
-
-  def type(%module{} = provider) do
-    if function_exported?(module, :provider_type, 1) do
-      module.provider_type(provider)
-    else
-      module |> Module.split() |> List.last()
-    end
+  def type(%__MODULE__{inner: %module{} = inner} = provider) do
+    if supports?(provider, :provider_type, 1),
+      do: module.provider_type(inner),
+      else: module |> Module.split() |> List.last()
   end
+
+  def type(%_{} = provider), do: provider |> new() |> type()
 
   @doc "Returns additional HTTP routes exposed by this provider."
-  def http_routes(%__MODULE__{inner: inner}), do: http_routes(inner)
+  def http_routes(%__MODULE__{inner: %module{} = inner} = provider) do
+    if supports?(provider, :http_routes, 1), do: List.wrap(module.http_routes(inner)), else: []
+  end
 
-  def http_routes(%module{} = provider) do
-    if function_exported?(module, :http_routes, 1) do
-      List.wrap(module.http_routes(provider))
+  def http_routes(%_{} = provider), do: provider |> new() |> http_routes()
+
+  defp do_list_components(
+         %__MODULE__{inner: %module{} = inner} = provider,
+         component_type,
+         operation
+       ) do
+    if supports?(provider, :list_components, 3) do
+      List.wrap(module.list_components(inner, component_type, operation))
     else
       []
     end
   end
 
-  defp do_list_components(%module{} = provider, component_type, operation) do
-    if function_exported?(module, :list_components, 3) do
-      List.wrap(module.list_components(provider, component_type, operation))
-    else
-      []
-    end
-  end
-
-  defp do_get_component_candidates(%module{} = provider, component_type, identifier, operation) do
+  defp do_get_component_candidates(
+         %__MODULE__{inner: %module{} = inner} = provider,
+         component_type,
+         identifier,
+         operation
+       ) do
     cond do
-      function_exported?(module, :get_component_candidates, 4) ->
-        provider
+      supports?(provider, :get_component_candidates, 4) ->
+        inner
         |> module.get_component_candidates(component_type, to_string(identifier), operation)
         |> List.wrap()
 
-      function_exported?(module, :get_component, 4) ->
-        provider
+      supports?(provider, :get_component, 4) ->
+        inner
         |> module.get_component(component_type, to_string(identifier), operation)
         |> List.wrap()
 
-      function_exported?(module, :list_components, 3) ->
+      supports?(provider, :list_components, 3) ->
         listed_component_candidates(provider, component_type, identifier, operation)
 
       true ->
@@ -234,14 +284,18 @@ defmodule FastestMCP.Provider do
     |> Enum.filter(&(Component.identifier(&1) == to_string(identifier)))
   end
 
-  defp do_get_resource_target_candidates(%module{} = provider, uri, operation) do
+  defp do_get_resource_target_candidates(
+         %__MODULE__{inner: %module{} = inner} = provider,
+         uri,
+         operation
+       ) do
     cond do
-      function_exported?(module, :get_resource_target_candidates, 3) ->
-        provider
+      supports?(provider, :get_resource_target_candidates, 3) ->
+        inner
         |> module.get_resource_target_candidates(to_string(uri), operation)
         |> List.wrap()
 
-      function_exported?(module, :list_components, 3) ->
+      supports?(provider, :list_components, 3) ->
         exact =
           provider
           |> do_get_component_candidates(:resource, uri, operation)
@@ -264,8 +318,8 @@ defmodule FastestMCP.Provider do
             Enum.map(components, &{:exact, &1, %{}})
         end
 
-      function_exported?(module, :get_resource_target, 3) ->
-        provider
+      supports?(provider, :get_resource_target, 3) ->
+        inner
         |> module.get_resource_target(to_string(uri), operation)
         |> List.wrap()
 
@@ -273,6 +327,9 @@ defmodule FastestMCP.Provider do
         []
     end
   end
+
+  defp supports?(%__MODULE__{callbacks: callbacks}, name, arity),
+    do: MapSet.member?(callbacks, {name, arity})
 
   defp validate!(provider, module) do
     unless function_exported?(module, :list_components, 3) or

@@ -17,12 +17,12 @@ defmodule FastestMCP.Runtime.SessionCapacityTest do
     assert {:ok, _pid} = FastestMCP.start_server(server, session_idle_ttl: 20)
 
     assert %{count: 1} ==
-             FastestMCP.call_tool(server_name, "remember", %{}, session_id: "ttl-session")
+             FastestMCP.call_tool!(server_name, "remember", %{}, session_id: "ttl-session")
 
     Process.sleep(50)
 
     assert %{count: 1} ==
-             FastestMCP.call_tool(server_name, "remember", %{}, session_id: "ttl-session")
+             FastestMCP.call_tool!(server_name, "remember", %{}, session_id: "ttl-session")
   end
 
   test "session caps reject new sessions while allowing reuse of active sessions" do
@@ -36,18 +36,18 @@ defmodule FastestMCP.Runtime.SessionCapacityTest do
              FastestMCP.start_server(server, max_sessions: 1, session_idle_ttl: :infinity)
 
     assert %{"message" => "first"} ==
-             FastestMCP.call_tool(server_name, "echo", %{"message" => "first"},
+             FastestMCP.call_tool!(server_name, "echo", %{"message" => "first"},
                session_id: "session-a"
              )
 
     assert %{"message" => "reuse"} ==
-             FastestMCP.call_tool(server_name, "echo", %{"message" => "reuse"},
+             FastestMCP.call_tool!(server_name, "echo", %{"message" => "reuse"},
                session_id: "session-a"
              )
 
     error =
       assert_raise Error, fn ->
-        FastestMCP.call_tool(server_name, "echo", %{"message" => "second"},
+        FastestMCP.call_tool!(server_name, "echo", %{"message" => "second"},
           session_id: "session-b"
         )
       end

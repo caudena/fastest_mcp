@@ -13,6 +13,8 @@ defmodule FastestMCP.Middleware.ToolSearch do
   alias FastestMCP.Error
   alias FastestMCP.InputValidator
   alias FastestMCP.Middleware.ToolInjection
+  @behaviour FastestMCP.Middleware
+
   alias FastestMCP.Operation
   alias FastestMCP.OperationPipeline
   alias FastestMCP.Protocol
@@ -27,7 +29,6 @@ defmodule FastestMCP.Middleware.ToolSearch do
   @token_pattern ~r/[\p{L}\p{N}]+/u
 
   defstruct [
-    :middleware,
     :injection,
     search_tool_name: @default_search_tool_name,
     call_tool_name: @default_call_tool_name,
@@ -37,7 +38,6 @@ defmodule FastestMCP.Middleware.ToolSearch do
   ]
 
   @type t :: %__MODULE__{
-          middleware: (Operation.t(), (Operation.t() -> any()) -> any()),
           injection: struct(),
           search_tool_name: String.t(),
           call_tool_name: String.t(),
@@ -107,7 +107,7 @@ defmodule FastestMCP.Middleware.ToolSearch do
       max_scan: max_scan
     }
 
-    %{tool_search | middleware: fn operation, next -> call(tool_search, operation, next) end}
+    tool_search
   end
 
   def new(other) do
@@ -120,6 +120,7 @@ defmodule FastestMCP.Middleware.ToolSearch do
   end
 
   @doc false
+  @impl FastestMCP.Middleware
   def call(%__MODULE__{} = tool_search, %Operation{method: "tools/list"} = operation, _next) do
     ensure_no_collisions!(tool_search, operation)
     catalog_operation = OperationPipeline.tool_catalog_operation(operation)
@@ -259,11 +260,11 @@ defmodule FastestMCP.Middleware.ToolSearch do
         message: "tool search query must contain at least one letter or number"
     end
 
-    %{text: query |> String.trim() |> String.downcase(), tokens: tokens}
+    %{text: query |> String.trim() |> normalize_search_text(), tokens: tokens}
   end
 
   defp search_rank(tool, %{text: query, tokens: query_tokens}) do
-    name = tool.name |> to_string() |> String.downcase()
+    name = normalize_search_text(tool.name)
     name_tokens = tokenize(name)
 
     descriptive_tokens =
@@ -360,11 +361,14 @@ defmodule FastestMCP.Middleware.ToolSearch do
 
   defp tokenize(value) do
     value
-    |> to_string()
-    |> String.downcase()
+    |> normalize_search_text()
     |> then(&Regex.scan(@token_pattern, &1))
     |> Enum.map(&List.first/1)
     |> Enum.uniq()
+  end
+
+  defp normalize_search_text(value) do
+    value |> to_string() |> String.normalize(:nfkc) |> :string.casefold()
   end
 
   defp bounded_insert(entries, entry, limit) do

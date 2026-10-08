@@ -2,6 +2,24 @@
 
 FastestMCP is designed to be tested from normal Elixir code.
 
+## MCP Interoperability
+
+The optional interoperability lane checks FastestMCP against independent MCP
+peers. Its test dependencies are pinned by `test/interop/uv.lock`. Run it after
+fetching the Elixir dependencies with `mix deps.get`:
+
+```bash
+uv sync --frozen --project test/interop
+mix test --only interop
+```
+
+The four tests exercise FastestMCP in both client and server roles over HTTP
+and stdio. They cover both supported MCP revisions, tool discovery, structured
+results, and resource reads. The hermetic native suite excludes this lane;
+CI installs its locked test environment separately.
+
+## Native Testing Layers
+
 You do not need a separate inspector or a separate application container to get
 confidence in your server. In practice there are three useful layers:
 
@@ -24,7 +42,7 @@ test "sum tool works" do
   assert {:ok, _pid} = FastestMCP.start_server(server)
   on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-  assert 42 == FastestMCP.call_tool(server_name, "sum", %{"a" => 20, "b" => 22})
+  assert 42 == FastestMCP.call_tool!(server_name, "sum", %{"a" => 20, "b" => 22})
 end
 ```
 
@@ -64,7 +82,7 @@ client =
     client_info: %{"name" => "docs-client", "version" => "1.0.0"}
   )
 
-assert 42 == FastestMCP.Client.call_tool(client, "sum", %{"a" => 20, "b" => 22})
+assert %FastestMCP.Client.ToolResult{structured_content: 42} = FastestMCP.Client.call_tool!(client, "sum", %{"a" => 20, "b" => 22})
 ```
 
 Use this layer when you care about:
@@ -98,24 +116,24 @@ defect.
 Background task behavior is testable through the same public API:
 
 ```elixir
-task = FastestMCP.call_tool(MyApp.MCPServer, "slow", %{}, task: true)
+task = FastestMCP.call_tool!(MyApp.MCPServer, "slow", %{}, task: true)
 assert %FastestMCP.BackgroundTask{} = task
-assert :done == FastestMCP.await_task(task, 1_000)
+assert :done == FastestMCP.await_task!(task, 1_000)
 ```
 
 Interactive tasks can be driven by sending task input:
 
 ```elixir
-task = FastestMCP.call_tool(MyApp.MCPServer, "approve_release", %{}, task: true)
+task = FastestMCP.call_tool!(MyApp.MCPServer, "approve_release", %{}, task: true)
 
-FastestMCP.send_task_input(
+FastestMCP.send_task_input!(
   MyApp.MCPServer,
   task.task_id,
   :accept,
   %{"confirmed" => true}
 )
 
-assert %{approved: true} = FastestMCP.await_task(task, 1_000)
+assert %{approved: true} = FastestMCP.await_task!(task, 1_000)
 ```
 
 ## What To Test At Each Layer
@@ -195,3 +213,22 @@ go through an external inspector or network boundary.
 - [Client](client.md)
 - [Background Tasks](background-tasks.md)
 - [Telemetry](telemetry.md)
+
+## Index scaling measurements
+
+Run `mix run scripts/benchmark_indexes.exs` separately from correctness tests.
+The script warms each path and measures 300 registry lookups and 500 client
+catalog lookups at each size. It does not enforce timing thresholds.
+
+On the local Elixir 1.20.4 / OTP 29 checkout, the 0.4 implementation measured:
+
+| Unrelated components / catalog tools | Registry default reads | Registry exact reads | Catalog preferred reads |
+| --- | --- | --- | --- |
+| 100 | 0.316 ms | 0.116 ms | 0.038 ms |
+| 1,000 | 0.324 ms | 0.123 ms | 0.037 ms |
+| 10,000 | 0.356 ms | 0.150 ms | 0.046 ms |
+
+These isolate lookup cost, excluding construction, network traffic, and handler
+execution. They establish scaling behavior for this machine, not an end-to-end
+latency guarantee. HTTP workers receive bounded transport snapshots without
+copying the connection's catalog or pending-request indexes.

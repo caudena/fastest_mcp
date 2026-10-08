@@ -126,21 +126,21 @@ defmodule FastestMCP.ContextStateTest do
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
     assert %{stored: "hello"} ==
-             FastestMCP.call_tool(server_name, "write_session", %{"value" => "hello"},
+             FastestMCP.call_tool!(server_name, "write_session", %{"value" => "hello"},
                session_id: "state-session"
              )
 
     assert %{shared: "hello"} ==
-             FastestMCP.call_tool(server_name, "read_session", %{}, session_id: "state-session")
+             FastestMCP.call_tool!(server_name, "read_session", %{}, session_id: "state-session")
 
     assert %{same_request: true, later: "hello"} ==
-             FastestMCP.call_tool(server_name, "request_only", %{}, session_id: "state-session")
+             FastestMCP.call_tool!(server_name, "request_only", %{}, session_id: "state-session")
 
     assert %{shared: :missing} ==
-             FastestMCP.call_tool(server_name, "clear_session", %{}, session_id: "state-session")
+             FastestMCP.call_tool!(server_name, "clear_session", %{}, session_id: "state-session")
 
     assert %{shared: :missing} ==
-             FastestMCP.call_tool(server_name, "read_session", %{}, session_id: "state-session")
+             FastestMCP.call_tool!(server_name, "read_session", %{}, session_id: "state-session")
   end
 
   test "custom session state backends are used for state operations and cleanup" do
@@ -162,7 +162,7 @@ defmodule FastestMCP.ContextStateTest do
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
     assert %{value: "stored"} ==
-             FastestMCP.call_tool(server_name, "remember", %{"value" => "stored"},
+             FastestMCP.call_tool!(server_name, "remember", %{"value" => "stored"},
                session_id: "recorded-session"
              )
 

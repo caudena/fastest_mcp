@@ -28,7 +28,7 @@ defmodule FastestMCP.Middleware do
     |> FastestMCP.add_middleware(FastestMCP.Middleware.error_handling())
   ```
 
-  Each function in this module returns the concrete middleware object expected by
+  Each function in this module returns the immutable middleware configuration accepted by
   `FastestMCP.add_middleware/2`.
   """
 
@@ -44,10 +44,40 @@ defmodule FastestMCP.Middleware do
   alias FastestMCP.Middleware.Timing
   alias FastestMCP.Middleware.ToolInjection
 
+  @callback call(struct(), FastestMCP.Operation.t(), (FastestMCP.Operation.t() -> term())) ::
+              term()
+  @callback activate_runtime(struct()) :: struct()
+  @callback deactivate_runtime(struct()) :: :ok
+  @optional_callbacks activate_runtime: 1, deactivate_runtime: 1
+
+  @doc false
+  def validate!(middleware) when is_function(middleware, 2), do: middleware
+
+  def validate!(%module{} = middleware) do
+    unless Code.ensure_loaded?(module) and function_exported?(module, :call, 3) do
+      raise ArgumentError, "middleware #{inspect(module)} must implement call/3"
+    end
+
+    middleware
+  end
+
+  @doc false
+  def run([], operation, executor), do: executor.(operation)
+
+  def run([middleware | rest], operation, executor) do
+    call(middleware, operation, &run(rest, &1, executor))
+  end
+
+  @doc false
+  def call(middleware, operation, next) when is_function(middleware, 2),
+    do: middleware.(operation, next)
+
+  def call(%module{} = config, operation, next), do: module.call(config, operation, next)
+
   @doc false
   def callable(middleware) when is_function(middleware, 2), do: middleware
 
-  def callable(%{middleware: middleware}) when is_function(middleware, 2), do: middleware
+  def callable(%module{} = config), do: &module.call(config, &1, &2)
 
   @doc false
   def activate_runtime(middleware) when is_function(middleware, 2), do: middleware

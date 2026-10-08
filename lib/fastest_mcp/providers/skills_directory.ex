@@ -1,4 +1,5 @@
 defmodule FastestMCP.Providers.SkillsDirectory do
+  @behaviour FastestMCP.Provider
   @moduledoc """
   Provider that scans one or more roots for skill folders.
 
@@ -47,6 +48,7 @@ defmodule FastestMCP.Providers.SkillsDirectory do
   end
 
   @doc "Returns the provider type label."
+  @impl FastestMCP.Provider
   def provider_type(%__MODULE__{}), do: "SkillsDirectoryProvider"
 
   @doc false
@@ -73,6 +75,7 @@ defmodule FastestMCP.Providers.SkillsDirectory do
   def deactivate_runtime(%__MODULE__{}), do: :ok
 
   @doc "Lists the components exposed by this module."
+  @impl FastestMCP.Provider
   def list_components(%__MODULE__{} = provider, component_type, operation) do
     provider
     |> current_providers()
@@ -80,6 +83,7 @@ defmodule FastestMCP.Providers.SkillsDirectory do
   end
 
   @doc "Resolves one component by type and identifier."
+  @impl FastestMCP.Provider
   def get_component(%__MODULE__{} = provider, component_type, identifier, operation) do
     provider
     |> current_providers()
@@ -87,6 +91,7 @@ defmodule FastestMCP.Providers.SkillsDirectory do
   end
 
   @doc "Resolves the backing resource target for a concrete URI."
+  @impl FastestMCP.Provider
   def get_resource_target(%__MODULE__{} = provider, uri, operation) do
     provider
     |> current_providers()

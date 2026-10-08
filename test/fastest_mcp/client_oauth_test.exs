@@ -1154,7 +1154,7 @@ defmodule FastestMCP.ClientOAuthTest do
         ]
       )
 
-    on_exit(fn -> if Client.connected?(client), do: Client.disconnect(client) end)
+    on_exit(fn -> if Client.connected?(client), do: Client.disconnect!(client) end)
 
     state = :sys.get_state(client.pid)
 

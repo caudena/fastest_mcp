@@ -1,4 +1,5 @@
 defmodule FastestMCP.Providers.Proxy do
+  @behaviour FastestMCP.Provider
   @moduledoc """
   Request-scoped proxy provider for a remote MCP server.
 
@@ -139,9 +140,11 @@ defmodule FastestMCP.Providers.Proxy do
   end
 
   @doc "Returns the provider type label."
+  @impl FastestMCP.Provider
   def provider_type(%__MODULE__{}), do: "ProxyProvider"
 
   @doc "Lists remote components through the request-scoped upstream client."
+  @impl FastestMCP.Provider
   def list_components(%__MODULE__{} = proxy, component_type, %Operation{} = operation)
       when component_type in @component_types do
     proxy
@@ -152,6 +155,7 @@ defmodule FastestMCP.Providers.Proxy do
   def list_components(%__MODULE__{}, _component_type, _operation), do: []
 
   @doc false
+  @impl FastestMCP.Provider
   def get_component_candidates(
         %__MODULE__{} = proxy,
         component_type,
@@ -173,6 +177,7 @@ defmodule FastestMCP.Providers.Proxy do
   def get_component_candidates(%__MODULE__{}, _component_type, _identifier, _operation), do: []
 
   @doc "Resolves a remote resource or resource template for one concrete URI."
+  @impl FastestMCP.Provider
   def get_resource_target_candidates(
         %__MODULE__{} = proxy,
         uri,
@@ -243,13 +248,13 @@ defmodule FastestMCP.Providers.Proxy do
       reraise sanitize_upstream_exception(exception, proxy, operation.context), __STACKTRACE__
   end
 
-  defp list_remote_page(client, :tool, opts), do: Client.list_tools(client, opts)
-  defp list_remote_page(client, :resource, opts), do: Client.list_resources(client, opts)
+  defp list_remote_page(client, :tool, opts), do: Client.list_tools!(client, opts)
+  defp list_remote_page(client, :resource, opts), do: Client.list_resources!(client, opts)
 
   defp list_remote_page(client, :resource_template, opts),
-    do: Client.list_resource_templates(client, opts)
+    do: Client.list_resource_templates!(client, opts)
 
-  defp list_remote_page(client, :prompt, opts), do: Client.list_prompts(client, opts)
+  defp list_remote_page(client, :prompt, opts), do: Client.list_prompts!(client, opts)
 
   defp compile_descriptor(proxy, component_type, descriptor, operation, concrete_uri \\ nil)
 
@@ -340,7 +345,11 @@ defmodule FastestMCP.Providers.Proxy do
     proxy
     |> request_upstream(context, "tools/call", params, request_opts)
     |> normalize_upstream_result!()
+    |> explicit_tool_result()
   end
+
+  defp explicit_tool_result(%InputRequiredResult{} = result), do: result
+  defp explicit_tool_result(result), do: FastestMCP.Tools.Result.from_raw(result)
 
   defp forward_resource(proxy, descriptor, uri, context) do
     params =
@@ -351,6 +360,7 @@ defmodule FastestMCP.Providers.Proxy do
     proxy
     |> request_upstream(context, "resources/read", params)
     |> normalize_upstream_result!()
+    |> explicit_result(FastestMCP.Resources.Result)
   end
 
   defp forward_prompt(proxy, descriptor, arguments, context) do
@@ -365,13 +375,17 @@ defmodule FastestMCP.Providers.Proxy do
     proxy
     |> request_upstream(context, "prompts/get", params)
     |> normalize_upstream_result!()
+    |> explicit_result(FastestMCP.Prompts.Result)
   end
+
+  defp explicit_result(%InputRequiredResult{} = result, _module), do: result
+  defp explicit_result(result, module), do: module.from_raw(result)
 
   defp request_upstream(proxy, context, method, params, opts \\ []) do
     proxy
     |> upstream_client(context)
-    |> Client.request_async(method, params, opts)
-    |> Client.await(:infinity)
+    |> Client.request_async!(method, params, opts)
+    |> Client.await!(:infinity)
   rescue
     exception ->
       reraise sanitize_upstream_exception(exception, proxy, context), __STACKTRACE__
@@ -648,7 +662,7 @@ defmodule FastestMCP.Providers.Proxy do
   defp scrub_secret_values(value, _secrets), do: value
 
   defp disconnect_client(%Client{} = client) do
-    if Client.connected?(client), do: Client.disconnect(client)
+    if Client.connected?(client), do: Client.disconnect!(client)
     :ok
   catch
     :exit, _reason -> :ok

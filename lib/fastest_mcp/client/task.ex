@@ -60,4 +60,27 @@ defmodule FastestMCP.Client.Task do
   def on_status_change(%__MODULE__{} = task, callback) when is_function(callback) do
     FastestMCP.Client.on_task_status_change(task.client, task.task_id, callback)
   end
+
+  @doc "Raising variant of `status/1`."
+  def status!(task), do: FastestMCP.OperationResult.unwrap!(status(task))
+
+  @doc "Raising variant of `fetch/2`."
+  def fetch!(task, opts \\ []), do: FastestMCP.OperationResult.unwrap!(fetch(task, opts))
+
+  @doc "Raising variant of `wait/2`."
+  def wait!(task, opts \\ []), do: FastestMCP.OperationResult.unwrap!(wait(task, opts))
+
+  @doc "Raising variant of `result/2`."
+  def result!(task, opts \\ []), do: FastestMCP.OperationResult.unwrap!(result(task, opts))
+
+  @doc "Raising variant of `cancel/2`."
+  def cancel!(task, opts \\ []), do: FastestMCP.OperationResult.unwrap!(cancel(task, opts))
+
+  @doc "Raising variant of `update/3`."
+  def update!(task, input_responses, opts \\ []),
+    do: FastestMCP.OperationResult.unwrap!(update(task, input_responses, opts))
+
+  @doc "Raising variant of `on_status_change/2`."
+  def on_status_change!(task, callback),
+    do: FastestMCP.OperationResult.unwrap!(on_status_change(task, callback))
 end

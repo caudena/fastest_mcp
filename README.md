@@ -9,6 +9,7 @@ bounded work, and familiar OTP supervision rather than a separate runtime.
 
 [Protocol support](#protocol-support) · [Installation](#installation) ·
 [Quick start](#quick-start) · [Examples](#server-and-component-dsl) ·
+[Client groups](#client-groups) ·
 [Phoenix and authentication](#phoenix-and-authentication) ·
 [Documentation](#documentation)
 
@@ -45,20 +46,26 @@ and lifecycle differences.
 | --- | --- |
 | Server runtime | Module-owned or dynamic servers with supervised execution, bounded concurrency, overload control, and isolated lifecycles |
 | Connected client | Supervised Streamable HTTP, stdio, and in-process connections with callbacks, progress, subscriptions, Tasks, automatic protocol negotiation, and end-to-end OpenTelemetry |
+| Client groups | Independently negotiated connections, namespaced tools, complete catalog refreshes, and caller-owned cancellation |
 | Components | Tools, resources, resource templates, prompts, completion, runtime mutation, transforms, and visibility policies |
 | Security | Pluggable authentication, RFC 9728 protected-resource metadata, scope-aware authorization, and secure-by-default lexical resource-template screening |
-| Extensibility | Middleware, providers, mounted servers, active negotiated extensions, request-scoped proxying, and bounded tool search |
+| Extensibility | Middleware, providers, mounted servers, provider-bundled negotiated extensions, request-scoped proxying, and Unicode-aware bounded tool search |
+| API and skill imports | OpenAPI request validation and reference-preserving schemas; skill resources with multiline and nested YAML metadata |
 | Protocol features | MRTR, modern and legacy Tasks, MCP Apps metadata/resources, pagination, logging, cancellation, and JSON Schema validation |
 | State and operations | Request state, legacy transport sessions, application sessions, background tasks, telemetry, and structured cleanup |
 
 ## Installation
 
-Add FastestMCP to your dependencies:
+This source tree targets **0.4.0**, currently unreleased. It changes Elixir
+return values and middleware configuration while retaining the MCP wire
+contracts. See [the 0.4 migration guide](docs/migrating-to-0.4.md).
+
+To use this checkout from another local project:
 
 ```elixir
 def deps do
   [
-    {:fastest_mcp, "~> 0.3.1"}
+    {:fastest_mcp, path: "../fastest_mcp"}
   ]
 end
 ```
@@ -83,6 +90,10 @@ defmodule MyApp.MCPServer do
   def server(opts) do
     base_server(opts)
     |> FastestMCP.add_tool("sum", fn %{"a" => a, "b" => b}, _ctx -> a + b end)
+    |> FastestMCP.add_tool("slow_sum", fn %{"a" => a, "b" => b}, _ctx ->
+      Process.sleep(1_000)
+      a + b
+    end)
     |> FastestMCP.add_tool("visit", fn _arguments, ctx ->
       visits = Context.get_state(ctx, :visits, 0) + 1
       :ok = Context.set_state(ctx, :visits, visits)
@@ -96,7 +107,7 @@ children = [
 ]
 
 FastestMCP.call_tool(MyApp.MCPServer, "sum", %{"a" => 20, "b" => 22})
-# => 42
+# => {:ok, 42}
 ```
 
 Connect over HTTP with automatic latest-first negotiation:
@@ -109,12 +120,12 @@ client =
   )
 
 FastestMCP.Client.protocol_version(client)
-# => "2026-07-28"
+# => {:ok, "2026-07-28"}
 
-%FastestMCP.Client.ToolResult{structured_content: 42} =
-  FastestMCP.Client.call_tool_result(client, "sum", %{"a" => 20, "b" => 22})
+{:ok, %FastestMCP.Client.ToolResult{structured_content: 42}} =
+  FastestMCP.Client.call_tool(client, "sum", %{"a" => 20, "b" => 22})
 
-request =
+{:ok, request} =
   FastestMCP.Client.start_tool_result(client, "slow_sum", %{"a" => 20, "b" => 22})
 
 # This remains valid if tools/call becomes a negotiated remote task.
@@ -135,7 +146,7 @@ children = [
 ]
 
 :ok = FastestMCP.Client.await_ready(MyApp.MCPClient, 10_000)
-%{items: tools} = FastestMCP.Client.list_tools(MyApp.MCPClient)
+{:ok, %{items: tools}} = FastestMCP.Client.list_tools(MyApp.MCPClient)
 ```
 
 Client operations create OpenTelemetry CLIENT spans and propagate W3C trace
@@ -144,6 +155,43 @@ the remote MCP call without application glue.
 
 The full onboarding path, including transport startup and the first connected
 client call, lives in [docs/onboarding.md](docs/onboarding.md).
+
+## Client groups
+
+Use `FastestMCP.ClientGroup` to coordinate several servers without forcing them
+onto one protocol revision. Add one configuration per server to your application
+supervision tree:
+
+```elixir
+children = [
+  {FastestMCP.ClientGroup,
+   name: MyApp.MCPGroup,
+   clients: %{
+     "math" => [target: "http://localhost:4100/mcp"],
+     "reports" => [target: "https://reports.example.com/mcp"]
+   }}
+]
+
+{:ok, tools} = FastestMCP.ClientGroup.list_tools(MyApp.MCPGroup)
+
+result =
+  FastestMCP.ClientGroup.call_tool!(
+    MyApp.MCPGroup,
+    "math_sum",
+    %{"a" => 20, "b" => 22}
+  )
+```
+
+Each member retains its own authentication, callbacks, and task handling. Startup
+and catalog refresh require every member to succeed; later outages do not stop
+known tools on healthy members. Borrowed clients and cancellable calls use the
+same underlying client APIs. See [Multiple Independent Clients](docs/client.md#multiple-independent-clients)
+for ownership, cache behavior, and process replacement.
+
+Providers and mounted servers can also bundle the extensions their components
+need. Opt in with `FastestMCP.ServerExtension.new/2`'s `auto_register: true`, or configure
+the extension explicitly on the root. Conflicting bundles require an explicit
+root declaration. See [Provider-bundled extensions](docs/extensions.md#provider-bundled-extensions).
 
 ## Server and component DSL
 
@@ -342,6 +390,13 @@ protected resource server; token issuance, JWT verification, introspection,
 and login UI remain application or authorization-server responsibilities.
 
 ## Upgrading
+
+For the unreleased changes, review the [changelog](CHANGELOG.md#unreleased).
+OpenAPI dictionary and constrained bodies may now use a whole `body` argument;
+supplied bodies must satisfy the original schema before an HTTP request is sent.
+See [OpenAPI request fidelity](docs/providers-and-mounting.md#openapi-request-fidelity)
+for examples. Ordinary nested tool calls execute inline; local background work
+requires an explicit `task: true` even when the outer client negotiated Tasks.
 
 FastestMCP `0.3.x` keeps the complete MCP `2025-11-25` profile while adding
 `2026-07-28` as the preferred modern profile. Existing `0.2.x` deployments may

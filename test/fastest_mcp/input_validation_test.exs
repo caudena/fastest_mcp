@@ -40,10 +40,10 @@ defmodule FastestMCP.InputValidationTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    assert 30 == FastestMCP.call_tool(server_name, "add", %{"a" => 10, "b" => 20})
+    assert 30 == FastestMCP.call_tool!(server_name, "add", %{"a" => 10, "b" => 20})
 
     assert_raise Error, ~r/#\/a value has an invalid JSON type/, fn ->
-      FastestMCP.call_tool(server_name, "add", %{"a" => "10", "b" => 20})
+      FastestMCP.call_tool!(server_name, "add", %{"a" => "10", "b" => 20})
     end
   end
 
@@ -74,12 +74,12 @@ defmodule FastestMCP.InputValidationTest do
     profile = %{"name" => "Alice", "age" => 30, "email" => "alice@example.com"}
 
     assert "Alice:30:alice@example.com" ==
-             FastestMCP.call_tool(server_name, "create_user", %{"profile" => profile})
+             FastestMCP.call_tool!(server_name, "create_user", %{"profile" => profile})
 
     encoded = JSON.encode!(profile)
 
     assert_raise Error, ~r/#\/profile value has an invalid JSON type/, fn ->
-      FastestMCP.call_tool(server_name, "create_user", %{"profile" => encoded})
+      FastestMCP.call_tool!(server_name, "create_user", %{"profile" => encoded})
     end
   end
 
@@ -109,7 +109,7 @@ defmodule FastestMCP.InputValidationTest do
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
     assert %{id: "41", enabled: "true"} ==
-             FastestMCP.read_resource(server_name, "item://41?enabled=true")
+             FastestMCP.read_resource!(server_name, "item://41?enabled=true")
   end
 
   test "prompt required arguments are validated" do
@@ -125,7 +125,7 @@ defmodule FastestMCP.InputValidationTest do
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
     assert_raise Error, ~r/missing required argument "name"/, fn ->
-      FastestMCP.render_prompt(server_name, "greet", %{})
+      FastestMCP.render_prompt!(server_name, "greet", %{})
     end
   end
 
@@ -148,8 +148,10 @@ defmodule FastestMCP.InputValidationTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    assert nil == FastestMCP.call_tool(server_name, "echo_category", %{"category" => nil})
-    assert "books" == FastestMCP.call_tool(server_name, "echo_category", %{"category" => "books"})
+    assert nil == FastestMCP.call_tool!(server_name, "echo_category", %{"category" => nil})
+
+    assert "books" ==
+             FastestMCP.call_tool!(server_name, "echo_category", %{"category" => "books"})
   end
 
   test "anyOf preserves the matching submitted type" do
@@ -177,8 +179,8 @@ defmodule FastestMCP.InputValidationTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    assert 41 == FastestMCP.call_tool(server_name, "echo_value", %{"value" => 41})
-    assert "41" == FastestMCP.call_tool(server_name, "echo_value", %{"value" => "41"})
+    assert 41 == FastestMCP.call_tool!(server_name, "echo_value", %{"value" => 41})
+    assert "41" == FastestMCP.call_tool!(server_name, "echo_value", %{"value" => "41"})
   end
 
   test "oneOf rejects values that match multiple branches" do
@@ -207,7 +209,7 @@ defmodule FastestMCP.InputValidationTest do
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
     assert_raise Error, ~r/does not match exactly one allowed schema/, fn ->
-      FastestMCP.call_tool(server_name, "echo_value", %{"value" => 7})
+      FastestMCP.call_tool!(server_name, "echo_value", %{"value" => 7})
     end
   end
 
@@ -232,16 +234,16 @@ defmodule FastestMCP.InputValidationTest do
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
     assert %{"anything" => %{"nested" => "value"}} ==
-             FastestMCP.call_tool(server_name, "echo", %{
+             FastestMCP.call_tool!(server_name, "echo", %{
                "anything" => %{"nested" => "value"}
              })
 
     assert_raise Error, ~r/#\/blocked/, fn ->
-      FastestMCP.call_tool(server_name, "echo", %{"blocked" => "nope"})
+      FastestMCP.call_tool!(server_name, "echo", %{"blocked" => "nope"})
     end
 
     assert_raise Error, ~r/additional properties are not allowed/, fn ->
-      FastestMCP.call_tool(server_name, "echo", %{"extra" => "nope"})
+      FastestMCP.call_tool!(server_name, "echo", %{"extra" => "nope"})
     end
   end
 end

@@ -34,7 +34,7 @@ defmodule FastestMCP.ClientHTTPCleanupTest do
 
     request_task =
       Task.async(fn ->
-        capture_client_result(fn -> Client.ping(client, timeout_ms: 500) end)
+        capture_client_result(fn -> Client.ping!(client, timeout_ms: 500) end)
       end)
 
     entry = wait_for_request_entry(client)
@@ -43,7 +43,7 @@ defmodule FastestMCP.ClientHTTPCleanupTest do
 
     assert {:error, %Error{code: :timeout}} = Task.await(request_task, 1_000)
     assert_receive {:raw_http_closed, ^server_ref}, 750
-    assert :sys.get_state(client.pid).in_flight == %{}
+    assert :sys.get_state(client.pid).pending.in_flight == %{}
     assert Client.connected?(client)
   end
 
@@ -57,7 +57,7 @@ defmodule FastestMCP.ClientHTTPCleanupTest do
 
     request_task =
       Task.async(fn ->
-        capture_client_result(fn -> Client.ping(client, timeout_ms: 5_000) end)
+        capture_client_result(fn -> Client.ping!(client, timeout_ms: 5_000) end)
       end)
 
     assert_receive {:raw_http_request, ^server_ref, _request}, 1_000
@@ -65,13 +65,13 @@ defmodule FastestMCP.ClientHTTPCleanupTest do
     refute is_nil(request_ref)
 
     started_at = System.monotonic_time(:millisecond)
-    assert :ok = Client.disconnect(client)
+    assert :ok = Client.disconnect!(client)
     elapsed_ms = System.monotonic_time(:millisecond) - started_at
 
     assert elapsed_ms < 500
     assert_receive {:raw_http_closed, ^server_ref}, 750
     refute Process.alive?(worker_pid)
-    assert {:exit, _reason} = Task.await(request_task, 1_000)
+    assert {:error, %Error{code: :not_found}} = Task.await(request_task, 1_000)
   end
 
   test "killing a request worker cannot leak its HTTP request" do
@@ -85,7 +85,7 @@ defmodule FastestMCP.ClientHTTPCleanupTest do
 
     request_task =
       Task.async(fn ->
-        capture_client_result(fn -> Client.ping(client, timeout_ms: 5_000) end)
+        capture_client_result(fn -> Client.ping!(client, timeout_ms: 5_000) end)
       end)
 
     assert_receive {:raw_http_request, ^server_ref, _request}, 1_000
@@ -96,7 +96,7 @@ defmodule FastestMCP.ClientHTTPCleanupTest do
 
     assert {:error, %Error{code: :internal_error}} = Task.await(request_task, 1_000)
     assert_receive {:raw_http_closed, ^server_ref}, 750
-    assert :sys.get_state(client.pid).in_flight == %{}
+    assert :sys.get_state(client.pid).pending.in_flight == %{}
   end
 
   test "disconnect cancels the long-lived session stream promptly" do
@@ -107,7 +107,7 @@ defmodule FastestMCP.ClientHTTPCleanupTest do
 
     mark_initialized(client)
 
-    assert :ok = Client.open_session_stream(client)
+    assert :ok = Client.open_session_stream!(client)
     assert_receive {:raw_http_request, ^server_ref, _request}, 1_000
 
     session_stream = wait_for_session_stream_request(client)
@@ -115,7 +115,7 @@ defmodule FastestMCP.ClientHTTPCleanupTest do
     refute is_nil(session_stream.request_ref)
 
     started_at = System.monotonic_time(:millisecond)
-    assert :ok = Client.disconnect(client)
+    assert :ok = Client.disconnect!(client)
     elapsed_ms = System.monotonic_time(:millisecond) - started_at
 
     assert elapsed_ms < 500
@@ -139,13 +139,13 @@ defmodule FastestMCP.ClientHTTPCleanupTest do
     on_exit(fn -> disconnect_if_alive(client) end)
 
     for _iteration <- 1..3 do
-      assert %{"ok" => true} = Client.ping(client)
+      assert %{"ok" => true} = Client.ping!(client)
     end
 
     atom_count = :erlang.system_info(:atom_count)
 
     for _iteration <- 1..25 do
-      assert %{"ok" => true} = Client.ping(client)
+      assert %{"ok" => true} = Client.ping!(client)
     end
 
     assert :erlang.system_info(:atom_count) == atom_count
@@ -256,6 +256,7 @@ defmodule FastestMCP.ClientHTTPCleanupTest do
     entry =
       client.pid
       |> :sys.get_state()
+      |> Map.fetch!(:pending)
       |> Map.fetch!(:in_flight)
       |> Map.values()
       |> Enum.find(&(not is_nil(Map.get(&1, :request_ref))))
@@ -293,14 +294,14 @@ defmodule FastestMCP.ClientHTTPCleanupTest do
   end
 
   defp disconnect_if_alive(client) do
-    if Client.connected?(client), do: Client.disconnect(client)
+    if Client.connected?(client), do: Client.disconnect!(client)
   end
 
   defp mark_initialized(client) do
     :sys.replace_state(client.pid, fn state ->
       %{
         state
-        | lifecycle_state: :initialized,
+        | lifecycle: %{state.lifecycle | lifecycle_state: :initialized},
           initialize_result: %{
             "protocolVersion" => "2025-11-25",
             "capabilities" => %{},

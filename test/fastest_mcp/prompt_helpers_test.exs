@@ -73,7 +73,7 @@ defmodule FastestMCP.PromptHelpersTest do
                  }
                }
              ]
-           } = FastestMCP.render_prompt(server_name, "review", %{})
+           } = FastestMCP.render_prompt!(server_name, "review", %{})
 
     assert %{
              "messages" => [

@@ -116,8 +116,8 @@ defmodule FastestMCP.TaskSpecParityTest do
 
     task_id = create.task.taskId
 
-    assert %{isError: true, structuredContent: %{reason: "boom"}} =
-             FastestMCP.await_task(server_name, task_id, 1_000, session_id: "tool-error-session")
+    assert %{is_error: true, structured_content: %{reason: "boom"}} =
+             FastestMCP.await_task!(server_name, task_id, 1_000, session_id: "tool-error-session")
 
     status =
       Engine.dispatch!(server_name, %Request{
@@ -195,7 +195,7 @@ defmodule FastestMCP.TaskSpecParityTest do
 
     assert wrong_owner_error.code == :invalid_task_id
 
-    assert FastestMCP.list_tasks(server_name,
+    assert FastestMCP.list_tasks!(server_name,
              session_id: "shared-session",
              auth: %{"client_id" => "beta-client"},
              principal: %{"sub" => "beta-user"}
@@ -251,7 +251,7 @@ defmodule FastestMCP.TaskSpecParityTest do
 
     assert wrong_subject_error.code == :invalid_task_id
 
-    assert FastestMCP.list_tasks(server_name,
+    assert FastestMCP.list_tasks!(server_name,
              session_id: "shared-client-session",
              auth: %{"client_id" => "shared-client"},
              principal: %{"sub" => "delta-user"}

@@ -81,15 +81,15 @@ defmodule FastestMCP.ToolResultHelperTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    assert %{
+    assert %ToolResult{
              content: [
                %{type: "text", text: "Release checklist generated"},
                %{type: "text", text: "Warnings: 0"}
              ],
-             structuredContent: %{status: "ok", generated_at: "2025-11-05T12:30:45Z"},
+             structured_content: %{status: "ok", generated_at: "2025-11-05T12:30:45Z"},
              meta: %{source: "helper"},
-             isError: false
-           } = FastestMCP.call_tool(server_name, "report", %{})
+             is_error: false
+           } = FastestMCP.call_tool!(server_name, "report", %{})
 
     assert %{
              "content" => [
@@ -110,7 +110,7 @@ defmodule FastestMCP.ToolResultHelperTest do
              })
   end
 
-  test "connected client keeps full explicit tool envelopes and still unwraps mirrored structured results" do
+  test "connected client returns ToolResult for explicit and derived envelopes" do
     server_name = "tool-result-client-" <> Integer.to_string(System.unique_integer([:positive]))
 
     server =
@@ -153,22 +153,28 @@ defmodule FastestMCP.ToolResultHelperTest do
       Client.connect!("http://127.0.0.1:#{port}/mcp", protocol_version: "2025-11-25")
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     assert %{
-             "content" => [%{"type" => "text", "text" => "Release checklist generated"}],
-             "structuredContent" => %{"status" => "ok"},
-             "_meta" => %{"source" => "helper"}
-           } = Client.call_tool(client, "report", %{})
+             raw: %{
+               "content" => [%{"type" => "text", "text" => "Release checklist generated"}],
+               "structuredContent" => %{"status" => "ok"},
+               "_meta" => %{"source" => "helper"}
+             }
+           } = Client.call_tool!(client, "report", %{})
 
-    assert %{"message" => "hi"} = Client.call_tool(client, "mirror", %{})
-    assert %{"message" => "explicit"} = Client.call_tool(client, "explicit_success_mirror", %{})
+    assert %{structured_content: %{"message" => "hi"}} = Client.call_tool!(client, "mirror", %{})
+
+    assert %{structured_content: %{"message" => "explicit"}} =
+             Client.call_tool!(client, "explicit_success_mirror", %{})
 
     assert %{
-             "content" => [%{"type" => "text"}],
-             "structuredContent" => %{"reason" => "boom"},
-             "isError" => true
-           } = Client.call_tool(client, "structured_error", %{})
+             raw: %{
+               "content" => [%{"type" => "text"}],
+               "structuredContent" => %{"reason" => "boom"},
+               "isError" => true
+             }
+           } = Client.call_tool!(client, "structured_error", %{})
   end
 end

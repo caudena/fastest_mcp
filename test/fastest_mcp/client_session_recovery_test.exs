@@ -44,6 +44,14 @@ defmodule FastestMCP.ClientSessionRecoveryTest do
 
           send(test_pid, {:initialize_request, initialize_count, session_id})
 
+          if initialize_count > 1 and Agent.get(state, & &1.mode) == :blocked_recovery do
+            send(test_pid, {:recovery_blocked, self()})
+
+            receive do
+              :release_recovery -> :ok
+            end
+          end
+
           response = %{
             "jsonrpc" => "2.0",
             "id" => id,
@@ -231,11 +239,11 @@ defmodule FastestMCP.ClientSessionRecoveryTest do
   test "a 404 session miss reinitializes without replaying the original request" do
     {client, state} = start_client(:recovery)
 
-    assert Client.session_id(client) == "recovery-session-1"
+    assert Client.session_id!(client) == "recovery-session-1"
 
     error =
       assert_raise Error, fn ->
-        Client.call_tool(client, "charge_card_1", %{"amount" => 10})
+        Client.call_tool!(client, "charge_card_1", %{"amount" => 10})
       end
 
     assert error.code == :bad_request
@@ -245,17 +253,17 @@ defmodule FastestMCP.ClientSessionRecoveryTest do
     assert_receive {:initialize_request, 1, nil}, 1_000
     assert_receive {:initialize_request, 2, nil}, 1_000
 
-    assert Client.session_id(client) == "recovery-session-2"
+    assert Client.session_id!(client) == "recovery-session-2"
 
-    assert get_in(Client.initialize_result(client), ["serverInfo", "name"]) ==
+    assert get_in(Client.initialize_result!(client), ["serverInfo", "name"]) ==
              "recovery-server-2"
 
     assert :sys.get_state(client.pid).server_identity["name"] == "recovery-server-2"
 
-    assert %{"charged" => true} =
-             Client.call_tool(client, "charge_card_2", %{"amount" => 20})
+    assert %{structured_content: %{"charged" => true}} =
+             Client.call_tool!(client, "charge_card_2", %{"amount" => 20})
 
-    assert %{} = Client.ping(client)
+    assert %{} = Client.ping!(client)
 
     snapshot = Agent.get(state, & &1)
     assert snapshot.initialize_count == 2
@@ -274,7 +282,7 @@ defmodule FastestMCP.ClientSessionRecoveryTest do
         sse_reconnect: [max_attempts: 1, min_retry_ms: 0, max_retry_ms: 10]
       )
 
-    assert :ok = Client.open_session_stream(client)
+    assert :ok = Client.open_session_stream!(client)
 
     assert_receive {:session_stream_request, 1, nil}, 1_000
     assert_receive {:stream_message, "one"}, 1_000
@@ -296,7 +304,7 @@ defmodule FastestMCP.ClientSessionRecoveryTest do
         sse_reconnect: [max_attempts: 5, min_retry_ms: 0, max_retry_ms: 0]
       )
 
-    assert :ok = Client.open_session_stream(client)
+    assert :ok = Client.open_session_stream!(client)
 
     assert_receive {:stream_message, "before-delete"}, 1_000
     assert_receive {:session_stream_request, 2, "deleted-event-1"}, 1_000
@@ -320,16 +328,16 @@ defmodule FastestMCP.ClientSessionRecoveryTest do
   test "a standalone session GET 404 recovers once and opens the replacement stream" do
     {client, state} = start_client(:get_recovery, sse_reconnect: false)
 
-    assert :ok = Client.open_session_stream(client)
+    assert :ok = Client.open_session_stream!(client)
 
     assert_receive {:session_stream_request, 1, nil}, 1_000
     assert_receive {:initialize_request, 2, nil}, 1_000
     assert_receive {:session_stream_request, 2, nil}, 1_000
     assert_receive {:stream_message, "after-recovery"}, 1_000
 
-    assert Client.session_id(client) == "recovery-session-2"
+    assert Client.session_id!(client) == "recovery-session-2"
 
-    assert get_in(Client.initialize_result(client), ["serverInfo", "name"]) ==
+    assert get_in(Client.initialize_result!(client), ["serverInfo", "name"]) ==
              "recovery-server-2"
 
     wait_for_session_stream_to_close(client)
@@ -347,13 +355,52 @@ defmodule FastestMCP.ClientSessionRecoveryTest do
 
     error =
       assert_raise Error, fn ->
-        Client.open_session_stream(client)
+        Client.open_session_stream!(client)
       end
 
     assert error.code == :bad_request
     assert error.message == "HTTP MCP response has an unsupported Content-Type"
     assert error.details.content_type == "application/json; charset=utf-8"
     assert Agent.get(state, & &1).stream_connections == 1
+  end
+
+  test "requests that expire while recovery is blocked are never dispatched later" do
+    {client, state} = start_client(:blocked_recovery)
+    params = %{"name" => "charge_card_1", "arguments" => %{"amount" => 1}}
+    trigger = Task.async(fn -> Client.request(client, "tools/call", params) end)
+    assert_receive {:recovery_blocked, recovery_handler}, 1_000
+    parent = self()
+
+    waiting =
+      for mode <- [:sync, :async] do
+        Task.async(fn ->
+          result =
+            case mode do
+              :sync -> Client.request(client, "tools/call", params, timeout_ms: 10)
+              :async -> Client.request_async(client, "tools/call", params, timeout_ms: 10)
+            end
+
+          send(parent, {:expired_request, mode, result})
+          # Keep the owner alive so only the deadline can discard this request.
+          receive do
+            :finish -> :ok
+          end
+        end)
+      end
+
+    for mode <- [:sync, :async] do
+      assert_receive {:expired_request, ^mode, {:error, %Error{code: :timeout}}}, 2_000
+    end
+
+    send(recovery_handler, :release_recovery)
+    assert {:error, %Error{}} = Task.await(trigger, 2_000)
+    assert {:ok, %{}} = Client.ping(client)
+    assert Agent.get(state, & &1.tool_call_count) == 1
+
+    Enum.each(waiting, fn task ->
+      send(task.pid, :finish)
+      assert :ok = Task.await(task)
+    end)
   end
 
   defp start_client(mode, opts \\ []) do
@@ -386,7 +433,7 @@ defmodule FastestMCP.ClientSessionRecoveryTest do
       )
 
     on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end)
 
     {client, state}

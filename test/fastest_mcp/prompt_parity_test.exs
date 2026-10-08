@@ -18,7 +18,7 @@ defmodule FastestMCP.PromptParityTest do
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
 
-    [prompt] = FastestMCP.list_prompts(server_name)
+    [prompt] = FastestMCP.list_prompts!(server_name)
 
     assert prompt.name == "summarize"
     assert prompt.description == "Summarize a topic."
@@ -51,7 +51,7 @@ defmodule FastestMCP.PromptParityTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    [prompt] = FastestMCP.list_prompts(server_name)
+    [prompt] = FastestMCP.list_prompts!(server_name)
     [argument] = prompt.arguments
 
     assert %{name: "topic", description: "The topic to summarize.", required: true} = argument
@@ -65,14 +65,14 @@ defmodule FastestMCP.PromptParityTest do
     server =
       FastestMCP.server(server_name)
       |> FastestMCP.add_prompt("review", fn %{"subject" => subject}, _ctx ->
-        %{
+        FastestMCP.Prompts.Result.from(%{
           messages: [
             %{role: "user", content: "Review #{subject}"},
             %{role: "assistant", content: "Looks good", _meta: %{confidence: "high"}}
           ],
           description: "Review result",
           _meta: %{source: "prompt"}
-        }
+        })
       end)
 
     assert {:ok, _pid} = FastestMCP.start_server(server)
@@ -88,7 +88,7 @@ defmodule FastestMCP.PromptParityTest do
                  meta: %{confidence: "high"}
                }
              ]
-           } = FastestMCP.render_prompt(server_name, "review", %{"subject" => "docs"})
+           } = FastestMCP.render_prompt!(server_name, "review", %{"subject" => "docs"})
   end
 
   test "invalid prompt argument configuration raises" do

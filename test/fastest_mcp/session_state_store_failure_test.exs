@@ -281,8 +281,8 @@ defmodule FastestMCP.SessionStateStoreFailureTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    first = FastestMCP.call_tool(server_name, "session", %{}, session_id: nil)
-    second = FastestMCP.call_tool(server_name, "session", %{}, session_id: nil)
+    first = FastestMCP.call_tool!(server_name, "session", %{}, session_id: nil)
+    second = FastestMCP.call_tool!(server_name, "session", %{}, session_id: nil)
 
     assert first.state_scope == :session
     assert is_binary(first.session_id) and first.session_id != ""
@@ -291,7 +291,7 @@ defmodule FastestMCP.SessionStateStoreFailureTest do
     refute first.session_id == second.session_id
 
     assert %{session_id: nil, state_scope: :request} ==
-             FastestMCP.call_tool(server_name, "session", %{},
+             FastestMCP.call_tool!(server_name, "session", %{},
                state_scope: :request,
                session_id: nil
              )

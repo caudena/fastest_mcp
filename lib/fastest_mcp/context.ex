@@ -345,18 +345,20 @@ defmodule FastestMCP.Context do
 
   @doc "Stores request-scoped state on the context."
   def put_request_state(%__MODULE__{} = context, key, value) do
-    Process.put({__MODULE__, context.request_id, key}, value)
+    scope = {__MODULE__, :request_state, context.request_id}
+    Process.put(scope, Map.put(Process.get(scope, %{}), key, value))
     :ok
   end
 
   @doc "Reads request-scoped state from the context."
   def get_request_state(%__MODULE__{} = context, key, default \\ nil) do
-    Process.get({__MODULE__, context.request_id, key}, default)
+    Process.get({__MODULE__, :request_state, context.request_id}, %{}) |> Map.get(key, default)
   end
 
   @doc "Deletes one request-scoped value from the context."
   def delete_request_state(%__MODULE__{} = context, key) do
-    Process.delete({__MODULE__, context.request_id, key})
+    scope = {__MODULE__, :request_state, context.request_id}
+    Process.put(scope, Map.delete(Process.get(scope, %{}), key))
     :ok
   end
 
@@ -886,7 +888,7 @@ defmodule FastestMCP.Context do
 
   @doc "Notifies subscribed sessions that one concrete resource URI changed."
   def notify_resource_updated(%__MODULE__{} = context, uri) do
-    FastestMCP.notify_resource_updated(context.server_name, uri)
+    FastestMCP.notify_resource_updated!(context.server_name, uri)
   end
 
   @doc "Lists visible prompts using the current request context."
@@ -1195,15 +1197,7 @@ defmodule FastestMCP.Context do
   end
 
   defp clear_request_state(%__MODULE__{} = context) do
-    Process.get()
-    |> Enum.each(fn
-      {{__MODULE__, request_id, _key} = dictionary_key, _value}
-      when request_id == context.request_id ->
-        Process.delete(dictionary_key)
-
-      _other ->
-        :ok
-    end)
+    Process.delete({__MODULE__, :request_state, context.request_id})
   end
 
   defp restore_current(nil), do: Process.delete({__MODULE__, :current_context})

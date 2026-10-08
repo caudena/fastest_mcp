@@ -56,7 +56,7 @@ defmodule FastestMCP.TaskTTLTest do
 
     send(worker_pid, :release)
 
-    assert FastestMCP.await_task(server_name, task_id, 1_000, session_id: "ttl-session") == :done
+    assert FastestMCP.await_task!(server_name, task_id, 1_000, session_id: "ttl-session") == :done
 
     completed =
       Engine.dispatch!(server_name, %Request{
@@ -93,26 +93,26 @@ defmodule FastestMCP.TaskTTLTest do
 
     task_id = create.task.taskId
 
-    assert FastestMCP.await_task(server_name, task_id, 1_000, session_id: "ttl-expiry-session") ==
+    assert FastestMCP.await_task!(server_name, task_id, 1_000, session_id: "ttl-expiry-session") ==
              "hi"
 
     Process.sleep(35)
 
     fetch_error =
       assert_raise Error, fn ->
-        FastestMCP.fetch_task(server_name, task_id, session_id: "ttl-expiry-session")
+        FastestMCP.fetch_task!(server_name, task_id, session_id: "ttl-expiry-session")
       end
 
     assert fetch_error.code == :invalid_task_id
 
     result_error =
       assert_raise Error, fn ->
-        FastestMCP.task_result(server_name, task_id, session_id: "ttl-expiry-session")
+        FastestMCP.task_result!(server_name, task_id, session_id: "ttl-expiry-session")
       end
 
     assert result_error.code == :invalid_task_id
 
-    assert FastestMCP.list_tasks(server_name, session_id: "ttl-expiry-session") == %{
+    assert FastestMCP.list_tasks!(server_name, session_id: "ttl-expiry-session") == %{
              tasks: [],
              next_cursor: nil
            }
@@ -140,7 +140,7 @@ defmodule FastestMCP.TaskTTLTest do
     task_id = create.task.taskId
     assert create.task.ttl == 60_000
 
-    assert FastestMCP.await_task(server_name, task_id, 1_000, session_id: "ttl-default-session") ==
+    assert FastestMCP.await_task!(server_name, task_id, 1_000, session_id: "ttl-default-session") ==
              "ok"
 
     status =

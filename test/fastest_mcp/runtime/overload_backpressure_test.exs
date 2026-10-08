@@ -35,14 +35,14 @@ defmodule FastestMCP.Runtime.OverloadBackpressureTest do
 
     task =
       Task.async(fn ->
-        FastestMCP.call_tool(server_a, "wait", %{})
+        FastestMCP.call_tool!(server_a, "wait", %{})
       end)
 
     assert_receive {:entered, pid}, 1_000
 
     error =
       assert_raise Error, fn ->
-        FastestMCP.call_tool(server_a, "wait", %{})
+        FastestMCP.call_tool!(server_a, "wait", %{})
       end
 
     assert error.code == :overloaded
@@ -51,7 +51,7 @@ defmodule FastestMCP.Runtime.OverloadBackpressureTest do
 
     other =
       Task.async(fn ->
-        FastestMCP.call_tool(server_b, "wait", %{})
+        FastestMCP.call_tool!(server_b, "wait", %{})
       end)
 
     assert_receive {:entered, other_pid}, 1_000
@@ -87,7 +87,7 @@ defmodule FastestMCP.Runtime.OverloadBackpressureTest do
 
     task =
       Task.async(fn ->
-        FastestMCP.call_tool(server_name, "wait", %{})
+        FastestMCP.call_tool!(server_name, "wait", %{})
       end)
 
     assert_receive {:entered, pid}, 1_000

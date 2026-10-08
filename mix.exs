@@ -4,9 +4,9 @@ defmodule FastestMCP.MixProject do
   def project do
     [
       app: :fastest_mcp,
-      version: "0.3.2",
+      version: "0.4.0",
       description:
-        "Production-grade Model Context Protocol (MCP) SDK for Elixir and Phoenix. Complete server and client support for MCP 2026-07-28 and 2025-11-25, with OAuth authentication, MCP Apps, Tasks, Streamable HTTP, stdio, strict validation, observability, and a FastMCP-inspired DSL.",
+        "Production-grade Model Context Protocol (MCP) SDK for Elixir and Phoenix. Complete server and client support for MCP 2026-07-28 and 2025-11-25, with OAuth authentication, MCP Apps, Tasks, Streamable HTTP, stdio, strict validation, observability, and composable server definitions.",
       source_url: "https://github.com/caudena/fastest_mcp",
       homepage_url: "https://github.com/caudena/fastest_mcp",
       elixir: "~> 1.19",
@@ -32,13 +32,14 @@ defmodule FastestMCP.MixProject do
     [
       {:bandit, "~> 1.5"},
       {:ex_doc, "~> 0.40", only: :dev, runtime: false},
-      {:jsv, "~> 0.22.0"},
+      {:jsv, "~> 0.26.0"},
       {:mint, "~> 1.9"},
       {:opentelemetry, "~> 1.6", only: :test},
       {:opentelemetry_api, "~> 1.5"},
       {:plug, "~> 1.16"},
       {:telemetry, "~> 1.2"},
-      {:texture, "~> 1.2"}
+      {:texture, "~> 2.0"},
+      {:yamerl, "~> 0.10.0"}
     ]
   end
 
@@ -57,6 +58,7 @@ defmodule FastestMCP.MixProject do
         "CHANGELOG.md",
         "README.md",
         "docs/onboarding.md",
+        "docs/migrating-to-0.4.md",
         "docs/why-fastest-mcp.md",
         "docs/components.md",
         "docs/tools.md",
@@ -88,7 +90,12 @@ defmodule FastestMCP.MixProject do
         "docs/compatibility-and-scope.md"
       ],
       groups_for_extras: [
-        "Start Here": ["README.md", "CHANGELOG.md", "docs/onboarding.md"],
+        "Start Here": [
+          "README.md",
+          "CHANGELOG.md",
+          "docs/onboarding.md",
+          "docs/migrating-to-0.4.md"
+        ],
         Explanation: [
           "docs/why-fastest-mcp.md",
           "docs/compatibility-and-scope.md",
@@ -158,6 +165,7 @@ defmodule FastestMCP.MixProject do
       ],
       "Client and Transport": [
         FastestMCP.Client,
+        FastestMCP.ClientGroup,
         FastestMCP.Client.CallbackContext,
         FastestMCP.Client.OAuth,
         FastestMCP.Client.OAuth.AuthorizationHandler,

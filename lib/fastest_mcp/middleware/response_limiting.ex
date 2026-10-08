@@ -3,8 +3,8 @@ defmodule FastestMCP.Middleware.ResponseLimiting do
   Middleware that limits tool response sizes and truncates oversized payloads.
 
   Middleware modules in FastestMCP are configured as explicit structs that
-  carry options plus a ready-to-run `middleware` function. That keeps runtime
-  assembly cheap while making the configured value easy to inspect in tests.
+  carry immutable configuration. Dispatch calls the module with that configuration;
+  runtime state is owned separately by the server.
 
   Most applications reach this module through `FastestMCP.Middleware` helper
   functions or by adding the configured struct directly with
@@ -14,6 +14,8 @@ defmodule FastestMCP.Middleware.ResponseLimiting do
   require Logger
 
   alias FastestMCP.Error
+  @behaviour FastestMCP.Middleware
+
   alias FastestMCP.Operation
   alias FastestMCP.OperationPipeline
   alias FastestMCP.Transport.Serializer
@@ -21,7 +23,6 @@ defmodule FastestMCP.Middleware.ResponseLimiting do
   @default_suffix "\n\n[Response truncated due to size limit]"
 
   defstruct [
-    :middleware,
     :logger,
     max_size: 1_000_000,
     truncation_suffix: @default_suffix,
@@ -29,7 +30,6 @@ defmodule FastestMCP.Middleware.ResponseLimiting do
   ]
 
   @type t :: %__MODULE__{
-          middleware: (Operation.t(), (Operation.t() -> any()) -> any()),
           logger: (String.t() -> any()),
           max_size: pos_integer(),
           truncation_suffix: String.t(),
@@ -58,10 +58,11 @@ defmodule FastestMCP.Middleware.ResponseLimiting do
       tools: normalize_tools(Keyword.get(opts, :tools))
     }
 
-    %{middleware | middleware: fn operation, next -> call(middleware, operation, next) end}
+    middleware
   end
 
   @doc "Runs the middleware around the next operation."
+  @impl FastestMCP.Middleware
   def call(%__MODULE__{} = middleware, %Operation{} = operation, next)
       when is_function(next, 1) do
     result = next.(operation)
@@ -257,9 +258,13 @@ defmodule FastestMCP.Middleware.ResponseLimiting do
 
   defp limited_result(text, metadata) do
     Map.merge(%{"content" => [%{"type" => "text", "text" => text}]}, metadata)
+    |> FastestMCP.Tools.Result.from_raw()
   end
 
   defp extract_text(result) when is_binary(result), do: result
+
+  defp extract_text(%FastestMCP.Tools.Result{} = result),
+    do: result |> FastestMCP.Tools.Result.to_map() |> extract_text()
 
   defp extract_text(result) when is_map(result) do
     case fetch_content(result) do
@@ -300,6 +305,9 @@ defmodule FastestMCP.Middleware.ResponseLimiting do
   defp fetch_content(result) do
     Map.get(result, :content, Map.get(result, "content"))
   end
+
+  defp extract_metadata(%FastestMCP.Tools.Result{meta: meta}),
+    do: maybe_put_metadata(%{}, "_meta", meta)
 
   defp extract_metadata(%{} = result) do
     %{}

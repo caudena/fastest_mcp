@@ -108,7 +108,7 @@ defmodule FastestMCP.OpenAPIProviderTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    tools = FastestMCP.list_tools(server_name)
+    tools = FastestMCP.list_tools!(server_name)
     assert Enum.map(tools, & &1.name) == ["create_user", "get_user"]
 
     get_user = Enum.find(tools, &(&1.name == "get_user"))
@@ -138,7 +138,7 @@ defmodule FastestMCP.OpenAPIProviderTest do
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
     assert %{"ok" => true} ==
-             FastestMCP.call_tool(server_name, "get_user", %{
+             FastestMCP.call_tool!(server_name, "get_user", %{
                "id" => 123,
                "include_details" => true,
                "X-API-Key" => "secret"
@@ -149,7 +149,7 @@ defmodule FastestMCP.OpenAPIProviderTest do
     assert get_opts[:headers] == [{"X-API-Key", "secret"}]
 
     assert %{"ok" => true} ==
-             FastestMCP.call_tool(server_name, "create_user", %{
+             FastestMCP.call_tool!(server_name, "create_user", %{
                "name" => "Nate",
                "email" => "nate@example.com"
              })
@@ -193,7 +193,7 @@ defmodule FastestMCP.OpenAPIProviderTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    assert %{"ok" => true} == FastestMCP.call_tool(server_name, "ping", %{})
+    assert %{"ok" => true} == FastestMCP.call_tool!(server_name, "ping", %{})
 
     assert_receive {:request, :get, "https://staging.example.com/v1/ping", _opts}, 1_000
   end
@@ -251,12 +251,12 @@ defmodule FastestMCP.OpenAPIProviderTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
     on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    [tool] = FastestMCP.list_tools(server_name)
+    [tool] = FastestMCP.list_tools!(server_name)
     assert tool.input_schema["properties"]["nickname"]["type"] == ["string", "null"]
     assert tool.output_schema["properties"]["display_name"]["type"] == ["string", "null"]
 
     assert %{"ok" => true} ==
-             FastestMCP.call_tool(server_name, "create_profile", %{"nickname" => nil})
+             FastestMCP.call_tool!(server_name, "create_profile", %{"nickname" => nil})
 
     assert_receive {:request, :post, "https://nullable.example.com/profiles", opts}, 1_000
     assert opts[:json] == %{"nickname" => nil}

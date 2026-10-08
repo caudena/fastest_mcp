@@ -127,7 +127,7 @@ defmodule FastestMCP.MiddlewareErrorHandlingTest do
     assert {:ok, _pid} = FastestMCP.start_server(server)
 
     assert_raise Error, fn ->
-      FastestMCP.call_tool(server_name, "echo", %{"message" => "hi"})
+      FastestMCP.call_tool!(server_name, "echo", %{"message" => "hi"})
     end
 
     assert %{"ArgumentError:tools/call" => 1} = ErrorHandling.get_error_stats(middleware)

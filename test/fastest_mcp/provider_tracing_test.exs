@@ -23,7 +23,7 @@ defmodule FastestMCP.ProviderTracingTest do
     assert {:ok, _pid} = FastestMCP.start_server(parent)
     on_exit(fn -> FastestMCP.stop_server(parent_name) end)
 
-    assert "Hello" == FastestMCP.call_tool(parent_name, "ns_greet", %{})
+    assert "Hello" == FastestMCP.call_tool!(parent_name, "ns_greet", %{})
 
     spans = TraceTestHelper.drain_spans()
     parent_span = TraceTestHelper.find_span!(spans, "tools/call ns_greet")
