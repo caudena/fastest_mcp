@@ -1,5 +1,5 @@
 defmodule FastestMCP.MiddlewareToolInjectionTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Authorization
   alias FastestMCP.Error
@@ -8,17 +8,15 @@ defmodule FastestMCP.MiddlewareToolInjectionTest do
   test "generic tool injection adds tools to list_tools and handles tool calls" do
     server_name = "tool-injection-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("add", fn %{"a" => a, "b" => b}, _ctx -> %{"result" => a + b} end)
-      |> FastestMCP.add_middleware(
-        Middleware.tool_injection([
-          {"multiply", fn %{"a" => a, "b" => b}, _ctx -> %{"result" => a * b} end,
-           [description: "Multiply two numbers."]}
-        ])
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("add", fn %{"a" => a, "b" => b}, _ctx -> %{"result" => a + b} end)
+    |> FastestMCP.add_middleware(
+      Middleware.tool_injection([
+        {"multiply", fn %{"a" => a, "b" => b}, _ctx -> %{"result" => a * b} end,
+         [description: "Multiply two numbers."]}
+      ])
+    )
+    |> start_server!()
 
     tool_names =
       server_name
@@ -36,18 +34,16 @@ defmodule FastestMCP.MiddlewareToolInjectionTest do
   test "injected tools override base tools with the same name" do
     server_name = "tool-override-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("echo", fn %{"message" => message}, _ctx ->
-        %{"message" => message}
-      end)
-      |> FastestMCP.add_middleware(
-        Middleware.tool_injection([
-          {"echo", fn %{"message" => message}, _ctx -> %{"message" => String.upcase(message)} end}
-        ])
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("echo", fn %{"message" => message}, _ctx ->
+      %{"message" => message}
+    end)
+    |> FastestMCP.add_middleware(
+      Middleware.tool_injection([
+        {"echo", fn %{"message" => message}, _ctx -> %{"message" => String.upcase(message)} end}
+      ])
+    )
+    |> start_server!()
 
     assert ["echo"] ==
              server_name
@@ -62,18 +58,15 @@ defmodule FastestMCP.MiddlewareToolInjectionTest do
     server_name =
       "tool-injection-duplicate-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_middleware(
-        Middleware.tool_injection([
-          {"echo", fn _arguments, _context -> %{"source" => "first"} end},
-          {"other", fn _arguments, _context -> %{"source" => "other"} end},
-          {"echo", fn _arguments, _context -> %{"source" => "replacement"} end}
-        ])
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_middleware(
+      Middleware.tool_injection([
+        {"echo", fn _arguments, _context -> %{"source" => "first"} end},
+        {"other", fn _arguments, _context -> %{"source" => "other"} end},
+        {"echo", fn _arguments, _context -> %{"source" => "replacement"} end}
+      ])
+    )
+    |> start_server!()
 
     assert ["echo", "other"] ==
              server_name
@@ -88,17 +81,14 @@ defmodule FastestMCP.MiddlewareToolInjectionTest do
     server_name =
       "tool-injection-filtered-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("echo", fn _arguments, _context -> %{"source" => "base"} end)
-      |> FastestMCP.add_middleware(
-        Middleware.tool_injection([
-          {"echo", fn _arguments, _context -> %{"source" => "injected"} end, [enabled: false]}
-        ])
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("echo", fn _arguments, _context -> %{"source" => "base"} end)
+    |> FastestMCP.add_middleware(
+      Middleware.tool_injection([
+        {"echo", fn _arguments, _context -> %{"source" => "injected"} end, [enabled: false]}
+      ])
+    )
+    |> start_server!()
 
     assert [%{name: "echo"}] = FastestMCP.list_tools!(server_name)
     assert %{"source" => "base"} = FastestMCP.call_tool!(server_name, "echo", %{})
@@ -128,8 +118,7 @@ defmodule FastestMCP.MiddlewareToolInjectionTest do
         ])
       )
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
     assert [%{name: "visible", description: "transformed"}] =
              FastestMCP.list_tools!(server_name)
@@ -155,14 +144,12 @@ defmodule FastestMCP.MiddlewareToolInjectionTest do
   test "prompt tools expose prompt listing and rendering through injected tools" do
     server_name = "prompt-tools-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_prompt("greet", fn %{"name" => name}, _ctx ->
-        FastestMCP.Prompts.Result.new("Hello #{name}")
-      end)
-      |> FastestMCP.add_middleware(Middleware.prompt_tools())
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_prompt("greet", fn %{"name" => name}, _ctx ->
+      FastestMCP.Prompts.Result.new("Hello #{name}")
+    end)
+    |> FastestMCP.add_middleware(Middleware.prompt_tools())
+    |> start_server!()
 
     assert %{"prompts" => prompts} = FastestMCP.call_tool!(server_name, "list_prompts", %{})
     assert Enum.any?(prompts, &(&1.name == "greet"))
@@ -181,17 +168,15 @@ defmodule FastestMCP.MiddlewareToolInjectionTest do
   test "resource tools expose resource listing, templates, and reads through injected tools" do
     server_name = "resource-tools-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_resource("config://app", fn _arguments, _ctx ->
-        %{"theme" => "sunrise"}
-      end)
-      |> FastestMCP.add_resource_template("docs://{slug}", fn %{"slug" => slug}, _ctx ->
-        %{"slug" => slug}
-      end)
-      |> FastestMCP.add_middleware(Middleware.resource_tools())
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_resource("config://app", fn _arguments, _ctx ->
+      %{"theme" => "sunrise"}
+    end)
+    |> FastestMCP.add_resource_template("docs://{slug}", fn %{"slug" => slug}, _ctx ->
+      %{"slug" => slug}
+    end)
+    |> FastestMCP.add_middleware(Middleware.resource_tools())
+    |> start_server!()
 
     assert %{"resources" => resources, "resource_templates" => templates} =
              FastestMCP.call_tool!(server_name, "list_resources", %{})
@@ -207,15 +192,12 @@ defmodule FastestMCP.MiddlewareToolInjectionTest do
     server_name =
       "resource-tools-auth-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_resource("config://private", fn _arguments, _ctx -> "authorized" end,
-        auth: Authorization.require_scopes("resources:read")
-      )
-      |> FastestMCP.add_middleware(Middleware.resource_tools())
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_resource("config://private", fn _arguments, _ctx -> "authorized" end,
+      auth: Authorization.require_scopes("resources:read")
+    )
+    |> FastestMCP.add_middleware(Middleware.resource_tools())
+    |> start_server!()
 
     assert %{"result" => "authorized"} ==
              FastestMCP.call_tool!(
@@ -232,23 +214,21 @@ defmodule FastestMCP.MiddlewareToolInjectionTest do
   test "multiple tool injection middlewares can be stacked" do
     server_name = "tool-stack-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("subtract", fn %{"a" => a, "b" => b}, _ctx ->
-        %{"result" => a - b}
-      end)
-      |> FastestMCP.add_middleware(
-        Middleware.tool_injection([
-          {"power", fn %{"a" => a, "b" => b}, _ctx -> %{"result" => round(:math.pow(a, b))} end}
-        ])
-      )
-      |> FastestMCP.add_middleware(
-        Middleware.tool_injection([
-          {"modulo", fn %{"a" => a, "b" => b}, _ctx -> %{"result" => rem(a, b)} end}
-        ])
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("subtract", fn %{"a" => a, "b" => b}, _ctx ->
+      %{"result" => a - b}
+    end)
+    |> FastestMCP.add_middleware(
+      Middleware.tool_injection([
+        {"power", fn %{"a" => a, "b" => b}, _ctx -> %{"result" => round(:math.pow(a, b))} end}
+      ])
+    )
+    |> FastestMCP.add_middleware(
+      Middleware.tool_injection([
+        {"modulo", fn %{"a" => a, "b" => b}, _ctx -> %{"result" => rem(a, b)} end}
+      ])
+    )
+    |> start_server!()
 
     assert ["power", "modulo", "subtract"] ==
              server_name

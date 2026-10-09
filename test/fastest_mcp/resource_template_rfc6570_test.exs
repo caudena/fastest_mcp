@@ -1,5 +1,5 @@
 defmodule FastestMCP.ResourceTemplateRFC6570Test do
-  use ExUnit.Case, async: true
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Components.ResourceTemplate
 

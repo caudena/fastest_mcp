@@ -1,7 +1,7 @@
 defmodule FastestMCP.Client.ToolCatalog do
   @moduledoc false
 
-  alias FastestMCP.Component
+  alias FastestMCP.Component.Lookup
   alias FastestMCP.Protocol.HTTPHeaders
   alias FastestMCP.Schema
 
@@ -33,12 +33,9 @@ defmodule FastestMCP.Client.ToolCatalog do
           expires_at_ms: integer() | nil
         }
 
-  def new(generation \\ 0) when is_integer(generation) and generation >= 0,
-    do: %__MODULE__{generation: generation}
-
   def build(tools, generation, schema_options)
       when is_list(tools) and is_integer(generation) and is_list(schema_options) do
-    Enum.reduce(tools, %{new(generation) | raw: tools}, fn tool, catalog ->
+    Enum.reduce(tools, %__MODULE__{generation: generation, raw: tools}, fn tool, catalog ->
       put_tool(catalog, tool, schema_options)
     end)
     |> index_preferred()
@@ -82,7 +79,7 @@ defmodule FastestMCP.Client.ToolCatalog do
       Enum.reduce([catalog.descriptors, catalog.errors], %{}, fn entries, preferred ->
         Enum.reduce(entries, preferred, fn {{name, _version}, entry}, acc ->
           Map.update(acc, name, entry, fn existing ->
-            if Component.compare_versions(entry.version, existing.version) == :gt,
+            if Lookup.compare_versions(entry.version, existing.version) == :gt,
               do: entry,
               else: existing
           end)

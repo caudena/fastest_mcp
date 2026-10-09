@@ -1,5 +1,5 @@
 defmodule FastestMCP.MountedProviderTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   test "mounted servers expose namespaced tools, resources, prompts, and child middleware" do
     test_pid = self()
@@ -17,12 +17,9 @@ defmodule FastestMCP.MountedProviderTest do
         result
       end)
 
-    parent =
-      FastestMCP.server(parent_name)
-      |> FastestMCP.mount(child, namespace: "child")
-
-    assert {:ok, _pid} = FastestMCP.start_server(parent)
-    on_exit(fn -> FastestMCP.stop_server(parent_name) end)
+    FastestMCP.server(parent_name)
+    |> FastestMCP.mount(child, namespace: "child")
+    |> start_server!()
 
     assert [%{name: "child_greet"}] = FastestMCP.list_tools!(parent_name)
 
@@ -72,8 +69,7 @@ defmodule FastestMCP.MountedProviderTest do
       |> FastestMCP.mount(child, namespace: "c")
       |> FastestMCP.add_middleware(trace_middleware("parent", test_pid))
 
-    assert {:ok, _pid} = FastestMCP.start_server(parent)
-    on_exit(fn -> FastestMCP.stop_server(parent_name) end)
+    start_server!(parent)
 
     assert 10 == FastestMCP.call_tool!(parent_name, "c_gc_compute", %{"x" => 5})
 
@@ -150,8 +146,7 @@ defmodule FastestMCP.MountedProviderTest do
       |> FastestMCP.mount(child, namespace: "c")
       |> FastestMCP.add_middleware(trace_middleware("parent", test_pid))
 
-    assert {:ok, _pid} = FastestMCP.start_server(parent)
-    on_exit(fn -> FastestMCP.stop_server(parent_name) end)
+    start_server!(parent)
 
     assert "42:json" == FastestMCP.read_resource!(parent_name, "item://c/gc/42?format=json")
 
@@ -176,12 +171,9 @@ defmodule FastestMCP.MountedProviderTest do
         "file:#{path}"
       end)
 
-    parent =
-      FastestMCP.server(parent_name)
-      |> FastestMCP.mount(child, namespace: "child")
-
-    assert {:ok, _pid} = FastestMCP.start_server(parent)
-    on_exit(fn -> FastestMCP.stop_server(parent_name) end)
+    FastestMCP.server(parent_name)
+    |> FastestMCP.mount(child, namespace: "child")
+    |> start_server!()
 
     assert "file:alpha/beta/gamma.txt" ==
              FastestMCP.read_resource!(parent_name, "files://child/alpha/beta/gamma.txt")
@@ -196,6 +188,12 @@ defmodule FastestMCP.MountedProviderTest do
       FastestMCP.mount(server, server)
     end
 
+    assert_raise ArgumentError, ~r/unknown keys \[:prefix\]/, fn ->
+      FastestMCP.mount(FastestMCP.server("mount-parent"), FastestMCP.server("mount-child"),
+        prefix: "child"
+      )
+    end
+
     child =
       FastestMCP.server("lifespan-child")
       |> FastestMCP.add_lifespan(fn _server ->
@@ -204,15 +202,14 @@ defmodule FastestMCP.MountedProviderTest do
       end)
       |> FastestMCP.add_tool("scope", fn _args, ctx -> ctx.lifespan_context end)
 
-    parent =
-      FastestMCP.server(parent_name)
-      |> FastestMCP.add_lifespan(fn _server ->
-        send(test_pid, :parent_enter)
-        {%{"scope" => "parent"}, fn -> send(test_pid, :parent_exit) end}
-      end)
-      |> FastestMCP.mount(child, namespace: "child")
+    FastestMCP.server(parent_name)
+    |> FastestMCP.add_lifespan(fn _server ->
+      send(test_pid, :parent_enter)
+      {%{"scope" => "parent"}, fn -> send(test_pid, :parent_exit) end}
+    end)
+    |> FastestMCP.mount(child, namespace: "child")
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(parent)
     assert_receive :parent_enter, 1_000
     assert_receive :child_enter, 1_000
 
@@ -231,13 +228,10 @@ defmodule FastestMCP.MountedProviderTest do
       FastestMCP.server("child-server")
       |> FastestMCP.add_tool("greet", fn %{"name" => name}, _ctx -> "Child says hi, #{name}" end)
 
-    parent =
-      FastestMCP.server(parent_name)
-      |> FastestMCP.mount(child)
-      |> FastestMCP.add_tool("greet", fn %{"name" => name}, _ctx -> "Parent override, #{name}" end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(parent)
-    on_exit(fn -> FastestMCP.stop_server(parent_name) end)
+    FastestMCP.server(parent_name)
+    |> FastestMCP.mount(child)
+    |> FastestMCP.add_tool("greet", fn %{"name" => name}, _ctx -> "Parent override, #{name}" end)
+    |> start_server!()
 
     assert [%{name: "greet"}, %{name: "greet"}] = FastestMCP.list_tools!(parent_name)
 

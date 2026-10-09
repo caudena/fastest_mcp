@@ -1,35 +1,22 @@
 defmodule FastestMCP.Middleware.Ping do
-  @moduledoc """
-  Middleware that emits periodic keepalive events for active transport sessions.
+  @moduledoc false
 
-  Middleware modules in FastestMCP are configured as explicit structs that
-  carry immutable configuration. Dispatch calls the module with that configuration;
-  runtime state is owned separately by the server.
-
-  Most applications reach this module through `FastestMCP.Middleware` helper
-  functions or by adding the configured struct directly with
-  `FastestMCP.Server.add_middleware/2`.
-  """
-
-  alias FastestMCP.EventBus
-  alias FastestMCP.Middleware.Runtime
+  alias FastestMCP.Middleware
   @behaviour FastestMCP.Middleware
 
   alias FastestMCP.Operation
   alias FastestMCP.Registry
 
-  defstruct [:instance_id, :runtime_id, :middleware, :state, interval_ms: 30_000]
+  defstruct [:instance_id, :runtime, interval_ms: 30_000]
 
   @type session_key :: {String.t(), String.t()}
 
   @type t :: %__MODULE__{
           instance_id: reference(),
-          runtime_id: reference() | nil,
-          state: pid() | nil,
+          runtime: pid() | nil,
           interval_ms: pos_integer()
         }
 
-  @doc "Builds a new value for this module from the supplied options."
   def new(opts \\ []) do
     interval_ms = Keyword.get(opts, :interval_ms, 30_000)
 
@@ -37,69 +24,36 @@ defmodule FastestMCP.Middleware.Ping do
       raise ArgumentError, "interval_ms must be positive"
     end
 
-    middleware = %__MODULE__{
-      instance_id: make_ref(),
-      runtime_id: nil,
-      state: nil,
-      interval_ms: interval_ms
-    }
-
-    middleware
+    %__MODULE__{instance_id: make_ref(), interval_ms: interval_ms}
   end
 
-  @doc "Runs the middleware around the next operation."
   @impl FastestMCP.Middleware
+  def call(%__MODULE__{runtime: nil} = middleware, _operation, _next),
+    do: Middleware.not_running(middleware)
+
   def call(%__MODULE__{} = middleware, %Operation{} = operation, next)
       when is_function(next, 1) do
-    middleware = ensure_runtime(middleware)
     maybe_start_ping_loop(middleware, operation)
     next.(operation)
   end
 
-  @doc "Returns the currently tracked active sessions."
+  @impl FastestMCP.Middleware
+  def child_spec(%__MODULE__{} = middleware), do: {__MODULE__.State, middleware}
+
   def active_sessions(%__MODULE__{} = middleware) do
     middleware
-    |> runtime_middlewares()
-    |> Enum.reduce(MapSet.new(), fn %{state: runtime_state}, sessions ->
-      MapSet.union(sessions, __MODULE__.State.active_sessions(runtime_state))
-    end)
-  end
-
-  @doc "Releases resources owned by this module."
-  def close(%__MODULE__{} = middleware), do: deactivate_runtime(middleware)
-
-  @doc false
-  @impl FastestMCP.Middleware
-  def activate_runtime(%__MODULE__{} = middleware) do
-    Runtime.activate(
-      middleware,
-      fn -> __MODULE__.State.start_link(middleware.interval_ms) end,
-      :state
-    )
-  end
-
-  @doc false
-  @impl FastestMCP.Middleware
-  def deactivate_runtime(config), do: Runtime.close(config, :state)
-
-  @doc false
-  def state_pid(%__MODULE__{} = middleware) do
-    case runtime_middleware(middleware) do
-      %__MODULE__{state: state} -> state
-      nil -> nil
-    end
+    |> Middleware.runtimes()
+    |> Enum.reduce(MapSet.new(), &MapSet.union(&2, GenServer.call(&1, :active_sessions)))
   end
 
   defp maybe_start_ping_loop(%__MODULE__{} = middleware, %Operation{} = operation) do
     if trackable_session?(operation) do
       with {:ok, session_pid} <-
              Registry.lookup_session(operation.context.server_name, operation.context.session_id) do
-        __MODULE__.State.ensure_session(
-          middleware.state,
-          {operation.context.server_name, operation.context.session_id},
-          session_pid,
-          operation.context.event_bus,
-          operation.context.transport
+        GenServer.call(
+          middleware.runtime,
+          {:ensure_session, {operation.context.server_name, operation.context.session_id},
+           session_pid, operation.context.event_bus, operation.context.transport}
         )
       end
     end
@@ -113,50 +67,27 @@ defmodule FastestMCP.Middleware.Ping do
       session_id_provided?(operation.context.request_metadata)
   end
 
-  defp session_id_provided?(request_metadata) do
-    Map.get(
-      request_metadata,
-      :session_id_provided,
-      Map.get(request_metadata, "session_id_provided", false)
-    )
-  end
-
-  defp ensure_runtime(config), do: Runtime.ensure(config, :state)
-  defp runtime_middleware(config), do: Runtime.fetch(config, :state)
-  defp runtime_middlewares(config), do: Runtime.all(config, :state)
+  defp session_id_provided?(request_metadata),
+    do: Map.get(request_metadata, :session_id_provided, false)
 
   defmodule State do
-    @moduledoc """
-    State process that tracks active sessions and schedules keepalive pings.
-    """
+    @moduledoc false
+    # Tracks active sessions and schedules their keepalive pings.
 
     use GenServer
 
     alias FastestMCP.EventBus
+    alias FastestMCP.Middleware
 
-    @doc "Starts the ping state process."
-    def start_link(interval_ms) do
-      GenServer.start_link(__MODULE__, interval_ms)
-    end
+    def start_link(middleware), do: GenServer.start_link(__MODULE__, middleware)
 
-    @doc "Registers or refreshes a tracked session."
-    def ensure_session(pid, session_key, session_pid, event_bus, transport) do
-      GenServer.call(pid, {:ensure_session, session_key, session_pid, event_bus, transport})
-    end
-
-    @doc "Returns the currently tracked active sessions."
-    def active_sessions(pid) do
-      GenServer.call(pid, :active_sessions)
+    @impl true
+    def init(middleware) do
+      Middleware.register_runtime(middleware.instance_id)
+      {:ok, %{interval_ms: middleware.interval_ms, sessions: %{}}}
     end
 
     @impl true
-    @doc "Initializes the ping state."
-    def init(interval_ms) do
-      {:ok, %{interval_ms: interval_ms, sessions: %{}}}
-    end
-
-    @impl true
-    @doc "Processes synchronous GenServer calls for the ping state process."
     def handle_call(:active_sessions, _from, state) do
       {:reply, MapSet.new(Map.keys(state.sessions)), state}
     end
@@ -169,15 +100,12 @@ defmodule FastestMCP.Middleware.Ping do
       if Map.has_key?(state.sessions, session_key) do
         {:reply, :ok, state}
       else
-        ref = Process.monitor(session_pid)
-        timer_ref = Process.send_after(self(), {:tick, session_key}, state.interval_ms)
-
         session = %{
           session_pid: session_pid,
           event_bus: event_bus,
           transport: transport,
-          monitor_ref: ref,
-          timer_ref: timer_ref
+          monitor_ref: Process.monitor(session_pid),
+          timer_ref: Process.send_after(self(), {:tick, session_key}, state.interval_ms)
         }
 
         {:reply, :ok, put_in(state.sessions[session_key], session)}
@@ -185,7 +113,6 @@ defmodule FastestMCP.Middleware.Ping do
     end
 
     @impl true
-    @doc "Processes periodic keepalive ticks emitted by the ping scheduler."
     def handle_info({:tick, {server_name, session_id} = session_key}, state) do
       case Map.get(state.sessions, session_key) do
         nil ->
@@ -228,20 +155,6 @@ defmodule FastestMCP.Middleware.Ping do
       end
     end
 
-    @impl true
-    @doc "Cancels timers owned by the ping state process."
-    def terminate(_reason, state) do
-      Enum.each(state.sessions, fn {_session_key, session} ->
-        Process.demonitor(session.monitor_ref, [:flush])
-
-        if session.timer_ref do
-          Process.cancel_timer(session.timer_ref, async: true, info: false)
-        end
-      end)
-
-      :ok
-    end
-
     defp drop_session(state, session_key) do
       case Map.get(state.sessions, session_key) do
         nil ->
@@ -249,11 +162,7 @@ defmodule FastestMCP.Middleware.Ping do
 
         session ->
           Process.demonitor(session.monitor_ref, [:flush])
-
-          if session.timer_ref do
-            Process.cancel_timer(session.timer_ref, async: true, info: false)
-          end
-
+          Process.cancel_timer(session.timer_ref, async: true, info: false)
           update_in(state.sessions, &Map.delete(&1, session_key))
       end
     end

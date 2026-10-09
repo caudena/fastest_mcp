@@ -14,16 +14,4 @@ defmodule FastestMCP.Client.Workers do
           details: %{reason: inspect(reason)}
     end
   end
-
-  def start_monitored!(supervisor, fun) do
-    pid = start!(supervisor, fun)
-    {pid, Process.monitor(pid)}
-  end
-
-  def start(supervisor, fun) do
-    case Task.Supervisor.start_child(supervisor, fun, restart: :temporary) do
-      {:ok, _pid} -> :ok
-      {:error, reason} -> {:error, reason}
-    end
-  end
 end

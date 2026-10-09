@@ -1,5 +1,5 @@
 defmodule FastestMCP.HTTPContextTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   import Plug.Conn
   import Plug.Test
@@ -12,17 +12,15 @@ defmodule FastestMCP.HTTPContextTest do
     server_name =
       "http-request-snapshot-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("request_tool", fn _args, ctx -> http_request_payload(ctx) end)
-      |> FastestMCP.add_prompt("request_prompt", fn _args, ctx ->
-        inspect(http_request_payload(ctx))
-      end)
-      |> FastestMCP.add_resource("request://snapshot", fn _args, ctx ->
-        http_request_payload(ctx)
-      end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("request_tool", fn _args, ctx -> http_request_payload(ctx) end)
+    |> FastestMCP.add_prompt("request_prompt", fn _args, ctx ->
+      inspect(http_request_payload(ctx))
+    end)
+    |> FastestMCP.add_resource("request://snapshot", fn _args, ctx ->
+      http_request_payload(ctx)
+    end)
+    |> start_server!()
 
     request_metadata = %{
       method: "POST",
@@ -66,22 +64,20 @@ defmodule FastestMCP.HTTPContextTest do
   test "http_headers excludes private headers and background tasks keep only the public snapshot" do
     server_name = "http-headers-task-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool(
-        "headers",
-        fn _args, ctx ->
-          %{
-            filtered: Context.http_headers(ctx),
-            all: Context.http_headers(ctx, include_all: true),
-            access_token: Context.access_token(ctx),
-            method: Context.http_request(ctx).method
-          }
-        end,
-        task: true
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool(
+      "headers",
+      fn _args, ctx ->
+        %{
+          filtered: Context.http_headers(ctx),
+          all: Context.http_headers(ctx, include_all: true),
+          access_token: Context.access_token(ctx),
+          method: Context.http_request(ctx).method
+        }
+      end,
+      task: true
+    )
+    |> start_server!()
 
     task =
       FastestMCP.call_tool!(server_name, "headers", %{},
@@ -119,16 +115,14 @@ defmodule FastestMCP.HTTPContextTest do
     server_name =
       "http-request-transport-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("inspect_headers", fn _args, ctx ->
-        %{
-          request: http_request_payload(ctx),
-          filtered_headers: Context.http_headers(ctx)
-        }
-      end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("inspect_headers", fn _args, ctx ->
+      %{
+        request: http_request_payload(ctx),
+        filtered_headers: Context.http_headers(ctx)
+      }
+    end)
+    |> start_server!()
 
     {session_id, _initialize_response, initialized_response} =
       ProtocolTest.initialize_http(server_name)
@@ -184,18 +178,7 @@ defmodule FastestMCP.HTTPContextTest do
     secret = "Bearer handler-private-secret"
     test_pid = self()
 
-    telemetry_handler =
-      "http-private-authorization-telemetry-" <>
-        Integer.to_string(System.unique_integer([:positive]))
-
-    :telemetry.attach_many(
-      telemetry_handler,
-      [[:fastest_mcp, :operation, :start], [:fastest_mcp, :operation, :stop]],
-      &__MODULE__.handle_telemetry/4,
-      test_pid
-    )
-
-    on_exit(fn -> :telemetry.detach(telemetry_handler) end)
+    attach_telemetry([[:fastest_mcp, :operation, :start], [:fastest_mcp, :operation, :stop]])
 
     authenticator = fn input, context ->
       send(
@@ -221,8 +204,7 @@ defmodule FastestMCP.HTTPContextTest do
         }
       end)
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
     response =
       ProtocolTest.modern_http_request(
@@ -256,13 +238,12 @@ defmodule FastestMCP.HTTPContextTest do
     refute auth_context_inspect =~ "handler-private-secret"
 
     for _event <- 1..2 do
-      assert_receive {:credential_telemetry, _event_name, metadata}, 1_000
+      assert_receive {:telemetry, _event_name, _measurements,
+                      %{server_name: ^server_name} = metadata},
+                     1_000
+
       refute inspect(metadata) =~ "handler-private-secret"
     end
-  end
-
-  def handle_telemetry(event_name, _measurements, metadata, test_pid) do
-    send(test_pid, {:credential_telemetry, event_name, metadata})
   end
 
   defp http_request_payload(ctx) do

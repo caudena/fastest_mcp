@@ -6,6 +6,9 @@ defmodule FastestMCP.Client.CallbackContext do
   retaining transport details or constructing protocol notifications.
   """
 
+  alias FastestMCP.Client.Requests
+  alias FastestMCP.Error
+
   @enforce_keys [:client, :request_id, :method]
   defstruct [
     :client,
@@ -33,13 +36,10 @@ defmodule FastestMCP.Client.CallbackContext do
           cancelled?: boolean()
         }
 
-  @doc "Returns whether the peer cancelled this callback or its task."
-  def cancelled?(%__MODULE__{} = context) do
-    FastestMCP.Client.callback_cancelled?(context)
-  end
+  @doc "Returns whether the peer cancelled this callback or its task, or its client stopped."
+  defdelegate cancelled?(context), to: Requests, as: :callback_cancelled?
 
-  @doc "Sends a monotonic progress update for this callback."
-  def report_progress(%__MODULE__{} = context, progress, opts \\ []) do
-    FastestMCP.Client.report_progress!(context, progress, opts)
-  end
+  @doc "Sends a monotonic progress update for this callback; raises on failure."
+  def report_progress(%__MODULE__{} = context, progress, opts \\ []),
+    do: Error.unwrap!(Requests.report_progress(context, progress, opts))
 end

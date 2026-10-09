@@ -1,5 +1,5 @@
 defmodule FastestMCP.HTTPKeepaliveBodyTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Transport.HTTPApp
 
@@ -28,8 +28,7 @@ defmodule FastestMCP.HTTPKeepaliveBodyTest do
           else: {:error, :unauthorized}
       end)
 
-    {:ok, _} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(name) end)
+    start_server!(server)
     opts = HTTPApp.init(server_name: name, allowed_hosts: :localhost, json_response: true)
 
     plug = fn conn, _opts ->
@@ -37,8 +36,7 @@ defmodule FastestMCP.HTTPKeepaliveBodyTest do
       HTTPApp.call(conn, opts)
     end
 
-    listener = start_supervised!({Bandit, plug: plug, port: 0})
-    {:ok, {_host, port}} = ThousandIsland.listener_info(listener)
+    %{port: port} = serve!(plug)
     {:ok, socket} = :gen_tcp.connect(~c"127.0.0.1", port, [:binary, active: false, nodelay: true])
 
     try do

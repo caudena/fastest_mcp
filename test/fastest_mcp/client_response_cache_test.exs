@@ -153,7 +153,9 @@ defmodule FastestMCP.TestSupport.ClientResponseCachePlug do
 end
 
 defmodule FastestMCP.ClientResponseCacheTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: false
+
+  alias FastestMCP.Test.ClientProbe
 
   require OpenTelemetry.Tracer, as: Tracer
 
@@ -163,27 +165,15 @@ defmodule FastestMCP.ClientResponseCacheTest do
   setup do
     counters = start_supervised!({Agent, fn -> %{} end})
 
-    bandit =
-      start_supervised!(
-        {Bandit,
-         plug:
-           {FastestMCP.TestSupport.ClientResponseCachePlug, counters: counters, parent: self()},
-         scheme: :http,
-         port: 0}
-      )
-
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+    %{url: url} =
+      serve!({FastestMCP.TestSupport.ClientResponseCachePlug, counters: counters, parent: self()})
 
     client =
-      Client.connect!("http://127.0.0.1:#{port}/mcp",
+      connect!(url,
         protocol_version: "2026-07-28",
         response_cache: true,
         roots: []
       )
-
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect!(client)
-    end)
 
     %{client: client, counters: counters}
   end
@@ -207,7 +197,7 @@ defmodule FastestMCP.ClientResponseCacheTest do
     assert %{items: [_tool]} = Client.list_tools!(client, cursor: "")
     assert count(counters, "tools/list") == 5
 
-    :ok = Client.set_access_token!(client, "connection-secret")
+    :ok = Client.set_auth!(client, access_token: "connection-secret")
     assert %{items: [_tool]} = Client.list_tools!(client)
     assert %{items: [_tool]} = Client.list_tools!(client)
     assert count(counters, "tools/list") == 6
@@ -266,7 +256,7 @@ defmodule FastestMCP.ClientResponseCacheTest do
 
     assert count(counters, "resources/read") == 1
 
-    cache = :sys.get_state(client.pid).catalog.response_cache
+    cache = ClientProbe.response_cache(client)
     rendered_cache = inspect(cache, limit: :infinity, printable_limit: :infinity)
     refute rendered_cache =~ "request-only-secret"
     refute rendered_cache =~ "semantic-meta-secret"
@@ -288,7 +278,7 @@ defmodule FastestMCP.ClientResponseCacheTest do
     assert count(counters, "tools/list") == 2
 
     Agent.update(counters, &Map.put(&1, :tools_ttl_ms, 60_000))
-    assert :ok = Client.set_auth_input!(client, %{})
+    assert :ok = Client.set_auth!(client, [])
 
     assert %{content: [%{"type" => "text", "text" => "ok"}]} =
              Client.call_tool!(client, "progress_echo", %{})
@@ -322,10 +312,14 @@ defmodule FastestMCP.ClientResponseCacheTest do
     client: client
   } do
     parent = self()
-    :ok = Client.set_progress_handler!(client, fn params -> send(parent, {:global, params}) end)
 
     :ok =
-      Client.set_notification_handler!(client, fn message ->
+      Client.set_handler!(client, :progress_handler, fn params ->
+        send(parent, {:global, params})
+      end)
+
+    :ok =
+      Client.set_handler!(client, :notification_handler, fn message ->
         send(parent, {:generic, message})
       end)
 

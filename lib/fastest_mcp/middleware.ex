@@ -30,9 +30,39 @@ defmodule FastestMCP.Middleware do
 
   Each function in this module returns the immutable middleware configuration accepted by
   `FastestMCP.add_middleware/2`.
+
+  ## Contract
+
+  Middleware is a two-arity function `fn operation, next -> ... end` or a
+  struct whose module implements `c:call/3`. `next` runs the rest of the
+  pipeline and returns `{:ok, operation}` with the `FastestMCP.Operation` it
+  produced (read `operation.result` and `operation.component`) or
+  `{:error, %FastestMCP.Error{}}`. Middleware returns the same shape:
+
+  ```elixir
+  fn operation, next ->
+    with {:ok, done} <- next.(operation) do
+      {:ok, %{done | result: transform(done.result)}}
+    end
+  end
+  ```
+
+  Short-circuit with `{:ok, %{operation | result: value}}` or
+  `{:error, error}`. A raised `FastestMCP.Error` becomes `{:error, error}`;
+  any other exception becomes an `:internal_error` that keeps the original
+  exception and stacktrace as its `:cause`; any other return value becomes an
+  `:internal_error` too.
+
+  ## Stateful Middleware
+
+  A middleware module that keeps state between requests implements
+  `c:child_spec/1`. Each server that uses the middleware starts that child
+  under its own supervisor and calls the middleware with the configuration
+  returned by `c:attach/2`. The configuration stays immutable, so one
+  configuration added to several servers keeps separate state per server.
   """
 
-  alias FastestMCP.Middleware.DetailedTiming
+  alias FastestMCP.Error
   alias FastestMCP.Middleware.ErrorHandling
   alias FastestMCP.Middleware.Logging
   alias FastestMCP.Middleware.Ping
@@ -40,15 +70,26 @@ defmodule FastestMCP.Middleware do
   alias FastestMCP.Middleware.ResponseCaching
   alias FastestMCP.Middleware.ResponseLimiting
   alias FastestMCP.Middleware.Retry
-  alias FastestMCP.Middleware.SlidingWindowRateLimiting
   alias FastestMCP.Middleware.Timing
   alias FastestMCP.Middleware.ToolInjection
+  alias FastestMCP.Operation
 
-  @callback call(struct(), FastestMCP.Operation.t(), (FastestMCP.Operation.t() -> term())) ::
-              term()
-  @callback activate_runtime(struct()) :: struct()
-  @callback deactivate_runtime(struct()) :: :ok
-  @optional_callbacks activate_runtime: 1, deactivate_runtime: 1
+  @type result :: {:ok, Operation.t()} | {:error, Error.t()}
+
+  @callback call(config :: struct(), Operation.t(), next :: (Operation.t() -> result())) ::
+              result()
+
+  @doc "Returns the child spec of the process holding the state of a stateful middleware."
+  @callback child_spec(config :: struct()) ::
+              Supervisor.child_spec() | {module(), term()} | module()
+
+  @doc "Returns `config` bound to its started state process (default: `pid` in `:runtime`)."
+  @callback attach(config :: struct(), pid()) :: struct()
+
+  @optional_callbacks child_spec: 1, attach: 2
+
+  # State processes register here under their middleware's instance id.
+  @runtimes FastestMCP.PubSub
 
   @doc false
   def validate!(middleware) when is_function(middleware, 2), do: middleware
@@ -62,95 +103,231 @@ defmodule FastestMCP.Middleware do
   end
 
   @doc false
-  def run([], operation, executor), do: executor.(operation)
+  # Runs `operation` through `middleware` around `executor`, the innermost
+  # layer. Every layer is guarded.
+  @spec run([term()], Operation.t(), (Operation.t() -> result())) :: result()
+  def run([], operation, executor), do: guard(executor, operation)
 
   def run([middleware | rest], operation, executor) do
-    call(middleware, operation, &run(rest, &1, executor))
+    guard(&call(middleware, &1, fn inner -> run(rest, inner, executor) end), operation)
   end
 
   @doc false
-  def call(middleware, operation, next) when is_function(middleware, 2),
+  # Applies `layer` to `operation`, turning raised exceptions and results
+  # outside the contract into errors.
+  @spec guard((Operation.t() -> result()), Operation.t()) :: result()
+  def guard(layer, operation) do
+    case layer.(operation) do
+      {:ok, %Operation{}} = ok ->
+        ok
+
+      {:error, %Error{}} = error ->
+        error
+
+      _other ->
+        {:error,
+         Error.internal(
+           "middleware must return {:ok, %FastestMCP.Operation{}} or {:error, %FastestMCP.Error{}}"
+         )}
+    end
+  rescue
+    error in Error ->
+      {:error, error}
+
+    exception ->
+      error = Error.from_exception(exception, "operation #{operation.method} failed")
+      {:error, %{error | cause: {exception, __STACKTRACE__}}}
+  end
+
+  @doc """
+  Applies `fun` to the result of a successful operation.
+
+  ```elixir
+  fn operation, next ->
+    operation |> next.() |> FastestMCP.Middleware.map_result(&Enum.take(&1, 10))
+  end
+  ```
+  """
+  @spec map_result(result(), (term() -> term())) :: result()
+  def map_result({:ok, %Operation{} = operation}, fun),
+    do: {:ok, %{operation | result: fun.(operation.result)}}
+
+  def map_result({:error, %Error{}} = error, _fun), do: error
+
+  defp call(middleware, operation, next) when is_function(middleware, 2),
     do: middleware.(operation, next)
 
-  def call(%module{} = config, operation, next), do: module.call(config, operation, next)
+  defp call(%module{} = config, operation, next), do: module.call(config, operation, next)
 
   @doc false
-  def callable(middleware) when is_function(middleware, 2), do: middleware
-
-  def callable(%module{} = config), do: &module.call(config, &1, &2)
-
-  @doc false
-  def activate_runtime(middleware) when is_function(middleware, 2), do: middleware
-
-  def activate_runtime(%module{} = middleware) do
-    if function_exported?(module, :activate_runtime, 1) do
-      module.activate_runtime(middleware)
+  # Starts the state process of a stateful middleware under `supervisor` and
+  # returns the middleware attached to it. `child_spec/1` and `attach/2` are
+  # optional callbacks of a module that may be the user's.
+  def start(%module{} = middleware, supervisor) do
+    if function_exported?(module, :child_spec, 1) do
+      with {:ok, pid} <- DynamicSupervisor.start_child(supervisor, module.child_spec(middleware)),
+           do: {:ok, attach(middleware, pid)}
     else
-      middleware
+      {:ok, middleware}
     end
+  end
+
+  def start(middleware, _supervisor), do: {:ok, middleware}
+
+  @doc false
+  def attach(%module{} = config, pid) do
+    if function_exported?(module, :attach, 2),
+      do: module.attach(config, pid),
+      else: %{config | runtime: pid}
   end
 
   @doc false
-  def deactivate_runtime(middleware) when is_function(middleware, 2), do: :ok
-
-  def deactivate_runtime(%module{} = middleware) do
-    cond do
-      function_exported?(module, :deactivate_runtime, 1) ->
-        module.deactivate_runtime(middleware)
-
-      function_exported?(module, :close, 1) ->
-        module.close(middleware)
-
-      true ->
-        :ok
-    end
+  # Called by a state process from its `init/1`, so stats functions can find
+  # the state of every server using the middleware. Returns `handle`.
+  def register_runtime(instance_id, handle \\ self()) do
+    {:ok, _owner} = Registry.register(@runtimes, instance_id, handle)
+    handle
   end
 
   @doc false
-  def shutdown_runtime_pid(pid) when is_pid(pid) do
-    Process.unlink(pid)
-    ref = Process.monitor(pid)
-    Process.exit(pid, :shutdown)
-
-    receive do
-      {:DOWN, ^ref, :process, ^pid, _reason} ->
-        :ok
-    after
-      1_000 ->
-        Process.demonitor(ref, [:flush])
-        :ok
-    end
+  # The handles registered by the running state processes of `config`.
+  def runtimes(%{instance_id: instance_id}) do
+    for {pid, handle} <- Registry.lookup(@runtimes, instance_id),
+        Process.alive?(pid),
+        do: handle
   end
 
-  @doc "Builds detailed-timing middleware with per-operation labels."
-  def detailed_timing(opts \\ []), do: DetailedTiming.new(opts)
-  @doc "Builds error-handling middleware with logging and counters."
+  @doc false
+  def not_running(%module{}) do
+    {:error,
+     Error.internal(
+       "#{inspect(module)} has no running state: stateful middleware runs inside the server it is added to"
+     )}
+  end
+
+  @doc "`timing/1` with `label: :detailed`."
+  def detailed_timing(opts \\ []), do: Timing.new(Keyword.put(opts, :label, :detailed))
+
+  @doc """
+  Builds stateful middleware that logs, counts, and normalizes failures.
+
+  Options: `:logger` (a function of the message, or of level and message;
+  default `Logger.log/2`), `:include_traceback` (default `false`),
+  `:transform_errors` (default `true`; `false` returns the error unchanged),
+  and `:error_callback`, called with the exception and the operation.
+  """
   def error_handling(opts \\ []), do: ErrorHandling.new(opts)
-  @doc "Builds request-logging middleware."
+
+  @doc """
+  Returns the failures counted by an `error_handling/1` middleware, keyed by
+  `"ExceptionName:method"` and summed over the servers using it.
+  """
+  defdelegate error_counts(error_handling), to: ErrorHandling
+
+  @doc """
+  Builds request-logging middleware.
+
+  Options: `:log_level` (default `:info`), `:methods` (log only these MCP
+  methods), `:include_payloads`, `:include_payload_length`,
+  `:estimate_payload_tokens` (all default `false`), `:max_payload_length`
+  (default 1,000), `:payload_serializer`, `:structured_logging` (default
+  `false`), and `:log_fn` (default `Logger.log/2`).
+  """
   def logging(opts \\ []), do: Logging.new(opts)
-  @doc "Runs a ping request."
+
+  @doc """
+  Builds stateful middleware that keeps transport sessions alive: every
+  session that sent a request with its session id gets a ping each
+  `:interval_ms` (default 30,000).
+  """
   def ping(opts \\ []), do: Ping.new(opts)
-  @doc "Builds token-bucket rate-limiting middleware."
+
+  @doc """
+  Returns the `{server_name, session_id}` pairs a `ping/1` middleware keeps
+  alive, over the servers using it.
+  """
+  defdelegate ping_sessions(ping), to: Ping, as: :active_sessions
+
+  @doc """
+  Builds stateful token-bucket rate limiting.
+
+  Options: `:max_requests_per_second` (default 10.0), `:burst_capacity`
+  (default twice the rate), `:max_clients` (default 10,000), `:get_client_id`
+  (a function of the operation; without it, or with `global_limit: true`, all
+  requests share one bucket). A rejected request fails with `:rate_limited`,
+  and a new client beyond `:max_clients` with `:overloaded`.
+  """
   def rate_limiting(opts \\ []), do: RateLimiting.new(opts)
-  @doc "Builds response-caching middleware."
+
+  @doc """
+  Builds stateful response caching.
+
+  Each cached method has its own settings, a keyword list with `:enabled`
+  (default `true`) and `:ttl_ms`: `:list_tools`, `:list_resources`, and
+  `:list_prompts` (default 5 minutes), and `:read_resource`, `:get_prompt`, and
+  `:call_tool` (default 1 hour; `:call_tool` also takes `:included_tools` and
+  `:excluded_tools`). Other options: `:max_item_size` (default 1,000,000
+  bytes), `:cleanup_interval_ms` (default 60,000), and `:logger`.
+  """
   def response_caching(opts \\ []), do: ResponseCaching.new(opts)
-  @doc "Builds middleware that truncates oversized responses."
+
+  @doc """
+  Returns the counters of a `response_caching/1` middleware per cached method
+  (`"tools/list"`, `"tools/call"`, ...): `:hits`, `:misses`, `:puts`,
+  `:expired`, `:skipped_too_large`, and `:evictions`, summed over the servers
+  using it.
+  """
+  defdelegate cache_statistics(cache), to: ResponseCaching, as: :statistics
+
+  @doc """
+  Builds middleware that truncates tool results larger than `:max_size` bytes
+  (default 1,000,000), appending `:truncation_suffix`. `:tools` limits it to
+  the named tools.
+  """
   def response_limiting(opts \\ []), do: ResponseLimiting.new(opts)
-  @doc "Builds retry middleware for transient failures."
+
+  @doc """
+  Builds middleware that retries failed operations with exponential backoff.
+
+  Options: `:max_retries` (default 3), `:base_delay` and `:max_delay` in
+  seconds (defaults 1.0 and 60.0), `:backoff_multiplier` (default 2.0),
+  `:retry_codes` (error codes to retry, default `[:timeout]`),
+  `:retry_exceptions` (exception modules whose crashes are retried), and
+  `:logger`.
+  """
   def retry(opts \\ []), do: Retry.new(opts)
-  @doc "Builds sliding-window rate-limiting middleware."
-  def sliding_window_rate_limiting(opts), do: SlidingWindowRateLimiting.new(opts)
-  @doc "Builds middleware that injects synthetic tools into the runtime."
+
+  @doc """
+  Builds stateful sliding-window rate limiting: at most `:max_requests`
+  (required) per client in each `:window_minutes` (default 1). Also takes
+  `:max_clients` and `:get_client_id` like `rate_limiting/1`.
+  """
+  def sliding_window_rate_limiting(opts), do: RateLimiting.sliding_window(opts)
+
+  @doc """
+  Builds middleware that adds `tools` ahead of the server's own tools.
+
+  Each tool is a `{name, handler}` or `{name, handler, opts}` tuple taking the
+  `FastestMCP.add_tool/4` options; `opts` apply to every tool.
+  """
   def tool_injection(tools, opts \\ []), do: ToolInjection.new(tools, opts)
 
-  @doc "Builds request-logging middleware with structured output enabled."
+  @doc "`logging/1` with `structured_logging: true`."
   def structured_logging(opts \\ []),
     do: Logging.new(Keyword.put(opts, :structured_logging, true))
 
-  @doc "Builds middleware that exposes prompts as synthetic tools."
+  @doc "Injects `list_prompts` and `get_prompt` tools; see `tool_injection/2`."
   def prompt_tools(opts \\ []), do: ToolInjection.prompt_tools(opts)
-  @doc "Builds the synthetic resource-tool set used by tool injection."
+  @doc "Injects `list_resources` and `read_resource` tools; see `tool_injection/2`."
   def resource_tools(opts \\ []), do: ToolInjection.resource_tools(opts)
-  @doc "Builds timing middleware that records total request duration."
+
+  @doc """
+  Builds middleware that logs each request's duration.
+
+  Options: `:label` names the request in the log: `"Request <method>"` by
+  default, `:detailed` names the called component or listed kind
+  (`"Tool 'echo'"`, `"List tools"`), and a function receives the operation.
+  Also `:log_level` (default `:info`) and `:log_fn` (default `Logger.log/2`).
+  """
   def timing(opts \\ []), do: Timing.new(opts)
 end

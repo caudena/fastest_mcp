@@ -1,5 +1,5 @@
 defmodule FastestMCP.CompletionTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Client
   alias FastestMCP.Error
@@ -36,8 +36,7 @@ defmodule FastestMCP.CompletionTest do
         ]
       )
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
     assert %{values: ["preview"], total: 1} =
              FastestMCP.complete!(
@@ -80,60 +79,41 @@ defmodule FastestMCP.CompletionTest do
       next.(operation)
     end
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_middleware(completion_observer)
-      |> FastestMCP.add_tool("deploy", fn arguments, _ctx -> arguments end,
-        input_schema: %{
-          "type" => "object",
-          "properties" => %{
-            "environment" => %{
-              "type" => "string",
-              "completion" => ["preview", "production", "staging"]
-            }
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_middleware(completion_observer)
+    |> FastestMCP.add_tool("deploy", fn arguments, _ctx -> arguments end,
+      input_schema: %{
+        "type" => "object",
+        "properties" => %{
+          "environment" => %{
+            "type" => "string",
+            "completion" => ["preview", "production", "staging"]
           }
         }
-      )
-      |> FastestMCP.add_prompt("greet", fn %{"name" => name}, _ctx -> "Hello #{name}" end,
-        arguments: [%{name: "name", description: "Name", completion: ["Nate", "Nadia", "Nova"]}]
-      )
-      |> FastestMCP.add_prompt("bulk", fn _arguments, _ctx -> "bulk" end,
-        arguments: [
-          %{
-            name: "value",
-            completion: Enum.map(1..101, &String.pad_leading(to_string(&1), 3, "0"))
-          }
-        ]
-      )
-      |> FastestMCP.add_resource_template(
-        "users://{tenant}/{id}",
-        fn arguments, _ctx -> arguments end,
-        completions: [id: ["100", "200", "300"]]
-      )
+      }
+    )
+    |> FastestMCP.add_prompt("greet", fn %{"name" => name}, _ctx -> "Hello #{name}" end,
+      arguments: [%{name: "name", description: "Name", completion: ["Nate", "Nadia", "Nova"]}]
+    )
+    |> FastestMCP.add_prompt("bulk", fn _arguments, _ctx -> "bulk" end,
+      arguments: [
+        %{
+          name: "value",
+          completion: Enum.map(1..101, &String.pad_leading(to_string(&1), 3, "0"))
+        }
+      ]
+    )
+    |> FastestMCP.add_resource_template(
+      "users://{tenant}/{id}",
+      fn arguments, _ctx -> arguments end,
+      completions: [id: ["100", "200", "300"]]
+    )
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    %{url: url} =
+      start_http!(server_name, allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"])
 
-    bandit =
-      start_supervised!(
-        {Bandit,
-         plug:
-           {FastestMCP.Transport.HTTPApp,
-            server_name: server_name,
-            path: "/mcp",
-            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
-         scheme: :http,
-         port: 0}
-      )
-
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
-
-    client =
-      Client.connect!("http://127.0.0.1:#{port}/mcp", protocol_version: "2025-11-25")
-
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect!(client)
-    end)
+    client = connect!(url, protocol_version: "2025-11-25")
 
     assert %{"values" => ["Nate", "Nadia"], "total" => 2} =
              Client.complete!(

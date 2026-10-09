@@ -106,7 +106,9 @@ That ordering matters when later startup steps depend on earlier ones.
 
 Mounted server lifespans are entered recursively when the parent runtime starts.
 Mounted handlers see their own server's `ctx.lifespan_context`; parent and
-child lifespan maps are not merged together. Shutdown runs child cleanup before
+child lifespan maps are not merged together, except that the root's lifespan
+state of each extension the mounted server requires stays available under that
+extension's identifier. Shutdown runs child cleanup before
 parent cleanup so mounted resources are released before parent resources they
 may depend on.
 

@@ -1,10 +1,25 @@
 defmodule FastestMCP.ClientOAuthTest do
-  use ExUnit.Case, async: true
+  use FastestMCP.Case, async: true
+
+  alias FastestMCP.Test.ClientProbe
 
   alias FastestMCP.Client
   alias FastestMCP.Client.OAuth
   alias FastestMCP.Client.OAuth.Error
   alias FastestMCP.Protocol.Extensions
+
+  defmodule ChallengePlug do
+    @moduledoc false
+    import Plug.Conn
+
+    def init(opts), do: opts
+
+    def call(conn, _opts) do
+      conn
+      |> put_resp_header("www-authenticate", "Bearer")
+      |> send_resp(401, "")
+    end
+  end
 
   @resource "https://mcp.example.com/public/mcp"
   @resource_metadata "https://mcp.example.com/.well-known/oauth-protected-resource/public/mcp"
@@ -1141,9 +1156,222 @@ defmodule FastestMCP.ClientOAuthTest do
             }} = OAuth.authorize(oauth, @resource)
   end
 
+  describe "single-flight coordinator" do
+    test "a header request joins a pending authorization and the handler runs once" do
+      requester = fn method, url, opts -> oauth_response(method, url, opts) end
+      handler = blocking_authorization_handler(self(), fn _request -> true end)
+
+      assert {:ok, oauth} =
+               OAuth.start_link(oauth_opts(requester, authorization_handler: handler))
+
+      authorizing = Task.async(fn -> OAuth.authorize(oauth, @resource) end)
+      assert_receive {:authorizing, handler_pid, _request}
+
+      joining = Task.async(fn -> OAuth.authorization_header(oauth, @resource) end)
+      refute Task.yield(joining, 100)
+      send(handler_pid, :continue)
+
+      assert {:ok, "Bearer access-one"} = Task.await(authorizing)
+      assert {:ok, "Bearer access-one"} = Task.await(joining)
+      refute_received {:authorizing, _pid, _request}
+    end
+
+    test "other resources answer while a flow is blocked in the host handler" do
+      other = "https://mcp.example.com/other/mcp"
+      other_metadata = "https://mcp.example.com/.well-known/oauth-protected-resource/other/mcp"
+
+      requester = fn
+        :get, ^other_metadata, _opts ->
+          json_response(%{"resource" => other, "authorization_servers" => [@issuer]})
+
+        method, url, opts ->
+          oauth_response(method, url, opts)
+      end
+
+      handler = blocking_authorization_handler(self(), &(&1.resource == other))
+
+      assert {:ok, oauth} =
+               OAuth.start_link(oauth_opts(requester, authorization_handler: handler))
+
+      assert {:ok, "Bearer access-one"} = OAuth.authorize(oauth, @resource)
+
+      blocked = Task.async(fn -> OAuth.authorize(oauth, other) end)
+      assert_receive {:authorizing, handler_pid, %{resource: ^other}}
+
+      header = Task.async(fn -> OAuth.authorization_header(oauth, @resource) end)
+      assert {:ok, {:ok, "Bearer access-one"}} = Task.yield(header, 1_000)
+
+      clear = Task.async(fn -> OAuth.clear(oauth, @resource) end)
+      assert {:ok, :ok} = Task.yield(clear, 1_000)
+      assert :none = OAuth.authorization_header(oauth, @resource)
+
+      send(handler_pid, :continue)
+      assert {:ok, "Bearer access-one"} = Task.await(blocked)
+      assert {:ok, "Bearer access-one"} = OAuth.authorization_header(oauth, other)
+    end
+
+    test "clear cancels a pending flow, which never stores its credential" do
+      requester = fn method, url, opts -> oauth_response(method, url, opts) end
+      handler = blocking_authorization_handler(self(), fn _request -> true end)
+
+      assert {:ok, oauth} =
+               OAuth.start_link(
+                 oauth_opts(requester,
+                   authorization_handler: handler,
+                   credential_listener: self()
+                 )
+               )
+
+      authorizing = Task.async(fn -> OAuth.authorize(oauth, @resource) end)
+      assert_receive {:authorizing, handler_pid, _request}
+      handler_ref = Process.monitor(handler_pid)
+
+      clear = Task.async(fn -> OAuth.clear(oauth, @resource) end)
+      assert {:ok, :ok} = Task.yield(clear, 1_000)
+      assert {:error, %Error{stage: :authorization, reason: :cleared}} = Task.await(authorizing)
+      assert_receive {:DOWN, ^handler_ref, :process, ^handler_pid, _reason}
+
+      assert :none = OAuth.authorization_header(oauth, @resource)
+      refute_received :oauth_credentials_refreshed
+    end
+
+    @tag :capture_log
+    test "a crashed flow answers its callers with an error and the coordinator survives" do
+      requester = fn
+        :post, "https://auth.example.com/token", _opts -> raise "token endpoint exploded"
+        method, url, opts -> oauth_response(method, url, opts)
+      end
+
+      assert {:ok, oauth} = OAuth.start_link(oauth_opts(requester))
+
+      assert {:error, %Error{stage: :authorization, reason: :flow_crashed}} =
+               OAuth.authorize(oauth, @resource)
+
+      assert Process.alive?(oauth)
+      assert :none = OAuth.authorization_header(oauth, @resource)
+    end
+
+    test "a caller that times out leaves the flow running to store its result" do
+      requester = fn method, url, opts -> oauth_response(method, url, opts) end
+      handler = blocking_authorization_handler(self(), fn _request -> true end)
+
+      assert {:ok, oauth} =
+               OAuth.start_link(oauth_opts(requester, authorization_handler: handler))
+
+      authorizing = Task.async(fn -> OAuth.authorize(oauth, @resource, timeout_ms: 100) end)
+      assert_receive {:authorizing, handler_pid, _request}
+
+      assert {:error, %Error{stage: :authorization, reason: :timeout}} =
+               Task.await(authorizing, 1_000)
+
+      assert {:error, %Error{stage: :authorization, reason: :timeout}} =
+               OAuth.authorization_header(oauth, @resource, 50)
+
+      send(handler_pid, :continue)
+      assert {:ok, "Bearer access-one"} = OAuth.authorization_header(oauth, @resource)
+      refute_received {:authorizing, _pid, _request}
+    end
+
+    test "an authorization request waits out a pending refresh and authorizes if it fails" do
+      test_pid = self()
+      authorizations = :counters.new(1, [])
+
+      requester = fn
+        :post, "https://auth.example.com/token", opts ->
+          case Map.new(opts[:form])["grant_type"] do
+            "refresh_token" ->
+              send(test_pid, {:refreshing, self()})
+              receive do: (:continue -> {:ok, 400, [], ""})
+
+            "authorization_code" ->
+              :counters.add(authorizations, 1, 1)
+
+              json_response(%{
+                "access_token" => "access-#{:counters.get(authorizations, 1)}",
+                "token_type" => "Bearer",
+                "refresh_token" => "refresh-one",
+                "expires_in" => 1
+              })
+          end
+
+        method, url, opts ->
+          oauth_response(method, url, opts)
+      end
+
+      assert {:ok, oauth} = OAuth.start_link(oauth_opts(requester))
+      assert {:ok, "Bearer access-1"} = OAuth.authorize(oauth, @resource)
+
+      header = Task.async(fn -> OAuth.authorization_header(oauth, @resource, :infinity) end)
+      assert_receive {:refreshing, refresher}
+
+      unauthorized =
+        Task.async(fn -> OAuth.handle_unauthorized(oauth, @resource, [], attempt: 2) end)
+
+      refute Task.yield(unauthorized, 50)
+      send(refresher, :continue)
+
+      assert {:error, %Error{stage: :token_refresh, reason: {:http_status, 400}}} =
+               Task.await(header)
+
+      assert {:ok, "Bearer access-2"} = Task.await(unauthorized)
+    end
+
+    test "a connected client stops promptly while its authorization is pending" do
+      %{port: port} = serve!(ChallengePlug)
+      resource = "http://127.0.0.1:#{port}/mcp"
+      metadata = "http://127.0.0.1:#{port}/.well-known/oauth-protected-resource/mcp"
+
+      requester = fn
+        :get, ^metadata, _opts ->
+          json_response(%{"resource" => resource, "authorization_servers" => [@issuer]})
+
+        method, url, opts ->
+          oauth_response(method, url, opts)
+      end
+
+      handler = blocking_authorization_handler(self(), fn _request -> true end)
+
+      %Client{pid: client_pid} =
+        client =
+        Client.connect!(resource,
+          protocol_version: "2025-11-25",
+          auto_initialize: false,
+          oauth: oauth_opts(requester, authorization_handler: handler)
+        )
+
+      spawn(fn -> Client.initialize(client) end)
+      assert_receive {:authorizing, handler_pid, _request}, 2_000
+      handler_ref = Process.monitor(handler_pid)
+      client_ref = Process.monitor(client_pid)
+
+      assert :ok = Client.disconnect(client)
+      assert_receive {:DOWN, ^client_ref, :process, ^client_pid, _reason}, 2_000
+      assert_receive {:DOWN, ^handler_ref, :process, ^handler_pid, _reason}, 2_000
+    end
+  end
+
+  test "the connected client validates oauth options before it starts" do
+    requester = fn method, url, opts -> oauth_response(method, url, opts) end
+    insecure = oauth_opts(requester, authorization_server: "http://127.0.0.1:8766/tenant")
+
+    assert_raise ArgumentError, "OAuth configuration failed: https required", fn ->
+      Client.connect("https://mcp.example.com/mcp", oauth: insecure)
+    end
+
+    error =
+      assert_raise ArgumentError, fn ->
+        Client.connect("https://mcp.example.com/mcp",
+          oauth: oauth_opts(requester, client_secret: "s3cret")
+        )
+      end
+
+    assert error.message =~ "unknown keys [:client_secret]"
+    refute error.message =~ "s3cret"
+  end
+
   test "tagged noninteractive grants declare their matching MCP extension" do
     client =
-      Client.connect!("https://mcp.example.com/mcp",
+      connect!("https://mcp.example.com/mcp",
         auto_initialize: false,
         oauth: [
           grant:
@@ -1154,11 +1382,7 @@ defmodule FastestMCP.ClientOAuthTest do
         ]
       )
 
-    on_exit(fn -> if Client.connected?(client), do: Client.disconnect!(client) end)
-
-    state = :sys.get_state(client.pid)
-
-    assert state.extensions == %{
+    assert ClientProbe.extensions(client) == %{
              Extensions.oauth_client_credentials() => %{}
            }
   end
@@ -1186,6 +1410,19 @@ defmodule FastestMCP.ClientOAuthTest do
          state: state,
          redirect_uri: request.redirect_uri
        }}
+    end
+  end
+
+  # Succeeds like `successful_authorization_handler/0`, but first blocks the
+  # requests `block?` selects until the test sends `:continue`.
+  defp blocking_authorization_handler(test_pid, block?) do
+    fn request ->
+      if block?.(request) do
+        send(test_pid, {:authorizing, self(), request})
+        receive do: (:continue -> :ok)
+      end
+
+      successful_authorization_handler().(request)
     end
   end
 

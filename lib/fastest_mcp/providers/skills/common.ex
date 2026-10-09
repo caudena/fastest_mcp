@@ -1,36 +1,22 @@
 defmodule FastestMCP.Providers.Skills.Common do
-  @moduledoc """
-  Shared helpers for parsing skill directories and their supporting files.
-
-  This module is a thin adapter over `FastestMCP.Providers.SkillsDirectory`.
-  Its job is to point the shared directory scanner at the conventional paths
-  and file layout used by this editor or agent environment.
-
-  Use these helpers when you want to expose locally installed skills as MCP
-  resources without hard-coding directory conventions in your application.
-  """
+  @moduledoc false
+  # Skill directory loading shared by `Providers.Skill` and
+  # `Providers.SkillsDirectory`: frontmatter, file scanning, and safe paths.
 
   alias FastestMCP.PathSafety
 
   defmodule SkillFileInfo do
-    @moduledoc """
-    Metadata describing one file inside a loaded skill directory.
-    """
-
+    @moduledoc false
     defstruct [:path, :size, :hash]
   end
 
   defmodule SkillInfo do
-    @moduledoc """
-    Normalized description of a loaded skill directory.
-    """
-
+    @moduledoc false
     defstruct [:name, :description, :path, :real_path, :main_file, files: [], frontmatter: %{}]
   end
 
   @frontmatter ~r/\A---[\t ]*\r?\n(.*?)^---[\t ]*(?:\r?\n|\z)/ms
 
-  @doc "Parses optional frontmatter from the given content."
   def parse_frontmatter(content) when is_binary(content) do
     if String.starts_with?(content, "---") do
       parse_frontmatter_block(content)
@@ -39,7 +25,6 @@ defmodule FastestMCP.Providers.Skills.Common do
     end
   end
 
-  @doc "Loads one skill directory into a normalized description."
   def load_skill!(skill_path, main_file_name \\ "SKILL.md") do
     skill_path = Path.expand(to_string(skill_path))
     main_file_path = Path.join(skill_path, main_file_name)
@@ -77,7 +62,6 @@ defmodule FastestMCP.Providers.Skills.Common do
     }
   end
 
-  @doc false
   def skill_metadata_key(skill_path, main_file_name \\ "SKILL.md") do
     skill_path = Path.expand(to_string(skill_path))
 
@@ -101,7 +85,6 @@ defmodule FastestMCP.Providers.Skills.Common do
     end
   end
 
-  @doc "Builds the JSON manifest payload for a loaded skill."
   def manifest_json(%SkillInfo{} = skill_info) do
     JSON.encode!(%{
       "skill" => skill_info.name,
@@ -112,7 +95,6 @@ defmodule FastestMCP.Providers.Skills.Common do
     })
   end
 
-  @doc "Infers the mime type for the given file path."
   def infer_mime_type(path) do
     case String.downcase(Path.extname(path)) do
       ".md" -> "text/markdown"
@@ -121,7 +103,6 @@ defmodule FastestMCP.Providers.Skills.Common do
     end
   end
 
-  @doc "Resolves a supporting file path while keeping it inside the skill root."
   def safe_file_path(%SkillInfo{} = skill_info, relative_path) do
     relative_path = to_string(relative_path)
 
@@ -138,13 +119,6 @@ defmodule FastestMCP.Providers.Skills.Common do
     else
       {:error, :invalid_path}
     end
-  end
-
-  @doc "Returns the path relative to the skill root."
-  def relative_file_path(%SkillInfo{} = skill_info, real_path) do
-    real_path
-    |> Path.relative_to(skill_info.real_path)
-    |> String.replace("\\", "/")
   end
 
   defp parse_frontmatter_block(content) do

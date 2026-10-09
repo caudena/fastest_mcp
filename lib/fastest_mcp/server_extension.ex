@@ -9,6 +9,8 @@ defmodule FastestMCP.ServerExtension do
   the existing operation pipeline and lifespan machinery.
   """
 
+  import FastestMCP.Protocol.Version
+
   alias FastestMCP.Lifespan
   alias FastestMCP.Protocol.Extensions
   alias FastestMCP.Schema
@@ -42,7 +44,9 @@ defmodule FastestMCP.ServerExtension do
           methods: [Method.t()],
           tool_interceptor:
             nil
-            | (FastestMCP.Operation.t(), (FastestMCP.Operation.t() -> any()) -> any()),
+            | (FastestMCP.Operation.t(),
+               (FastestMCP.Operation.t() -> FastestMCP.Middleware.result()) ->
+                 FastestMCP.Middleware.result()),
           lifespan: term() | nil
         }
 
@@ -146,7 +150,7 @@ defmodule FastestMCP.ServerExtension do
     fn operation, next ->
       negotiated? =
         operation.method == "tools/call" and
-          operation.context.negotiated_protocol_version == "2026-07-28" and
+          is_modern(operation.context.negotiated_protocol_version) and
           Extensions.enabled?(operation.context.client_capabilities, extension.identifier)
 
       if negotiated? do

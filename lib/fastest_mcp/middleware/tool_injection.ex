@@ -1,26 +1,16 @@
 defmodule FastestMCP.Middleware.ToolInjection do
-  @moduledoc """
-  Middleware that injects synthetic tools into the shared operation pipeline.
-  Injected tools are listed ahead of registered tools and are executed before
-  normal registry lookup, so they can override base tools when names collide.
-
-  Middleware modules in FastestMCP are configured as explicit structs that
-  carry immutable configuration. Dispatch calls the module with that configuration;
-  runtime state is owned separately by the server.
-
-  Most applications reach this module through `FastestMCP.Middleware` helper
-  functions or by adding the configured struct directly with
-  `FastestMCP.Server.add_middleware/2`.
-  """
+  @moduledoc false
+  # Injected tools are listed ahead of registered tools and resolved before the
+  # registry, so they override base tools of the same name.
 
   alias FastestMCP.Component
   alias FastestMCP.ComponentCompiler
   alias FastestMCP.ComponentPolicy
   alias FastestMCP.Error
+  alias FastestMCP.Middleware
   @behaviour FastestMCP.Middleware
 
   alias FastestMCP.Operation
-  alias FastestMCP.OperationPipeline
 
   defstruct [:middleware, tools: [], tools_by_name: %{}]
 
@@ -34,7 +24,6 @@ defmodule FastestMCP.Middleware.ToolInjection do
           tools_by_name: %{optional(String.t()) => FastestMCP.Components.Tool.t()}
         }
 
-  @doc "Builds a new value for this module from the supplied options."
   def new(tools, opts \\ []) do
     normalized =
       tools
@@ -50,7 +39,6 @@ defmodule FastestMCP.Middleware.ToolInjection do
     middleware
   end
 
-  @doc "Builds the synthetic prompt-tool set used by tool injection."
   def prompt_tools(opts \\ []) do
     new(
       [
@@ -63,7 +51,6 @@ defmodule FastestMCP.Middleware.ToolInjection do
     )
   end
 
-  @doc "Builds the synthetic resource-tool set used by tool injection."
   def resource_tools(opts \\ []) do
     new(
       [
@@ -76,19 +63,18 @@ defmodule FastestMCP.Middleware.ToolInjection do
     )
   end
 
-  @doc "Runs the middleware around the next operation."
   @impl FastestMCP.Middleware
   def call(%__MODULE__{} = middleware, %Operation{method: "tools/list"} = operation, next)
       when is_function(next, 1) do
     visible_tools = visible_tools(middleware, operation)
     visible_names = MapSet.new(visible_tools, & &1.name)
 
-    base_tools =
-      next.(operation)
-      |> List.wrap()
-      |> Enum.reject(&MapSet.member?(visible_names, listed_tool_name(&1)))
-
-    Enum.map(visible_tools, &Component.metadata/1) ++ base_tools
+    operation
+    |> next.()
+    |> Middleware.map_result(fn base_tools ->
+      Enum.map(visible_tools, &Component.metadata/1) ++
+        Enum.reject(List.wrap(base_tools), &MapSet.member?(visible_names, listed_tool_name(&1)))
+    end)
   end
 
   def call(
@@ -98,17 +84,9 @@ defmodule FastestMCP.Middleware.ToolInjection do
       )
       when is_function(next, 1) do
     case prepare_tool(middleware, target, operation) do
-      {:ok, visible_tool} ->
-        execute_tool(visible_tool, operation)
-
-      :not_found ->
-        next.(operation)
-
-      :hidden ->
-        next.(operation)
-
-      {:error, %Error{} = error} ->
-        raise error
+      {:ok, visible_tool} -> execute_tool(visible_tool, operation)
+      {:error, %Error{}} = error -> error
+      _hidden_or_missing -> next.(operation)
     end
   end
 
@@ -116,15 +94,12 @@ defmodule FastestMCP.Middleware.ToolInjection do
     next.(operation)
   end
 
-  @doc false
   def visible_tools(%__MODULE__{} = middleware, %Operation{} = operation) do
     apply_list_policy(middleware.tools, operation)
   end
 
-  @doc false
   def tool_names(%__MODULE__{} = middleware), do: Enum.map(middleware.tools, & &1.name)
 
-  @doc false
   def prepare_tool(%__MODULE__{} = middleware, target, %Operation{} = operation) do
     case Map.fetch(middleware.tools_by_name, to_string(target)) do
       {:ok, tool} ->
@@ -144,12 +119,12 @@ defmodule FastestMCP.Middleware.ToolInjection do
     end
   end
 
-  @doc false
-  def execute_tool(tool, %Operation{} = operation) do
+  defp execute_tool(tool, %Operation{} = operation) do
     operation = %{operation | component: tool}
     FastestMCP.Telemetry.annotate_span(operation)
-    OperationPipeline.record_resolved_component(operation.context, tool)
-    Component.execute(tool, operation)
+
+    with {:ok, result} <- Component.execute(tool, operation),
+         do: {:ok, %{operation | result: result}}
   end
 
   defp normalize_tool(%FastestMCP.Components.Tool{} = tool, _opts), do: tool
@@ -161,7 +136,6 @@ defmodule FastestMCP.Middleware.ToolInjection do
   defp normalize_tool({name, handler, tool_opts}, opts) do
     ComponentCompiler.compile(
       :tool,
-      "__injected__",
       name,
       handler,
       Keyword.merge(opts, tool_opts)
@@ -198,11 +172,8 @@ defmodule FastestMCP.Middleware.ToolInjection do
     |> Enum.reverse()
   end
 
-  defp listed_tool_name(tool) when is_map(tool) do
-    tool
-    |> Map.get(:name, Map.get(tool, "name"))
-    |> to_string()
-  end
+  # Listed tools are `Component.metadata/1` maps.
+  defp listed_tool_name(tool) when is_map(tool), do: to_string(Map.get(tool, :name))
 
   defp list_prompts_tool(_arguments, context) do
     %{"prompts" => FastestMCP.list_prompts!(context.server_name, inherited_opts(context))}

@@ -1,5 +1,5 @@
 defmodule FastestMCP.ServerLifespanTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   test "server lifespans enter on startup, expose merged context, and clean up in reverse order" do
     server_name = "lifespan-" <> Integer.to_string(System.unique_integer([:positive]))
@@ -23,15 +23,14 @@ defmodule FastestMCP.ServerLifespanTest do
        end}
     end
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_lifespan(first_enter)
-      |> FastestMCP.add_lifespan(second_enter)
-      |> FastestMCP.add_tool("lifespan_info", fn _args, ctx ->
-        ctx.lifespan_context
-      end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_lifespan(first_enter)
+    |> FastestMCP.add_lifespan(second_enter)
+    |> FastestMCP.add_tool("lifespan_info", fn _args, ctx ->
+      ctx.lifespan_context
+    end)
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
     assert_receive :first_enter, 1_000
     assert_receive {:second_enter, ^server_name}, 1_000
 
@@ -76,20 +75,19 @@ defmodule FastestMCP.ServerLifespanTest do
     server_name = "lifespan-cleanup-" <> Integer.to_string(System.unique_integer([:positive]))
     test_pid = self()
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_lifespan(fn _server ->
-        {%{}, fn -> send(test_pid, :first_cleanup) end}
-      end)
-      |> FastestMCP.add_lifespan(fn _server ->
-        {%{},
-         fn ->
-           send(test_pid, :failing_cleanup)
-           raise "cleanup failed"
-         end}
-      end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_lifespan(fn _server ->
+      {%{}, fn -> send(test_pid, :first_cleanup) end}
+    end)
+    |> FastestMCP.add_lifespan(fn _server ->
+      {%{},
+       fn ->
+         send(test_pid, :failing_cleanup)
+         raise "cleanup failed"
+       end}
+    end)
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
     assert :ok = FastestMCP.stop_server(server_name)
     assert_receive :failing_cleanup, 1_000
     assert_receive :first_cleanup, 1_000

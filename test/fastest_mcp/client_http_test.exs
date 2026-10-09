@@ -1,5 +1,7 @@
 defmodule FastestMCP.ClientHTTPTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
+
+  import ExUnit.CaptureLog
 
   alias FastestMCP.Client
   alias FastestMCP.Client.Task, as: RemoteTask
@@ -12,48 +14,32 @@ defmodule FastestMCP.ClientHTTPTest do
     test_pid = self()
     server_name = "client-http-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
-      |> FastestMCP.add_tool("slow", fn _arguments, _ctx ->
-        send(test_pid, :slow_tool_started)
-        Process.sleep(200)
-        %{ok: true}
-      end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+    |> FastestMCP.add_tool("slow", fn _arguments, _ctx ->
+      send(test_pid, {:slow_tool_started, self()})
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+      receive do
+        :release -> %{ok: true}
+      end
+    end)
+    |> start_server!()
 
-    bandit =
-      start_supervised!(
-        {Bandit,
-         plug:
-           {FastestMCP.Transport.HTTPApp,
-            server_name: server_name,
-            path: "/mcp",
-            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
-         scheme: :http,
-         port: 0}
-      )
-
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+    %{url: url} =
+      start_http!(server_name, allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"])
 
     client =
-      Client.connect!(
-        "http://127.0.0.1:#{port}/mcp",
+      connect!(
+        url,
         protocol_version: "2025-11-25",
         client_info: %{"name" => "client-http-test", "version" => "1.0.0"},
         max_in_flight: 1
       )
 
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect!(client)
-    end)
-
     assert Client.connected?(client)
-    assert Client.protocol_version!(client) == "2025-11-25"
-    assert is_map(Client.initialize_result!(client))
-    assert is_map(Client.capabilities!(client))
+
+    assert %Client.Info{protocol_version: "2025-11-25", initialize_result: %{}, capabilities: %{}} =
+             Client.info!(client)
 
     assert [%{"name" => "echo"}, %{"name" => "slow"}] =
              client
@@ -66,7 +52,7 @@ defmodule FastestMCP.ClientHTTPTest do
 
     task = Task.async(fn -> Client.call_tool!(client, "slow", %{}) end)
 
-    assert_receive :slow_tool_started, 1_000
+    assert_receive {:slow_tool_started, slow_tool}, 1_000
 
     error =
       assert_raise Error, fn ->
@@ -74,63 +60,45 @@ defmodule FastestMCP.ClientHTTPTest do
       end
 
     assert error.code == :overloaded
+    send(slow_tool, :release)
     assert %{structured_content: %{"ok" => true}} = Task.await(task, 1_000)
   end
 
   test "connected client lists and reads resources, templates, and prompts over HTTP" do
     server_name = "client-http-content-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_resource("memo://welcome", fn _arguments, _ctx -> %{message: "hello"} end,
-        tags: ["docs", "utility"],
-        version: "2.0.0",
-        task: true,
-        meta: %{
-          "vendor" => %{"stable" => true},
-          "fastestmcp" => %{"hint" => "keep", "_private" => "drop"}
-        }
-      )
-      |> FastestMCP.add_resource_template(
-        "memo://users/{id}",
-        fn %{"id" => id}, _ctx ->
-          %{id: id, kind: "template"}
-        end,
-        tags: ["docs", "utility"],
-        version: "2.0.0",
-        task: true,
-        meta: %{
-          "vendor" => %{"stable" => true},
-          "fastestmcp" => %{"hint" => "keep", "_private" => "drop"}
-        }
-      )
-      |> FastestMCP.add_prompt("welcome", fn %{"name" => name}, _ctx ->
-        FastestMCP.Prompts.Result.new("Welcome #{name}")
-      end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
-
-    bandit =
-      start_supervised!(
-        {Bandit,
-         plug:
-           {FastestMCP.Transport.HTTPApp,
-            server_name: server_name,
-            path: "/mcp",
-            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
-         scheme: :http,
-         port: 0}
-      )
-
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
-
-    client =
-      Client.connect!("http://127.0.0.1:#{port}/mcp", protocol_version: "2025-11-25")
-
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect!(client)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_resource("memo://welcome", fn _arguments, _ctx -> %{message: "hello"} end,
+      tags: ["docs", "utility"],
+      version: "2.0.0",
+      task: true,
+      meta: %{
+        "vendor" => %{"stable" => true},
+        "fastestmcp" => %{"hint" => "keep", "_private" => "drop"}
+      }
+    )
+    |> FastestMCP.add_resource_template(
+      "memo://users/{id}",
+      fn %{"id" => id}, _ctx ->
+        %{id: id, kind: "template"}
+      end,
+      tags: ["docs", "utility"],
+      version: "2.0.0",
+      task: true,
+      meta: %{
+        "vendor" => %{"stable" => true},
+        "fastestmcp" => %{"hint" => "keep", "_private" => "drop"}
+      }
+    )
+    |> FastestMCP.add_prompt("welcome", fn %{"name" => name}, _ctx ->
+      FastestMCP.Prompts.Result.new("Welcome #{name}")
     end)
+    |> start_server!()
+
+    %{url: url} =
+      start_http!(server_name, allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"])
+
+    client = connect!(url, protocol_version: "2025-11-25")
 
     assert %{items: [resource], next_cursor: nil} = Client.list_resources!(client)
 
@@ -180,27 +148,24 @@ defmodule FastestMCP.ClientHTTPTest do
     server_name =
       "client-http-resource-version-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_resource("memo://config", fn _arguments, _ctx -> %{version: "1.0.0"} end,
-        version: "1.0.0"
-      )
-      |> FastestMCP.add_resource("memo://config", fn _arguments, _ctx -> %{version: "2.0.0"} end,
-        version: "2.0.0"
-      )
-      |> FastestMCP.add_resource_template(
-        "memo://users/{id}",
-        fn %{"id" => id}, _ctx -> %{id: id, version: "1.0.0"} end,
-        version: "1.0.0"
-      )
-      |> FastestMCP.add_resource_template(
-        "memo://users/{id}",
-        fn %{"id" => id}, _ctx -> %{id: id, version: "2.0.0"} end,
-        version: "2.0.0"
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_resource("memo://config", fn _arguments, _ctx -> %{version: "1.0.0"} end,
+      version: "1.0.0"
+    )
+    |> FastestMCP.add_resource("memo://config", fn _arguments, _ctx -> %{version: "2.0.0"} end,
+      version: "2.0.0"
+    )
+    |> FastestMCP.add_resource_template(
+      "memo://users/{id}",
+      fn %{"id" => id}, _ctx -> %{id: id, version: "1.0.0"} end,
+      version: "1.0.0"
+    )
+    |> FastestMCP.add_resource_template(
+      "memo://users/{id}",
+      fn %{"id" => id}, _ctx -> %{id: id, version: "2.0.0"} end,
+      version: "2.0.0"
+    )
+    |> start_server!()
 
     :ok =
       FastestMCP.disable_components!(server_name,
@@ -208,26 +173,10 @@ defmodule FastestMCP.ClientHTTPTest do
         components: [:resource, :resource_template]
       )
 
-    bandit =
-      start_supervised!(
-        {Bandit,
-         plug:
-           {FastestMCP.Transport.HTTPApp,
-            server_name: server_name,
-            path: "/mcp",
-            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
-         scheme: :http,
-         port: 0}
-      )
+    %{url: url} =
+      start_http!(server_name, allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"])
 
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
-
-    client =
-      Client.connect!("http://127.0.0.1:#{port}/mcp", protocol_version: "2025-11-25")
-
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect!(client)
-    end)
+    client = connect!(url, protocol_version: "2025-11-25")
 
     assert %{"version" => "1.0.0"} = Client.read_resource!(client, "memo://config")
 
@@ -249,7 +198,7 @@ defmodule FastestMCP.ClientHTTPTest do
     end
   end
 
-  test "connected client treats page size options as compatibility no-ops" do
+  test "connected client lists complete pages and rejects page size options" do
     server_name =
       "client-http-pagination-" <> Integer.to_string(System.unique_integer([:positive]))
 
@@ -262,29 +211,12 @@ defmodule FastestMCP.ClientHTTPTest do
       |> FastestMCP.add_prompt("prompt_1", fn _arguments, _ctx -> "prompt-1" end)
       |> FastestMCP.add_prompt("prompt_2", fn _arguments, _ctx -> "prompt-2" end)
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
-    bandit =
-      start_supervised!(
-        {Bandit,
-         plug:
-           {FastestMCP.Transport.HTTPApp,
-            server_name: server_name,
-            path: "/mcp",
-            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
-         scheme: :http,
-         port: 0}
-      )
+    %{url: url} =
+      start_http!(server_name, allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"])
 
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
-
-    client =
-      Client.connect!("http://127.0.0.1:#{port}/mcp", protocol_version: "2025-11-25")
-
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect!(client)
-    end)
+    client = connect!(url, protocol_version: "2025-11-25")
 
     task_a = Client.call_tool_task!(client, "echo_1", %{"value" => 1}, task: true)
     task_b = Client.call_tool_task!(client, "echo_2", %{"value" => 2}, task: true)
@@ -305,18 +237,21 @@ defmodule FastestMCP.ClientHTTPTest do
              }
            } = RemoteTask.result!(task_b).raw
 
-    assert %{items: tools, next_cursor: nil} = Client.list_tools!(client, page_size: 1)
+    # The server owns the page size; the client has no page size option.
+    assert_raise ArgumentError, ~r/unknown keys \[:page_size\]/, fn ->
+      Client.list_tools(client, page_size: 1)
+    end
+
+    assert %{items: tools, next_cursor: nil} = Client.list_tools!(client)
     assert Enum.map(tools, & &1["name"]) == ["echo_1", "echo_2"]
 
-    assert %{items: prompts, next_cursor: nil} = Client.list_prompts!(client, page_size: 1)
+    assert %{items: prompts, next_cursor: nil} = Client.list_prompts!(client)
     assert Enum.map(prompts, & &1["name"]) == ["prompt_1", "prompt_2"]
 
-    assert %{items: resources, next_cursor: nil} =
-             Client.list_resources!(client, page_size: 1)
-
+    assert %{items: resources, next_cursor: nil} = Client.list_resources!(client)
     assert Enum.map(resources, & &1["uri"]) == ["memo://1", "memo://2"]
 
-    assert %{items: tasks, next_cursor: nil} = Client.list_tasks!(client, page_size: 1)
+    assert %{items: tasks, next_cursor: nil} = Client.list_tasks!(client)
 
     assert Enum.sort(Enum.map(tasks, & &1["taskId"])) ==
              Enum.sort([task_a.task_id, task_b.task_id])
@@ -338,34 +273,18 @@ defmodule FastestMCP.ClientHTTPTest do
         %{ok: true}
       end)
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
-    bandit =
-      start_supervised!(
-        {Bandit,
-         plug:
-           {FastestMCP.Transport.HTTPApp,
-            server_name: server_name,
-            path: "/mcp",
-            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
-         scheme: :http,
-         port: 0}
-      )
-
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+    %{url: url} =
+      start_http!(server_name, allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"])
 
     client =
-      Client.connect!(
-        "http://127.0.0.1:#{port}/mcp",
+      connect!(
+        url,
         protocol_version: "2025-11-25",
         log_handler: fn payload -> send(parent, {:log_notification, payload}) end,
         progress_handler: fn payload -> send(parent, {:progress_notification, payload}) end
       )
-
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect!(client)
-    end)
 
     assert %{structured_content: %{"ok" => true}} =
              Client.call_tool!(client, "notify", %{}, progress_token: "token-1")
@@ -388,37 +307,23 @@ defmodule FastestMCP.ClientHTTPTest do
     server_name =
       "client-http-callbacks-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("sample", fn _arguments, ctx ->
-        Context.sample(ctx, "Reply with sampled")
-      end)
-      |> FastestMCP.add_tool("ask_name", fn _arguments, ctx ->
-        case Context.elicit(ctx, "What is your name?", :string) do
-          %Accepted{data: name} -> %{name: name}
-        end
-      end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("sample", fn _arguments, ctx ->
+      Context.sample(ctx, "Reply with sampled")
+    end)
+    |> FastestMCP.add_tool("ask_name", fn _arguments, ctx ->
+      case Context.elicit(ctx, "What is your name?", :string) do
+        %Accepted{data: name} -> %{name: name}
+      end
+    end)
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
-
-    bandit =
-      start_supervised!(
-        {Bandit,
-         plug:
-           {FastestMCP.Transport.HTTPApp,
-            server_name: server_name,
-            path: "/mcp",
-            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
-         scheme: :http,
-         port: 0}
-      )
-
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+    %{url: url} =
+      start_http!(server_name, allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"])
 
     client =
-      Client.connect!(
-        "http://127.0.0.1:#{port}/mcp",
+      connect!(
+        url,
         protocol_version: "2025-11-25",
         sampling_handler: fn messages, params ->
           send(test_pid, {:sampling_handler_called, messages, params})
@@ -440,10 +345,6 @@ defmodule FastestMCP.ClientHTTPTest do
         end
       )
 
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect!(client)
-    end)
-
     sample_task = Task.async(fn -> Client.call_tool!(client, "sample", %{}) end)
     assert_receive {:sampling_handler_called, _messages, _params}, 1_000
 
@@ -464,25 +365,13 @@ defmodule FastestMCP.ClientHTTPTest do
 
     server = FastestMCP.server(server_name)
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
-    bandit =
-      start_supervised!(
-        {Bandit,
-         plug:
-           {FastestMCP.Transport.HTTPApp,
-            server_name: server_name,
-            path: "/mcp",
-            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
-         scheme: :http,
-         port: 0}
-      )
-
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+    %{url: url} =
+      start_http!(server_name, allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"])
 
     client =
-      Client.connect!("http://127.0.0.1:#{port}/mcp",
+      connect!(url,
         protocol_version: "2025-11-25",
         session_stream: true,
         elicitation_handler: fn message, params ->
@@ -491,11 +380,7 @@ defmodule FastestMCP.ClientHTTPTest do
         end
       )
 
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect!(client)
-    end)
-
-    assert wait_for_session_stream(client) == :ok
+    assert_eventually(fn -> Client.info!(client).session_stream_open? end)
 
     params = %{
       "message" => "Accept the defaults",
@@ -514,7 +399,7 @@ defmodule FastestMCP.ClientHTTPTest do
       Task.async(fn ->
         Session.request_peer(
           server_name,
-          Client.session_id!(client),
+          Client.info!(client).session_id,
           "elicitation/create",
           params,
           timeout_ms: 2_000
@@ -542,47 +427,33 @@ defmodule FastestMCP.ClientHTTPTest do
     server_name =
       "client-http-protected-callbacks-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_auth(FastestMCP.Auth.StaticToken,
-        tokens: %{
-          "dev-token" => %{
-            client_id: "local-client",
-            scopes: ["tools:call"],
-            principal: %{"sub" => "local-client"}
-          }
-        },
-        required_scopes: ["tools:call"]
-      )
-      |> FastestMCP.add_tool("sample", fn _arguments, ctx ->
-        Context.sample(ctx, "Reply with sampled")
-      end)
-      |> FastestMCP.add_tool("ask_name", fn _arguments, ctx ->
-        case Context.elicit(ctx, "What is your name?", :string) do
-          %Accepted{data: name} -> %{name: name}
-        end
-      end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_auth(FastestMCP.Auth.StaticToken,
+      tokens: %{
+        "dev-token" => %{
+          client_id: "local-client",
+          scopes: ["tools:call"],
+          principal: %{"sub" => "local-client"}
+        }
+      },
+      required_scopes: ["tools:call"]
+    )
+    |> FastestMCP.add_tool("sample", fn _arguments, ctx ->
+      Context.sample(ctx, "Reply with sampled")
+    end)
+    |> FastestMCP.add_tool("ask_name", fn _arguments, ctx ->
+      case Context.elicit(ctx, "What is your name?", :string) do
+        %Accepted{data: name} -> %{name: name}
+      end
+    end)
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
-
-    bandit =
-      start_supervised!(
-        {Bandit,
-         plug:
-           {FastestMCP.Transport.HTTPApp,
-            server_name: server_name,
-            path: "/mcp",
-            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
-         scheme: :http,
-         port: 0}
-      )
-
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+    %{url: url} =
+      start_http!(server_name, allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"])
 
     client =
-      Client.connect!(
-        "http://127.0.0.1:#{port}/mcp",
+      connect!(
+        url,
         protocol_version: "2025-11-25",
         access_token: "dev-token",
         sampling_handler: fn messages, params ->
@@ -594,10 +465,6 @@ defmodule FastestMCP.ClientHTTPTest do
           {:accept, %{"value" => "Alice"}}
         end
       )
-
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect!(client)
-    end)
 
     sample_task =
       Task.async(fn ->
@@ -631,104 +498,76 @@ defmodule FastestMCP.ClientHTTPTest do
     server_name =
       "client-http-request-state-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
-
-    bandit =
-      start_supervised!(
-        {Bandit,
-         plug:
-           {FastestMCP.Transport.HTTPApp,
-            server_name: server_name,
-            path: "/mcp",
-            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"],
-            state_scope: :request},
-         scheme: :http,
-         port: 0}
+    %{url: url} =
+      start_http!(server_name,
+        allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"],
+        state_scope: :request
       )
 
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
-
     client =
-      Client.connect!("http://127.0.0.1:#{port}/mcp",
+      connect!(url,
         protocol_version: "2025-11-25",
         session_stream: false
       )
 
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect!(client)
-    end)
-
-    assert is_binary(Client.session_id!(client))
+    assert is_binary(Client.info!(client).session_id)
     assert :ok = Client.open_session_stream!(client)
-    assert wait_for_session_stream(client) == :ok
-    assert Client.session_stream_open?(client)
+    assert_eventually(fn -> Client.info!(client).session_stream_open? end)
+    assert Client.info!(client).session_stream_open?
   end
 
   test "connected client manages protected task lifecycle over HTTP" do
+    parent = self()
     server_name = "client-http-tasks-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_auth(FastestMCP.Auth.StaticToken,
-        tokens: %{
-          "dev-token" => %{
-            client_id: "local-client",
-            scopes: ["tools:call"],
-            principal: %{"sub" => "local-client"}
-          }
-        },
-        required_scopes: ["tools:call"]
-      )
-      |> FastestMCP.add_tool(
-        "confirm",
-        fn _arguments, _ctx ->
-          Process.sleep(25)
-          %{approved: true}
-        end,
-        task: true
-      )
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_auth(FastestMCP.Auth.StaticToken,
+      tokens: %{
+        "dev-token" => %{
+          client_id: "local-client",
+          scopes: ["tools:call"],
+          principal: %{"sub" => "local-client"}
+        }
+      },
+      required_scopes: ["tools:call"]
+    )
+    |> FastestMCP.add_tool(
+      "confirm",
+      fn _arguments, _ctx ->
+        send(parent, {:confirm_started, self()})
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+        receive do
+          :release -> %{approved: true}
+        end
+      end,
+      task: true
+    )
+    |> start_server!()
 
-    bandit =
-      start_supervised!(
-        {Bandit,
-         plug:
-           {FastestMCP.Transport.HTTPApp,
-            server_name: server_name,
-            path: "/mcp",
-            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
-         scheme: :http,
-         port: 0}
-      )
-
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+    %{url: url} =
+      start_http!(server_name, allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"])
 
     client =
-      Client.connect!("http://127.0.0.1:#{port}/mcp",
+      connect!(url,
         protocol_version: "2025-11-25",
         access_token: "dev-token"
       )
-
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect!(client)
-    end)
 
     assert %RemoteTask{task_id: task_id, kind: :tool, target: "confirm"} =
              task = Client.call_tool_task!(client, "confirm", %{}, task: true)
 
     assert %{items: [%{"taskId" => ^task_id}], next_cursor: nil} = Client.list_tasks!(client)
-    assert %{"taskId" => ^task_id} = Client.fetch_task!(client, task_id)
+    assert %{"taskId" => ^task_id} = client |> Client.track_task!(task_id) |> RemoteTask.fetch!()
     assert %{"taskId" => ^task_id} = RemoteTask.fetch!(task)
     assert %{"taskId" => ^task_id} = RemoteTask.status!(task)
 
-    assert wait_for_task_status(client, task_id, "completed") == :ok
+    assert_receive {:confirm_started, confirm}, 1_000
+    send(confirm, :release)
+    assert_eventually(fn -> RemoteTask.fetch!(task)["status"] == "completed" end)
     assert %{"taskId" => ^task_id, "status" => "completed"} = RemoteTask.wait!(task)
 
     assert %{
@@ -764,26 +603,14 @@ defmodule FastestMCP.ClientHTTPTest do
         task: true
       )
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
-    bandit =
-      start_supervised!(
-        {Bandit,
-         plug:
-           {FastestMCP.Transport.HTTPApp,
-            server_name: server_name,
-            path: "/mcp",
-            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
-         scheme: :http,
-         port: 0}
-      )
-
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+    %{url: url} =
+      start_http!(server_name, allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"])
 
     client =
-      Client.connect!(
-        "http://127.0.0.1:#{port}/mcp",
+      connect!(
+        url,
         protocol_version: "2025-11-25",
         session_stream: true,
         notification_handler: fn payload ->
@@ -791,14 +618,10 @@ defmodule FastestMCP.ClientHTTPTest do
         end
       )
 
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect!(client)
-    end)
+    assert_eventually(fn -> Client.info!(client).session_stream_open? end)
+    assert Client.info!(client).session_stream_open?
 
-    assert wait_for_session_stream(client) == :ok
-    assert Client.session_stream_open?(client)
-
-    session_id = Client.session_id!(client)
+    session_id = Client.info!(client).session_id
 
     assert %RemoteTask{task_id: task_id, kind: :tool, target: "wait"} =
              task = Client.call_tool_task!(client, "wait", %{}, task: true)
@@ -822,7 +645,7 @@ defmodule FastestMCP.ClientHTTPTest do
                    1_000
 
     assert %{"taskId" => ^task_id, "status" => "completed"} = RemoteTask.wait!(task)
-    assert wait_for_task_status(client, task_id, "completed") == :ok
+    assert_eventually(fn -> RemoteTask.fetch!(task)["status"] == "completed" end)
     assert :ok = Client.disconnect!(client)
   end
 
@@ -830,47 +653,42 @@ defmodule FastestMCP.ClientHTTPTest do
     server_name =
       "client-http-notification-errors-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("notify", fn _arguments, ctx ->
-        Context.log(ctx, :info, "hello from server")
-        Context.report_progress(ctx, 1, 1, "done")
-        %{ok: true}
-      end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("notify", fn _arguments, ctx ->
+      Context.log(ctx, :info, "hello from server")
+      Context.report_progress(ctx, 1, 1, "done")
+      %{ok: true}
+    end)
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    %{url: url} =
+      start_http!(server_name, allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"])
 
-    bandit =
-      start_supervised!(
-        {Bandit,
-         plug:
-           {FastestMCP.Transport.HTTPApp,
-            server_name: server_name,
-            path: "/mcp",
-            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
-         scheme: :http,
-         port: 0}
-      )
-
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+    parent = self()
 
     client =
-      Client.connect!(
-        "http://127.0.0.1:#{port}/mcp",
+      connect!(
+        url,
         protocol_version: "2025-11-25",
         log_handler: fn _payload -> raise "boom" end,
         progress_handler: fn _payload -> raise "boom" end,
-        notification_handler: fn _payload -> raise "boom" end
+        notification_handler: fn
+          %{"method" => "notifications/progress"} -> send(parent, :progress_dispatched)
+          _payload -> raise "boom"
+        end
       )
 
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect!(client)
-    end)
+    # Handlers run in order outside the connection; a failing one is logged
+    # and the next still runs.
+    log =
+      capture_log(fn ->
+        assert %{structured_content: %{"ok" => true}} =
+                 Client.call_tool!(client, "notify", %{}, progress_token: "token-1")
 
-    assert %{structured_content: %{"ok" => true}} =
-             Client.call_tool!(client, "notify", %{}, progress_token: "token-1")
+        assert_receive :progress_dispatched, 1_000
+      end)
 
+    assert log =~ "MCP client notification handler failed"
     assert Client.connected?(client)
   end
 
@@ -880,74 +698,67 @@ defmodule FastestMCP.ClientHTTPTest do
     server_name =
       "client-http-runtime-updates-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_auth(FastestMCP.Auth.StaticToken,
-        tokens: %{
-          "dev-token" => %{
-            client_id: "local-client",
-            scopes: ["tools:call"],
-            principal: %{"sub" => "local-client"}
-          }
-        },
-        required_scopes: ["tools:call"]
-      )
-      |> FastestMCP.add_tool("headers", fn _arguments, ctx ->
-        Context.http_headers(ctx, include_all: true)
-      end)
-      |> FastestMCP.add_tool("notify", fn _arguments, ctx ->
-        Context.log(ctx, :info, "runtime hello")
-        Context.report_progress(ctx, 2, 3, "runtime progress")
-        %{ok: true}
-      end)
-      |> FastestMCP.add_tool("sample", fn _arguments, ctx ->
-        Context.sample(ctx, "Reply with runtime sampled")
-      end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_auth(FastestMCP.Auth.StaticToken,
+      tokens: %{
+        "dev-token" => %{
+          client_id: "local-client",
+          scopes: ["tools:call"],
+          principal: %{"sub" => "local-client"}
+        }
+      },
+      required_scopes: ["tools:call"]
+    )
+    |> FastestMCP.add_tool("headers", fn _arguments, ctx ->
+      Context.http_headers(ctx, include_all: true)
+    end)
+    |> FastestMCP.add_tool("notify", fn _arguments, ctx ->
+      Context.log(ctx, :info, "runtime hello")
+      Context.report_progress(ctx, 2, 3, "runtime progress")
+      %{ok: true}
+    end)
+    |> FastestMCP.add_tool("sample", fn _arguments, ctx ->
+      Context.sample(ctx, "Reply with runtime sampled")
+    end)
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
-
-    bandit =
-      start_supervised!(
-        {Bandit,
-         plug:
-           {FastestMCP.Transport.HTTPApp,
-            server_name: server_name,
-            path: "/mcp",
-            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
-         scheme: :http,
-         port: 0}
-      )
-
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+    %{url: url} =
+      start_http!(server_name, allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"])
 
     client =
-      Client.connect!(
-        "http://127.0.0.1:#{port}/mcp",
+      connect!(
+        url,
         protocol_version: "2025-11-25",
         auto_initialize: false
       )
 
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect!(client)
+    :ok =
+      Client.set_auth!(client, headers: [{"x-trace-id", "trace-123"}], access_token: "dev-token")
+
+    Client.set_handler!(client, :log_handler, fn payload ->
+      send(parent, {:runtime_log, payload})
     end)
 
-    :ok = Client.set_auth_input!(client, headers: [{"x-trace-id", "trace-123"}])
-    Client.set_access_token!(client, "dev-token")
-    Client.set_log_handler!(client, fn payload -> send(parent, {:runtime_log, payload}) end)
-
-    Client.set_progress_handler!(client, fn payload ->
+    Client.set_handler!(client, :progress_handler, fn payload ->
       send(parent, {:runtime_progress, payload})
     end)
 
-    Client.set_notification_handler!(client, fn payload ->
+    Client.set_handler!(client, :notification_handler, fn payload ->
       send(parent, {:runtime_notification, payload})
     end)
 
-    Client.set_sampling_handler!(client, fn messages, _params ->
+    Client.set_handler!(client, :sampling_handler, fn messages, _params ->
       send(parent, {:runtime_sampling, messages})
       sampling_result("runtime sampled")
     end)
+
+    assert_raise ArgumentError, ~r/unknown handler :task_handler, the handlers are: \[/, fn ->
+      Client.set_handler(client, :task_handler, fn _status -> :ok end)
+    end
+
+    assert_raise ArgumentError, "log_handler must be a function, got: :log", fn ->
+      Client.set_handler(client, :log_handler, :log)
+    end
 
     assert is_map(Client.initialize!(client))
 
@@ -983,9 +794,43 @@ defmodule FastestMCP.ClientHTTPTest do
                    1_000
   end
 
-  defp wait_for_task_status(client, task_id, expected_status, timeout \\ 1_000) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-    do_wait_for_task_status(client, task_id, expected_status, deadline)
+  test "server-initiated requests on an HTTP stream never copy connection state to workers" do
+    server_name = unique_name("snapshot")
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("sampled", fn _arguments, context ->
+      sampled = Context.sample(context, "continue", timeout_ms: 2_000)
+      %{"model" => sampled["model"]}
+    end)
+    |> start_server!()
+
+    %{url: url} = start_http!(server_name)
+
+    client =
+      connect!(url,
+        protocol_version: "2025-11-25",
+        sampling_handler: fn _messages, _params ->
+          %{
+            "role" => "assistant",
+            "model" => "snapshot-model",
+            "content" => %{"type" => "text", "text" => "ok"}
+          }
+        end
+      )
+
+    :erlang.trace(client.pid, true, [:send])
+
+    assert %{structured_content: %{"model" => "snapshot-model"}} =
+             Client.call_tool!(client, "sampled", %{})
+
+    :erlang.trace(client.pid, false, [:send])
+
+    leaked =
+      for {:trace, _pid, :send, message, _to} <- drain_trace_messages(),
+          contains_client_state?(message),
+          do: message
+
+    assert leaked == []
   end
 
   defp sampling_result(text) do
@@ -996,40 +841,30 @@ defmodule FastestMCP.ClientHTTPTest do
     }
   end
 
-  defp wait_for_session_stream(client, timeout \\ 1_000) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-    do_wait_for_session_stream(client, deadline)
-  end
-
-  defp do_wait_for_task_status(client, task_id, expected_status, deadline) do
-    task = Client.fetch_task!(client, task_id)
-
-    cond do
-      task["status"] == expected_status ->
-        :ok
-
-      System.monotonic_time(:millisecond) >= deadline ->
-        flunk(
-          "timed out waiting for task #{inspect(task_id)} to reach #{inspect(expected_status)}"
-        )
-
-      true ->
-        Process.sleep(10)
-        do_wait_for_task_status(client, task_id, expected_status, deadline)
+  defp drain_trace_messages(acc \\ []) do
+    receive do
+      {:trace, _pid, :send, _message, _to} = trace -> drain_trace_messages([trace | acc])
+    after
+      100 -> Enum.reverse(acc)
     end
   end
 
-  defp do_wait_for_session_stream(client, deadline) do
-    cond do
-      Client.session_stream_open?(client) ->
-        :ok
+  defp contains_client_state?(%FastestMCP.Client.Connection.State{}), do: true
 
-      System.monotonic_time(:millisecond) >= deadline ->
-        flunk("timed out waiting for the client session stream to open")
+  defp contains_client_state?(%_{} = struct),
+    do: struct |> Map.from_struct() |> contains_client_state?()
 
-      true ->
-        Process.sleep(10)
-        do_wait_for_session_stream(client, deadline)
-    end
-  end
+  defp contains_client_state?(map) when is_map(map),
+    do:
+      Enum.any?(map, fn {key, value} ->
+        contains_client_state?(key) or contains_client_state?(value)
+      end)
+
+  defp contains_client_state?(tuple) when is_tuple(tuple),
+    do: tuple |> Tuple.to_list() |> contains_client_state?()
+
+  defp contains_client_state?([head | tail]),
+    do: contains_client_state?(head) or contains_client_state?(tail)
+
+  defp contains_client_state?(_term), do: false
 end

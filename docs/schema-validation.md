@@ -132,13 +132,19 @@ Defaults are deliberately bounded:
 | Validation time | 1 second | `validation_timeout_ms:` |
 | Returned violations | 20 | fixed bounded error surface |
 
-These are explicit options, not environment-driven behavior. A limit or
-deadline failure returns a bounded schema error instead of continuing with an
+These are explicit options, not environment-driven behavior: set them in a
+server's `schema_options:` (a component's own `schema_options:` replace the
+server's) or pass them to `FastestMCP.Schema.compile/2`. A limit or deadline
+failure returns a bounded schema error instead of continuing with an
 incomplete validator.
+
+```elixir
+FastestMCP.server("schemas", schema_options: [validation_timeout_ms: 5_000])
+```
 
 ## Implementation Boundary
 
-JSV `0.22.x` is the direct runtime dependency used for schema compilation and
+JSV `0.26.x` is the direct runtime dependency used for schema compilation and
 validation. Texture handles RFC 6570 templates, while Mint provides incremental
 HTTP streaming for connected clients.
 FastestMCP includes the official schemas for MCP `2026-07-28`, MCP
@@ -148,9 +154,9 @@ notices are packaged beside those schemas.
 The published 2025 schema's `NumberSchema` declares `minimum`, `maximum`, and
 `default` as integers, and generated `ElicitResult.content` likewise excludes
 non-integer numbers. The corresponding TypeScript definitions and elicitation
-specification define all four positions as numbers. `FastestMCP.Schema`
-therefore applies a version-specific correction only to its compiled protocol
-view. Tests cover the corrected compiled definitions.
+specification define all four positions as numbers. FastestMCP therefore
+applies a version-specific correction only to its compiled protocol view.
+Tests cover the corrected compiled definitions.
 
 General JSON Schema dialect conformance is delegated to the JSV
 dependency. Focused FastestMCP tests cover the observable library boundary:

@@ -93,7 +93,7 @@ defmodule FastestMCP.PackageConsumerSmoke do
             )
 
           try do
-            assert Client.protocol_version!(client) == expected
+            assert Client.info!(client).protocol_version == expected
             assert %{items: [%{"name" => "echo"}], next_cursor: nil} = Client.list_tools!(client)
             result =
               Client.call_tool!(client, "echo", %{
@@ -141,7 +141,7 @@ defmodule FastestMCP.PackageConsumerSmoke do
             )
 
           try do
-            assert Client.protocol_version!(client) == expected
+            assert Client.info!(client).protocol_version == expected
             assert %{items: [%{"name" => "echo"}], next_cursor: nil} = Client.list_tools!(client)
             result =
               Client.call_tool!(client, "echo", %{

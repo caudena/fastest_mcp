@@ -75,7 +75,13 @@ FastestMCP.Middleware.logging(
 
 FastestMCP.Middleware.timing()
 FastestMCP.Middleware.detailed_timing()
+FastestMCP.Middleware.timing(label: fn operation -> "MCP #{operation.method}" end)
 ```
+
+Timing logs each request as `"Request <method>"` by default; `detailed_timing/1`
+(`label: :detailed`) names the called component or listed kind instead, such as
+`"Tool 'echo'"` or `"List tools"`. The `FastestMCP.Middleware` functions list
+every built-in middleware's options.
 
 Read more in:
 
@@ -169,12 +175,14 @@ tool-only client needs resource access.
 
 ## Custom Middleware
 
-Custom middleware is just a two-arity function on operations:
+Custom middleware is a two-arity function on operations. `next` runs the rest
+of the pipeline and returns `{:ok, operation}` or `{:error, %FastestMCP.Error{}}`;
+middleware returns the same shape:
 
 ```elixir
 middleware = fn operation, next ->
   if operation.method == "tools/call" and operation.target == "dangerous" do
-    raise FastestMCP.Error, code: :permission_denied, message: "blocked by policy"
+    {:error, %FastestMCP.Error{code: :permission_denied, message: "blocked by policy"}}
   else
     next.(operation)
   end
@@ -183,6 +191,86 @@ end
 server =
   FastestMCP.server("middleware")
   |> FastestMCP.add_middleware(middleware)
+```
+
+The operation returned by `next` carries the `result` and the `component` that
+produced it. Transform the result on the way back out, or short-circuit with a
+result of your own:
+
+```elixir
+fn
+  %{method: "tools/call", target: "status"} = operation, _next ->
+    {:ok, %{operation | result: %{"status" => "maintenance"}}}
+
+  %{method: "tools/list"} = operation, next ->
+    operation |> next.() |> FastestMCP.Middleware.map_result(&Enum.take(&1, 50))
+
+  operation, next ->
+    with {:ok, done} <- next.(operation) do
+      {:ok, %{done | result: redact(done.result)}}
+    end
+end
+```
+
+Raising `FastestMCP.Error` still fails the operation with that error. Any other
+exception becomes an `:internal_error` whose `:cause` is
+`{exception, stacktrace}`; a return value other than `{:ok, operation}` or
+`{:error, error}` becomes an `:internal_error` too.
+
+Middleware can also be a struct whose module implements the
+`FastestMCP.Middleware` behaviour:
+
+```elixir
+defmodule MyApp.AuditMiddleware do
+  @behaviour FastestMCP.Middleware
+  defstruct [:audit]
+
+  @impl true
+  def call(%__MODULE__{} = config, operation, next) do
+    with {:error, error} <- next.(operation) do
+      config.audit.(operation.method, error.code)
+      {:error, error}
+    end
+  end
+end
+```
+
+### Stateful middleware
+
+Middleware that keeps state between requests implements
+`c:FastestMCP.Middleware.child_spec/1`. Every server that uses the middleware
+starts that child under its own supervisor and stops it with the server. The
+server calls the middleware with the configuration returned by
+`c:FastestMCP.Middleware.attach/2`, which by default stores the child's pid in
+the struct's `:runtime` field:
+
+```elixir
+defmodule MyApp.CountingMiddleware do
+  @behaviour FastestMCP.Middleware
+  defstruct [:runtime]
+
+  @impl true
+  def child_spec(%__MODULE__{}), do: {Agent, fn -> 0 end}
+
+  @impl true
+  def call(%__MODULE__{runtime: counter}, operation, next) do
+    Agent.update(counter, &(&1 + 1))
+    next.(operation)
+  end
+end
+```
+
+The configuration stays immutable, so adding one struct to several servers
+gives each server its own state. The built-in rate limiting, response caching,
+error handling, and ping middleware work this way, so each server keeps its own
+limiter, cache, error counts, and keepalive sessions. The inspection functions
+take the configuration you added and combine the state of every server using
+it:
+
+```elixir
+FastestMCP.Middleware.cache_statistics(cache)
+FastestMCP.Middleware.error_counts(error_handling)
+FastestMCP.Middleware.ping_sessions(ping)
 ```
 
 Use custom middleware when the behavior is about request execution, not about
@@ -206,7 +294,8 @@ FastestMCP puts middleware around one shared execution path so behavior does not
 fork by transport.
 
 That keeps retries, logging, rate limiting, caching, and injected tool surfaces
-aligned for direct calls, HTTP, stdio, and mounted providers.
+aligned for direct calls, HTTP, and stdio. A mounted server's own middleware
+wraps calls into its components, not the parent's list operations.
 
 ## Related Guides
 

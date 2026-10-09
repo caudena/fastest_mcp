@@ -1,12 +1,7 @@
 # Run with: mix run scripts/benchmark_indexes.exs
 # Measurements are diagnostic output, not correctness assertions.
-alias FastestMCP.{ComponentCompiler, Registry}
+alias FastestMCP.ComponentIndex
 alias FastestMCP.Client.ToolCatalog
-
-target = "lookup-benchmark-target"
-unrelated = "lookup-benchmark-unrelated"
-tool = ComponentCompiler.compile(:tool, target, "echo", fn args, _ -> args end, version: "1.0.0")
-Registry.register_component(target, tool)
 
 measure = fn count, operation ->
   Enum.each(1..count, fn _ -> operation.() end)
@@ -15,9 +10,15 @@ measure = fn count, operation ->
 end
 
 for size <- [100, 1_000, 10_000] do
-  Enum.each(1..size, fn index ->
-    Registry.register_component(unrelated, %{tool | name: "tool_#{index}"})
-  end)
+  server_name = "lookup-benchmark-#{size}"
+
+  server =
+    Enum.reduce(1..size, FastestMCP.server(server_name), fn index, server ->
+      FastestMCP.add_tool(server, "tool_#{index}", fn args, _ctx -> args end)
+    end)
+    |> FastestMCP.add_tool("echo", fn args, _ctx -> args end, version: "1.0.0")
+
+  {:ok, _pid} = FastestMCP.start_server(server)
 
   tools =
     for index <- 1..size, do: %{"name" => "tool_#{index}", "inputSchema" => %{"type" => "object"}}
@@ -26,13 +27,15 @@ for size <- [100, 1_000, 10_000] do
 
   IO.puts(
     JSON.encode!(%{
-      unrelated_components: size,
-      registry_300_default_reads_ms:
-        measure.(300, fn -> Registry.get_component(target, :tool, "echo") end),
-      registry_300_exact_reads_ms:
-        measure.(300, fn -> Registry.get_component(target, :tool, "echo", version: "1.0.0") end),
+      components: size + 1,
+      index_300_default_reads_ms:
+        measure.(300, fn -> ComponentIndex.candidates(server_name, :tool, "echo") end),
+      index_300_exact_reads_ms:
+        measure.(300, fn -> ComponentIndex.candidates(server_name, :tool, "echo", "1.0.0") end),
       catalog_tools: size,
       catalog_500_reads_ms: measure.(500, fn -> ToolCatalog.lookup(catalog, "tool_#{size}") end)
     })
   )
+
+  :ok = FastestMCP.stop_server(server_name)
 end

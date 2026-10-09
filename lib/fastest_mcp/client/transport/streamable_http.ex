@@ -1,9 +1,9 @@
 defmodule FastestMCP.Client.Transport.StreamableHTTP do
   @moduledoc false
+  # Each request opens its own HTTP exchange in `FastestMCP.Client.HTTP`, so
+  # the transport itself holds no connection.
 
   @behaviour FastestMCP.Client.Transport
-
-  alias FastestMCP.HTTP
 
   @impl true
   def open(transport, _owner, _opts), do: {:ok, transport}
@@ -16,13 +16,4 @@ defmodule FastestMCP.Client.Transport.StreamableHTTP do
 
   @impl true
   def close(_transport), do: :ok
-
-  @doc false
-  def request(method, url, opts), do: HTTP.request(method, url, opts)
-
-  @doc false
-  def stream_request(method, url, opts), do: HTTP.stream_request(method, url, opts)
-
-  @doc false
-  def cancel_request(request_ref), do: HTTP.cancel_request(request_ref)
 end

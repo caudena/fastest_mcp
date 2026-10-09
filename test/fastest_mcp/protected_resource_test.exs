@@ -1,5 +1,5 @@
 defmodule FastestMCP.ProtectedResourceTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   import Plug.Conn
   import Plug.Test
@@ -45,8 +45,7 @@ defmodule FastestMCP.ProtectedResourceTest do
   end
 
   test "verified audience and scope evidence survives the context handoff" do
-    assert {:ok, context} =
-             Context.build(unique_name("verified-context"), state_scope: :request)
+    context = Context.new(test_runtime(unique_name("verified-context")), state_scope: :request)
 
     auth_result = %AuthResult{
       principal: %{"sub" => "user-1"},
@@ -69,8 +68,8 @@ defmodule FastestMCP.ProtectedResourceTest do
   end
 
   test "canonical and compatibility auth evidence cannot contradict each other" do
-    assert {:ok, context} =
-             Context.build(unique_name("conflicting-auth-evidence"), state_scope: :request)
+    context =
+      Context.new(test_runtime(unique_name("conflicting-auth-evidence")), state_scope: :request)
 
     auth =
       Auth.new(fn _input, _context ->
@@ -194,13 +193,11 @@ defmodule FastestMCP.ProtectedResourceTest do
   test "the public HTTP app serves metadata from the running server on the MCP origin" do
     server_name = unique_name("protected-public-mount")
 
-    server =
-      FastestMCP.server(server_name,
-        auth: allow_auth(),
-        protected_resource: protected_resource()
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    FastestMCP.server(server_name,
+      auth: allow_auth(),
+      protected_resource: protected_resource()
+    )
+    |> start_server!()
 
     app =
       FastestMCP.http_app(server_name,
@@ -212,7 +209,7 @@ defmodule FastestMCP.ProtectedResourceTest do
     conn =
       :get
       |> conn("https://mcp.example.com/.well-known/oauth-protected-resource/public/mcp")
-      |> app.()
+      |> Plug.run([app])
 
     assert conn.status == 200
     assert JSON.decode!(conn.resp_body) == ProtectedResource.metadata(protected_resource())
@@ -220,7 +217,7 @@ defmodule FastestMCP.ProtectedResourceTest do
     wrong_origin =
       :get
       |> conn("https://alias.example.com/.well-known/oauth-protected-resource/public/mcp")
-      |> app.()
+      |> Plug.run([app])
 
     assert wrong_origin.status == 404
 
@@ -234,13 +231,11 @@ defmodule FastestMCP.ProtectedResourceTest do
   test "a separately mounted well-known plug reads the running server configuration" do
     server_name = unique_name("protected-phoenix-mount")
 
-    server =
-      FastestMCP.server(server_name,
-        auth: allow_auth(),
-        protected_resource: protected_resource()
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    FastestMCP.server(server_name,
+      auth: allow_auth(),
+      protected_resource: protected_resource()
+    )
+    |> start_server!()
 
     opts =
       WellKnownHTTP.init(
@@ -284,13 +279,11 @@ defmodule FastestMCP.ProtectedResourceTest do
         required_scopes: ["files:read"]
       )
 
-    server =
-      FastestMCP.server(server_name,
-        auth: authenticator,
-        protected_resource: protected_resource
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    FastestMCP.server(server_name,
+      auth: authenticator,
+      protected_resource: protected_resource
+    )
+    |> start_server!()
 
     response =
       server_name
@@ -326,13 +319,11 @@ defmodule FastestMCP.ProtectedResourceTest do
          }}
       end
 
-      server =
-        FastestMCP.server(server_name,
-          auth: authenticator,
-          protected_resource: protected_resource()
-        )
-
-      assert {:ok, _pid} = FastestMCP.start_server(server)
+      FastestMCP.server(server_name,
+        auth: authenticator,
+        protected_resource: protected_resource()
+      )
+      |> start_server!()
 
       response =
         server_name
@@ -360,13 +351,11 @@ defmodule FastestMCP.ProtectedResourceTest do
        }}
     end
 
-    server =
-      FastestMCP.server(server_name,
-        auth: authenticator,
-        protected_resource: protected_resource()
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    FastestMCP.server(server_name,
+      auth: authenticator,
+      protected_resource: protected_resource()
+    )
+    |> start_server!()
 
     response =
       server_name
@@ -401,16 +390,14 @@ defmodule FastestMCP.ProtectedResourceTest do
        }}
     end
 
-    server =
-      FastestMCP.server(server_name,
-        auth: authenticator,
-        protected_resource: protected_resource
-      )
-      |> FastestMCP.add_tool("admin", fn -> "secret" end,
-        auth: Authorization.require_scopes("files:admin")
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    FastestMCP.server(server_name,
+      auth: authenticator,
+      protected_resource: protected_resource
+    )
+    |> FastestMCP.add_tool("admin", fn -> "secret" end,
+      auth: Authorization.require_scopes("files:admin")
+    )
+    |> start_server!()
 
     payload =
       ProtocolTest.modern_request(1, "tools/call", %{"name" => "admin", "arguments" => %{}})
@@ -424,7 +411,7 @@ defmodule FastestMCP.ProtectedResourceTest do
       |> put_req_header("mcp-protocol-version", "2026-07-28")
       |> put_req_header("mcp-method", "tools/call")
       |> put_req_header("mcp-name", "admin")
-      |> then(protected_app(server_name))
+      |> Plug.run([protected_app(server_name)])
 
     assert response.status == 403
     assert [challenge] = get_resp_header(response, "www-authenticate")
@@ -438,14 +425,12 @@ defmodule FastestMCP.ProtectedResourceTest do
   test "opaque component denial returns 403 without a scope challenge" do
     server_name = unique_name("protected-component-opaque")
 
-    server =
-      FastestMCP.server(server_name,
-        auth: allow_auth(),
-        protected_resource: protected_resource()
-      )
-      |> FastestMCP.add_tool("private", fn -> "secret" end, auth: fn _context -> false end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    FastestMCP.server(server_name,
+      auth: allow_auth(),
+      protected_resource: protected_resource()
+    )
+    |> FastestMCP.add_tool("private", fn -> "secret" end, auth: fn _context -> false end)
+    |> start_server!()
 
     payload =
       ProtocolTest.modern_request(1, "tools/call", %{"name" => "private", "arguments" => %{}})
@@ -459,7 +444,7 @@ defmodule FastestMCP.ProtectedResourceTest do
       |> put_req_header("mcp-protocol-version", "2026-07-28")
       |> put_req_header("mcp-method", "tools/call")
       |> put_req_header("mcp-name", "private")
-      |> then(protected_app(server_name))
+      |> Plug.run([protected_app(server_name)])
 
     assert response.status == 403
     assert get_resp_header(response, "www-authenticate") == []
@@ -474,13 +459,11 @@ defmodule FastestMCP.ProtectedResourceTest do
       {:ok, %{principal: "unexpected"}}
     end
 
-    server =
-      FastestMCP.server(server_name,
-        auth: authenticator,
-        protected_resource: protected_resource()
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    FastestMCP.server(server_name,
+      auth: authenticator,
+      protected_resource: protected_resource()
+    )
+    |> start_server!()
 
     response =
       server_name
@@ -506,12 +489,10 @@ defmodule FastestMCP.ProtectedResourceTest do
   test "protected HTTP fails closed when no authenticator is configured" do
     server_name = unique_name("protected-no-auth")
 
-    server =
-      FastestMCP.server(server_name,
-        protected_resource: protected_resource()
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    FastestMCP.server(server_name,
+      protected_resource: protected_resource()
+    )
+    |> start_server!()
 
     response =
       server_name
@@ -526,21 +507,20 @@ defmodule FastestMCP.ProtectedResourceTest do
   test "protected-resource challenges include discovery and authoritative scope" do
     server_name = unique_name("protected-challenge")
 
-    server =
-      FastestMCP.server(server_name,
-        protected_resource: protected_resource()
-      )
-      |> FastestMCP.add_auth(FastestMCP.Auth.StaticToken,
-        tokens: %{
-          "wrong-scope" => %{
-            audiences: ["https://mcp.example.com/public/mcp"],
-            scopes: []
-          }
-        },
-        required_scopes: ["files:read"]
-      )
+    FastestMCP.server(server_name,
+      protected_resource: protected_resource()
+    )
+    |> FastestMCP.add_auth(FastestMCP.Auth.StaticToken,
+      tokens: %{
+        "wrong-scope" => %{
+          audiences: ["https://mcp.example.com/public/mcp"],
+          scopes: []
+        }
+      },
+      required_scopes: ["files:read"]
+    )
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
     app = protected_app(server_name)
 
     unauthorized = initialize_request(app, "https://mcp.example.com/public/mcp")
@@ -593,7 +573,7 @@ defmodule FastestMCP.ProtectedResourceTest do
       |> put_req_header("accept", "application/json, text/event-stream")
       |> maybe_put_authorization(Keyword.get(opts, :authorization))
 
-    app.(conn)
+    Plug.run(conn, [app])
   end
 
   defp maybe_put_authorization(conn, nil), do: conn
@@ -612,9 +592,5 @@ defmodule FastestMCP.ProtectedResourceTest do
          verified_scopes: input["expected_scopes"]
        }}
     end
-  end
-
-  defp unique_name(prefix) do
-    prefix <> "-" <> Integer.to_string(System.unique_integer([:positive]))
   end
 end

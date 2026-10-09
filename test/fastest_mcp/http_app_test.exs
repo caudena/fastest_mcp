@@ -1,5 +1,5 @@
 defmodule FastestMCP.HTTPAppTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   import ExUnit.CaptureLog
   import Plug.Conn
@@ -7,6 +7,23 @@ defmodule FastestMCP.HTTPAppTest do
 
   alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
   alias FastestMCP.Transport.HTTPApp
+
+  test "http_app/2 is a plug that Bandit serves and Plug.run/2 runs" do
+    server_name = unique_name("http-app-plug")
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+    |> start_server!()
+
+    app = FastestMCP.http_app(server_name, allowed_hosts: :localhost)
+    client = connect!(serve!(app).url, protocol_version: "2026-07-28")
+
+    assert %{structured_content: %{"value" => 1}} =
+             FastestMCP.Client.call_tool!(client, "echo", %{"value" => 1})
+
+    assert %{status: 404} =
+             conn(:get, "/missing") |> Map.put(:host, "localhost") |> Plug.run([app])
+  end
 
   test "http child spec defaults to loopback and forwards Bandit options" do
     server_name = "http-child-spec-#{System.unique_integer([:positive])}"
@@ -64,7 +81,7 @@ defmodule FastestMCP.HTTPAppTest do
 
   test "http app applies custom middleware to custom routes" do
     server_name = "http-app-routes-" <> Integer.to_string(System.unique_integer([:positive]))
-    assert {:ok, _pid} = FastestMCP.start_server(FastestMCP.server(server_name))
+    start_server!(FastestMCP.server(server_name))
 
     app =
       FastestMCP.http_app(server_name,
@@ -81,7 +98,7 @@ defmodule FastestMCP.HTTPAppTest do
         ]
       )
 
-    response = conn(:get, "/test") |> app.()
+    response = conn(:get, "/test") |> Plug.run([app])
 
     assert response.status == 200
     assert get_resp_header(response, "x-custom-header") == ["test-value"]
@@ -90,7 +107,7 @@ defmodule FastestMCP.HTTPAppTest do
 
   test "http app middleware can modify request state for custom routes" do
     server_name = "http-app-state-" <> Integer.to_string(System.unique_integer([:positive]))
-    assert {:ok, _pid} = FastestMCP.start_server(FastestMCP.server(server_name))
+    start_server!(FastestMCP.server(server_name))
 
     app =
       FastestMCP.http_app(server_name,
@@ -107,7 +124,7 @@ defmodule FastestMCP.HTTPAppTest do
         ]
       )
 
-    response = conn(:get, "/test") |> app.()
+    response = conn(:get, "/test") |> Plug.run([app])
 
     assert response.status == 200
 
@@ -119,11 +136,9 @@ defmodule FastestMCP.HTTPAppTest do
   test "http app middleware also wraps MCP transport routes" do
     server_name = "http-app-mcp-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+    |> start_server!()
 
     app =
       FastestMCP.http_app(server_name,
@@ -166,11 +181,9 @@ defmodule FastestMCP.HTTPAppTest do
   test "http app rejects legacy stateless streamable HTTP options" do
     server_name = "http-app-stateless-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+    |> start_server!()
 
     assert_raise ArgumentError,
                  "stateless HTTP is no longer supported; use state_scope: :request for request-local handler state",
@@ -184,7 +197,7 @@ defmodule FastestMCP.HTTPAppTest do
 
   test "http app can reject non-local host and origin headers when allowed_hosts is configured" do
     server_name = "http-app-host-guard-" <> Integer.to_string(System.unique_integer([:positive]))
-    assert {:ok, _pid} = FastestMCP.start_server(FastestMCP.server(server_name))
+    start_server!(FastestMCP.server(server_name))
 
     app = FastestMCP.http_app(server_name, allowed_hosts: :localhost)
 
@@ -205,7 +218,7 @@ defmodule FastestMCP.HTTPAppTest do
           |> put_req_header("content-type", "application/json")
           |> put_req_header("accept", "application/json, text/event-stream")
           |> put_req_header("origin", "http://evil.example.com")
-          |> app.()
+          |> Plug.run([app])
 
         assert blocked.status == 403
       end)
@@ -234,7 +247,7 @@ defmodule FastestMCP.HTTPAppTest do
           |> put_req_header("content-type", "application/json")
           |> put_req_header("accept", "application/json, text/event-stream")
           |> put_req_header("origin", "https://app.example.com")
-          |> app.()
+          |> Plug.run([app])
 
         assert blocked.status == 403
       end)
@@ -260,17 +273,17 @@ defmodule FastestMCP.HTTPAppTest do
           |> put_req_header("content-type", "application/json")
           |> put_req_header("accept", "application/json, text/event-stream")
           |> put_req_header("origin", "http://127.0.0.1:4000")
-          |> app.()
+          |> Plug.run([app])
 
         assert allowed.status == 200
       end)
 
-    refute allowed_log =~ "DNS-rebinding protection"
+    refute allowed_log =~ ~s(received_origins=["http://127.0.0.1:4000"])
   end
 
   test "http app rejects malformed, opaque, and repeated Origin headers" do
     server_name = "http-app-origin-syntax-#{System.unique_integer([:positive])}"
-    assert {:ok, _pid} = FastestMCP.start_server(FastestMCP.server(server_name))
+    start_server!(FastestMCP.server(server_name))
 
     app = FastestMCP.http_app(server_name, allowed_hosts: :localhost)
 
@@ -287,14 +300,14 @@ defmodule FastestMCP.HTTPAppTest do
             " https://127.0.0.1",
             <<255>>
           ] do
-        assert origin |> origin_initialize_conn() |> app.() |> Map.fetch!(:status) == 403
+        assert origin |> origin_initialize_conn() |> Plug.run([app]) |> Map.fetch!(:status) == 403
       end
 
       repeated =
         "https://127.0.0.1"
         |> origin_initialize_conn()
         |> Map.update!(:req_headers, &[{"origin", "https://127.0.0.1"} | &1])
-        |> app.()
+        |> Plug.run([app])
 
       assert repeated.status == 403
     end)
@@ -303,7 +316,7 @@ defmodule FastestMCP.HTTPAppTest do
       "HTTP://[::1]:4000"
       |> origin_initialize_conn()
       |> Map.put(:host, "::1")
-      |> app.()
+      |> Plug.run([app])
 
     assert ipv6.status == 200
   end
@@ -331,7 +344,7 @@ defmodule FastestMCP.HTTPAppTest do
 
   test "http app applies multiple middleware in order" do
     server_name = "http-app-order-" <> Integer.to_string(System.unique_integer([:positive]))
-    assert {:ok, _pid} = FastestMCP.start_server(FastestMCP.server(server_name))
+    start_server!(FastestMCP.server(server_name))
 
     app =
       FastestMCP.http_app(server_name,
@@ -353,7 +366,7 @@ defmodule FastestMCP.HTTPAppTest do
         ]
       )
 
-    response = conn(:get, "/test") |> app.()
+    response = conn(:get, "/test") |> Plug.run([app])
 
     assert response.status == 200
     assert get_resp_header(response, "x-first-header") == ["first"]
@@ -409,7 +422,7 @@ defmodule FastestMCP.HTTPAppTest do
     |> put_req_header("content-type", "application/json")
     |> put_req_header("accept", "application/json, text/event-stream")
     |> maybe_put_session_headers(session_id)
-    |> app.()
+    |> Plug.run([app])
   end
 
   defp maybe_put_session_headers(conn, nil), do: conn

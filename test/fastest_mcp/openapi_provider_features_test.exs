@@ -1,5 +1,5 @@
 defmodule FastestMCP.OpenAPIProviderFeaturesTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   defp feature_spec do
     %{
@@ -147,8 +147,7 @@ defmodule FastestMCP.OpenAPIProviderFeaturesTest do
     end
 
     server = FastestMCP.from_openapi(feature_spec(), name: server_name, requester: requester)
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
     tools = FastestMCP.list_tools!(server_name)
     update_user = Enum.find(tools, &(&1.name == "update_user"))

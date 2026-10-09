@@ -1,5 +1,5 @@
 defmodule FastestMCP.StdioWireIntegrityTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: false
 
   defmodule UnknownStdoutLoggerHandler do
     def adding_handler(config), do: {:ok, config}
@@ -10,6 +10,7 @@ defmodule FastestMCP.StdioWireIntegrityTest do
 
   alias FastestMCP.Registry
   alias FastestMCP.ServerRuntime
+  alias FastestMCP.TestSupport.RawPeer.Input
   alias FastestMCP.Transport.Stdio
   alias FastestMCP.Transport.StdioAdapter
 
@@ -132,8 +133,7 @@ defmodule FastestMCP.StdioWireIntegrityTest do
 
   test "stdio restores logger and runtime supervisor output routing after EOF" do
     server_name = "stdio-routing-#{System.unique_integer([:positive])}"
-    assert {:ok, _pid} = FastestMCP.start_server(FastestMCP.server(server_name))
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(FastestMCP.server(server_name))
 
     assert {:ok, runtime} = ServerRuntime.fetch(server_name)
     assert {:ok, logger_before} = :logger.get_handler_config(:default)
@@ -152,6 +152,43 @@ defmodule FastestMCP.StdioWireIntegrityTest do
     assert logger_after == logger_before
 
     assert Map.new(supervisors, &{&1, process_group_leader(&1)}) == group_leaders_before
+  end
+
+  test "concurrent stdio connections keep stdout isolated until the last one ends" do
+    server_name = "stdio-shared-routing-#{System.unique_integer([:positive])}"
+    start_server!(FastestMCP.server(server_name))
+
+    assert {:ok, runtime} = ServerRuntime.fetch(server_name)
+    assert {:ok, logger_before} = :logger.get_handler_config(:default)
+    group_leader_before = process_group_leader(runtime.call_supervisor)
+    test_pid = self()
+
+    [{first_input, first}, {second_input, second}] =
+      for _connection <- 1..2 do
+        {:ok, input} = Input.start_link([])
+        {:ok, wire_io} = StringIO.open("")
+
+        serve_pid =
+          spawn(fn ->
+            true = Process.group_leader(self(), wire_io)
+            result = Stdio.serve(server_name, Input.stream(input), wire_io)
+            send(test_pid, {:served, self(), result})
+          end)
+
+        :ok = Input.push(input, initialize_line())
+        assert_eventually(fn -> response_written?(wire_io, 1) end)
+        {input, serve_pid}
+      end
+
+    :ok = Input.eof(first_input)
+    assert_receive {:served, ^first, :ok}, 2_000
+    assert {:ok, %{config: %{type: :standard_error}}} = :logger.get_handler_config(:default)
+    assert process_group_leader(runtime.call_supervisor) == Process.whereis(:standard_error)
+
+    :ok = Input.eof(second_input)
+    assert_receive {:served, ^second, :ok}, 2_000
+    assert :logger.get_handler_config(:default) == {:ok, logger_before}
+    assert process_group_leader(runtime.call_supervisor) == group_leader_before
   end
 
   test "stdio startup fails closed when an active stdout Logger handler is unsupported" do
@@ -303,6 +340,60 @@ defmodule FastestMCP.StdioWireIntegrityTest do
     end)
   end
 
+  test "stdio serve releases its connection session at EOF" do
+    server_name = unique_name("stdio-eof")
+    start_server!(FastestMCP.server(server_name))
+    connection_id = {:stdio_eof, make_ref()}
+    session_id = StdioAdapter.connection_session_id(connection_id)
+
+    input = [
+      initialize_line(),
+      JSON.encode!(ProtocolTest.jsonrpc_notification("notifications/initialized")) <> "\n"
+    ]
+
+    {:ok, output} = StringIO.open("")
+    assert :ok = Stdio.serve(server_name, input, output, connection_id: connection_id)
+    assert {:error, :not_found} = Registry.lookup_session(server_name, session_id)
+  end
+
+  test "stdio EOF during initialize leaves no session behind" do
+    server_name = unique_name("stdio-eof-start")
+    start_server!(FastestMCP.server(server_name))
+    {:ok, %{session_supervisor: sessions}} = ServerRuntime.fetch(server_name)
+    connection_id = {:stdio_eof, make_ref()}
+    session_id = StdioAdapter.connection_session_id(connection_id)
+
+    # The initialize worker's session start waits at the suspended session
+    # supervisor; input ends meanwhile, so the connection kills that worker.
+    :ok = :sys.suspend(sessions)
+
+    input =
+      Stream.concat(
+        [initialize_line()],
+        Stream.flat_map([:eof], fn :eof ->
+          assert_eventually(fn -> message_queue_len(sessions) == 1 end, 5_000)
+          []
+        end)
+      )
+
+    {:ok, output} = StringIO.open("")
+
+    {serve, serve_monitor} =
+      spawn_monitor(fn ->
+        exit({:served, Stdio.serve(server_name, input, output, connection_id: connection_id)})
+      end)
+
+    # Resume once the connection is gone or waits on the session supervisor.
+    assert_eventually(fn -> not Process.alive?(serve) or message_queue_len(sessions) > 1 end)
+    :ok = :sys.resume(sessions)
+
+    assert_receive {:DOWN, ^serve_monitor, :process, ^serve, {:served, :ok}}
+    assert %{active: 0} = DynamicSupervisor.count_children(sessions)
+    assert {:error, :not_found} = Registry.lookup_session(server_name, session_id)
+  end
+
+  defp message_queue_len(pid), do: pid |> Process.info(:message_queue_len) |> elem(1)
+
   defp start_stdio_server(stderr_path) do
     elixir = System.find_executable("elixir") || flunk("elixir executable not found on PATH")
     shell = System.find_executable("sh") || flunk("sh executable not found on PATH")
@@ -452,19 +543,6 @@ defmodule FastestMCP.StdioWireIntegrityTest do
       _other -> do_receive_until_id(port, id, deadline)
     end
   end
-
-  defp assert_eventually(fun, attempts \\ 100)
-
-  defp assert_eventually(fun, attempts) when attempts > 0 do
-    if fun.() do
-      :ok
-    else
-      Process.sleep(10)
-      assert_eventually(fun, attempts - 1)
-    end
-  end
-
-  defp assert_eventually(_fun, 0), do: flunk("condition did not become true")
 
   defp process_group_leader(pid) do
     assert {:group_leader, group_leader} = Process.info(pid, :group_leader)

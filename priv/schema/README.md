@@ -13,13 +13,15 @@ independently from the core protocol:
   `LICENSE.upstream-apps`
 
 The package includes these schemas and their upstream license notices.
-`FastestMCP.Schema` compiles the protocol definitions through JSV. Focused
-tests exercise FastestMCP's dialect, resolver, caching, and resource-limit
-contract; general JSON Schema conformance is delegated to JSV. See
-`docs/schema-validation.md` for the supported boundary.
+`FastestMCP.Protocol.Schema` compiles the protocol definitions through JSV and
+derives its method tables from them at compile time. Focused tests exercise
+FastestMCP's dialect, resolver, caching, and resource-limit contract; general
+JSON Schema conformance is delegated to JSV. See `docs/schema-validation.md`
+for the supported boundary.
 
 The published 2025-11-25 schema types `NumberSchema.minimum`, `maximum`, and
 `default` as integers even though the corresponding TypeScript definitions and
 elicitation specification define them as numbers. The bundled artifact is not
-edited: `FastestMCP.Schema` applies an explicitly versioned correction only to
-its compiled protocol view, with tests for the corrected definitions.
+edited: `FastestMCP.Protocol.Schema` applies an explicitly versioned
+correction only to its compiled protocol view, with tests for the corrected
+definitions.

@@ -83,13 +83,13 @@ defmodule FastestMCP.ServerModule do
     Code.ensure_loaded?(module) and function_exported?(module, :__fastest_mcp_server_module__?, 0)
   end
 
-  @doc "Starts the process owned by this module."
+  @doc "Starts the server of `module` and its configured transports under one supervisor; what the generated `start_link/1` calls."
   def start_link(module, opts \\ []) when is_atom(module) and is_list(opts) do
     ensure_server_module!(module)
     FastestMCP.ServerInstance.start_link({module, opts})
   end
 
-  @doc "Builds a child specification for supervising this module."
+  @doc "Returns the child spec of `module`, with `opts` merged over its configuration; what the generated `child_spec/1` calls."
   def child_spec(module, opts \\ []) when is_atom(module) and is_list(opts) do
     ensure_server_module!(module)
     resolved = resolve_config(module, opts)

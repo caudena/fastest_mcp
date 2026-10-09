@@ -4,47 +4,100 @@
 
 ### 0.4.0 breaking Elixir API changes
 
-- return tagged results from client and local operations, with raising bang
+See [Migrating to 0.4](docs/migrating-to-0.4.md) for each change.
+
+- results: client and local operations return tagged results with raising bang
   variants; commands return `:ok` or `{:error, error}`
-- always return the complete `Client.ToolResult` from connected tool calls;
-  deprecate `call_tool_result`, remove automatic JSON-text decoding and result
-  projection, and reserve explicit task handles for `call_tool_task`
-- treat plain handler maps as application data; explicit tool, resource, and
-  prompt result structs select MCP envelopes
-- dispatch immutable middleware configurations through module callbacks, share
-  activation/cleanup and mounted chains, and unify timing implementations
-- retain updated Plug connections after reading request bodies, including error
-  and authentication paths, so HTTP keep-alive framing survives split bodies
-- split client request ownership, protocol, callbacks, discovery, and execution
-  responsibilities; supervise terminal calls and monitor request handles
-- index component versions and preferred client descriptors once, share complete
-  catalog loads, and compile OpenAPI request binding plans before execution
-- share schema policy, session validation, request-state scopes, and deadline
-  handling; expire queued recovery calls before dispatch and address ClientGroup
-  coordinators directly through names or handles
+- handler results: explicit tool, prompt, and resource result structs select
+  MCP envelopes and plain maps are application data; local tool content is
+  normalized like the wire, and `FastestMCP.ResultNormalizer` is removed
+- servers and components: component options are validated per kind,
+  `FastestMCP.complete/4` reads string keys, `FastestMCP.Context.new/2`
+  replaces `build/2`, `FastestMCP.Resources.HTTP` reads are bounded, and
+  `approve/3` and `new_many/1` are gone from `FastestMCP.Interact` and
+  `FastestMCP.Auth`
+- middleware: `call/3` returns `{:ok, operation}` or `{:error, error}`,
+  stateful middleware keeps per-server state through `child_spec/1` and
+  `attach/2`, one rate-limiting and one timing implementation remain, and the
+  inspection functions are `FastestMCP.Middleware.cache_statistics/1`,
+  `error_counts/1`, and `ping_sessions/1`
+- providers and transforms: `use FastestMCP.Provider` and
+  `use FastestMCP.ProviderTransform` behaviours with overridable defaults;
+  provider dispatch functions are internal, `FastestMCP.mount/3` rejects
+  unknown options, `FastestMCP.Providers.Skills.vendor/2` replaces the vendor
+  modules, and `FastestMCP.Providers.SkillsDirectory.new/1` replaces
+  `Providers.Skills.new/1`
+- connected client: options are validated in the caller;
+  `FastestMCP.Client.info/1`, `set_handler/3`, and `set_auth/2` replace the
+  getters and setters; request, task, and callback operations live on their
+  handle modules; `call_tool_result/4` is removed; and handlers run outside the
+  client process
+- client groups: owned-member options are validated before start, `:infinity`
+  timeouts work, and `disconnect/1` is idempotent
+- OAuth: discovery, token requests, and host callbacks run in a task per
+  resource; waits are bounded, `clear/2` cancels a running flow, failures are
+  error reasons instead of exits, and `oauth:` options are validated in the
+  caller
+- background tasks: `FastestMCP.TaskBackend` is a state-passing behaviour;
+  local task functions return task structs and list newest first with offset
+  cursors; `task_meta:` and the `FastestMCP.BackgroundTask` wrapper functions
+  are removed; notification payloads use string keys
+- runtime and transports: `max_global_event_subscribers:` is removed,
+  Streamable HTTP validates `stream_request_timeout_ms:` when it starts, a
+  server that stdio starts belongs to its connection, and
+  `FastestMCP.http_app/2` returns a `{FastestMCP.Transport.HTTPApp, opts}`
+  plug that Bandit can serve
+- map keys: options and metadata take atom keys and wire-shaped maps string
+  keys; `version/2` is removed from `FastestMCP.Protocol`
+- wire: crashes and non-`Error` exceptions are answered with JSON-RPC internal
+  errors, related-task `_meta` drops its always-null `"elicitation"` key, a task
+  waiting for input reports `input_required` progress, client callback-task
+  listing uses offset cursors, tool-search results match `tools/list`
+  descriptors, and proxied resource contents keep their own `mimeType`
 
-See [Migrating to 0.4](docs/migrating-to-0.4.md) for source changes.
+### Improvements and fixes
 
-### OpenAPI, task, and composition improvements
+- schemas: `validation_timeout_ms:` bounds validation as documented (it was
+  ignored)
 
-- preserve OpenAPI schema references and literal annotation data, validate
-  complete request bodies, preserve raw media and parameter examples, and send
-  repeated multipart fields
-- fix nested task-enabled tool calls receiving background handles implicitly;
-  explicit local tasks and top-level protocol tasks retain their existing APIs
-- parse multiline and nested skill YAML without scalar coercion, normalize
-  Unicode search terms, and match URI literal percent triplets regardless of hex case
-- add `FastestMCP.ClientGroup` for supervised, independently negotiated clients,
-  complete namespaced discovery, shared client catalogs, and cancellable routing
-- add opt-in provider-bundled extensions with root conflict resolution and
-  isolated, exactly-once root lifecycle execution across mounted providers
-- avoid duplicate default HTTP headers when an explicit header is supplied
+- documented API: the provider, provider-transform, component, progress, and
+  elicitation-result modules the guides use are public, and
+  `FastestMCP.Components.Tool.new/3` and its siblings build the components a
+  custom provider returns
+
+- OpenAPI: preserve schema references and literal annotation data, validate
+  complete request bodies, keep raw media and parameter examples, and send
+  repeated multipart fields; bodies with dynamic keys, schema-local
+  definitions, or constraints that cannot be flattened use a whole `body`
+  argument (collision aliases still apply), and a supplied partial body must
+  satisfy the original schema before a request is sent
+- composition: add `FastestMCP.ClientGroup` for supervised, independently
+  negotiated clients with namespaced discovery and cancellable routing, and
+  opt-in provider-bundled extensions with root conflict resolution and
+  exactly-once root lifecycles
+- tasks: nested task-enabled tool calls no longer receive background handles
+  implicitly, and transport task results resolve tools like calls do
+- connected client: forward a per-call `meta:` to `tasks/get` and
+  `tasks/update`, default a non-positive peer poll interval instead of raising,
+  return `true` from `FastestMCP.Client.CallbackContext.cancelled?/1` once the
+  client stopped, answer server requests without blocking, stop the request of
+  a subscription stream the server rejected, disconnect while an OAuth
+  authorization is pending, stop sending a token cleared with
+  `set_auth(client, [])`, and keep killing a stdio process group until it is
+  gone
+- stdio: serving returns only after its last responses are written, a request
+  whose worker crashed gets an error response, and a session never outlives
+  its connection
+- HTTP: keep the updated Plug connection after reading request bodies so
+  keep-alive framing survives split bodies, avoid duplicate default headers,
+  and replace line breaks in the default `WWW-Authenticate` error description
+- components: a duplicate `FastestMCP.ComponentManager` add raises in the
+  caller instead of restarting the runtime; skill YAML parses multiline and
+  nested values without scalar coercion; search terms are Unicode-normalized;
+  URI literal percent triplets match regardless of hex case
+- protocol: the MCP method tables are derived from the vendored schemas, and
+  protocol messages are validated without a process per message
 - add HTTP/stdio interoperability tests for both client and server roles
-
-OpenAPI bodies with dynamic keys, schema-local definitions, or constraints that
-cannot be flattened now use a whole `body` argument (collision aliases still
-apply). Missing optional bodies are distinct from supplied partial bodies,
-which must satisfy the original schema before an HTTP request is sent.
 
 ## 0.3.2 - 2026-08-28
 

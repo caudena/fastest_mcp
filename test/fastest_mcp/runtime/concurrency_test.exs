@@ -1,5 +1,5 @@
 defmodule FastestMCP.Runtime.ConcurrencyTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   test "tool executions run concurrently in isolated worker processes" do
     parent = self()
@@ -13,11 +13,11 @@ defmodule FastestMCP.Runtime.ConcurrencyTest do
         receive do
           :release -> "done"
         after
-          1_000 -> "timed out"
+          5_000 -> "timed out"
         end
       end)
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    start_server!(server)
 
     tasks =
       for _ <- 1..3 do

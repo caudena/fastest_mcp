@@ -1,13 +1,14 @@
 defmodule FastestMCP.SchemaAtomSafetyTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: false
 
   alias FastestMCP.Protocol.Meta
+  alias FastestMCP.Protocol.Schema, as: ProtocolSchema
   alias FastestMCP.Schema
   alias FastestMCP.Transport.JSONRPC
 
   test "untrusted schema, method, and metadata strings do not create atoms after warmup" do
     Enum.each(1..20, &exercise_boundaries("warm-#{&1}"))
-    _ = Schema.compile_protocol_definition!("ContentBlock")
+    {:ok, _compiled} = ProtocolSchema.compile_definition("2026-07-28", "ContentBlock")
     before_count = :erlang.system_info(:atom_count)
 
     Enum.each(1..200, &exercise_boundaries("untrusted-#{&1}"))

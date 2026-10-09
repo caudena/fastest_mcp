@@ -1,5 +1,5 @@
 defmodule FastestMCP.ContextConvenienceTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Context
   alias FastestMCP.RequestContext
@@ -32,8 +32,7 @@ defmodule FastestMCP.ContextConvenienceTest do
         }
       end)
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
     assert %{
              explicit_request_id: request_id,
@@ -76,26 +75,19 @@ defmodule FastestMCP.ContextConvenienceTest do
            } = Context.request_context(context)
   end
 
-  test "build generates opaque random session ids when none are supplied" do
+  test "new generates opaque random session ids when none are supplied" do
     server_name =
       "ctx-generated-session-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    assert {:ok, _pid} = FastestMCP.start_server(FastestMCP.server(server_name))
+    start_server!(FastestMCP.server(server_name))
     assert {:ok, runtime} = FastestMCP.ServerRuntime.fetch(server_name)
 
-    assert {:ok, context_a} =
-             Context.build(server_name, session_supervisor: runtime.session_supervisor)
-
-    assert {:ok, context_b} =
-             Context.build(server_name, session_supervisor: runtime.session_supervisor)
+    context_a = Context.new(runtime)
+    context_b = Context.new(runtime)
 
     assert context_a.session_id =~ ~r/\A[0-9a-f]{32}\z/
     assert context_b.session_id =~ ~r/\A[0-9a-f]{32}\z/
     refute context_a.session_id == context_b.session_id
-
-    on_exit(fn ->
-      FastestMCP.stop_server(server_name)
-    end)
   end
 
   test "client_id resolves from auth and principal payloads" do
@@ -133,8 +125,7 @@ defmodule FastestMCP.ContextConvenienceTest do
         }
       end)
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
     assert is_map(
              FastestMCP.initialize!(

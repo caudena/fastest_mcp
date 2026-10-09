@@ -1,5 +1,5 @@
 defmodule FastestMCP.Protocol.HTTPHeadersTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   import Plug.Conn
   import Plug.Test
@@ -189,7 +189,7 @@ defmodule FastestMCP.Protocol.HTTPHeadersTest do
   end
 
   test "modern HTTP decodes Mcp-Name and parameter sentinels before comparison" do
-    server_name = "http-headers-#{System.unique_integer([:positive])}"
+    server_name = unique_name("http-headers")
     tool_name = "lookup 世界"
 
     schema = %{
@@ -199,35 +199,29 @@ defmodule FastestMCP.Protocol.HTTPHeadersTest do
       }
     }
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool(tool_name, fn arguments, _context -> arguments end,
-        input_schema: schema
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool(tool_name, fn arguments, _context -> arguments end,
+      input_schema: schema
+    )
+    |> start_server!()
 
     encoded_name = "=?base64?" <> Base.encode64(tool_name) <> "?="
     encoded_region = "=?base64?" <> Base.encode64(" eu ") <> "?="
+    call = %{"name" => tool_name, "arguments" => %{"region" => " eu "}}
 
     matched =
-      modern_request(
+      ProtocolTest.modern_http_post(
         server_name,
-        1,
-        "tools/call",
-        %{"name" => tool_name, "arguments" => %{"region" => " eu "}},
+        ProtocolTest.modern_request(1, "tools/call", call),
         [{"mcp-name", encoded_name}, {"mcp-param-region", encoded_region}]
       )
 
     assert matched.status == 200, matched.resp_body
 
     invalid_base64 =
-      modern_request(
+      ProtocolTest.modern_http_post(
         server_name,
-        2,
-        "tools/call",
-        %{"name" => tool_name, "arguments" => %{"region" => " eu "}},
+        ProtocolTest.modern_request(2, "tools/call", call),
         [{"mcp-name", encoded_name}, {"mcp-param-region", "=?base64?invalid!?="}]
       )
 
@@ -235,8 +229,107 @@ defmodule FastestMCP.Protocol.HTTPHeadersTest do
     assert get_in(JSON.decode!(invalid_base64.resp_body), ["error", "code"]) == -32_020
   end
 
+  test "modern routing headers require matching body metadata before schema validation" do
+    server_name = unique_name("routing-headers")
+    start_server!(FastestMCP.server(server_name))
+    valid_meta = ProtocolTest.modern_request(0, "server/discover")["params"]["_meta"]
+
+    missing_protocol_params = [
+      %{},
+      %{"_meta" => Map.delete(valid_meta, "io.modelcontextprotocol/protocolVersion")}
+    ]
+
+    for {params, id} <- Enum.with_index(missing_protocol_params, 1) do
+      response =
+        ProtocolTest.modern_http_post(
+          server_name,
+          ProtocolTest.jsonrpc_request(id, "server/discover", params)
+        )
+
+      assert response.status == 400
+
+      assert %{
+               "id" => ^id,
+               "error" => %{
+                 "code" => -32_020,
+                 "data" => %{"fastestmcp" => %{"code" => "header_mismatch"}}
+               }
+             } = JSON.decode!(response.resp_body)
+    end
+
+    response =
+      ProtocolTest.modern_http_post(
+        server_name,
+        ProtocolTest.jsonrpc_request(3, "server/discover", %{
+          "_meta" => Map.delete(valid_meta, "io.modelcontextprotocol/clientCapabilities")
+        })
+      )
+
+    assert response.status == 400
+
+    assert %{
+             "id" => 3,
+             "error" => %{
+               "code" => -32_602,
+               "data" => %{"fastestmcp" => %{"code" => "invalid_params"}}
+             }
+           } = JSON.decode!(response.resp_body)
+
+    payload = ProtocolTest.jsonrpc_request(4, "server/discover", %{"_meta" => valid_meta})
+
+    duplicate_header_response =
+      :post
+      |> conn("/mcp", JSON.encode!(payload))
+      |> put_req_header("content-type", "application/json")
+      |> put_req_header("accept", "application/json, text/event-stream")
+      |> put_req_header("mcp-protocol-version", "2026-07-28")
+      |> put_req_header("mcp-method", "server/discover")
+      |> Map.update!(:req_headers, &[{"mcp-method", "server/discover"} | &1])
+      |> Map.put(:host, "localhost")
+      |> StreamableHTTP.call(server_name: server_name, json_response: true)
+
+    assert duplicate_header_response.status == 400
+    assert get_in(JSON.decode!(duplicate_header_response.resp_body), ["error", "code"]) == -32_020
+
+    notification_response =
+      ProtocolTest.modern_http_post(
+        server_name,
+        ProtocolTest.jsonrpc_notification("server/discover", %{})
+      )
+
+    assert notification_response.status == 400
+    assert notification_response.resp_body == ""
+  end
+
+  test "modern routing headers ignore only leading and trailing HTTP OWS" do
+    server_name = unique_name("routing-header-ows")
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("echo", fn arguments, _context -> arguments end)
+    |> start_server!()
+
+    response =
+      ProtocolTest.modern_http_post(
+        server_name,
+        ProtocolTest.modern_request(40, "tools/call", %{
+          "name" => "echo",
+          "arguments" => %{"value" => "ok"}
+        }),
+        [
+          {"mcp-protocol-version", " \t2026-07-28\t "},
+          {"mcp-method", "\t tools/call  "},
+          {"mcp-name", "  echo\t"}
+        ]
+      )
+
+    assert response.status == 200
+
+    assert get_in(JSON.decode!(response.resp_body), ["result", "structuredContent", "value"]) ==
+             "ok"
+  end
+
   test "the HTTP client encodes unsafe Mcp-Name and nested parameter values" do
-    server_name = "client-http-headers-#{System.unique_integer([:positive])}"
+    server_name = unique_name("client-http-headers")
     tool_name = "lookup 世界"
 
     schema = %{
@@ -251,35 +344,21 @@ defmodule FastestMCP.Protocol.HTTPHeadersTest do
       }
     }
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool(tool_name, fn arguments, _context -> arguments end,
-        input_schema: schema
-      )
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool(tool_name, fn arguments, _context -> arguments end,
+      input_schema: schema
+    )
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
-
-    bandit =
-      start_supervised!(
-        {Bandit,
-         plug:
-           {FastestMCP.Transport.HTTPApp,
-            server_name: server_name, path: "/mcp", allowed_hosts: ["127.0.0.1", "localhost"]},
-         scheme: :http,
-         port: 0}
-      )
-
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
-    client = Client.connect!("http://127.0.0.1:#{port}/mcp")
-    on_exit(fn -> if Client.connected?(client), do: Client.disconnect!(client) end)
+    %{url: url} = start_http!(server_name, allowed_hosts: ["127.0.0.1", "localhost"])
+    client = connect!(url)
 
     assert %{raw: %{"structuredContent" => %{"routing" => %{"region" => " eu "}}}} =
              Client.call_tool!(client, tool_name, %{"routing" => %{"region" => " eu "}})
   end
 
   test "modern HTTP excludes tools containing invalid annotated schemas" do
-    server_name = "invalid-http-headers-#{System.unique_integer([:positive])}"
+    server_name = unique_name("invalid-http-headers")
 
     valid_schema = %{
       "type" => "object",
@@ -296,39 +375,18 @@ defmodule FastestMCP.Protocol.HTTPHeadersTest do
       }
     }
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("valid", fn arguments, _context -> arguments end,
-        input_schema: valid_schema
-      )
-      |> FastestMCP.add_tool("invalid", fn arguments, _context -> arguments end,
-        input_schema: invalid_schema
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("valid", fn arguments, _context -> arguments end,
+      input_schema: valid_schema
+    )
+    |> FastestMCP.add_tool("invalid", fn arguments, _context -> arguments end,
+      input_schema: invalid_schema
+    )
+    |> start_server!()
 
     list = ProtocolTest.modern_http_request(server_name, 1, "tools/list")
 
     assert get_in(JSON.decode!(list.resp_body), ["result", "tools"]) |> Enum.map(& &1["name"]) ==
              ["valid"]
-  end
-
-  defp modern_request(server_name, id, method, params, headers) do
-    payload = ProtocolTest.modern_request(id, method, params)
-
-    conn =
-      :post
-      |> conn("/mcp", JSON.encode!(payload))
-      |> put_req_header("content-type", "application/json")
-      |> put_req_header("accept", "application/json, text/event-stream")
-      |> put_req_header("mcp-protocol-version", "2026-07-28")
-      |> put_req_header("mcp-method", method)
-      |> Map.put(:host, "localhost")
-
-    conn =
-      Enum.reduce(headers, conn, fn {name, value}, conn -> put_req_header(conn, name, value) end)
-
-    StreamableHTTP.call(conn, server_name: server_name, json_response: true)
   end
 end

@@ -1,5 +1,5 @@
 defmodule FastestMCP.DocsExamplesTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: false
 
   @moduletag :docs_examples
 
@@ -48,17 +48,12 @@ defmodule FastestMCP.DocsExamplesTest do
 
   test "transport and client guide examples work over streamable http" do
     assert {:ok, _pid} = start_supervised(OnboardingServer)
-    bandit = start_supervised!(DocsFixture.bandit_child_spec(OnboardingServer))
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+    %{url: url} = start_http!(OnboardingServer)
 
     client =
-      Client.connect!("http://127.0.0.1:#{port}/mcp",
+      connect!(url,
         client_info: %{"name" => "docs-client", "version" => "1.0.0"}
       )
-
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect!(client)
-    end)
 
     assert ["sum", "visit"] ==
              client
@@ -77,11 +72,10 @@ defmodule FastestMCP.DocsExamplesTest do
     test_pid = self()
 
     assert {:ok, _pid} = start_supervised(InteractiveServer)
-    bandit = start_supervised!(DocsFixture.bandit_child_spec(InteractiveServer))
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+    %{url: url} = start_http!(InteractiveServer)
 
     client =
-      Client.connect!("http://127.0.0.1:#{port}/mcp",
+      connect!(url,
         client_info: %{"name" => "docs-client", "version" => "1.0.0"},
         sampling_handler: fn messages, params ->
           send(test_pid, {:sampling_handler_called, messages, params})
@@ -94,10 +88,6 @@ defmodule FastestMCP.DocsExamplesTest do
         end
       )
 
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect!(client)
-    end)
-
     assert %{
              raw: %{
                "resultType" => "complete",
@@ -108,7 +98,7 @@ defmodule FastestMCP.DocsExamplesTest do
     assert_receive {:sampling_handler_called, _messages, %{"maxTokens" => 64}}, 1_000
 
     approval = FastestMCP.call_tool!(InteractiveServer, "approve_release", %{}, task: true)
-    :ok = DocsFixture.wait_for_input_required(InteractiveServer, approval.task_id)
+    await_task_status(InteractiveServer, approval.task_id, :input_required)
 
     _ =
       FastestMCP.send_task_input!(
@@ -126,18 +116,13 @@ defmodule FastestMCP.DocsExamplesTest do
 
   test "auth and component manager guide examples work" do
     assert {:ok, _pid} = start_supervised(AuthServer)
-    bandit = start_supervised!(DocsFixture.bandit_child_spec(AuthServer))
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+    %{url: url} = start_http!(AuthServer)
 
     client =
-      Client.connect!("http://127.0.0.1:#{port}/mcp",
+      connect!(url,
         access_token: "dev-token",
         client_info: %{"name" => "docs-client", "version" => "1.0.0"}
       )
-
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect!(client)
-    end)
 
     whoami = Client.call_tool!(client, "whoami", %{})
 
@@ -147,17 +132,11 @@ defmodule FastestMCP.DocsExamplesTest do
     server_name =
       "docs-component-manager-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    assert {:ok, _pid} =
-             FastestMCP.start_server(
-               FastestMCP.server(server_name)
-               |> FastestMCP.add_tool(
-                 "beta.echo",
-                 fn %{"value" => value}, _ctx -> %{value: value} end,
-                 enabled: false
-               )
-             )
-
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("beta.echo", fn %{"value" => value}, _ctx -> %{value: value} end,
+      enabled: false
+    )
+    |> start_server!()
 
     manager = FastestMCP.component_manager!(server_name)
 
@@ -203,12 +182,9 @@ defmodule FastestMCP.DocsExamplesTest do
       FastestMCP.server("child-server")
       |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
 
-    parent =
-      FastestMCP.server(parent_name)
-      |> FastestMCP.mount(child, namespace: "child")
-
-    assert {:ok, _pid} = FastestMCP.start_server(parent)
-    on_exit(fn -> FastestMCP.stop_server(parent_name) end)
+    FastestMCP.server(parent_name)
+    |> FastestMCP.mount(child, namespace: "child")
+    |> start_server!()
 
     assert %{"message" => "hi"} ==
              FastestMCP.call_tool!(parent_name, "child_echo", %{"message" => "hi"})
@@ -217,98 +193,90 @@ defmodule FastestMCP.DocsExamplesTest do
   test "tools guide examples work in process and over transport" do
     server_name = "docs-tools-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool(
-        "calculate_sum",
-        fn %{"a" => a, "b" => b}, _ctx -> a + b end,
-        input_schema: %{
-          "type" => "object",
-          "properties" => %{
-            "a" => %{"type" => "integer"},
-            "b" => %{"type" => "integer"}
-          },
-          "required" => ["a", "b"]
-        }
-      )
-      |> FastestMCP.add_tool(
-        "search_products",
-        fn arguments, _ctx ->
-          Map.take(arguments, ["query", "max_results", "sort_by", "category"])
-        end,
-        input_schema: %{
-          "type" => "object",
-          "properties" => %{
-            "query" => %{"type" => "string"},
-            "max_results" => %{"type" => "integer"},
-            "sort_by" => %{"type" => "string"},
-            "category" => %{"type" => ["string", "null"]}
-          },
-          "required" => ["query"]
-        }
-      )
-      |> FastestMCP.add_tool(
-        "whoami",
-        fn arguments, _ctx -> arguments end,
-        input_schema: %{
-          "type" => "object",
-          "properties" => %{
-            "value" => %{"type" => "integer"}
-          },
-          "required" => ["value"]
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool(
+      "calculate_sum",
+      fn %{"a" => a, "b" => b}, _ctx -> a + b end,
+      input_schema: %{
+        "type" => "object",
+        "properties" => %{
+          "a" => %{"type" => "integer"},
+          "b" => %{"type" => "integer"}
         },
-        inject: [session_id: fn ctx -> ctx.session_id end]
-      )
-      |> FastestMCP.add_tool(
-        "ship_order",
-        fn arguments, _ctx -> arguments end,
-        input_schema: %{
-          "$defs" => %{
-            "address" => %{
-              "type" => "object",
-              "properties" => %{
-                "city" => %{"type" => "string"}
-              },
-              "required" => ["city"]
-            }
-          },
-          "type" => "object",
-          "properties" => %{
-            "shipping" => %{"$ref" => "#/$defs/address"}
-          },
-          "required" => ["shipping"]
-        }
-      )
-      |> FastestMCP.add_tool(
-        "list_values",
-        fn _args, _ctx -> %{"values" => ["alpha", "beta"]} end,
-        output_schema: %{
-          "type" => "object",
-          "properties" => %{
-            "values" => %{"type" => "array", "items" => %{"type" => "string"}}
-          },
-          "required" => ["values"]
-        }
-      )
-      |> FastestMCP.add_tool("private_tool", fn _args, _ctx -> "private" end, tags: ["private"])
-      |> FastestMCP.add_tool("explode", fn _args, _ctx ->
-        raise Error, code: :bad_request, message: "boom"
-      end)
+        "required" => ["a", "b"]
+      }
+    )
+    |> FastestMCP.add_tool(
+      "search_products",
+      fn arguments, _ctx ->
+        Map.take(arguments, ["query", "max_results", "sort_by", "category"])
+      end,
+      input_schema: %{
+        "type" => "object",
+        "properties" => %{
+          "query" => %{"type" => "string"},
+          "max_results" => %{"type" => "integer"},
+          "sort_by" => %{"type" => "string"},
+          "category" => %{"type" => ["string", "null"]}
+        },
+        "required" => ["query"]
+      }
+    )
+    |> FastestMCP.add_tool(
+      "whoami",
+      fn arguments, _ctx -> arguments end,
+      input_schema: %{
+        "type" => "object",
+        "properties" => %{
+          "value" => %{"type" => "integer"}
+        },
+        "required" => ["value"]
+      },
+      inject: [session_id: fn ctx -> ctx.session_id end]
+    )
+    |> FastestMCP.add_tool(
+      "ship_order",
+      fn arguments, _ctx -> arguments end,
+      input_schema: %{
+        "$defs" => %{
+          "address" => %{
+            "type" => "object",
+            "properties" => %{
+              "city" => %{"type" => "string"}
+            },
+            "required" => ["city"]
+          }
+        },
+        "type" => "object",
+        "properties" => %{
+          "shipping" => %{"$ref" => "#/$defs/address"}
+        },
+        "required" => ["shipping"]
+      }
+    )
+    |> FastestMCP.add_tool(
+      "list_values",
+      fn _args, _ctx -> %{"values" => ["alpha", "beta"]} end,
+      output_schema: %{
+        "type" => "object",
+        "properties" => %{
+          "values" => %{"type" => "array", "items" => %{"type" => "string"}}
+        },
+        "required" => ["values"]
+      }
+    )
+    |> FastestMCP.add_tool("private_tool", fn _args, _ctx -> "private" end, tags: ["private"])
+    |> FastestMCP.add_tool("explode", fn _args, _ctx ->
+      raise Error, code: :bad_request, message: "boom"
+    end)
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    bandit = start_supervised!(DocsFixture.bandit_child_spec(server_name))
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+    %{url: url} = start_http!(server_name)
 
     client =
-      Client.connect!("http://127.0.0.1:#{port}/mcp",
+      connect!(url,
         client_info: %{"name" => "docs-tools-client", "version" => "1.0.0"}
       )
-
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect!(client)
-      if Process.alive?(bandit), do: Supervisor.stop(bandit)
-      FastestMCP.stop_server(server_name)
-    end)
 
     assert 42 == FastestMCP.call_tool!(server_name, "calculate_sum", %{"a" => 20, "b" => 22})
 
@@ -379,20 +347,13 @@ defmodule FastestMCP.DocsExamplesTest do
         }
       end)
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    bandit = start_supervised!(DocsFixture.bandit_child_spec(server_name))
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+    start_server!(server)
+    %{url: url} = start_http!(server_name)
 
     client =
-      Client.connect!("http://127.0.0.1:#{port}/mcp",
+      connect!(url,
         client_info: %{"name" => "docs-client", "version" => "1.0.0"}
       )
-
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect!(client)
-      if Process.alive?(bandit), do: Supervisor.stop(bandit)
-      FastestMCP.stop_server(server_name)
-    end)
 
     assert %{name: "fastest_mcp", version: "0.1.0"} ==
              FastestMCP.read_resource!(server_name, "config://release")
@@ -477,53 +438,50 @@ defmodule FastestMCP.DocsExamplesTest do
     test_pid = self()
     server_name = "docs-modern-apis-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name,
-        application_sessions: [allow_anonymous: true],
-        extensions: %{Extensions.tasks() => %{}},
-        active_extensions: [extension]
-      )
-      |> FastestMCP.add_tool("application_session_round_trip", fn _arguments, context ->
-        session = FastestMCP.ApplicationSession.create!(context)
-        session_id = FastestMCP.ApplicationSession.id(session)
-        session = FastestMCP.ApplicationSession.fetch!(context, session_id)
-        :ok = FastestMCP.ApplicationSession.put(session, :value, "stored")
-        {:ok, stored} = FastestMCP.ApplicationSession.get(session, :value)
-        :ok = FastestMCP.ApplicationSession.delete(session, :value)
-        {:ok, missing} = FastestMCP.ApplicationSession.get(session, :value, "missing")
-        :ok = FastestMCP.ApplicationSession.terminate(session)
-        %{"stored" => stored, "missing" => missing}
-      end)
-      |> FastestMCP.add_tool("report_progress", fn _arguments, context ->
-        :ok = Context.report_progress(context, 1, 1, "done")
-        %{"ok" => true}
-      end)
-      |> FastestMCP.add_tool(
-        "task_echo",
-        fn arguments, _context -> arguments end,
-        task: [mode: :optional, poll_interval_ms: 20]
-      )
-      |> FastestMCP.add_resource("docs://status", fn _arguments, _context -> "ready" end)
-      |> FastestMCP.add_resource_template(
-        "safe://{+path}",
-        fn %{"path" => path}, _context -> %{"path" => path} end
-      )
-      |> FastestMCP.add_prompt("docs_prompt", fn _arguments, _context ->
-        FastestMCP.Prompts.Result.from(%{
-          messages: [
-            %{role: "user", content: %{type: "text", text: "docs example"}}
-          ]
-        })
-      end)
-      |> FastestMCP.add_provider(ApplicationSessions.new())
+    FastestMCP.server(server_name,
+      application_sessions: [allow_anonymous: true],
+      extensions: %{Extensions.tasks() => %{}},
+      active_extensions: [extension]
+    )
+    |> FastestMCP.add_tool("application_session_round_trip", fn _arguments, context ->
+      session = FastestMCP.ApplicationSession.create!(context)
+      session_id = FastestMCP.ApplicationSession.id(session)
+      session = FastestMCP.ApplicationSession.fetch!(context, session_id)
+      :ok = FastestMCP.ApplicationSession.put(session, :value, "stored")
+      {:ok, stored} = FastestMCP.ApplicationSession.get(session, :value)
+      :ok = FastestMCP.ApplicationSession.delete(session, :value)
+      {:ok, missing} = FastestMCP.ApplicationSession.get(session, :value, "missing")
+      :ok = FastestMCP.ApplicationSession.terminate(session)
+      %{"stored" => stored, "missing" => missing}
+    end)
+    |> FastestMCP.add_tool("report_progress", fn _arguments, context ->
+      :ok = Context.report_progress(context, 1, 1, "done")
+      %{"ok" => true}
+    end)
+    |> FastestMCP.add_tool(
+      "task_echo",
+      fn arguments, _context -> arguments end,
+      task: [mode: :optional, poll_interval_ms: 20]
+    )
+    |> FastestMCP.add_resource("docs://status", fn _arguments, _context -> "ready" end)
+    |> FastestMCP.add_resource_template(
+      "safe://{+path}",
+      fn %{"path" => path}, _context -> %{"path" => path} end
+    )
+    |> FastestMCP.add_prompt("docs_prompt", fn _arguments, _context ->
+      FastestMCP.Prompts.Result.from(%{
+        messages: [
+          %{role: "user", content: %{type: "text", text: "docs example"}}
+        ]
+      })
+    end)
+    |> FastestMCP.add_provider(ApplicationSessions.new())
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    bandit = start_supervised!(DocsFixture.bandit_child_spec(server_name))
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
-    endpoint = "http://127.0.0.1:#{port}/mcp"
+    %{url: endpoint} = start_http!(server_name)
 
     client =
-      Client.connect!(endpoint,
+      connect!(endpoint,
         protocol_version: "2026-07-28",
         response_cache: [max_entries: 32, max_item_size: 100_000],
         extensions: %{
@@ -531,12 +489,6 @@ defmodule FastestMCP.DocsExamplesTest do
           extension_id => %{}
         }
       )
-
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect!(client)
-      if Process.alive?(bandit), do: Supervisor.stop(bandit)
-      FastestMCP.stop_server(server_name)
-    end)
 
     assert %{"path" => "folder/file.txt"} =
              FastestMCP.read_resource!(server_name, "safe://folder/file.txt")
@@ -590,34 +542,32 @@ defmodule FastestMCP.DocsExamplesTest do
     search_server_name =
       "docs-tool-search-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    search_server =
-      FastestMCP.server(search_server_name)
-      |> FastestMCP.add_tool(
-        "deploy_status",
-        fn arguments, _context -> %{"target" => arguments["target"]} end,
-        description: "Deploy status for an environment",
-        input_schema: %{
-          "type" => "object",
-          "properties" => %{
-            "target" => %{
-              "type" => "string",
-              "description" => "Deployment region or environment"
-            }
+    FastestMCP.server(search_server_name)
+    |> FastestMCP.add_tool(
+      "deploy_status",
+      fn arguments, _context -> %{"target" => arguments["target"]} end,
+      description: "Deploy status for an environment",
+      input_schema: %{
+        "type" => "object",
+        "properties" => %{
+          "target" => %{
+            "type" => "string",
+            "description" => "Deployment region or environment"
           }
         }
-      )
-      |> FastestMCP.add_tool(
-        "release_report",
-        fn _arguments, _context -> %{"report" => true} end,
-        title: "Deploy release report"
-      )
-      |> FastestMCP.enable_tool_search(
-        pinned: ["deploy_status"],
-        max_results: 2,
-        max_scan: 8
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(search_server)
+      }
+    )
+    |> FastestMCP.add_tool(
+      "release_report",
+      fn _arguments, _context -> %{"report" => true} end,
+      title: "Deploy release report"
+    )
+    |> FastestMCP.enable_tool_search(
+      pinned: ["deploy_status"],
+      max_results: 2,
+      max_scan: 8
+    )
+    |> start_server!()
 
     client_name = {:global, {__MODULE__, search_server_name}}
     client_id = {:docs_supervised_client, search_server_name}
@@ -630,8 +580,6 @@ defmodule FastestMCP.DocsExamplesTest do
          id: client_id,
          protocol_version: "2026-07-28"}
       )
-
-    on_exit(fn -> FastestMCP.stop_server(search_server_name) end)
 
     assert :ok = Client.await_ready!(client_name, 1_000)
 

@@ -1,5 +1,5 @@
 defmodule FastestMCP.ToolSearchTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Apps
   alias FastestMCP.Authorization
@@ -15,6 +15,8 @@ defmodule FastestMCP.ToolSearchTest do
   alias FastestMCP.Server
 
   defmodule PagedProvider do
+    use FastestMCP.Provider
+
     defstruct [:tools, :test_pid]
 
     def list_components(%__MODULE__{} = provider, :tool, _operation) do
@@ -47,6 +49,8 @@ defmodule FastestMCP.ToolSearchTest do
   end
 
   defmodule ListOnlyProvider do
+    use FastestMCP.Provider
+
     defstruct [:tools, :test_pid]
 
     def list_components(%__MODULE__{} = provider, :tool, _operation) do
@@ -67,15 +71,38 @@ defmodule FastestMCP.ToolSearchTest do
   test "search normalizes Unicode without renaming tools" do
     name = unique_name("unicode-search")
 
-    server =
-      FastestMCP.server(name, tool_search: true)
-      |> FastestMCP.add_tool("original", fn _, _ -> "ok" end, description: "café Straße")
-
-    start_server!(server)
+    FastestMCP.server(name, tool_search: true)
+    |> FastestMCP.add_tool("original", fn _, _ -> "ok" end, description: "café Straße")
+    |> start_server!()
 
     for query <- ["café", "café", "ＣＡＦÉ", "STRASSE", "Straße"] do
       assert %{"tools" => [%{"name" => "original"}]} =
                FastestMCP.call_tool!(name, "search_tools", %{"query" => query})
+    end
+  end
+
+  test "search results describe a tool exactly as tools/list does" do
+    server_name = unique_name("tool-search-shape")
+
+    FastestMCP.server(server_name, tool_search: [pinned: ["report"]])
+    |> FastestMCP.add_tool("report", fn arguments, _ctx -> arguments end,
+      description: "Quarterly report",
+      task: true,
+      input_schema: %{
+        "type" => "object",
+        "properties" => %{"region" => %{"type" => "string", "completion" => ["eu", "us"]}}
+      }
+    )
+    |> start_server!()
+
+    for version <- ["2025-11-25", "2026-07-28"] do
+      client = connect!({:in_process, server_name}, protocol_version: version)
+      %{items: listed} = FastestMCP.Client.list_tools!(client)
+
+      %{structured_content: %{"tools" => [found]}} =
+        FastestMCP.Client.call_tool!(client, "search_tools", %{"query" => "quarterly"})
+
+      assert found == Enum.find(listed, &(&1["name"] == "report")), version
     end
   end
 
@@ -107,19 +134,17 @@ defmodule FastestMCP.ToolSearchTest do
   test "search ranking is deterministic and rejects tokenless queries" do
     server_name = unique_name("tool-search-ranking")
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("deploy", &echo_name/2, description: "Exact")
-      |> FastestMCP.add_tool("deploy_status", &echo_name/2, description: "Prefix")
-      |> FastestMCP.add_tool("production_deploy", &echo_name/2, description: "Name token")
-      |> FastestMCP.add_tool("release", &echo_name/2,
-        title: "Deploy workflow",
-        description: "Description token"
-      )
-      |> FastestMCP.add_tool("unrelated", &echo_name/2)
-      |> FastestMCP.enable_tool_search(max_results: 10, max_scan: 100)
-
-    start_server!(server)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("deploy", &echo_name/2, description: "Exact")
+    |> FastestMCP.add_tool("deploy_status", &echo_name/2, description: "Prefix")
+    |> FastestMCP.add_tool("production_deploy", &echo_name/2, description: "Name token")
+    |> FastestMCP.add_tool("release", &echo_name/2,
+      title: "Deploy workflow",
+      description: "Description token"
+    )
+    |> FastestMCP.add_tool("unrelated", &echo_name/2)
+    |> FastestMCP.enable_tool_search(max_results: 10, max_scan: 100)
+    |> start_server!()
 
     assert %{"tools" => tools, "truncated" => false} =
              FastestMCP.call_tool!(server_name, "search_tools", %{"query" => "DEPLOY"})
@@ -154,16 +179,14 @@ defmodule FastestMCP.ToolSearchTest do
       "additionalProperties" => false
     }
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("recipient", &echo_name/2, description: "Name match")
-      |> FastestMCP.add_tool("account_lookup", &echo_name/2,
-        description: "Lookup by input",
-        input_schema: parameter_schema
-      )
-      |> FastestMCP.enable_tool_search()
-
-    start_server!(server)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("recipient", &echo_name/2, description: "Name match")
+    |> FastestMCP.add_tool("account_lookup", &echo_name/2,
+      description: "Lookup by input",
+      input_schema: parameter_schema
+    )
+    |> FastestMCP.enable_tool_search()
+    |> start_server!()
 
     assert %{"tools" => tools} =
              FastestMCP.call_tool!(server_name, "search_tools", %{"query" => "recipient"})
@@ -201,12 +224,10 @@ defmodule FastestMCP.ToolSearchTest do
 
     provider = %PagedProvider{tools: [transformed_tool], test_pid: self()}
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_provider(provider)
-      |> FastestMCP.enable_tool_search()
-
-    start_server!(server)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_provider(provider)
+    |> FastestMCP.enable_tool_search()
+    |> start_server!()
 
     assert %{"tools" => [%{"name" => "lookup"}]} =
              FastestMCP.call_tool!(server_name, "search_tools", %{"query" => "visible query"})
@@ -227,16 +248,14 @@ defmodule FastestMCP.ToolSearchTest do
 
     provider = %PagedProvider{tools: tools, test_pid: self()}
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_provider(provider)
-      |> FastestMCP.enable_tool_search(
-        pinned: ["tool_01"],
-        max_results: 2,
-        max_scan: 5
-      )
-
-    start_server!(server)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_provider(provider)
+    |> FastestMCP.enable_tool_search(
+      pinned: ["tool_01"],
+      max_results: 2,
+      max_scan: 5
+    )
+    |> start_server!()
 
     assert ["tool_01", "search_tools", "call_tool"] ==
              server_name
@@ -306,12 +325,10 @@ defmodule FastestMCP.ToolSearchTest do
       |> Provider.new()
       |> Provider.add_transform(Namespace.new("ns"))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_provider(provider)
-      |> FastestMCP.enable_tool_search()
-
-    start_server!(server)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_provider(provider)
+    |> FastestMCP.enable_tool_search()
+    |> start_server!()
 
     assert %{"tools" => [%{"name" => "ns_remote_find"}]} =
              FastestMCP.call_tool!(server_name, "search_tools", %{"query" => "remote"})
@@ -326,24 +343,22 @@ defmodule FastestMCP.ToolSearchTest do
   test "search and delegated calls use model visibility and verified scope evidence" do
     server_name = unique_name("tool-search-policy")
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("model_public", &echo_name/2, title: "Model public")
-      |> FastestMCP.add_tool("model_scoped", &echo_name/2,
-        title: "Model scoped",
-        auth: Authorization.require_scopes("catalog:read")
-      )
-      |> FastestMCP.add_tool("model_denied", &echo_name/2,
-        title: "Model denied",
-        auth: Authorization.require_scopes("catalog:admin")
-      )
-      |> FastestMCP.add_tool("app_secret", &echo_name/2,
-        title: "Model app secret",
-        visibility: [:app]
-      )
-      |> FastestMCP.enable_tool_search()
-
-    start_server!(server)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("model_public", &echo_name/2, title: "Model public")
+    |> FastestMCP.add_tool("model_scoped", &echo_name/2,
+      title: "Model scoped",
+      auth: Authorization.require_scopes("catalog:read")
+    )
+    |> FastestMCP.add_tool("model_denied", &echo_name/2,
+      title: "Model denied",
+      auth: Authorization.require_scopes("catalog:admin")
+    )
+    |> FastestMCP.add_tool("app_secret", &echo_name/2,
+      title: "Model app secret",
+      visibility: [:app]
+    )
+    |> FastestMCP.enable_tool_search()
+    |> start_server!()
 
     auth_opts = [
       audience: :app,
@@ -397,19 +412,17 @@ defmodule FastestMCP.ToolSearchTest do
       "additionalProperties" => false
     }
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool(
-        "sum",
-        fn %{"a" => a, "b" => b}, _context -> %{"sum" => a + b} end,
-        input_schema: sum_schema
-      )
-      |> FastestMCP.add_tool("recursive", fn _arguments, context ->
-        FastestMCP.call_tool!(context.server_name, "call_tool", %{"name" => "recursive"})
-      end)
-      |> FastestMCP.enable_tool_search()
-
-    start_server!(server)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool(
+      "sum",
+      fn %{"a" => a, "b" => b}, _context -> %{"sum" => a + b} end,
+      input_schema: sum_schema
+    )
+    |> FastestMCP.add_tool("recursive", fn _arguments, context ->
+      FastestMCP.call_tool!(context.server_name, "call_tool", %{"name" => "recursive"})
+    end)
+    |> FastestMCP.enable_tool_search()
+    |> start_server!()
 
     assert %{"sum" => 7} =
              FastestMCP.call_tool!(server_name, "call_tool", %{
@@ -486,16 +499,14 @@ defmodule FastestMCP.ToolSearchTest do
   test "search descriptors preserve Apps metadata only when Apps is negotiated" do
     server_name = unique_name("tool-search-apps")
 
-    server =
-      FastestMCP.server(server_name, extensions: %{Apps.extension_id() => %{}})
-      |> FastestMCP.add_tool("dashboard", &echo_name/2,
-        description: "Dashboard UI",
-        output_schema: %{"type" => "string"},
-        meta: Apps.tool_meta("ui://dashboard/index.html")
-      )
-      |> FastestMCP.enable_tool_search()
-
-    start_server!(server)
+    FastestMCP.server(server_name, extensions: %{Apps.extension_id() => %{}})
+    |> FastestMCP.add_tool("dashboard", &echo_name/2,
+      description: "Dashboard UI",
+      output_schema: %{"type" => "string"},
+      meta: Apps.tool_meta("ui://dashboard/index.html")
+    )
+    |> FastestMCP.enable_tool_search()
+    |> start_server!()
 
     assert %{"tools" => [%{"_meta" => unnegotiated_meta} = unnegotiated]} =
              FastestMCP.call_tool!(server_name, "search_tools", %{"query" => "dashboard"})
@@ -560,7 +571,6 @@ defmodule FastestMCP.ToolSearchTest do
   defp tool(name, opts \\ []) do
     ComponentCompiler.compile(
       :tool,
-      "tool-search-provider",
       name,
       fn _arguments, _context -> %{"name" => name} end,
       opts
@@ -568,12 +578,4 @@ defmodule FastestMCP.ToolSearchTest do
   end
 
   defp echo_name(_arguments, _context), do: %{"name" => "ok"}
-
-  defp start_server!(server) do
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server.name) end)
-    server
-  end
-
-  defp unique_name(prefix), do: "#{prefix}-#{System.unique_integer([:positive])}"
 end

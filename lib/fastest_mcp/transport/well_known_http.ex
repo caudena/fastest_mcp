@@ -16,7 +16,11 @@ defmodule FastestMCP.Transport.WellKnownHTTP do
   alias FastestMCP.ServerRuntime
   alias FastestMCP.Transport.HTTPCommon
 
-  @doc "Builds a child specification for supervising this module."
+  @doc """
+  Returns a child spec that starts a Bandit listener serving this plug for
+  `:server_name`, on `:port` (default 4001) of the loopback interface unless
+  `:bandit_options` say otherwise.
+  """
   def child_spec(opts) do
     server_name = Keyword.fetch!(opts, :server_name)
     port = Keyword.get(opts, :port, 4_001)
@@ -37,7 +41,7 @@ defmodule FastestMCP.Transport.WellKnownHTTP do
     }
   end
 
-  @doc "Initializes the state used by this module before it starts processing work."
+  @doc "Plug callback: validates the options, raising `ArgumentError` for invalid ones."
   def init(opts) when is_list(opts) do
     opts = HTTPCommon.normalize_dns_rebinding_options!(opts)
     protected_resource = normalize_protected_resource(Keyword.get(opts, :protected_resource))
@@ -45,7 +49,7 @@ defmodule FastestMCP.Transport.WellKnownHTTP do
     %{opts: opts, protected_resource: protected_resource}
   end
 
-  @doc "Runs the main entrypoint for this module."
+  @doc "Plug callback: serves the protected resource metadata routes."
   def call(conn, %{opts: opts, protected_resource: configured_resource}) do
     protected_resource = configured_resource || runtime_protected_resource(opts)
 

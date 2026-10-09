@@ -1,54 +1,65 @@
 defmodule FastestMCP.Components.ResourceTemplate do
   @moduledoc """
-  Defines the runtime struct used for resource-template components and their URI matcher helpers.
+  A compiled RFC 6570 resource template,
+  as server transforms (`FastestMCP.add_transform/2`) and provider transforms
+  (`FastestMCP.ProviderTransform`) receive it, and as a custom provider's
+  `c:FastestMCP.Provider.list_components/3` returns it.
 
-  Resource templates are parsed and expanded as RFC 6570 level 1-4 templates.
-  Matching is deterministic, but necessarily lossy: RFC 6570 defines expansion,
-  and distinct input values can expand to the same URI.
+  Build one with `new/3`; `FastestMCP.add_resource_template/4` builds the same
+  struct. Its descriptive fields are `uri_template`, `name`, `version`,
+  `title`, `description`, `icons`, `mime_type`, `parameters`, `annotations`,
+  `tags` (a `MapSet`), `meta`, `enabled`, and `visibility`; the others hold
+  the compiled matcher and handler.
   """
 
+  # RFC 6570 level 1-4 templates. Matching is deterministic but necessarily
+  # lossy: RFC 6570 defines expansion, and distinct values can expand to the
+  # same URI.
+
+  alias FastestMCP.Component.Fields
+  alias FastestMCP.ComponentCompiler
   alias FastestMCP.Components.ResourceTemplate.Matcher
 
-  defstruct [
-    :server_name,
-    :uri_template,
-    :name,
-    :version,
-    :title,
-    :description,
-    :icons,
-    :annotations,
-    :inject,
-    :completions,
-    :task,
-    :timeout,
-    :parameters,
-    :compiled_parameters,
-    :mime_type,
-    :compiled,
-    :matcher,
-    resource_security: :inherit,
-    authorization: [],
-    policy_state: %{},
-    variables: [],
-    query_variables: [],
-    tags: MapSet.new(),
-    enabled: true,
-    visibility: [:model],
-    meta: %{}
-  ]
+  defstruct Fields.common() ++
+              [
+                :uri_template,
+                :annotations,
+                :completions,
+                :parameters,
+                :compiled_parameters,
+                :mime_type,
+                :matcher,
+                resource_security: :inherit,
+                variables: [],
+                query_variables: []
+              ]
 
-  @doc "Compiles the given RFC 6570 URI template into a matcher."
+  @type t :: %__MODULE__{
+          uri_template: String.t(),
+          name: String.t() | nil,
+          annotations: map() | nil,
+          parameters: map() | nil,
+          mime_type: String.t() | nil,
+          variables: [String.t()],
+          query_variables: [String.t()]
+        }
+
+  @doc """
+  Builds a template for `uri_template` whose `handler` gets the matched
+  parameters and the `FastestMCP.Context`. Takes the resource template options
+  listed under "Component Options" in `FastestMCP.Server`; any other option
+  raises `ArgumentError`.
+  """
+  @spec new(String.t(), function(), keyword()) :: t()
+  def new(uri_template, handler, opts \\ []),
+    do: ComponentCompiler.compile(:resource_template, uri_template, handler, opts)
+
+  @doc false
   def compile_matcher!(template) when is_binary(template) do
     Matcher.compile!(template)
   end
 
-  @doc "Expands this resource template with RFC 6570 variables."
-  def expand(%__MODULE__{matcher: matcher}, variables) do
-    expand_compiled(matcher, variables)
-  end
-
-  @doc "Expands a compiled resource template with RFC 6570 variables."
+  @doc false
   def expand_compiled(%{parsed: parsed}, variables) do
     variables =
       variables
@@ -60,12 +71,12 @@ defmodule FastestMCP.Components.ResourceTemplate do
     |> IO.iodata_to_binary()
   end
 
-  @doc "Matches a concrete URI against the compiled template."
+  @doc false
   def match(%__MODULE__{matcher: matcher}, uri) do
     match_compiled(matcher, uri)
   end
 
-  @doc "Matches a concrete URI against a compiled matcher."
+  @doc false
   def match_compiled(matcher, uri) do
     Matcher.match(matcher, uri)
   end
@@ -128,16 +139,11 @@ defmodule FastestMCP.Components.ResourceTemplate do
   end
 
   defp fetch_variable(variables, name) do
-    case Map.fetch(variables, name) do
-      {:ok, value} ->
-        {:ok, value}
-
-      :error ->
-        try do
-          Map.fetch(variables, String.to_existing_atom(name))
-        rescue
-          ArgumentError -> :error
-        end
+    with :error <- Map.fetch(variables, name) do
+      case FastestMCP.Util.existing_atom(name) do
+        nil -> :error
+        atom -> Map.fetch(variables, atom)
+      end
     end
   end
 

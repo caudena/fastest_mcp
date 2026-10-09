@@ -57,8 +57,9 @@ and lifecycle differences.
 ## Installation
 
 This source tree targets **0.4.0**, currently unreleased. It changes Elixir
-return values and middleware configuration while retaining the MCP wire
-contracts. See [the 0.4 migration guide](docs/migrating-to-0.4.md).
+APIs (return values, the connected-client facade, the middleware, provider, and
+task-backend behaviours, option validation, and map-key conventions) and a few
+wire details. See [the 0.4 migration guide](docs/migrating-to-0.4.md).
 
 To use this checkout from another local project:
 
@@ -119,8 +120,8 @@ client =
     client_info: %{"name" => "my_app", "version" => "1.0.0"}
   )
 
-FastestMCP.Client.protocol_version(client)
-# => {:ok, "2026-07-28"}
+{:ok, %FastestMCP.Client.Info{protocol_version: "2026-07-28"}} =
+  FastestMCP.Client.info(client)
 
 {:ok, %FastestMCP.Client.ToolResult{structured_content: 42}} =
   FastestMCP.Client.call_tool(client, "sum", %{"a" => 20, "b" => 22})
@@ -129,7 +130,7 @@ FastestMCP.Client.protocol_version(client)
   FastestMCP.Client.start_tool_result(client, "slow_sum", %{"a" => 20, "b" => 22})
 
 # This remains valid if tools/call becomes a negotiated remote task.
-:ok = FastestMCP.Client.cancel_tool_result(request, "no longer needed")
+:ok = FastestMCP.Client.ToolResultRequest.cancel(request, "no longer needed")
 
 :ok = FastestMCP.Client.disconnect(client)
 ```

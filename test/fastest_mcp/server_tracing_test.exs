@@ -1,5 +1,5 @@
 defmodule FastestMCP.ServerTracingTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: false
 
   require OpenTelemetry.Tracer, as: Tracer
 
@@ -15,12 +15,9 @@ defmodule FastestMCP.ServerTracingTest do
   test "tool calls create server spans with standard MCP attributes" do
     server_name = "trace-tool-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("greet", fn %{"name" => name}, _ctx -> "Hello, #{name}!" end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("greet", fn %{"name" => name}, _ctx -> "Hello, #{name}!" end)
+    |> start_server!()
 
     assert "Hello, World!" == FastestMCP.call_tool!(server_name, "greet", %{"name" => "World"})
 
@@ -41,15 +38,12 @@ defmodule FastestMCP.ServerTracingTest do
   test "resource template reads create spans keyed to the matched template" do
     server_name = "trace-resource-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_resource_template("users://{user_id}/profile", fn %{"user_id" => user_id},
-                                                                          _ctx ->
-        "profile for #{user_id}"
-      end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_resource_template("users://{user_id}/profile", fn %{"user_id" => user_id},
+                                                                        _ctx ->
+      "profile for #{user_id}"
+    end)
+    |> start_server!()
 
     assert "profile for 123" == FastestMCP.read_resource!(server_name, "users://123/profile")
 
@@ -70,12 +64,9 @@ defmodule FastestMCP.ServerTracingTest do
   test "failed operations mark the span as an error" do
     server_name = "trace-error-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("explode", fn _args, _ctx -> raise "boom" end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("explode", fn _args, _ctx -> raise "boom" end)
+    |> start_server!()
 
     assert_raise Error, fn ->
       FastestMCP.call_tool!(server_name, "explode", %{})
@@ -92,17 +83,14 @@ defmodule FastestMCP.ServerTracingTest do
   test "authenticated operations include auth attributes and continue an incoming trace" do
     server_name = "trace-auth-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_auth(FastestMCP.Auth.StaticToken,
-        tokens: %{
-          "valid-token" => %{client_id: "test-client-123", scopes: ["read", "write"]}
-        }
-      )
-      |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_auth(FastestMCP.Auth.StaticToken,
+      tokens: %{
+        "valid-token" => %{client_id: "test-client-123", scopes: ["read", "write"]}
+      }
+    )
+    |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+    |> start_server!()
 
     Tracer.with_span "client-request" do
       headers = FastestMCP.Telemetry.inject_trace_context()

@@ -1,10 +1,11 @@
 defmodule FastestMCP.RuntimeAggregateQuotaTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Registry
   alias FastestMCP.RuntimeQuota
   alias FastestMCP.ServerRuntime
   alias FastestMCP.Session
+  alias FastestMCP.SessionSupervisor
   alias FastestMCP.SSEReplay
   alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
 
@@ -13,14 +14,11 @@ defmodule FastestMCP.RuntimeAggregateQuotaTest do
     payload = %{"payload" => String.duplicate("x", 220)}
     replay_limit = replay_limit_for_two_cursors_and_one_notification(payload)
 
-    assert {:ok, _pid} =
-             FastestMCP.start_server(FastestMCP.server(server_name),
-               max_runtime_pending_requests: 1,
-               max_runtime_active_requests: 1,
-               sse_replay_max_total_bytes: replay_limit
-             )
-
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(FastestMCP.server(server_name),
+      max_runtime_pending_requests: 1,
+      max_runtime_active_requests: 1,
+      sse_replay_max_total_bytes: replay_limit
+    )
 
     {session_a, sink_a} = initialized_session_with_sink!(server_name, "session-a")
     {session_b, sink_b} = initialized_session_with_sink!(server_name, "session-b")
@@ -89,18 +87,39 @@ defmodule FastestMCP.RuntimeAggregateQuotaTest do
                     %{"method" => "example/replay-b"}}
 
     {:ok, runtime} = ServerRuntime.fetch(server_name)
-    snapshot = RuntimeQuota.snapshot(runtime.runtime_quota)
+    usage = RuntimeQuota.snapshot(runtime.runtime_quota)
     {:ok, session_a_pid} = Registry.lookup_session(server_name, session_a)
     {:ok, session_b_pid} = Registry.lookup_session(server_name, session_b)
     replay_a = :sys.get_state(session_a_pid).replay.total_bytes
     replay_b = :sys.get_state(session_b_pid).replay.total_bytes
 
-    assert snapshot.usage.pending_requests == 0
-    assert snapshot.usage.active_requests == 0
-    assert snapshot.usage.sse_replay_bytes == replay_a + replay_b
-    assert snapshot.usage.sse_replay_bytes == replay_limit
+    assert usage.pending_requests == 0
+    assert usage.active_requests == 0
+    assert usage.sse_replay_bytes == replay_a + replay_b
+    assert usage.sse_replay_bytes == replay_limit
     assert replay_a > replay_b
     assert replay_b > 0
+
+    # A stopping session releases everything it still holds.
+    assert :ok = SessionSupervisor.terminate_session(server_name, session_a)
+    assert RuntimeQuota.snapshot(runtime.runtime_quota).sse_replay_bytes == replay_b
+
+    pending_callback =
+      Task.async(fn ->
+        Session.request_peer(server_name, session_b, "roots/list", %{}, timeout_ms: 5_000)
+      end)
+
+    assert_receive {:fastest_mcp_session_message, ^sink_b, _event_id, %{"method" => "roots/list"}}
+    assert RuntimeQuota.snapshot(runtime.runtime_quota).pending_requests == 1
+
+    assert :ok = SessionSupervisor.terminate_session(server_name, session_b)
+    assert {:error, :session_terminated} = Task.await(pending_callback)
+
+    assert RuntimeQuota.snapshot(runtime.runtime_quota) == %{
+             pending_requests: 0,
+             active_requests: 0,
+             sse_replay_bytes: 0
+           }
   end
 
   defp replay_limit_for_two_cursors_and_one_notification(payload) do

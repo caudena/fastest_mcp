@@ -11,7 +11,10 @@ defmodule FastestMCP.Root do
   symlink-aware containment is required.
   """
 
+  import FastestMCP.Util, only: [maybe_put: 3]
+
   alias FastestMCP.PathSafety
+  alias FastestMCP.URIPolicy
 
   @enforce_keys [:uri]
   defstruct [:uri, :name, meta: nil]
@@ -114,8 +117,6 @@ defmodule FastestMCP.Root do
          {:ok, normalized_path} <- decode_and_normalize_path(parsed.path) do
       {:ok, path_to_uri(normalized_path, parsed.host)}
     end
-  rescue
-    ArgumentError -> {:error, :invalid_uri_encoding}
   end
 
   defp validate_file_uri(%URI{} = uri) do
@@ -125,7 +126,7 @@ defmodule FastestMCP.Root do
       not is_nil(uri.query) -> {:error, :file_uri_query}
       not is_nil(uri.fragment) -> {:error, :file_uri_fragment}
       not is_binary(uri.path) or uri.path == "" -> {:error, :missing_file_path}
-      not valid_percent_encoding?(uri.path) -> {:error, :invalid_uri_encoding}
+      not URIPolicy.valid_percent_encoding?(uri.path) -> {:error, :invalid_uri_encoding}
       true -> :ok
     end
   end
@@ -181,14 +182,13 @@ defmodule FastestMCP.Root do
 
   defp local_candidate_path(_root_path, _candidate), do: {:error, :invalid_path}
 
-  defp valid_percent_encoding?(value) do
-    not Regex.match?(~r/%(?![0-9A-Fa-f]{2})/, value)
-  end
-
+  # `URI.new/1` raises for invalid UTF-8.
   defp parse_uri(uri) do
-    case URI.new(uri) do
-      {:ok, parsed} -> {:ok, parsed}
-      {:error, _reason} -> {:error, :invalid_root_uri}
+    with true <- String.valid?(uri),
+         {:ok, parsed} <- URI.new(uri) do
+      {:ok, parsed}
+    else
+      _invalid -> {:error, :invalid_root_uri}
     end
   end
 
@@ -233,7 +233,4 @@ defmodule FastestMCP.Root do
   defp format_error(:invalid_name), do: "MCP root name must be a non-empty string"
   defp format_error(:invalid_meta), do: "MCP root _meta must be an object"
   defp format_error(_reason), do: "invalid MCP root"
-
-  defp maybe_put(map, _key, nil), do: map
-  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 end

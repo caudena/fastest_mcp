@@ -22,7 +22,11 @@ defmodule FastestMCP.Transport.HTTPApp do
           {atom() | String.t(), String.t(), (Plug.Conn.t() -> Plug.Conn.t())}
           | {atom() | String.t(), String.t(), {module(), keyword() | map()}}
 
-  @doc "Builds a child specification for supervising this module."
+  @doc """
+  Returns a child spec that starts a Bandit listener serving this plug for
+  `:server_name`, on `:port` (default 4000) of the loopback interface unless
+  `:bandit_options` say otherwise.
+  """
   def child_spec(opts) do
     opts = StreamableHTTP.validate_options!(opts)
     server_name = Keyword.fetch!(opts, :server_name)
@@ -44,10 +48,10 @@ defmodule FastestMCP.Transport.HTTPApp do
     }
   end
 
-  @doc "Initializes the state used by this module before it starts processing work."
+  @doc "Plug callback: validates the options, raising `ArgumentError` for invalid ones."
   def init(opts), do: StreamableHTTP.validate_options!(opts)
 
-  @doc "Runs the main entrypoint for this module."
+  @doc "Plug callback: serves the protected resource metadata, the extra routes, and the MCP endpoint."
   def call(conn, opts) do
     middleware = Keyword.get(opts, :middleware, [])
 
@@ -140,7 +144,7 @@ defmodule FastestMCP.Transport.HTTPApp do
   end
 
   defp runtime_routes(%{server: server}) do
-    server.http_routes ++ Enum.flat_map(server.providers, &Provider.http_routes/1)
+    server.http_routes ++ Enum.flat_map(server.providers, &Provider.Dispatch.http_routes/1)
   end
 
   defp runtime_routes(_runtime), do: []

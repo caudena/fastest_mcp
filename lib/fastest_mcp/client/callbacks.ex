@@ -1,16 +1,20 @@
 defmodule FastestMCP.Client.Callbacks do
   @moduledoc false
+  import FastestMCP.Protocol.Version
+
   alias FastestMCP.Client.URLElicitation
   alias FastestMCP.Elicitation
   alias FastestMCP.Error
+  alias FastestMCP.ErrorExposure
   alias FastestMCP.Protocol.Sampling, as: SamplingProtocol
+  alias FastestMCP.Protocol.Schema, as: ProtocolSchema
   alias FastestMCP.Schema
 
   def validate_callback_result!(method, result) do
     envelope = %{"jsonrpc" => "2.0", "id" => "callback-result", "result" => result}
 
-    case Schema.validate_protocol(
-           "2025-11-25",
+    case ProtocolSchema.validate(
+           legacy(),
            :client_to_server,
            :response,
            method,
@@ -152,6 +156,15 @@ defmodule FastestMCP.Client.Callbacks do
     end)
   end
 
+  def failure(target, code, message, details) do
+    %Error{
+      code: code,
+      message: message,
+      details: details,
+      exposure: %{mask_error_details: true, component_type: :callback_task, identifier: target}
+    }
+  end
+
   defp callback_response(method, callback) when is_binary(method) and is_function(callback, 0) do
     {:ok, callback.()}
   rescue
@@ -159,34 +172,29 @@ defmodule FastestMCP.Client.Callbacks do
       {:error, error}
 
     error ->
-      {:error,
-       FastestMCP.Client.HTTP.callback_failure(
-         method,
-         :internal_error,
-         Exception.message(error),
-         %{kind: inspect(error.__struct__)}
-       )
-       |> FastestMCP.Client.HTTP.public_callback_error(method)}
+      public_failure(method, Exception.message(error), %{kind: inspect(error.__struct__)})
   catch
     :exit, reason ->
-      {:error,
-       FastestMCP.Client.HTTP.callback_failure(
-         method,
-         :internal_error,
-         "client callback exited",
-         %{reason: inspect(reason)}
-       )
-       |> FastestMCP.Client.HTTP.public_callback_error(method)}
+      public_failure(method, "client callback exited", %{reason: inspect(reason)})
 
     kind, reason ->
-      {:error,
-       FastestMCP.Client.HTTP.callback_failure(
-         method,
-         :internal_error,
-         "client callback failed",
-         %{kind: inspect(kind), reason: inspect(reason)}
-       )
-       |> FastestMCP.Client.HTTP.public_callback_error(method)}
+      public_failure(method, "client callback failed", %{
+        kind: inspect(kind),
+        reason: inspect(reason)
+      })
+  end
+
+  defp public_failure(method, message, details) do
+    error =
+      method
+      |> failure(:internal_error, message, details)
+      |> ErrorExposure.public_error(
+        mask_error_details: true,
+        component_type: :callback_task,
+        target: method
+      )
+
+    {:error, error}
   end
 
   defp invoke_handler(handler, [first, second, third], _fallback) when is_function(handler, 3),

@@ -26,7 +26,7 @@ site to unwrap a paging object when it is not needed.
 server_name = "pagination"
 
 FastestMCP.list_tools!(server_name)
-#=> [%Tool{}, %Tool{}, ...]
+#=> [%{type: :tool, name: "tool_1", key: "tool:tool_1@", ...}, ...]
 
 %{items: tools, next_cursor: cursor} =
   FastestMCP.list_tools!(server_name, page_size: 20)
@@ -69,9 +69,10 @@ They are limited to 4 KiB and use keyset continuation rather than offset
 slicing. A cursor cannot be moved between methods, sessions with different
 visibility, principals, or runtime generations.
 
-Providers may implement the optional page callback to filter and limit at the
-source. Providers that implement only `list_components/3`, or whose transforms
-change key ordering, use that callback's materialized list. The shared pipeline
+Providers may implement the page callback to filter and limit at the source.
+Providers that implement only `list_components/3`, providers with any transform
+(including a mount namespace), and every provider of a server with server-level
+transforms are listed in full through `list_components/3`. The shared pipeline
 bounds the page it emits but cannot make a legacy all-components callback lazy.
 
 ## Example
@@ -99,7 +100,7 @@ server =
 Pagination raises a normalized bad-request error when:
 
 - `page_size` is not a positive integer
-- the cursor is invalid
+- the cursor is invalid (a `cursor:` without `page_size:` is ignored)
 
 The transport also rejects signed cursors that are tampered with or belong to a
 different method, runtime generation, principal, visibility/filter scope, or

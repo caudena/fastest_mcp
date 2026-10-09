@@ -1,5 +1,5 @@
 defmodule FastestMCP.Runtime.OverloadBackpressureTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Error
   alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
@@ -15,23 +15,17 @@ defmodule FastestMCP.Runtime.OverloadBackpressureTest do
       receive do
         :release -> :ok
       after
-        1_000 -> :timeout
+        10_000 -> :timeout
       end
     end
 
-    assert {:ok, _pid} =
-             FastestMCP.start_server(
-               FastestMCP.server(server_a)
-               |> FastestMCP.add_tool("wait", wait_tool),
-               max_concurrent_calls: 1
-             )
+    start_server!(FastestMCP.server(server_a) |> FastestMCP.add_tool("wait", wait_tool),
+      max_concurrent_calls: 1
+    )
 
-    assert {:ok, _pid} =
-             FastestMCP.start_server(
-               FastestMCP.server(server_b)
-               |> FastestMCP.add_tool("wait", wait_tool),
-               max_concurrent_calls: 1
-             )
+    start_server!(FastestMCP.server(server_b) |> FastestMCP.add_tool("wait", wait_tool),
+      max_concurrent_calls: 1
+    )
 
     task =
       Task.async(fn ->
@@ -74,16 +68,13 @@ defmodule FastestMCP.Runtime.OverloadBackpressureTest do
       receive do
         :release -> :ok
       after
-        1_000 -> :timeout
+        10_000 -> :timeout
       end
     end
 
-    assert {:ok, _pid} =
-             FastestMCP.start_server(
-               FastestMCP.server(server_name)
-               |> FastestMCP.add_tool("wait", wait_tool),
-               max_concurrent_calls: 1
-             )
+    start_server!(FastestMCP.server(server_name) |> FastestMCP.add_tool("wait", wait_tool),
+      max_concurrent_calls: 1
+    )
 
     task =
       Task.async(fn ->

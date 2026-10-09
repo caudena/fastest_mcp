@@ -1,5 +1,5 @@
 defmodule FastestMCP.OpenAPIRequestContractTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.HTTP
 
@@ -78,8 +78,7 @@ defmodule FastestMCP.OpenAPIRequestContractTest do
     assert MapSet.new(tool.input_schema["required"]) ==
              MapSet.new(["id", "id__path", "id__path_1"])
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
     assert %{"ok" => true} ==
              FastestMCP.call_tool!(server_name, "update_item", %{
@@ -157,8 +156,7 @@ defmodule FastestMCP.OpenAPIRequestContractTest do
     assert required_inputs(tools["required_array"]) == ["body"]
     assert required_inputs(tools["required_empty_object"]) == []
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
     assert %{"ok" => true} == FastestMCP.call_tool!(server_name, "optional_object", %{})
 
@@ -221,10 +219,6 @@ defmodule FastestMCP.OpenAPIRequestContractTest do
   end
 
   defp required_inputs(tool), do: Map.get(tool.input_schema, "required", [])
-
-  defp unique_name(prefix) do
-    prefix <> "-" <> Integer.to_string(System.unique_integer([:positive]))
-  end
 
   defp start_one_shot_http_server do
     {:ok, listen_socket} =

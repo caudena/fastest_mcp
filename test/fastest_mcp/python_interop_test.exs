@@ -1,5 +1,5 @@
 defmodule FastestMCP.PythonInteropTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: false
   @moduletag :interop
   @moduletag timeout: 120_000
   alias FastestMCP.Client
@@ -39,7 +39,15 @@ defmodule FastestMCP.PythonInteropTest do
         15_000 -> flunk("Python peer did not report its HTTP port")
       end
 
-    await_listener(number, System.monotonic_time(:millisecond) + 10_000)
+    assert_eventually(
+      fn ->
+        case :gen_tcp.connect({127, 0, 0, 1}, number, [active: false], 100) do
+          {:ok, socket} -> :gen_tcp.close(socket) == :ok
+          {:error, _reason} -> false
+        end
+      end,
+      10_000
+    )
 
     for version <- ["2025-11-25", "2026-07-28"] do
       client = Client.connect!("http://127.0.0.1:#{number}/mcp", protocol_version: version)
@@ -68,29 +76,16 @@ defmodule FastestMCP.PythonInteropTest do
   test "Python 4.0.11 client interoperates with Elixir over HTTP in both protocol eras" do
     name = "http-interop-#{System.unique_integer([:positive])}"
 
-    server =
-      FastestMCP.server(name)
-      |> FastestMCP.add_tool("echo", fn args, _ -> args end)
-      |> FastestMCP.add_tool("empty", fn _, _ -> %{} end)
-      |> FastestMCP.add_resource("data://interop/value", fn _, _ -> "hello" end)
+    FastestMCP.server(name)
+    |> FastestMCP.add_tool("echo", fn args, _ -> args end)
+    |> FastestMCP.add_tool("empty", fn _, _ -> %{} end)
+    |> FastestMCP.add_resource("data://interop/value", fn _, _ -> "hello" end)
+    |> start_server!()
 
-    assert {:ok, _} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(name) end)
-
-    listener =
-      start_supervised!(
-        {Bandit,
-         plug:
-           {FastestMCP.Transport.HTTPApp,
-            server_name: name, path: "/mcp", allowed_hosts: ["127.0.0.1"]},
-         ip: {127, 0, 0, 1},
-         port: 0}
-      )
-
-    {:ok, {_, number}} = ThousandIsland.listener_info(listener)
+    %{url: url} = start_http!(name, allowed_hosts: ["127.0.0.1"])
 
     for mode <- ["legacy", "2026-07-28"],
-        do: check_python_client(mode, "http://127.0.0.1:#{number}/mcp")
+        do: check_python_client(mode, url)
   end
 
   defp check_elixir_client(client) do
@@ -122,19 +117,5 @@ defmodule FastestMCP.PythonInteropTest do
     path = Path.join(@project, ".venv/bin/python")
     unless File.exists?(path), do: flunk("run uv sync --frozen --project test/interop first")
     path
-  end
-
-  defp await_listener(number, deadline) do
-    case :gen_tcp.connect({127, 0, 0, 1}, number, [:binary, active: false], 100) do
-      {:ok, socket} ->
-        :gen_tcp.close(socket)
-
-      _ ->
-        if System.monotonic_time(:millisecond) >= deadline,
-          do: flunk("Python HTTP peer did not start")
-
-        Process.sleep(10)
-        await_listener(number, deadline)
-    end
   end
 end

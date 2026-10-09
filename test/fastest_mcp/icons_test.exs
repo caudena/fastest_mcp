@@ -1,5 +1,5 @@
 defmodule FastestMCP.IconsTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Transport.Engine
   alias FastestMCP.Transport.Request
@@ -20,19 +20,16 @@ defmodule FastestMCP.IconsTest do
       }
     ]
 
-    server =
-      FastestMCP.server(server_name,
-        metadata: %{website_url: "https://example.com", icons: icons}
-      )
-      |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end, icons: icons)
-      |> FastestMCP.add_resource("data://config", fn _args, _ctx -> %{ok: true} end, icons: icons)
-      |> FastestMCP.add_resource_template("data://item/{id}", fn args, _ctx -> args end,
-        icons: icons
-      )
-      |> FastestMCP.add_prompt("greet", fn _args, _ctx -> "hi" end, icons: icons)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name,
+      metadata: %{website_url: "https://example.com", icons: icons}
+    )
+    |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end, icons: icons)
+    |> FastestMCP.add_resource("data://config", fn _args, _ctx -> %{ok: true} end, icons: icons)
+    |> FastestMCP.add_resource_template("data://item/{id}", fn args, _ctx -> args end,
+      icons: icons
+    )
+    |> FastestMCP.add_prompt("greet", fn _args, _ctx -> "hi" end, icons: icons)
+    |> start_server!()
 
     [tool] = FastestMCP.list_tools!(server_name)
     [resource] = FastestMCP.list_resources!(server_name)

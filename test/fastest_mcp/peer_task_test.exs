@@ -1,5 +1,5 @@
 defmodule FastestMCP.PeerTaskTest do
-  use ExUnit.Case, async: true
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.PeerTask
 
@@ -12,9 +12,9 @@ defmodule FastestMCP.PeerTaskTest do
              target: "sampling/createMessage"
            } =
              PeerTask.new(%{
-               "server_name" => "server",
-               "session_id" => "session",
-               "task_id" => "task",
+               server_name: "server",
+               session_id: "session",
+               task_id: "task",
                kind: :sampling,
                target: "sampling/createMessage"
              })

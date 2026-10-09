@@ -1,5 +1,5 @@
 defmodule FastestMCP.SessionStateStoreFailureTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   import ExUnit.CaptureLog
 
@@ -171,7 +171,6 @@ defmodule FastestMCP.SessionStateStoreFailureTest do
 
     assert {:error, %Error{} = error} =
              SessionSupervisor.terminate_session(
-               context.runtime.session_supervisor,
                context.server_name,
                session_id
              )
@@ -188,7 +187,6 @@ defmodule FastestMCP.SessionStateStoreFailureTest do
 
     assert :ok =
              SessionSupervisor.terminate_session(
-               context.runtime.session_supervisor,
                context.server_name,
                session_id
              )
@@ -198,34 +196,25 @@ defmodule FastestMCP.SessionStateStoreFailureTest do
   end
 
   test "idle expiry retries failed cleanup and stops only after cleanup succeeds" do
-    context = start_store_server!(session_idle_ttl: 60_000)
+    context = start_store_server!(session_idle_ttl: 100)
+    ControllableStore.fail(context.store, :delete_session, :delete_failed)
     session_id = "idle-cleanup"
     session_pid = ensure_session!(context, session_id)
-
+    monitor = Process.monitor(session_pid)
     assert :ok = Session.put(context.server_name, session_id, :secret, "kept")
-    ControllableStore.fail(context.store, :delete_session, :delete_failed)
 
-    first_generation = :sys.get_state(session_pid).expiry_generation
-    send(session_pid, {:expire_if_idle, first_generation})
+    capture_log(fn ->
+      # Every idle timeout attempts the cleanup; a failure keeps the session.
+      assert_receive {:session_store_delete_attempt, _, ^session_id}, 1_000
+      assert_receive {:session_store_delete_attempt, _, ^session_id}, 1_000
+      refute_received {:DOWN, ^monitor, _, _, _}
+      assert "kept" == Session.get(context.server_name, session_id, :secret, :missing)
 
-    assert_receive {:session_store_delete_attempt, _, ^session_id}, 1_000
-
-    assert_eventually(fn ->
-      state = :sys.get_state(session_pid)
-
-      Process.alive?(session_pid) and is_reference(state.expiry_generation) and
-        state.expiry_generation != first_generation
+      ControllableStore.clear_failure(context.store, :delete_session)
+      assert_receive {:session_store_deleted, _, ^session_id}, 1_000
+      assert_receive {:DOWN, ^monitor, :process, ^session_pid, :normal}, 1_000
     end)
 
-    assert "kept" == Session.get(context.server_name, session_id, :secret, :missing)
-    ControllableStore.clear_failure(context.store, :delete_session)
-
-    successful_generation = :sys.get_state(session_pid).expiry_generation
-    monitor = Process.monitor(session_pid)
-    send(session_pid, {:expire_if_idle, successful_generation})
-
-    assert_receive {:session_store_deleted, _, ^session_id}, 1_000
-    assert_receive {:DOWN, ^monitor, :process, ^session_pid, :normal}, 1_000
     assert Registry.lookup_session(context.server_name, session_id) == {:error, :not_found}
     assert :error = ControllableStore.get(context.store, session_id, :secret)
   end
@@ -242,7 +231,7 @@ defmodule FastestMCP.SessionStateStoreFailureTest do
     new_session_pid =
       assert_eventually(fn ->
         case Registry.lookup_session(context.server_name, session_id) do
-          {:ok, pid} when pid != old_session_pid -> {:ok, pid}
+          {:ok, pid} when pid != old_session_pid -> pid
           _other -> false
         end
       end)
@@ -270,16 +259,13 @@ defmodule FastestMCP.SessionStateStoreFailureTest do
   end
 
   test "nil session ids generate distinct stateful sessions but remain nil for request scope" do
-    server_name = unique_server_name("nil-session-id")
+    server_name = unique_name("nil-session-id")
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("session", fn _arguments, context ->
-        %{session_id: context.session_id, state_scope: context.state_scope}
-      end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("session", fn _arguments, context ->
+      %{session_id: context.session_id, state_scope: context.state_scope}
+    end)
+    |> start_server!()
 
     first = FastestMCP.call_tool!(server_name, "session", %{}, session_id: nil)
     second = FastestMCP.call_tool!(server_name, "session", %{}, session_id: nil)
@@ -298,7 +284,7 @@ defmodule FastestMCP.SessionStateStoreFailureTest do
   end
 
   defp start_store_server!(opts \\ []) do
-    server_name = unique_server_name("session-store-failure")
+    server_name = unique_name("session-store-failure")
     audit_table = :ets.new(:session_store_failure_audit, [:set, :public])
 
     runtime_opts =
@@ -310,8 +296,7 @@ defmodule FastestMCP.SessionStateStoreFailureTest do
         opts
       )
 
-    assert {:ok, _pid} = FastestMCP.start_server(FastestMCP.server(server_name), runtime_opts)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(FastestMCP.server(server_name), runtime_opts)
 
     assert {:ok, runtime} = ServerRuntime.fetch(server_name)
 
@@ -332,40 +317,5 @@ defmodule FastestMCP.SessionStateStoreFailureTest do
              )
 
     session_pid
-  end
-
-  defp assert_eventually(fun, timeout_ms \\ 1_000) do
-    deadline = System.monotonic_time(:millisecond) + timeout_ms
-    do_assert_eventually(fun, deadline)
-  end
-
-  defp do_assert_eventually(fun, deadline) do
-    case fun.() do
-      false ->
-        if System.monotonic_time(:millisecond) >= deadline do
-          flunk("condition did not become true before timeout")
-        else
-          Process.sleep(10)
-          do_assert_eventually(fun, deadline)
-        end
-
-      nil ->
-        if System.monotonic_time(:millisecond) >= deadline do
-          flunk("condition did not return a value before timeout")
-        else
-          Process.sleep(10)
-          do_assert_eventually(fun, deadline)
-        end
-
-      {:ok, value} ->
-        value
-
-      value ->
-        value
-    end
-  end
-
-  defp unique_server_name(prefix) do
-    prefix <> "-" <> Integer.to_string(System.unique_integer([:positive]))
   end
 end

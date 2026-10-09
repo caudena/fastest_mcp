@@ -9,6 +9,8 @@ defmodule FastestMCP.InputRequiredResult do
   the retried operation.
   """
 
+  import FastestMCP.Util, only: [maybe_put: 3]
+
   alias FastestMCP.Error
   alias FastestMCP.JSONValue
   alias FastestMCP.Protocol
@@ -70,14 +72,14 @@ defmodule FastestMCP.InputRequiredResult do
 
   defp normalize_input_requests(requests) when is_map(requests) and map_size(requests) > 0 do
     Map.new(requests, fn {key, request} ->
-      key = to_string(key)
+      {key, request} = {to_string(key), JSONValue.stringify_keys(request)}
 
-      unless key != "" and is_map(request) and is_binary(map_value(request, :method)) do
+      unless key != "" and match?(%{"method" => method} when is_binary(method), request) do
         raise ArgumentError,
               "each input request must have a non-empty key and an MCP method, got #{inspect({key, request})}"
       end
 
-      {key, JSONValue.stringify_keys(request)}
+      {key, request}
     end)
   end
 
@@ -101,9 +103,4 @@ defmodule FastestMCP.InputRequiredResult do
   defp normalize_meta(other) do
     raise ArgumentError, "input-required metadata must be a map, got #{inspect(other)}"
   end
-
-  defp map_value(map, key), do: Map.get(map, key, Map.get(map, to_string(key)))
-
-  defp maybe_put(map, _key, nil), do: map
-  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 end

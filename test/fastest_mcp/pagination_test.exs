@@ -1,5 +1,5 @@
 defmodule FastestMCP.PaginationTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Auth.Result, as: AuthResult
   alias FastestMCP.ComponentCompiler
@@ -9,6 +9,8 @@ defmodule FastestMCP.PaginationTest do
   alias FastestMCP.Transport.Request
 
   defmodule CountingPageProvider do
+    use FastestMCP.Provider
+
     defstruct [:pid, :tools]
 
     def list_components(%__MODULE__{pid: pid, tools: tools}, :tool, _operation) do
@@ -56,6 +58,8 @@ defmodule FastestMCP.PaginationTest do
   end
 
   defmodule FamilyPageProvider do
+    use FastestMCP.Provider
+
     defstruct [:pid, components: %{}]
 
     def list_components(%__MODULE__{pid: pid, components: components}, component_type, _operation) do
@@ -84,92 +88,82 @@ defmodule FastestMCP.PaginationTest do
     assert {:ok, 12} = Pagination.decode_cursor(cursor)
   end
 
-  test "invalid cursor raises through pagination helper" do
-    assert_raise Error, ~r/invalid cursor/, fn ->
-      Pagination.paginate([1, 2, 3], "bad-cursor", 2)
-    end
-  end
+  test "invalid cursors and page sizes are bad requests" do
+    assert {:error, %Error{code: :bad_request, message: "invalid cursor"}} =
+             Pagination.paginate([1, 2, 3], "bad-cursor", 2)
 
-  test "page_size must be positive" do
-    assert_raise Error, ~r/page_size must be a positive integer/, fn ->
-      Pagination.paginate([1, 2, 3], nil, 0)
-    end
+    assert {:error, %Error{code: :bad_request, message: "page_size must be a positive integer"}} =
+             Pagination.paginate([1, 2, 3], nil, 0)
   end
 
   test "wire cursors are cursor-only keyset continuations bound to their scope" do
     secret = :crypto.strong_rand_bytes(32)
     items = Enum.map(1..205, &%{name: "item-#{String.pad_leading(to_string(&1), 3, "0")}"})
 
-    first = Pagination.wire_page(items, secret: secret, scope: "tools/list")
+    assert {:ok, first} = Pagination.wire_page(items, secret: secret, scope: "tools/list")
     assert length(first.items) == 100
     assert is_binary(first.next_cursor)
 
-    second =
-      Pagination.wire_page(items,
-        secret: secret,
-        scope: "tools/list",
-        cursor: first.next_cursor
-      )
+    assert {:ok, second} =
+             Pagination.wire_page(items,
+               secret: secret,
+               scope: "tools/list",
+               cursor: first.next_cursor
+             )
 
     assert length(second.items) == 100
     assert hd(second.items).name == "item-101"
 
-    assert_raise Error, ~r/invalid cursor/, fn ->
-      Pagination.wire_page(items,
-        secret: secret,
-        scope: "prompts/list",
-        cursor: first.next_cursor
-      )
-    end
+    assert {:error, %Error{message: "invalid cursor"}} =
+             Pagination.wire_page(items,
+               secret: secret,
+               scope: "prompts/list",
+               cursor: first.next_cursor
+             )
   end
 
   test "wire cursors reject tampering and caller-fingerprint reuse" do
     secret = :crypto.strong_rand_bytes(32)
     items = Enum.map(1..101, &%{name: "item-#{&1}"})
 
-    first =
-      Pagination.wire_page(items,
-        secret: secret,
-        scope: "tools/list",
-        fingerprint: "principal-a"
-      )
+    assert {:ok, first} =
+             Pagination.wire_page(items,
+               secret: secret,
+               scope: "tools/list",
+               fingerprint: "principal-a"
+             )
 
-    assert_raise Error, ~r/invalid cursor/, fn ->
-      Pagination.wire_page(items,
-        secret: secret,
-        scope: "tools/list",
-        fingerprint: "principal-b",
-        cursor: first.next_cursor
-      )
-    end
+    assert {:error, %Error{message: "invalid cursor"}} =
+             Pagination.wire_page(items,
+               secret: secret,
+               scope: "tools/list",
+               fingerprint: "principal-b",
+               cursor: first.next_cursor
+             )
 
     [body, signature] = String.split(first.next_cursor, ".", parts: 2)
     replacement = if String.starts_with?(signature, "A"), do: "B", else: "A"
     tampered = body <> "." <> replacement <> String.slice(signature, 1..-1//1)
 
-    assert_raise Error, ~r/invalid cursor/, fn ->
-      Pagination.wire_page(items,
-        secret: secret,
-        scope: "tools/list",
-        fingerprint: "principal-a",
-        cursor: tampered
-      )
-    end
+    assert {:error, %Error{message: "invalid cursor"}} =
+             Pagination.wire_page(items,
+               secret: secret,
+               scope: "tools/list",
+               fingerprint: "principal-a",
+               cursor: tampered
+             )
   end
 
   test "list APIs support explicit pagination without changing the default return shape" do
     server_name = "pagination-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      Enum.reduce(1..5, FastestMCP.server(server_name), fn index, acc ->
-        acc
-        |> FastestMCP.add_tool("tool_#{index}", fn _args, _ctx -> index end)
-        |> FastestMCP.add_resource("data://resource/#{index}", fn _args, _ctx -> index end)
-        |> FastestMCP.add_prompt("prompt_#{index}", fn _args, _ctx -> "prompt-#{index}" end)
-      end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    Enum.reduce(1..5, FastestMCP.server(server_name), fn index, acc ->
+      acc
+      |> FastestMCP.add_tool("tool_#{index}", fn _args, _ctx -> index end)
+      |> FastestMCP.add_resource("data://resource/#{index}", fn _args, _ctx -> index end)
+      |> FastestMCP.add_prompt("prompt_#{index}", fn _args, _ctx -> "prompt-#{index}" end)
+    end)
+    |> start_server!()
 
     assert 5 = length(FastestMCP.list_tools!(server_name))
 
@@ -212,8 +206,7 @@ defmodule FastestMCP.PaginationTest do
         |> FastestMCP.add_prompt("prompt_#{suffix}", fn _args, _ctx -> "prompt-#{index}" end)
       end)
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
     principal_a = %AuthResult{
       principal: "principal-a",
@@ -323,7 +316,6 @@ defmodule FastestMCP.PaginationTest do
 
         ComponentCompiler.compile(
           :tool,
-          "counting-page-provider",
           "tool_#{suffix}",
           fn _arguments, _context -> index end,
           auth: fn _context ->
@@ -334,13 +326,10 @@ defmodule FastestMCP.PaginationTest do
       end)
       |> List.to_tuple()
 
-    server =
-      server_name
-      |> FastestMCP.server()
-      |> FastestMCP.add_provider(%CountingPageProvider{pid: self(), tools: tools})
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    server_name
+    |> FastestMCP.server()
+    |> FastestMCP.add_provider(%CountingPageProvider{pid: self(), tools: tools})
+    |> start_server!()
 
     principal = %AuthResult{principal: "principal-a", auth: %{tenant: "a"}}
 
@@ -422,7 +411,6 @@ defmodule FastestMCP.PaginationTest do
       tool: [
         ComponentCompiler.compile(
           :tool,
-          "family-page-provider",
           "tool",
           fn _arguments, _context -> :ok end,
           []
@@ -431,7 +419,6 @@ defmodule FastestMCP.PaginationTest do
       resource: [
         ComponentCompiler.compile(
           :resource,
-          "family-page-provider",
           "data://resource",
           fn _arguments, _context -> "resource" end,
           []
@@ -440,7 +427,6 @@ defmodule FastestMCP.PaginationTest do
       resource_template: [
         ComponentCompiler.compile(
           :resource_template,
-          "family-page-provider",
           "data://resources/{id}",
           fn arguments, _context -> arguments end,
           []
@@ -449,7 +435,6 @@ defmodule FastestMCP.PaginationTest do
       prompt: [
         ComponentCompiler.compile(
           :prompt,
-          "family-page-provider",
           "prompt",
           fn _arguments, _context -> "prompt" end,
           []
@@ -457,13 +442,10 @@ defmodule FastestMCP.PaginationTest do
       ]
     }
 
-    server =
-      server_name
-      |> FastestMCP.server()
-      |> FastestMCP.add_provider(%FamilyPageProvider{pid: self(), components: components})
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    server_name
+    |> FastestMCP.server()
+    |> FastestMCP.add_provider(%FamilyPageProvider{pid: self(), components: components})
+    |> start_server!()
 
     requests = [
       {:tool, "tools/list", :tools},

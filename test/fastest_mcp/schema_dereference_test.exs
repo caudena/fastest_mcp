@@ -1,5 +1,7 @@
 defmodule FastestMCP.SchemaDereferenceTest do
-  use ExUnit.Case, async: true
+  use FastestMCP.Case, async: true
+
+  alias FastestMCP.Component
 
   @input_schema %{
     "type" => "object",
@@ -67,10 +69,10 @@ defmodule FastestMCP.SchemaDereferenceTest do
 
     [tool] = server.tools
     assert tool.input_schema == schema
-    assert FastestMCP.InputValidator.validate(tool, %{"color" => "red"}) == %{"color" => "red"}
+    assert Component.validate_arguments(tool, %{"color" => "red"}) == %{"color" => "red"}
 
     assert_raise FastestMCP.Error, fn ->
-      FastestMCP.InputValidator.validate(tool, %{"color" => "purple"})
+      Component.validate_arguments(tool, %{"color" => "purple"})
     end
   end
 end

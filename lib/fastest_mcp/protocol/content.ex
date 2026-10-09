@@ -1,6 +1,8 @@
 defmodule FastestMCP.Protocol.Content do
   @moduledoc false
 
+  import FastestMCP.Util, only: [maybe_put: 3, string_keys: 1]
+
   alias FastestMCP.Base64
   alias FastestMCP.Error
   alias FastestMCP.JSONValue
@@ -9,6 +11,26 @@ defmodule FastestMCP.Protocol.Content do
   alias FastestMCP.Protocol.URI, as: ProtocolURI
 
   @base_types ~w(text image audio resource resource_link)
+
+  # One content value a handler returned, as a validated wire content block.
+  # Content maps (application data, with atom or string keys) keep their
+  # protocol fields, media and blob data are base64-encoded unless they
+  # already are, and any other value becomes text.
+  def normalize(value) when is_map(value) do
+    case string_keys(value) do
+      %{"type" => type} = block -> block |> wire_block(to_string(type)) |> block!()
+      _data -> text(value)
+    end
+  end
+
+  def normalize(value), do: text(value)
+
+  def text(value), do: %{"type" => "text", "text" => stringify(value)}
+
+  def encode_binary(value) when is_binary(value),
+    do: if(Base64.valid?(value), do: value, else: Base.encode64(value))
+
+  def encode_binary(_value), do: invalid!([], "media and blob data must be binary")
 
   def block!(block, opts \\ [])
 
@@ -67,6 +89,73 @@ defmodule FastestMCP.Protocol.Content do
   def resource_contents!(_resource, opts),
     do: invalid!(opts, "resource contents must be an object")
 
+  # `block` has string keys and may use the Elixir names `mime_type` and
+  # `meta`; an unsupported type is left for `block!/2` to reject.
+  defp wire_block(block, type) when type in @base_types do
+    base =
+      %{"type" => type}
+      |> maybe_put("annotations", JSONValue.stringify_keys(block["annotations"]))
+      |> maybe_put("_meta", Meta.output!(block["_meta"] || block["meta"]))
+
+    case type do
+      "text" ->
+        Map.put(base, "text", block["text"])
+
+      media when media in ["image", "audio"] ->
+        base
+        |> Map.put("data", encode_binary(block["data"]))
+        |> maybe_put("mimeType", block["mimeType"] || block["mime_type"])
+
+      "resource" ->
+        Map.put(base, "resource", wire_resource(block["resource"]))
+
+      "resource_link" ->
+        link =
+          case block["resource_link"] || block["resourceLink"] do
+            %{} = link -> string_keys(link)
+            _direct -> block
+          end
+
+        base
+        |> Map.put("uri", link["uri"])
+        |> maybe_put("name", link["name"])
+        |> maybe_put("title", link["title"])
+        |> maybe_put("description", link["description"])
+        |> maybe_put("mimeType", link["mimeType"] || link["mime_type"])
+        |> maybe_put("size", link["size"])
+        |> maybe_put("icons", JSONValue.stringify_keys(link["icons"]))
+        |> maybe_put("annotations", JSONValue.stringify_keys(link["annotations"]))
+        |> maybe_put("_meta", Meta.output!(link["_meta"] || link["meta"]))
+    end
+  end
+
+  defp wire_block(block, _type), do: block
+
+  defp wire_resource(%{} = resource) do
+    resource = string_keys(resource)
+
+    %{"uri" => resource["uri"]}
+    |> maybe_put("mimeType", resource["mimeType"] || resource["mime_type"])
+    |> maybe_put("text", resource["text"])
+    |> maybe_put("blob", wire_blob(resource["blob"]))
+    |> maybe_put("_meta", Meta.output!(resource["_meta"] || resource["meta"]))
+  end
+
+  defp wire_resource(_resource),
+    do: invalid!([], "embedded resource content requires an object")
+
+  defp wire_blob(nil), do: nil
+  defp wire_blob(blob), do: encode_binary(blob)
+
+  defp stringify(value) when is_binary(value), do: value
+
+  defp stringify(value) do
+    case JSONValue.stringify_keys(value) do
+      text when is_binary(text) -> text
+      normalized -> JSON.encode!(normalized)
+    end
+  end
+
   defp validate_common!(block, opts) do
     validate_meta!(block, opts)
     validate_annotations!(Map.get(block, "annotations"), opts)
@@ -86,11 +175,11 @@ defmodule FastestMCP.Protocol.Content do
     block
   end
 
-  defp validate_type!(block, "resource", opts) do
-    Map.update!(block, "resource", &resource_contents!(&1, opts))
-  rescue
-    KeyError -> invalid!(opts, "embedded resource content requires resource")
-  end
+  defp validate_type!(%{"resource" => resource} = block, "resource", opts),
+    do: %{block | "resource" => resource_contents!(resource, opts)}
+
+  defp validate_type!(_block, "resource", opts),
+    do: invalid!(opts, "embedded resource content requires resource")
 
   defp validate_type!(block, "resource_link", opts) do
     require_non_empty_string!(block, "uri", opts)

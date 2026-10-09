@@ -89,7 +89,15 @@ client =
 ```
 
 That handler receives legacy session logs or modern logs carried by an active
-request stream.
+request stream. On `2025-11-25` the session threshold defaults to `info`;
+`FastestMCP.Client.set_log_level!/3` changes it. On `2026-07-28` a request gets
+logs only when it names a level:
+
+```elixir
+FastestMCP.Client.call_tool!(client, "work", %{},
+  meta: %{"io.modelcontextprotocol/logLevel" => "info"}
+)
+```
 
 ## Choosing The Right Plane
 

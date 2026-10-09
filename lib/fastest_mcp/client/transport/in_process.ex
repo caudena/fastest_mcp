@@ -10,20 +10,24 @@ defmodule FastestMCP.Client.Transport.InProcess do
 
   @impl true
   def open(transport, owner, opts) do
+    connection_id = make_ref()
+
     with {:ok, _runtime} <- ServerRuntime.fetch(transport.server_name),
          {:ok, supervisor} <-
            ConnectionSupervisor.start_link(
              owner: owner,
              server_name: transport.server_name,
-             connection_id: transport.connection_id,
+             connection_id: connection_id,
              auth_input: Keyword.get(opts, :auth_input, %{})
            ) do
       case ConnectionSupervisor.coordinator(supervisor) do
         {:ok, coordinator} ->
           {:ok,
-           transport
-           |> Map.put(:supervisor, supervisor)
-           |> Map.put(:coordinator, coordinator)}
+           Map.merge(transport, %{
+             connection_id: connection_id,
+             supervisor: supervisor,
+             coordinator: coordinator
+           })}
 
         {:error, reason} ->
           Supervisor.stop(supervisor, :normal)

@@ -1,5 +1,5 @@
 defmodule FastestMCP.MountedProviderTaskTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.BackgroundTask
   alias FastestMCP.Context
@@ -40,7 +40,7 @@ defmodule FastestMCP.MountedProviderTaskTest do
       FastestMCP.server(parent_name)
       |> FastestMCP.mount(child, namespace: "child")
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    start_server!(server)
 
     tool_task =
       FastestMCP.call_tool!(parent_name, "child_multiply", %{"a" => 6, "b" => 7}, task: true)
@@ -88,11 +88,9 @@ defmodule FastestMCP.MountedProviderTaskTest do
         task: [mode: :optional, poll_interval_ms: 175]
       )
 
-    server =
-      FastestMCP.server(parent_name)
-      |> FastestMCP.mount(child, namespace: "child")
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    FastestMCP.server(parent_name)
+    |> FastestMCP.mount(child, namespace: "child")
+    |> start_server!()
 
     create =
       Engine.dispatch!(parent_name, %Request{
@@ -101,12 +99,12 @@ defmodule FastestMCP.MountedProviderTaskTest do
         session_id: "mounted-session",
         task_request: true,
         payload: %{"name" => "child_wait", "arguments" => %{}},
-        request_metadata: %{session_id_provided: true}
+        session_id_provided?: true
       })
 
-    task_id = create.task.taskId
-    assert create.task.pollInterval == 175
-    assert create._meta["io.modelcontextprotocol/related-task"].taskId == task_id
+    task_id = create["task"]["taskId"]
+    assert create["task"]["pollInterval"] == 175
+    assert create["_meta"]["io.modelcontextprotocol/related-task"]["taskId"] == task_id
 
     assert_receive {:entered_child_task, worker_pid}, 1_000
 
@@ -116,11 +114,11 @@ defmodule FastestMCP.MountedProviderTaskTest do
         transport: :stdio,
         session_id: "mounted-session",
         payload: %{"taskId" => task_id},
-        request_metadata: %{session_id_provided: true}
+        session_id_provided?: true
       })
 
-    assert status.taskId == task_id
-    assert status.status == "working"
+    assert status["taskId"] == task_id
+    assert status["status"] == "working"
 
     send(worker_pid, :release)
 
@@ -133,11 +131,11 @@ defmodule FastestMCP.MountedProviderTaskTest do
         transport: :stdio,
         session_id: "mounted-session",
         payload: %{"taskId" => task_id},
-        request_metadata: %{session_id_provided: true}
+        session_id_provided?: true
       })
 
     assert result["content"] == [%{"type" => "text", "text" => "\"done\""}]
     refute Map.has_key?(result, "structuredContent")
-    assert result._meta["io.modelcontextprotocol/related-task"].taskId == task_id
+    assert result["_meta"]["io.modelcontextprotocol/related-task"]["taskId"] == task_id
   end
 end

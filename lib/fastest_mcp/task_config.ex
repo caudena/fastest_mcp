@@ -1,14 +1,5 @@
 defmodule FastestMCP.TaskConfig do
-  @moduledoc """
-  Local background-task execution settings for tools, prompts, and resources.
-
-  This module keeps one focused piece of FastestMCP behavior in a dedicated
-  place so builders, runtimes, transports, and providers can share the same
-  rules without duplicating logic.
-
-  Unless you are extending FastestMCP itself, you will usually meet this
-  module indirectly through higher-level APIs rather than calling it first.
-  """
+  @moduledoc false
 
   defstruct mode: :forbidden, poll_interval_ms: 5_000
 
@@ -19,7 +10,6 @@ defmodule FastestMCP.TaskConfig do
           poll_interval_ms: pos_integer()
         }
 
-  @doc "Builds a new value for this module from the supplied options."
   def new(value \\ false)
   def new(%__MODULE__{} = config), do: validate!(config)
   def new(nil), do: %__MODULE__{}
@@ -34,11 +24,9 @@ defmodule FastestMCP.TaskConfig do
     |> validate!()
   end
 
-  @doc "Returns whether task execution is supported."
   def supports_tasks?(%__MODULE__{mode: :forbidden}), do: false
   def supports_tasks?(%__MODULE__{}), do: true
 
-  @doc "Returns the metadata map carried by this task configuration."
   def metadata(%__MODULE__{} = config) do
     %{
       mode: Atom.to_string(config.mode),

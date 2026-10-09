@@ -1,5 +1,5 @@
 defmodule FastestMCP.ResourceSecurityTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Components.ResourceTemplate
   alias FastestMCP.Error
@@ -46,7 +46,6 @@ defmodule FastestMCP.ResourceSecurityTest do
     inherited =
       FastestMCP.ComponentCompiler.compile(
         :resource_template,
-        "resource-security-default",
         "files://{+path}",
         fn args -> args end,
         []
@@ -57,7 +56,6 @@ defmodule FastestMCP.ResourceSecurityTest do
     disabled =
       FastestMCP.ComponentCompiler.compile(
         :resource_template,
-        "resource-security-default",
         "files://{+path}",
         fn args -> args end,
         resource_security: nil
@@ -105,18 +103,16 @@ defmodule FastestMCP.ResourceSecurityTest do
     server_name = unique_name("resource-security-order")
     test_pid = self()
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_resource_template(
-        "files://{+path}",
-        fn args -> args end,
-        auth: fn _context ->
-          send(test_pid, :authorization_ran)
-          true
-        end
-      )
-
-    start_server!(server)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_resource_template(
+      "files://{+path}",
+      fn args -> args end,
+      auth: fn _context ->
+        send(test_pid, :authorization_ran)
+        true
+      end
+    )
+    |> start_server!()
 
     error =
       assert_raise Error, fn ->
@@ -131,17 +127,15 @@ defmodule FastestMCP.ResourceSecurityTest do
   test "a rejected higher-priority template cannot fall through to an unsafe lower candidate" do
     server_name = unique_name("resource-security-priority")
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_resource_template("files://{+path}", fn _args -> "unsafe-v1" end,
-        version: "1",
-        resource_security: nil
-      )
-      |> FastestMCP.add_resource_template("files://{+path}", fn _args -> "secure-v2" end,
-        version: "2"
-      )
-
-    start_server!(server)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_resource_template("files://{+path}", fn _args -> "unsafe-v1" end,
+      version: "1",
+      resource_security: nil
+    )
+    |> FastestMCP.add_resource_template("files://{+path}", fn _args -> "secure-v2" end,
+      version: "2"
+    )
+    |> start_server!()
 
     error =
       assert_raise Error, fn ->
@@ -154,11 +148,9 @@ defmodule FastestMCP.ResourceSecurityTest do
   test "security rejection has the ordinary unknown-resource error in both protocol eras" do
     server_name = unique_name("resource-security-wire")
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_resource_template("files://{+path}", fn args -> args end)
-
-    start_server!(server)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_resource_template("files://{+path}", fn args -> args end)
+    |> start_server!()
 
     modern =
       ProtocolTest.modern_http_request(
@@ -187,14 +179,5 @@ defmodule FastestMCP.ResourceSecurityTest do
 
     assert legacy.status == 200
     assert get_in(JSON.decode!(legacy.resp_body), ["error", "code"]) == -32_002
-  end
-
-  defp start_server!(server) do
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server.name) end)
-  end
-
-  defp unique_name(prefix) do
-    prefix <> "-" <> Integer.to_string(System.unique_integer([:positive]))
   end
 end

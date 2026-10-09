@@ -39,7 +39,7 @@ FastestMCP.server("capability-demo",
 )
 ```
 
-`experimental_capabilities:` remains the separate legacy escape hatch for
+`experimental_capabilities:` remains the separate escape hatch for
 application-specific experimental capabilities:
 
 ```elixir
@@ -50,7 +50,8 @@ FastestMCP.server("capability-demo",
 )
 ```
 
-That map is exposed under legacy initialize capabilities as `"experimental"`.
+That map is advertised as `"experimental"` in both the `initialize` and the
+`server/discover` capabilities; prefer `extensions:` for modern negotiation.
 
 ## 2. Start it under your supervision tree
 
@@ -84,12 +85,15 @@ conversation.
 ## 4. Serve it over streamable HTTP
 
 The `http:` option in `use FastestMCP.ServerModule` starts the transport for
-you. If you want to embed it inside an existing Plug or Phoenix stack, use the
-shared HTTP app directly:
+you. If you want to embed it inside an existing Plug or Phoenix stack,
+`FastestMCP.http_app/2` returns the endpoint as a Plug:
 
 ```elixir
 children = [
-  {Bandit, plug: FastestMCP.http_app(MyApp.MCPServer, allowed_hosts: :localhost), port: 4100}
+  {Bandit,
+   plug: FastestMCP.http_app(MyApp.MCPServer, allowed_hosts: :localhost),
+   port: 4100,
+   ip: :loopback}
 ]
 ```
 
@@ -124,11 +128,6 @@ client =
 
 %{items: tools} = FastestMCP.Client.list_tools!(client)
 FastestMCP.Client.call_tool!(client, "sum", %{"a" => 20, "b" => 22})
-FastestMCP.Client.complete!(
-  client,
-  %{"type" => "ref/prompt", "name" => "draft_release"},
-  %{"name" => "environment", "value" => "pr"}
-)
 ```
 
 The client defaults to `protocol_version: :auto`: it prefers MCP `2026-07-28`

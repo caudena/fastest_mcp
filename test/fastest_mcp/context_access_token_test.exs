@@ -1,5 +1,5 @@
 defmodule FastestMCP.ContextAccessTokenTest do
-  use ExUnit.Case, async: true
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Context
 
@@ -58,15 +58,15 @@ defmodule FastestMCP.ContextAccessTokenTest do
   test "request authorization is private to the live request and cleared for background work" do
     secret = "Bearer private-transport-token"
 
-    assert {:ok, context} =
-             Context.build("context-private-authorization",
-               transport: :streamable_http,
-               state_scope: :request,
-               request_metadata: %{
-                 headers: %{"authorization" => secret, "x-demo" => "1"},
-                 authorization: secret
-               }
-             )
+    context =
+      Context.new(test_runtime("context-private-authorization"),
+        transport: :streamable_http,
+        state_scope: :request,
+        request_metadata: %{
+          headers: %{"authorization" => secret, "x-demo" => "1"},
+          authorization: secret
+        }
+      )
 
     assert Context.transport_authorization(context) == secret
     assert Context.access_token(context) == "private-transport-token"

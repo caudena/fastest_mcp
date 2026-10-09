@@ -1,5 +1,5 @@
 defmodule FastestMCP.DuplicatePolicyTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   import ExUnit.CaptureLog
 
@@ -74,8 +74,7 @@ defmodule FastestMCP.DuplicatePolicyTest do
   test "component manager adders honor duplicate policy overrides" do
     server_name = "dup-manager-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    assert {:ok, _pid} = FastestMCP.start_server(FastestMCP.server(server_name))
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(FastestMCP.server(server_name))
 
     manager = FastestMCP.component_manager!(server_name)
 
@@ -108,5 +107,19 @@ defmodule FastestMCP.DuplicatePolicyTest do
              )
 
     assert %{source: :second} == FastestMCP.call_tool!(server_name, "echo", %{}, version: "1.0.0")
+  end
+
+  test "component manager error policy raises in the caller and keeps the runtime" do
+    server_name = unique_name("dup-manager-error")
+    start_server!(FastestMCP.server(server_name))
+    manager = FastestMCP.component_manager!(server_name)
+
+    assert {:ok, _tool} = ComponentManager.add_tool(manager, "echo", fn _, _ -> :first end)
+
+    assert_raise ArgumentError, ~r/already defined/, fn ->
+      ComponentManager.add_tool(manager, "echo", fn _, _ -> :second end)
+    end
+
+    assert :first == FastestMCP.call_tool!(server_name, "echo", %{})
   end
 end

@@ -19,15 +19,8 @@ defmodule FastestMCP.SSEReplay do
             event_id_key: nil,
             next_prune_at: nil
 
-  def new(opts \\ []) do
-    %__MODULE__{
-      max_events: positive_option!(opts, :max_events, @default_max_events),
-      max_stream_bytes: positive_option!(opts, :max_stream_bytes, @default_max_stream_bytes),
-      max_total_bytes: positive_option!(opts, :max_total_bytes, @default_max_total_bytes),
-      ttl_ms: positive_option!(opts, :ttl_ms, @default_ttl_ms),
-      event_id_key: :crypto.strong_rand_bytes(32)
-    }
-  end
+  def new(opts \\ []),
+    do: struct!(__MODULE__, Keyword.put(opts, :event_id_key, :crypto.strong_rand_bytes(32)))
 
   def open(%__MODULE__{} = replay, last_event_id \\ nil, now_ms \\ now_ms()) do
     replay = maybe_prune(replay, now_ms)
@@ -351,11 +344,4 @@ defmodule FastestMCP.SSEReplay do
       |> Base.url_encode64(padding: false)
 
   defp now_ms, do: System.monotonic_time(:millisecond)
-
-  defp positive_option!(opts, key, default) do
-    case Keyword.get(opts, key, default) do
-      value when is_integer(value) and value > 0 -> value
-      value -> raise ArgumentError, "#{key} must be a positive integer, got #{inspect(value)}"
-    end
-  end
 end

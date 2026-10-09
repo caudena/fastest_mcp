@@ -8,7 +8,10 @@ defmodule FastestMCP.Auth.ProtectedResource do
   well-known URI and `WWW-Authenticate` challenge.
   """
 
+  import FastestMCP.Util, only: [maybe_put: 3]
+
   alias FastestMCP.Error
+  alias FastestMCP.URIPolicy
 
   @standard_fields MapSet.new([
                      "authorization_details_types_supported",
@@ -67,31 +70,29 @@ defmodule FastestMCP.Auth.ProtectedResource do
   def new(opts) when is_list(opts) or is_map(opts) do
     opts = Map.new(opts)
 
-    with {:ok, resource} <- validate_resource_uri(fetch(opts, :resource)),
+    with {:ok, resource} <- validate_resource_uri(opts[:resource]),
          {:ok, authorization_servers} <-
-           validate_authorization_servers(fetch(opts, :authorization_servers)),
-         {:ok, scopes_supported} <- validate_optional_scope_list(fetch(opts, :scopes_supported)),
+           validate_authorization_servers(opts[:authorization_servers]),
+         {:ok, scopes_supported} <- validate_optional_scope_list(opts[:scopes_supported]),
          {:ok, required_scopes} <-
-           validate_required_scopes(fetch(opts, :required_scopes, scopes_supported || [])),
+           validate_required_scopes(Map.get(opts, :required_scopes, scopes_supported || [])),
          :ok <- validate_required_scopes_supported(required_scopes, scopes_supported),
          {:ok, bearer_methods_supported} <-
-           validate_bearer_methods(fetch(opts, :bearer_methods_supported, ["header"])),
-         {:ok, resource_name} <- validate_optional_string(fetch(opts, :resource_name)),
+           validate_bearer_methods(Map.get(opts, :bearer_methods_supported, ["header"])),
+         {:ok, resource_name} <- validate_optional_string(opts[:resource_name]),
          {:ok, resource_documentation} <-
-           validate_optional_https_uri(fetch(opts, :resource_documentation)),
-         {:ok, resource_policy_uri} <-
-           validate_optional_https_uri(fetch(opts, :resource_policy_uri)),
-         {:ok, resource_tos_uri} <-
-           validate_optional_https_uri(fetch(opts, :resource_tos_uri)),
-         {:ok, jwks_uri} <- validate_optional_https_uri(fetch(opts, :jwks_uri)),
+           validate_optional_https_uri(opts[:resource_documentation]),
+         {:ok, resource_policy_uri} <- validate_optional_https_uri(opts[:resource_policy_uri]),
+         {:ok, resource_tos_uri} <- validate_optional_https_uri(opts[:resource_tos_uri]),
+         {:ok, jwks_uri} <- validate_optional_https_uri(opts[:jwks_uri]),
          {:ok, signing_algorithms} <-
-           validate_optional_string_list(fetch(opts, :resource_signing_alg_values_supported)),
+           validate_optional_string_list(opts[:resource_signing_alg_values_supported]),
          {:ok, certificate_bound?} <-
-           validate_optional_boolean(fetch(opts, :tls_client_certificate_bound_access_tokens)),
+           validate_optional_boolean(opts[:tls_client_certificate_bound_access_tokens]),
          {:ok, authorization_detail_types} <-
-           validate_optional_string_list(fetch(opts, :authorization_details_types_supported)),
-         {:ok, signed_metadata} <- validate_optional_string(fetch(opts, :signed_metadata)),
-         {:ok, extensions} <- validate_extensions(fetch(opts, :extensions, %{})) do
+           validate_optional_string_list(opts[:authorization_details_types_supported]),
+         {:ok, signed_metadata} <- validate_optional_string(opts[:signed_metadata]),
+         {:ok, extensions} <- validate_extensions(Map.get(opts, :extensions, %{})) do
       {:ok,
        %__MODULE__{
          resource: resource,
@@ -189,7 +190,7 @@ defmodule FastestMCP.Auth.ProtectedResource do
   def www_authenticate(%__MODULE__{} = protected_resource, opts \\ []) do
     scopes = Keyword.get(opts, :scopes, protected_resource.required_scopes)
 
-    [~s(resource_metadata="#{escape(metadata_url(protected_resource))}")]
+    [~s(resource_metadata="#{URIPolicy.quote_value(metadata_url(protected_resource))}")]
     |> maybe_append_scope(scopes)
     |> maybe_append_error(Keyword.get(opts, :error))
     |> maybe_append_parameter("error_description", Keyword.get(opts, :error_description))
@@ -206,7 +207,7 @@ defmodule FastestMCP.Auth.ProtectedResource do
   defp validate_resource_scheme(%URI{scheme: "https"}), do: :ok
 
   defp validate_resource_scheme(%URI{scheme: "http", host: host}) do
-    if loopback_host?(host), do: :ok, else: {:error, :https_resource_required}
+    if URIPolicy.loopback_host?(host), do: :ok, else: {:error, :https_resource_required}
   end
 
   defp validate_resource_scheme(_uri), do: {:error, :invalid_resource_uri}
@@ -249,7 +250,7 @@ defmodule FastestMCP.Auth.ProtectedResource do
   defp validate_optional_scope_list(nil), do: {:ok, nil}
 
   defp validate_optional_scope_list(values) when is_list(values) do
-    if Enum.all?(values, &valid_scope_token?/1) do
+    if Enum.all?(values, &URIPolicy.scope_token?/1) do
       {:ok, Enum.uniq(values)}
     else
       {:error, :invalid_scope}
@@ -259,7 +260,7 @@ defmodule FastestMCP.Auth.ProtectedResource do
   defp validate_optional_scope_list(_values), do: {:error, :invalid_scope}
 
   defp validate_required_scopes(values) when is_list(values) do
-    if Enum.all?(values, &valid_scope_token?/1) do
+    if Enum.all?(values, &URIPolicy.scope_token?/1) do
       {:ok, Enum.uniq(values)}
     else
       {:error, :invalid_required_scope}
@@ -326,7 +327,7 @@ defmodule FastestMCP.Auth.ProtectedResource do
       not is_binary(uri.host) or uri.host == "" -> {:error, :invalid_absolute_uri}
       not is_nil(uri.userinfo) -> {:error, :invalid_absolute_uri}
       not is_nil(uri.query) or not is_nil(uri.fragment) -> {:error, :invalid_absolute_uri}
-      not valid_percent_encoding?(uri.path) -> {:error, :invalid_absolute_uri}
+      not URIPolicy.valid_percent_encoding?(uri.path) -> {:error, :invalid_absolute_uri}
       true -> {:ok, uri}
     end
   end
@@ -342,25 +343,15 @@ defmodule FastestMCP.Auth.ProtectedResource do
     uri
     |> Map.update!(:scheme, &String.downcase/1)
     |> Map.update!(:host, &String.downcase/1)
-    |> normalize_default_port()
+    |> URIPolicy.drop_default_port()
     |> URI.to_string()
   end
-
-  defp normalize_default_port(%URI{scheme: "http", port: 80} = uri), do: %{uri | port: nil}
-  defp normalize_default_port(%URI{scheme: "https", port: 443} = uri), do: %{uri | port: nil}
-  defp normalize_default_port(uri), do: uri
-
-  defp loopback_host?(host) when is_binary(host) do
-    String.downcase(host) in ["localhost", "127.0.0.1", "::1"]
-  end
-
-  defp loopback_host?(_host), do: false
 
   defp maybe_append_scope(parameters, nil), do: parameters
   defp maybe_append_scope(parameters, []), do: parameters
 
   defp maybe_append_scope(parameters, scopes) when is_list(scopes) do
-    if Enum.all?(scopes, &valid_scope_token?/1) do
+    if Enum.all?(scopes, &URIPolicy.scope_token?/1) do
       parameters ++ [~s(scope="#{Enum.join(scopes, " ")}")]
     else
       raise ArgumentError, "challenge scopes must be non-empty RFC 6749 scope tokens"
@@ -370,7 +361,7 @@ defmodule FastestMCP.Auth.ProtectedResource do
   defp maybe_append_scope(parameters, scope) when is_binary(scope) and scope != "" do
     tokens = String.split(scope, " ", trim: true)
 
-    if tokens != [] and Enum.all?(tokens, &valid_scope_token?/1) and
+    if tokens != [] and Enum.all?(tokens, &URIPolicy.scope_token?/1) and
          not String.contains?(scope, ["\r", "\n", "\t"]) do
       parameters ++ [~s(scope="#{Enum.join(tokens, " ")}")]
     else
@@ -389,36 +380,19 @@ defmodule FastestMCP.Auth.ProtectedResource do
     do: parameters ++ [~s(error="invalid_token")]
 
   defp maybe_append_error(parameters, error) when is_binary(error) and error != "",
-    do: parameters ++ [~s(error="#{escape(error)}")]
+    do: parameters ++ [~s(error="#{URIPolicy.quote_value(error)}")]
 
   defp maybe_append_error(parameters, _error), do: parameters
 
   defp maybe_append_parameter(parameters, _name, nil), do: parameters
 
   defp maybe_append_parameter(parameters, name, value) when is_binary(value) and value != "",
-    do: parameters ++ [~s(#{name}="#{escape(value)}")]
+    do: parameters ++ [~s(#{name}="#{URIPolicy.quote_value(value)}")]
 
   defp maybe_append_parameter(parameters, _name, _value), do: parameters
 
-  defp escape(value) do
-    value
-    |> String.replace("\\", "\\\\")
-    |> String.replace("\"", "\\\"")
-    |> String.replace(["\r", "\n"], " ")
-  end
-
   defp ensure_leading_slash("/" <> _rest = path), do: path
   defp ensure_leading_slash(path), do: "/" <> path
-
-  defp valid_scope_token?(value) when is_binary(value) and value != "" do
-    value
-    |> :binary.bin_to_list()
-    |> Enum.all?(fn character ->
-      character == 0x21 or character in 0x23..0x5B or character in 0x5D..0x7E
-    end)
-  end
-
-  defp valid_scope_token?(_value), do: false
 
   defp json_value?(value) do
     _encoded = JSON.encode!(value)
@@ -427,19 +401,6 @@ defmodule FastestMCP.Auth.ProtectedResource do
     _error -> false
   end
 
-  defp valid_percent_encoding?(nil), do: true
-
-  defp valid_percent_encoding?(value) do
-    not Regex.match?(~r/%(?![0-9A-Fa-f]{2})/, value)
-  end
-
-  defp fetch(opts, key, default \\ nil) do
-    Map.get(opts, key, Map.get(opts, Atom.to_string(key), default))
-  end
-
   defp format_reason({:reserved_extension, key}), do: "extension #{inspect(key)} is reserved"
   defp format_reason(reason), do: inspect(reason)
-
-  defp maybe_put(map, _key, nil), do: map
-  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 end

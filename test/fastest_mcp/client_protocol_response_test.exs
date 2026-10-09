@@ -10,6 +10,7 @@ defmodule FastestMCP.TestSupport.ClientProtocolResponsePlug do
 
   @impl true
   def call(%Plug.Conn{method: "DELETE"} = conn, _opts), do: send_resp(conn, 204, "")
+  def call(%Plug.Conn{method: "GET"} = conn, _opts), do: send_resp(conn, 405, "")
 
   def call(conn, opts) do
     {:ok, body, conn} = read_body(conn)
@@ -423,9 +424,34 @@ defmodule FastestMCP.TestSupport.ClientProtocolResponsePlug do
     })
   end
 
-  defp respond(conn, :delayed_request, %{"id" => id, "method" => "ping"}) do
-    Process.sleep(1_000)
-    send_json(conn, %{"jsonrpc" => "2.0", "id" => id, "result" => %{}})
+  # The ping stays unanswered, so the client can only end it by cancelling.
+  defp respond(_conn, :delayed_request, %{"method" => "ping"}), do: Process.sleep(:infinity)
+
+  defp respond(conn, :rejected_callback_response, %{"method" => "notifications/initialized"}) do
+    send_resp(conn, 202, "")
+  end
+
+  defp respond(conn, :rejected_callback_response, %{"id" => id, "method" => "initialize"}) do
+    send_json(conn, %{
+      "jsonrpc" => "2.0",
+      "id" => id,
+      "result" => %{
+        "protocolVersion" => "2025-11-25",
+        "capabilities" => %{},
+        "serverInfo" => %{"name" => "rejecting-server", "version" => "1.0.0"}
+      }
+    })
+  end
+
+  # The ping response stream stays open after the server's own ping, whose
+  # answer is rejected.
+  defp respond(conn, :rejected_callback_response, %{"method" => "ping"}) do
+    send_sse(conn, %{"jsonrpc" => "2.0", "id" => "server-ping", "method" => "ping"})
+    Process.sleep(:infinity)
+  end
+
+  defp respond(conn, :rejected_callback_response, %{"id" => "server-ping"}) do
+    send_resp(conn, 500, "")
   end
 
   defp send_json(conn, payload, headers \\ []) do
@@ -454,7 +480,9 @@ defmodule FastestMCP.TestSupport.ClientProtocolResponsePlug do
 end
 
 defmodule FastestMCP.ClientProtocolResponseTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
+
+  alias FastestMCP.Test.ClientProbe
 
   alias FastestMCP.Client
   alias FastestMCP.Client.ProtocolError
@@ -462,10 +490,9 @@ defmodule FastestMCP.ClientProtocolResponseTest do
 
   test "all HTTP request families accept bounded SSE responses" do
     url = start_protocol_server(:sse)
-    client = Client.connect!(url, protocol_version: "2025-11-25")
-    on_exit(fn -> disconnect_if_alive(client) end)
+    client = connect!(url, protocol_version: "2025-11-25")
 
-    assert Client.session_id!(client) == "all-sse-session"
+    assert Client.info!(client).session_id == "all-sse-session"
 
     assert %{
              items: [
@@ -478,13 +505,12 @@ defmodule FastestMCP.ClientProtocolResponseTest do
     assert :ok = Client.set_log_level!(client, :warning)
 
     request = Client.request_async!(client, "ping")
-    assert %{} = Client.await!(request, 2_000)
+    assert %{} = Client.Request.await!(request, 2_000)
   end
 
   test "HTTP JSON and SSE responses require valid correlated JSON-RPC envelopes" do
     url = start_protocol_server(:invalid_envelopes)
-    client = Client.connect!(url, protocol_version: "2025-11-25")
-    on_exit(fn -> disconnect_if_alive(client) end)
+    client = connect!(url, protocol_version: "2025-11-25")
 
     error = assert_raise Error, fn -> Client.ping!(client) end
     assert error.code == :invalid_request
@@ -517,10 +543,9 @@ defmodule FastestMCP.ClientProtocolResponseTest do
   test "modern discovery retries a recognized supported protocol version once" do
     counter = start_supervised!({Agent, fn -> 0 end})
     url = start_protocol_server({:modern_version_retry, counter}, test_pid: self())
-    client = Client.connect!(url, protocol_version: "2026-07-28")
-    on_exit(fn -> disconnect_if_alive(client) end)
+    client = connect!(url, protocol_version: "2026-07-28")
 
-    assert Client.protocol_version!(client) == "2026-07-28"
+    assert Client.info!(client).protocol_version == "2026-07-28"
 
     assert_receive {:client_protocol_request, %{"method" => "server/discover"}}
     assert_receive {:client_protocol_request, %{"method" => "server/discover"}}
@@ -529,11 +554,11 @@ defmodule FastestMCP.ClientProtocolResponseTest do
 
   test "automatic HTTP negotiation falls back for a legacy method-not-found response" do
     url = start_protocol_server(:legacy_discovery_fallback, test_pid: self())
-    client = Client.connect!(url)
-    on_exit(fn -> disconnect_if_alive(client) end)
+    client = connect!(url)
 
-    assert Client.protocol_version!(client) == "2025-11-25"
-    assert Client.session_id!(client) == "legacy-fallback-session"
+    assert %Client.Info{protocol_version: "2025-11-25", session_id: "legacy-fallback-session"} =
+             Client.info!(client)
+
     assert_receive {:client_protocol_request, %{"method" => "server/discover"}}
     assert_receive {:client_protocol_request, %{"method" => "initialize"}}
     assert_receive {:client_protocol_request, %{"method" => "notifications/initialized"}}
@@ -561,16 +586,9 @@ defmodule FastestMCP.ClientProtocolResponseTest do
   test "supported_protocol_versions cannot replace the fixed library support set" do
     url = start_protocol_server(:unsupported_initialize)
 
-    assert {:error, %Error{} = error} =
-             Client.connect(url,
-               supported_protocol_versions: [
-                 "2025-11-25",
-                 "2025-03-26"
-               ]
-             )
-
-    assert error.code == :invalid_params
-    assert error.message =~ "is not configurable"
+    assert_raise ArgumentError, ~r/is not configurable/, fn ->
+      Client.connect(url, supported_protocol_versions: ["2025-11-25", "2025-03-26"])
+    end
   end
 
   test "invalid InitializeResult aborts connection with its method-specific ProtocolError" do
@@ -594,8 +612,7 @@ defmodule FastestMCP.ClientProtocolResponseTest do
 
   test "method-specific response schemas reject structurally invalid results" do
     url = start_protocol_server(:invalid_method_schema)
-    client = Client.connect!(url, protocol_version: "2025-11-25")
-    on_exit(fn -> disconnect_if_alive(client) end)
+    client = connect!(url, protocol_version: "2025-11-25")
 
     error = assert_raise ProtocolError, fn -> Client.list_tools!(client) end
     assert error.method == "tools/list"
@@ -609,8 +626,7 @@ defmodule FastestMCP.ClientProtocolResponseTest do
 
   test "MCP responses reject non-protocol structured JSON media types" do
     url = start_protocol_server(:invalid_media)
-    client = Client.connect!(url, protocol_version: "2025-11-25")
-    on_exit(fn -> disconnect_if_alive(client) end)
+    client = connect!(url, protocol_version: "2025-11-25")
 
     error = assert_raise Error, fn -> Client.list_tools!(client) end
     assert error.code == :bad_request
@@ -621,24 +637,19 @@ defmodule FastestMCP.ClientProtocolResponseTest do
   test "MCP responses reject duplicate Content-Type fields" do
     for mode <- [:duplicate_same_media, :duplicate_conflicting_media] do
       url = start_protocol_server(mode)
-      client = Client.connect!(url, protocol_version: "2025-11-25")
+      client = connect!(url, protocol_version: "2025-11-25")
 
       error = assert_raise Error, fn -> Client.list_tools!(client) end
       assert error.code == :bad_request
       assert error.message == "HTTP MCP response has an unsupported Content-Type"
       assert length(error.details.content_type) == 2
-
-      disconnect_if_alive(client)
     end
   end
 
   test "initialize rejects standard capabilities that the client cannot serve" do
     url = start_protocol_server(:sse)
 
-    client =
-      Client.connect!(url, auto_initialize: false, protocol_version: "2025-11-25")
-
-    on_exit(fn -> disconnect_if_alive(client) end)
+    client = connect!(url, auto_initialize: false, protocol_version: "2025-11-25")
 
     error =
       assert_raise Error, fn ->
@@ -651,17 +662,15 @@ defmodule FastestMCP.ClientProtocolResponseTest do
 
   test "asynchronous requests can be explicitly cancelled with a protocol notification" do
     url = start_protocol_server(:delayed_request, test_pid: self())
-    client = Client.connect!(url, protocol_version: "2025-11-25")
-    on_exit(fn -> disconnect_if_alive(client) end)
+    client = connect!(url, protocol_version: "2025-11-25")
 
     request = Client.request_async!(client, "ping", %{}, timeout_ms: 5_000)
     assert_receive {:client_protocol_request, %{"id" => request_id, "method" => "ping"}}, 1_000
     assert request.request_id == request_id
 
-    assert %{direction: :client_to_server, method: "ping", request_id: ^request_id} =
-             :sys.get_state(client.pid).pending.in_flight[request.ref]
+    assert %{method: "ping", id: ^request_id} = ClientProbe.requests(client)[request.ref]
 
-    assert :ok = Client.cancel!(request, "user cancelled")
+    assert :ok = Client.Request.cancel!(request, "user cancelled")
 
     assert_receive {:client_protocol_request,
                     %{
@@ -673,20 +682,36 @@ defmodule FastestMCP.ClientProtocolResponseTest do
                     }},
                    1_000
 
-    error = assert_raise Error, fn -> Client.await!(request, 1_000) end
+    error = assert_raise Error, fn -> Client.Request.await!(request, 1_000) end
     assert error.code == :cancelled
+  end
+
+  test "a rejected answer to a server request fails the request whose stream carried it" do
+    url = start_protocol_server(:rejected_callback_response, test_pid: self())
+    client = connect!(url, protocol_version: "2025-11-25")
+
+    error = assert_raise Error, fn -> Client.ping!(client, timeout_ms: 5_000) end
+    assert error.message == "client callback response was rejected"
+    assert error.details.status == 500
+    assert_receive {:client_protocol_request, %{"id" => "server-ping", "result" => %{}}}
+
+    # The request worker stops instead of reading the open stream until timeout.
+    assert ClientProbe.requests(client) == %{}
+    assert_eventually(fn -> ClientProbe.workers(client) == [] end)
   end
 
   test "client decodes standard and FastestMCP JSON-RPC error semantics" do
     url = start_protocol_server(:error_semantics)
-    client = Client.connect!(url, protocol_version: "2025-11-25")
-    on_exit(fn -> disconnect_if_alive(client) end)
+    client = connect!(url, protocol_version: "2025-11-25")
 
     assert_error_code(:method_not_found, fn -> Client.ping!(client) end)
     assert_error_code(:invalid_params, fn -> Client.list_tools!(client) end)
     assert_error_code(:not_found, fn -> Client.list_resources!(client) end)
     assert_error_code(:method_not_found, fn -> Client.list_prompts!(client) end)
-    assert_error_code(:invalid_task_id, fn -> Client.fetch_task!(client, "missing-task") end)
+
+    assert_error_code(:invalid_task_id, fn ->
+      client |> Client.track_task!("missing-task") |> Client.Task.fetch!()
+    end)
 
     error = assert_raise Error, fn -> Client.read_resource!(client, "https://example.com") end
     assert error.code == :url_elicitation_required
@@ -699,20 +724,8 @@ defmodule FastestMCP.ClientProtocolResponseTest do
   defp start_protocol_server(mode, opts \\ []) do
     plug_opts = Keyword.merge(opts, mode: mode)
 
-    bandit =
-      start_supervised!(
-        {Bandit,
-         plug: {FastestMCP.TestSupport.ClientProtocolResponsePlug, plug_opts},
-         scheme: :http,
-         port: 0}
-      )
-
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
-    "http://127.0.0.1:#{port}/mcp"
-  end
-
-  defp disconnect_if_alive(client) do
-    if Client.connected?(client), do: Client.disconnect!(client)
+    %{url: url} = serve!({FastestMCP.TestSupport.ClientProtocolResponsePlug, plug_opts})
+    url
   end
 
   defp assert_error_code(code, fun) do

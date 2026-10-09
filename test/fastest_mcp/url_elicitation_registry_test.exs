@@ -1,5 +1,5 @@
 defmodule FastestMCP.URLElicitationRegistryTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Auth
   alias FastestMCP.Elicitation.URL
@@ -22,8 +22,7 @@ defmodule FastestMCP.URLElicitationRegistryTest do
 
   test "URL elicitation ids are atomic across sessions and released on terminal ownership changes" do
     server_name = "url-registry-#{System.unique_integer([:positive])}"
-    assert {:ok, _pid} = FastestMCP.start_server(FastestMCP.server(server_name))
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(FastestMCP.server(server_name))
 
     first_session = ProtocolTest.initialize_session(server_name, "url-session-first")
     second_session = ProtocolTest.initialize_session(server_name, "url-session-second")
@@ -80,8 +79,7 @@ defmodule FastestMCP.URLElicitationRegistryTest do
 
   test "expired URL elicitation completion releases the exact ownership index" do
     server_name = "url-registry-expiry-#{System.unique_integer([:positive])}"
-    assert {:ok, _pid} = FastestMCP.start_server(FastestMCP.server(server_name))
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(FastestMCP.server(server_name))
 
     session_id = ProtocolTest.initialize_session(server_name, "url-expired-session")
     fingerprint = Auth.identity_fingerprint("url-user", %{})

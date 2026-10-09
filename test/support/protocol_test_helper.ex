@@ -51,14 +51,10 @@ defmodule FastestMCP.TestSupport.ProtocolTestHelper do
       SessionSupervisor.ensure_session(runtime.session_supervisor, server_name, session_id)
 
     :ok =
-      Session.begin_initialization(
-        server_name,
-        session_id,
-        params["protocolVersion"],
-        params["capabilities"],
-        params["clientInfo"],
-        :unbound,
-        Map.get(initialize_result, "capabilities", %{})
+      Session.begin_initialization(server_name, session_id,
+        client_capabilities: params["capabilities"],
+        client_info: params["clientInfo"],
+        server_capabilities: Map.get(initialize_result, "capabilities", %{})
       )
 
     :ok = Session.mark_initialized(server_name, session_id)
@@ -160,6 +156,37 @@ defmodule FastestMCP.TestSupport.ProtocolTestHelper do
     |> StreamableHTTP.call(call_opts)
   end
 
+  # POSTs `body` as given. `content_type:` and `accept:` replace the defaults
+  # (nil omits the header); the session headers are sent only with `session_id:`.
+  def http_post_raw(server_name, body, opts \\ []) do
+    session_id = Keyword.get(opts, :session_id)
+
+    transport_opts =
+      opts
+      |> Keyword.get(:transport_opts, json_response: true)
+      |> Keyword.put(:server_name, server_name)
+
+    :post
+    |> Plug.Test.conn("/mcp", body)
+    |> Map.put(:host, "localhost")
+    |> maybe_put_header("content-type", Keyword.get(opts, :content_type, "application/json"))
+    |> maybe_put_header("accept", Keyword.get(opts, :accept, @post_accept))
+    |> maybe_put_header("mcp-session-id", session_id)
+    |> maybe_put_header(
+      "mcp-protocol-version",
+      Keyword.get(opts, :protocol_version, session_id && @legacy_version)
+    )
+    |> StreamableHTTP.call(transport_opts)
+  end
+
+  # The first JSON-RPC message of an event-stream body.
+  def sse_message(body) do
+    Enum.find_value(String.split(body, "\n"), fn
+      "data: " <> json when json != "" -> JSON.decode!(json)
+      _line -> nil
+    end)
+  end
+
   def modern_request(id, method, params \\ %{}, opts \\ []) do
     client_info =
       Keyword.get(opts, :client_info, %{
@@ -194,6 +221,19 @@ defmodule FastestMCP.TestSupport.ProtocolTestHelper do
     |> Map.put(:host, "localhost")
     |> put_headers(headers)
     |> StreamableHTTP.call(call_opts)
+  end
+
+  # POSTs `payload` as given with modern routing headers; `headers` replace them.
+  def modern_http_post(server_name, payload, headers \\ []) do
+    :post
+    |> Plug.Test.conn("/mcp", JSON.encode!(payload))
+    |> Plug.Conn.put_req_header("content-type", "application/json")
+    |> Plug.Conn.put_req_header("accept", @post_accept)
+    |> Plug.Conn.put_req_header("mcp-protocol-version", @modern_version)
+    |> Plug.Conn.put_req_header("mcp-method", payload["method"])
+    |> Map.put(:host, "localhost")
+    |> put_headers(headers)
+    |> StreamableHTTP.call(server_name: server_name, json_response: true)
   end
 
   def jsonrpc_request(id, method, params \\ %{}) do

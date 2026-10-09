@@ -3,16 +3,10 @@ defmodule FastestMCP.BackgroundTask do
   Handle returned for submitted background tasks.
 
   A `%FastestMCP.BackgroundTask{}` is intentionally small. It is not the task
-  state itself; it is the stable reference a caller can keep after an operation
-  is offloaded.
-
-  Use it to:
-
-    * fetch fresh task state
-    * wait for completion
-    * carry the access scope needed to reopen the task from application code
-
-  The full mutable state lives in the internal background-task store.
+  state itself; it is the stable reference a caller keeps after an operation is
+  offloaded, carrying the access scope needed to reopen the task. Pass it to
+  `FastestMCP.fetch_task/1`, `FastestMCP.await_task/2`,
+  `FastestMCP.task_result/1`, or `FastestMCP.cancel_task/1`.
   """
 
   defstruct [
@@ -36,19 +30,4 @@ defmodule FastestMCP.BackgroundTask do
           ttl_ms: pos_integer() | nil,
           submitted_at: integer()
         }
-
-  @doc "Waits for completion and refreshes the current task state."
-  def await(%__MODULE__{} = task, timeout \\ 5_000) do
-    FastestMCP.await_task(task, timeout)
-  end
-
-  @doc "Fetches the latest state managed by this module."
-  def fetch(%__MODULE__{} = task) do
-    FastestMCP.fetch_task(task)
-  end
-
-  @doc "Waits for completion, raising on failure."
-  def await!(task, timeout \\ 5_000), do: FastestMCP.await_task!(task, timeout)
-  @doc "Fetches task state, raising on failure."
-  def fetch!(task), do: FastestMCP.fetch_task!(task)
 end

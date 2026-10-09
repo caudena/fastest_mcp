@@ -8,7 +8,7 @@ defmodule FastestMCP.Test.StdioProcessGroupFixture do
     directory =
       Path.join(
         System.tmp_dir!(),
-        "fastest-mcp-process-group-#{System.unique_integer([:positive])}"
+        "fastest-mcp-process-group-#{System.pid()}-#{System.unique_integer([:positive])}"
       )
 
     File.mkdir_p!(directory)

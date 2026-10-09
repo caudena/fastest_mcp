@@ -1,5 +1,7 @@
 defmodule FastestMCP.ClientSessionRecoveryTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
+
+  alias FastestMCP.Test.ClientProbe
 
   import Plug.Conn
 
@@ -239,7 +241,7 @@ defmodule FastestMCP.ClientSessionRecoveryTest do
   test "a 404 session miss reinitializes without replaying the original request" do
     {client, state} = start_client(:recovery)
 
-    assert Client.session_id!(client) == "recovery-session-1"
+    assert Client.info!(client).session_id == "recovery-session-1"
 
     error =
       assert_raise Error, fn ->
@@ -253,12 +255,12 @@ defmodule FastestMCP.ClientSessionRecoveryTest do
     assert_receive {:initialize_request, 1, nil}, 1_000
     assert_receive {:initialize_request, 2, nil}, 1_000
 
-    assert Client.session_id!(client) == "recovery-session-2"
+    assert %Client.Info{
+             session_id: "recovery-session-2",
+             initialize_result: %{"serverInfo" => %{"name" => "recovery-server-2"}}
+           } = Client.info!(client)
 
-    assert get_in(Client.initialize_result!(client), ["serverInfo", "name"]) ==
-             "recovery-server-2"
-
-    assert :sys.get_state(client.pid).server_identity["name"] == "recovery-server-2"
+    assert ClientProbe.server_identity(client)["name"] == "recovery-server-2"
 
     assert %{structured_content: %{"charged" => true}} =
              Client.call_tool!(client, "charge_card_2", %{"amount" => 20})
@@ -291,7 +293,7 @@ defmodule FastestMCP.ClientSessionRecoveryTest do
     refute_receive {:stream_message, "duplicate"}, 100
 
     wait_for_session_stream_to_close(client)
-    Process.sleep(25)
+    refute_receive {:session_stream_request, 3, _last_event_id}, 25
 
     snapshot = Agent.get(state, & &1)
     assert snapshot.stream_connections == 2
@@ -312,7 +314,7 @@ defmodule FastestMCP.ClientSessionRecoveryTest do
     assert_receive {:session_stream_request, 3, nil}, 1_000
 
     wait_for_session_stream_to_close(client)
-    Process.sleep(25)
+    refute_receive {:session_stream_request, 4, _last_event_id}, 25
 
     snapshot = Agent.get(state, & &1)
     assert snapshot.initialize_count == 2
@@ -335,10 +337,10 @@ defmodule FastestMCP.ClientSessionRecoveryTest do
     assert_receive {:session_stream_request, 2, nil}, 1_000
     assert_receive {:stream_message, "after-recovery"}, 1_000
 
-    assert Client.session_id!(client) == "recovery-session-2"
-
-    assert get_in(Client.initialize_result!(client), ["serverInfo", "name"]) ==
-             "recovery-server-2"
+    assert %Client.Info{
+             session_id: "recovery-session-2",
+             initialize_result: %{"serverInfo" => %{"name" => "recovery-server-2"}}
+           } = Client.info!(client)
 
     wait_for_session_stream_to_close(client)
 
@@ -406,17 +408,12 @@ defmodule FastestMCP.ClientSessionRecoveryTest do
   defp start_client(mode, opts \\ []) do
     state = start_supervised!({Agent, fn -> %{mode: mode} end})
 
-    bandit =
-      start_supervised!(
-        {Bandit, plug: {RecoveryPlug, state: state, test_pid: self()}, scheme: :http, port: 0}
-      )
-
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+    %{url: url} = serve!({RecoveryPlug, state: state, test_pid: self()})
     parent = self()
 
     client =
-      Client.connect!(
-        "http://127.0.0.1:#{port}/mcp",
+      connect!(
+        url,
         Keyword.merge(
           [
             protocol_version: "2025-11-25",
@@ -432,24 +429,12 @@ defmodule FastestMCP.ClientSessionRecoveryTest do
         )
       )
 
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect!(client)
-    end)
-
     {client, state}
   end
 
-  defp wait_for_session_stream_to_close(client, attempts \\ 100)
-
-  defp wait_for_session_stream_to_close(_client, 0),
-    do: flunk("session stream did not stop")
-
-  defp wait_for_session_stream_to_close(client, attempts) do
-    if Client.session_stream_open?(client) or :sys.get_state(client.pid).session_stream do
-      Process.sleep(10)
-      wait_for_session_stream_to_close(client, attempts - 1)
-    else
-      :ok
-    end
+  defp wait_for_session_stream_to_close(client) do
+    assert_eventually(fn ->
+      not Client.info!(client).session_stream_open? and is_nil(ClientProbe.session_stream(client))
+    end)
   end
 end

@@ -2,6 +2,7 @@ defmodule FastestMCP.Protocol.Meta do
   @moduledoc false
 
   alias FastestMCP.Error
+  alias FastestMCP.JSONValue
 
   @label ~r/^[A-Za-z](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/
   @name ~r/^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/
@@ -18,6 +19,8 @@ defmodule FastestMCP.Protocol.Meta do
   @logging_levels ~w(debug info notice warning error critical alert emergency)
 
   @type source :: :application | :peer | :protocol
+
+  def log_level_rank(level), do: Enum.find_index(@logging_levels, &(&1 == level))
 
   def validate(meta, opts \\ [])
   def validate(nil, _opts), do: {:ok, %{}}
@@ -57,7 +60,25 @@ defmodule FastestMCP.Protocol.Meta do
     end
   end
 
-  @doc false
+  # Metadata a handler produced, which may relate a task, in string-keyed wire
+  # form; nil stays nil.
+  def output!(nil), do: nil
+
+  def output!(meta) when is_map(meta) do
+    case validate(meta, allowed_reserved: ["io.modelcontextprotocol/related-task"]) do
+      {:ok, normalized} ->
+        JSONValue.stringify_keys(normalized)
+
+      {:error, reason} ->
+        raise Error,
+          code: :internal_error,
+          message: "handler produced invalid MCP metadata: #{reason}"
+    end
+  end
+
+  def output!(_meta),
+    do: raise(Error, code: :internal_error, message: "handler produced non-object MCP metadata")
+
   def validate_tree(value, opts \\ []) do
     opts = Keyword.put_new(opts, :source, :protocol)
     walk_tree(value, opts)

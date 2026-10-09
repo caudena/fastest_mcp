@@ -1,5 +1,5 @@
 defmodule FastestMCP.ClientInProcessTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Client
   alias FastestMCP.Client.Task, as: RemoteTask
@@ -10,39 +10,49 @@ defmodule FastestMCP.ClientInProcessTest do
 
   test "modern client discovers and correlates concurrent requests through the shared engine" do
     server_name = unique_name("modern")
+    test_pid = self()
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("echo", fn arguments, _context -> arguments end)
-      |> FastestMCP.add_tool("delay", fn %{"value" => value, "delay" => delay}, _context ->
-        Process.sleep(delay)
-        %{"value" => value}
-      end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("echo", fn arguments, _context -> arguments end)
+    |> FastestMCP.add_tool("held", fn %{"value" => value}, _context ->
+      send(test_pid, {:held, value, self()})
 
-    start_server!(server_name, server)
+      receive do
+        :release -> %{"value" => value}
+      end
+    end)
+    |> start_server!()
 
     client =
-      Client.connect!({:in_process, server_name},
+      connect!({:in_process, server_name},
         client_info: %{"name" => "in-process-test", "version" => "1.0.0"}
       )
 
-    on_exit(fn -> if Client.connected?(client), do: Client.disconnect!(client) end)
+    assert %Client.Info{
+             protocol_version: "2026-07-28",
+             session_id: nil,
+             initialize_result: nil,
+             discovery_result: %{"supportedVersions" => versions}
+           } = Client.info!(client)
 
-    assert Client.protocol_version!(client) == "2026-07-28"
-    assert Client.session_id!(client) == nil
-    assert Client.initialize_result!(client) == nil
-    assert %{"supportedVersions" => versions} = Client.discovery_result!(client)
     assert "2026-07-28" in versions
 
-    slow = delayed_request(client, "slow", 80)
-    fast = delayed_request(client, "fast", 1)
-    middle = delayed_request(client, "middle", 30)
+    slow = held_request(client, "slow")
+    fast = held_request(client, "fast")
+    middle = held_request(client, "middle")
 
     assert [slow.request_id, fast.request_id, middle.request_id] |> Enum.uniq() |> length() == 3
 
-    assert get_in(Client.await!(fast, 1_000), ["structuredContent", "value"]) == "fast"
-    assert get_in(Client.await!(middle, 1_000), ["structuredContent", "value"]) == "middle"
-    assert get_in(Client.await!(slow, 1_000), ["structuredContent", "value"]) == "slow"
+    # Released out of request order, so each response must find its request.
+    release_held("fast")
+    assert get_in(Client.Request.await!(fast, 1_000), ["structuredContent", "value"]) == "fast"
+    release_held("middle")
+
+    assert get_in(Client.Request.await!(middle, 1_000), ["structuredContent", "value"]) ==
+             "middle"
+
+    release_held("slow")
+    assert get_in(Client.Request.await!(slow, 1_000), ["structuredContent", "value"]) == "slow"
 
     assert %{raw: %{"structuredContent" => %{"message" => "hello"}}} =
              Client.call_tool!(client, "echo", %{"message" => "hello"})
@@ -51,20 +61,14 @@ defmodule FastestMCP.ClientInProcessTest do
   test "legacy client initializes through the same stdio session lifecycle" do
     server_name = unique_name("legacy")
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("echo", fn arguments, _context -> arguments end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("echo", fn arguments, _context -> arguments end)
+    |> start_server!()
 
-    start_server!(server_name, server)
+    client = connect!({:in_process, server_name}, protocol_version: "2025-11-25")
 
-    client =
-      Client.connect!({:in_process, server_name}, protocol_version: "2025-11-25")
-
-    on_exit(fn -> if Client.connected?(client), do: Client.disconnect!(client) end)
-
-    assert Client.protocol_version!(client) == "2025-11-25"
-    assert Client.session_id!(client) == nil
-    assert is_map(Client.initialize_result!(client))
+    assert %Client.Info{protocol_version: "2025-11-25", session_id: nil, initialize_result: %{}} =
+             Client.info!(client)
 
     assert Client.call_tool!(client, "echo", %{"era" => "legacy"}).structured_content == %{
              "era" => "legacy"
@@ -78,26 +82,24 @@ defmodule FastestMCP.ClientInProcessTest do
     server_name = unique_name("legacy-callbacks")
     test_pid = self()
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("sample", fn _arguments, context ->
-        Context.sample(context, "Reply with sampled")
-      end)
-      |> FastestMCP.add_tool("ask_name", fn _arguments, context ->
-        case Context.elicit(context, "What is your name?", :string) do
-          %Accepted{data: name} -> %{name: name}
-        end
-      end)
-      |> FastestMCP.add_tool("progress", fn _arguments, context ->
-        :ok = Context.report_progress(context, 1, 2, "started")
-        :ok = Context.report_progress(context, 2, 2, "finished")
-        %{done: true}
-      end)
-
-    start_server!(server_name, server)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("sample", fn _arguments, context ->
+      Context.sample(context, "Reply with sampled")
+    end)
+    |> FastestMCP.add_tool("ask_name", fn _arguments, context ->
+      case Context.elicit(context, "What is your name?", :string) do
+        %Accepted{data: name} -> %{name: name}
+      end
+    end)
+    |> FastestMCP.add_tool("progress", fn _arguments, context ->
+      :ok = Context.report_progress(context, 1, 2, "started")
+      :ok = Context.report_progress(context, 2, 2, "finished")
+      %{done: true}
+    end)
+    |> start_server!()
 
     client =
-      Client.connect!({:in_process, server_name},
+      connect!({:in_process, server_name},
         protocol_version: "2025-11-25",
         sampling_handler: fn messages, params ->
           send(test_pid, {:sampling, messages, params})
@@ -108,8 +110,6 @@ defmodule FastestMCP.ClientInProcessTest do
           {:accept, %{"value" => "Alice"}}
         end
       )
-
-    on_exit(fn -> if Client.connected?(client), do: Client.disconnect!(client) end)
 
     assert %{structured_content: %{"content" => %{"text" => "sampled"}}} =
              Client.call_tool!(client, "sample", %{})
@@ -152,15 +152,13 @@ defmodule FastestMCP.ClientInProcessTest do
         end
       end)
 
-    start_server!(server_name, server)
+    start_server!(server)
 
     client =
-      Client.connect!({:in_process, server_name},
+      connect!({:in_process, server_name},
         protocol_version: "2026-07-28",
         notification_handler: fn message -> send(test_pid, {:global_notification, message}) end
       )
-
-    on_exit(fn -> if Client.connected?(client), do: Client.disconnect!(client) end)
 
     listener =
       Client.listen!(
@@ -190,9 +188,9 @@ defmodule FastestMCP.ClientInProcessTest do
 
     assert_receive {:blocking_worker, worker}, 1_000
     worker_monitor = Process.monitor(worker)
-    assert :ok = Client.cancel!(blocked, "test cancellation")
+    assert :ok = Client.Request.cancel!(blocked, "test cancellation")
 
-    error = assert_raise Error, fn -> Client.await!(blocked, 1_000) end
+    error = assert_raise Error, fn -> Client.Request.await!(blocked, 1_000) end
     assert error.code == :cancelled
     assert_receive {:DOWN, ^worker_monitor, :process, ^worker, _reason}, 1_000
 
@@ -221,7 +219,7 @@ defmodule FastestMCP.ClientInProcessTest do
                     }},
                    1_000
 
-    assert :ok = Client.cancel!(listener, "test complete")
+    assert :ok = Client.Request.cancel!(listener, "test complete")
     assert Client.connected?(client)
   end
 
@@ -244,15 +242,13 @@ defmodule FastestMCP.ClientInProcessTest do
         task: [mode: :optional, poll_interval_ms: 10]
       )
 
-    start_server!(server_name, server)
+    start_server!(server)
 
     client =
-      Client.connect!({:in_process, server_name},
+      connect!({:in_process, server_name},
         protocol_version: "2026-07-28",
         extensions: task_extensions
       )
-
-    on_exit(fn -> if Client.connected?(client), do: Client.disconnect!(client) end)
 
     transparent =
       Task.async(fn ->
@@ -262,7 +258,7 @@ defmodule FastestMCP.ClientInProcessTest do
     assert_receive {:task_worker, transparent_worker, "transparent"}, 1_000
     send(transparent_worker, :release)
     assert %{structured_content: %{"value" => "transparent"}} = Task.await(transparent, 3_000)
-    refute Client.session_stream_open?(client)
+    refute Client.info!(client).session_stream_open?
 
     assert %RemoteTask{task_id: task_id} =
              task = Client.call_tool_task!(client, "deferred", %{"value" => "handle"})
@@ -289,7 +285,7 @@ defmodule FastestMCP.ClientInProcessTest do
                    1_000
 
     assert %{structured_content: %{"value" => "handle"}} = Task.await(result_waiter, 3_000)
-    assert :ok = Client.cancel!(listener, "test complete")
+    assert :ok = Client.Request.cancel!(listener, "test complete")
   end
 
   test "current and per-call auth input traverses normal authentication" do
@@ -310,10 +306,9 @@ defmodule FastestMCP.ClientInProcessTest do
         %{principal: context.principal}
       end)
 
-    start_server!(server_name, server)
+    start_server!(server)
 
-    client = Client.connect!({:in_process, server_name}, auth_input: %{token: "alpha"})
-    on_exit(fn -> if Client.connected?(client), do: Client.disconnect!(client) end)
+    client = connect!({:in_process, server_name}, auth_input: %{token: "alpha"})
 
     assert get_in(Client.call_tool!(client, "principal", %{}), [
              Access.key(:structured_content),
@@ -321,7 +316,7 @@ defmodule FastestMCP.ClientInProcessTest do
            ]) ==
              ["in-process-test", "alpha"]
 
-    assert :ok = Client.set_auth_input!(client, %{token: "beta"})
+    assert :ok = Client.set_auth!(client, auth_input: %{token: "beta"})
 
     assert get_in(Client.call_tool!(client, "principal", %{}), [
              Access.key(:structured_content),
@@ -379,14 +374,12 @@ defmodule FastestMCP.ClientInProcessTest do
         }
       end)
 
-    start_server!(server_name, server)
+    start_server!(server)
 
     client =
-      Client.connect!({:in_process, server_name},
+      connect!({:in_process, server_name},
         auth_input: %{"credential" => secret}
       )
-
-    on_exit(fn -> if Client.connected?(client), do: Client.disconnect!(client) end)
 
     assert %{
              raw: %{
@@ -404,7 +397,7 @@ defmodule FastestMCP.ClientInProcessTest do
 
   test "HTTP, SSE, and stdio-process options are rejected" do
     server_name = unique_name("invalid-options")
-    start_server!(server_name, FastestMCP.server(server_name))
+    start_server!(FastestMCP.server(server_name))
 
     for {option, value} <- [
           oauth: [],
@@ -417,10 +410,12 @@ defmodule FastestMCP.ClientInProcessTest do
           max_sse_event_bytes: 1_024,
           env: %{"VALUE" => "1"},
           legacy_stdio_auth_metadata: true,
-          stdio_restart: false
+          stdio_restart: false,
+          stdio_process_group: [launcher: "/bin/launcher"]
         ] do
-      assert {:error, %Error{code: :invalid_params, details: %{unsupported_options: [^option]}}} =
-               Client.connect({:in_process, server_name}, [{option, value}])
+      assert_raise ArgumentError, ~r/#{option}/, fn ->
+        Client.connect({:in_process, server_name}, [{option, value}])
+      end
     end
   end
 
@@ -439,15 +434,14 @@ defmodule FastestMCP.ClientInProcessTest do
     server_name = unique_name("shutdown")
     test_pid = self()
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("block", fn _arguments, _context ->
-        send(test_pid, :block_started)
-        Process.sleep(5_000)
-        %{completed: true}
-      end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("block", fn _arguments, _context ->
+      send(test_pid, :block_started)
+      Process.sleep(5_000)
+      %{completed: true}
+    end)
+    |> start_server!()
 
-    start_server!(server_name, server)
     client = Client.connect!({:in_process, server_name})
 
     request =
@@ -461,18 +455,88 @@ defmodule FastestMCP.ClientInProcessTest do
     assert_receive :block_started, 1_000
     assert :ok = FastestMCP.stop_server(server_name)
 
-    error = assert_raise Error, fn -> Client.await!(request, 2_000) end
+    error = assert_raise Error, fn -> Client.Request.await!(request, 2_000) end
     assert error.code == :internal_error
-    assert eventually(fn -> not Client.connected?(client) end)
+    assert_eventually(fn -> not Client.connected?(client) end)
   end
 
-  defp start_server!(server_name, server) do
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+  @tag timeout: 30_000
+  test "synchronous requests honour timeouts longer than five seconds" do
+    server_name = unique_name("slow-request")
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("slow", fn _arguments, _context ->
+      Process.sleep(6_500)
+      %{"done" => true}
+    end)
+    |> start_server!()
+
+    client = connect!({:in_process, server_name})
+
+    assert {:ok, %{"structuredContent" => %{"done" => true}}} =
+             Client.request(client, "tools/call", %{"name" => "slow", "arguments" => %{}},
+               timeout_ms: 9_000
+             )
   end
 
-  defp unique_name(suffix) do
-    "client-in-process-#{suffix}-#{System.unique_integer([:positive])}"
+  describe "request handles" do
+    setup do
+      parent = self()
+      server_name = unique_name("request-handles")
+
+      start_server!(
+        FastestMCP.server(server_name)
+        |> FastestMCP.add_tool("block", fn _, _ ->
+          send(parent, :handler_started)
+
+          receive do
+            :finish -> "done"
+          end
+        end)
+      )
+
+      client = connect!({:in_process, server_name})
+      %{client: client}
+    end
+
+    test "a coordinator failure completes a terminal handle with a tagged error", %{
+      client: client
+    } do
+      {:ok, request} = Client.start_tool_result(client, "block")
+      assert_receive :handler_started
+      Process.exit(request.pid, :kill)
+
+      assert {:error, %Error{code: :internal_error}} =
+               Client.ToolResultRequest.await(request, 1_000)
+    end
+
+    test "explicit cancellation releases the caller monitor and remains awaitable", %{
+      client: client
+    } do
+      {:ok, request} =
+        Client.request_async(client, "tools/call", %{"name" => "block", "arguments" => %{}})
+
+      assert_receive :handler_started
+      assert {:monitors, monitors} = Process.info(self(), :monitors)
+      assert {:process, client.pid} in monitors
+      assert :ok = Client.Request.cancel(request)
+      assert {:monitors, monitors} = Process.info(self(), :monitors)
+      refute {:process, client.pid} in monitors
+      assert {:error, %Error{code: :cancelled}} = Client.Request.await(request, 1_000)
+    end
+
+    test "low-level await reports connection death instead of waiting forever", %{
+      client: client
+    } do
+      Process.unlink(client.pid)
+
+      {:ok, request} =
+        Client.request_async(client, "tools/call", %{"name" => "block", "arguments" => %{}})
+
+      assert_receive :handler_started
+      Process.exit(client.pid, :kill)
+      assert {:error, %Error{code: :internal_error}} = Client.Request.await(request, 1_000)
+    end
   end
 
   defp sampling_result(text) do
@@ -483,24 +547,16 @@ defmodule FastestMCP.ClientInProcessTest do
     }
   end
 
-  defp delayed_request(client, value, delay) do
+  defp held_request(client, value) do
     Client.request_async!(
       client,
       "tools/call",
-      %{"name" => "delay", "arguments" => %{"value" => value, "delay" => delay}}
+      %{"name" => "held", "arguments" => %{"value" => value}}
     )
   end
 
-  defp eventually(fun, attempts \\ 50)
-
-  defp eventually(fun, attempts) when attempts > 0 do
-    if fun.() do
-      true
-    else
-      Process.sleep(10)
-      eventually(fun, attempts - 1)
-    end
+  defp release_held(value) do
+    assert_receive {:held, ^value, handler}, 1_000
+    send(handler, :release)
   end
-
-  defp eventually(fun, 0), do: fun.()
 end

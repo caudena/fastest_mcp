@@ -132,16 +132,8 @@ defmodule FastestMCP.MixProject do
       ],
       groups_for_modules: module_groups,
       skip_code_autolink_to: [
-        "FastestMCP.BackgroundTaskStore",
-        "FastestMCP.Client.Task",
-        "FastestMCP.EventBus",
         "FastestMCP.HTTP.request/3",
-        "FastestMCP.OperationPipeline",
-        "FastestMCP.Pagination.default_key/1",
-        "FastestMCP.Session",
-        "FastestMCP.Session.verify_identity/3",
-        "FastestMCP.Transport.HTTPCommon",
-        "FastestMCP.Transport.JSONRPC"
+        "FastestMCP.Pagination.default_key/1"
       ],
       filter_modules: fn module, _metadata -> module in public_modules end
     ]
@@ -155,6 +147,10 @@ defmodule FastestMCP.MixProject do
         FastestMCP.ServerModule,
         FastestMCP.Server,
         FastestMCP.Context,
+        FastestMCP.Progress,
+        FastestMCP.Elicitation.Accepted,
+        FastestMCP.Elicitation.Declined,
+        FastestMCP.Elicitation.Cancelled,
         FastestMCP.ApplicationSession,
         FastestMCP.Apps,
         FastestMCP.InputRequiredResult,
@@ -167,6 +163,7 @@ defmodule FastestMCP.MixProject do
         FastestMCP.Client,
         FastestMCP.ClientGroup,
         FastestMCP.Client.CallbackContext,
+        FastestMCP.Client.Info,
         FastestMCP.Client.OAuth,
         FastestMCP.Client.OAuth.AuthorizationHandler,
         FastestMCP.Client.OAuth.AuthorizationHandler.Request,
@@ -206,8 +203,15 @@ defmodule FastestMCP.MixProject do
         FastestMCP.Middleware.ToolSearch,
         FastestMCP.Operation,
         FastestMCP.Provider,
+        FastestMCP.ProviderTransform,
+        FastestMCP.ProviderTransforms.Namespace,
+        FastestMCP.ProviderTransforms.ToolTransform,
         FastestMCP.Providers.ApplicationSessions,
+        FastestMCP.Providers.Local,
+        FastestMCP.Providers.MountedServer,
         FastestMCP.Providers.Proxy,
+        FastestMCP.Providers.Skills,
+        FastestMCP.Providers.SkillsDirectory,
         FastestMCP.ResourceSecurity,
         FastestMCP.ServerExtension,
         FastestMCP.ServerExtension.Method,
@@ -222,6 +226,10 @@ defmodule FastestMCP.MixProject do
         FastestMCP.TaskBackend.Memory
       ],
       "Prompt, Resource, and Tool Helpers": [
+        FastestMCP.Components.Tool,
+        FastestMCP.Components.Resource,
+        FastestMCP.Components.ResourceTemplate,
+        FastestMCP.Components.Prompt,
         FastestMCP.Tools.Result,
         FastestMCP.Prompts.Message,
         FastestMCP.Prompts.Result,

@@ -1,5 +1,5 @@
 defmodule FastestMCP.OpenAPIProviderTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   defp simple_spec do
     %{
@@ -105,8 +105,7 @@ defmodule FastestMCP.OpenAPIProviderTest do
       )
 
     assert server.name == server_name
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
     tools = FastestMCP.list_tools!(server_name)
     assert Enum.map(tools, & &1.name) == ["create_user", "get_user"]
@@ -134,8 +133,7 @@ defmodule FastestMCP.OpenAPIProviderTest do
     end
 
     server = FastestMCP.from_openapi(simple_spec(), name: server_name, requester: requester)
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
     assert %{"ok" => true} ==
              FastestMCP.call_tool!(server_name, "get_user", %{
@@ -190,8 +188,7 @@ defmodule FastestMCP.OpenAPIProviderTest do
     end
 
     server = FastestMCP.from_openapi(spec, name: server_name, requester: requester)
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
     assert %{"ok" => true} == FastestMCP.call_tool!(server_name, "ping", %{})
 
@@ -248,8 +245,7 @@ defmodule FastestMCP.OpenAPIProviderTest do
     end
 
     server = FastestMCP.from_openapi(spec, name: server_name, requester: requester)
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
     [tool] = FastestMCP.list_tools!(server_name)
     assert tool.input_schema["properties"]["nickname"]["type"] == ["string", "null"]

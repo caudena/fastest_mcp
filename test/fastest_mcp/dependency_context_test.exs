@@ -1,5 +1,5 @@
 defmodule FastestMCP.DependencyContextTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.BackgroundTask
   alias FastestMCP.Context
@@ -31,7 +31,7 @@ defmodule FastestMCP.DependencyContextTest do
         value * div(multiplier_a + multiplier_b, 2)
       end)
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    start_server!(server)
 
     assert 50 == FastestMCP.call_tool!(server_name, "compute", %{"value" => 5})
 
@@ -72,7 +72,7 @@ defmodule FastestMCP.DependencyContextTest do
         task: true
       )
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    start_server!(server)
 
     task = FastestMCP.call_tool!(server_name, "use_connection", %{"value" => "ok"}, task: true)
     assert %BackgroundTask{} = task
@@ -103,7 +103,7 @@ defmodule FastestMCP.DependencyContextTest do
         task: true
       )
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    start_server!(server)
 
     prompt_task =
       FastestMCP.render_prompt!(server_name, "describe", %{"topic" => "tasks"}, task: true)
@@ -121,5 +121,33 @@ defmodule FastestMCP.DependencyContextTest do
 
     assert %{"server" => ^server_name, "task_store" => true} =
              FastestMCP.await_task!(resource_task, 1_000)
+  end
+
+  test "a KeyError raised inside a dependency resolver is not reported as an unknown dependency" do
+    parent = self()
+    server_name = unique_name("dependency-key-error")
+
+    server =
+      FastestMCP.server(server_name)
+      |> FastestMCP.add_dependency(:lookup, fn _context ->
+        raise KeyError, key: :missing, term: %{}
+      end)
+      |> FastestMCP.add_tool("probe", fn _arguments, context ->
+        for name <- [:lookup, :absent] do
+          try do
+            Context.dependency(context, name)
+          rescue
+            error -> send(parent, {:dependency_error, name, error.__struct__})
+          end
+        end
+
+        %{"ok" => true}
+      end)
+
+    start_server!(server)
+
+    assert {:ok, _result} = FastestMCP.call_tool(server_name, "probe", %{})
+    assert_receive {:dependency_error, :lookup, KeyError}
+    assert_receive {:dependency_error, :absent, ArgumentError}
   end
 end

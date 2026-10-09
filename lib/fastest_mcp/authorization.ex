@@ -11,6 +11,7 @@ defmodule FastestMCP.Authorization do
   alias FastestMCP.Context, as: RuntimeContext
   alias FastestMCP.Error, as: RuntimeError
   alias FastestMCP.Operation
+  alias FastestMCP.URIPolicy
 
   defmodule Context do
     @moduledoc """
@@ -73,9 +74,7 @@ defmodule FastestMCP.Authorization do
   end
 
   defmodule Error do
-    @moduledoc """
-    Exception raised when an authorization declaration is invalid.
-    """
+    @moduledoc false
 
     defexception [:message]
   end
@@ -83,7 +82,11 @@ defmodule FastestMCP.Authorization do
   @type check_result :: boolean() | :ok | {:error, String.t()}
   @type check :: (Context.t() -> check_result) | Check.t()
 
-  @doc "Transforms input into the normalized runtime representation used by this module."
+  @doc """
+  Returns a server transform that adds `checks` to every component: `mode:`
+  `:prepend` (default) or `:append` them to the component's own checks, or
+  `:replace` those.
+  """
   def transform(checks, opts \\ []) when is_list(opts) do
     normalized = normalize(checks)
     mode = Keyword.get(opts, :mode, :prepend)
@@ -97,7 +100,7 @@ defmodule FastestMCP.Authorization do
     end
   end
 
-  @doc "Normalizes input into the runtime shape expected by this module."
+  @doc "Normalizes one check or a list of checks (tagged checks or 1-arity functions) to a list; raises `ArgumentError` for anything else."
   def normalize(nil), do: []
 
   def normalize(checks) when is_list(checks) do
@@ -167,6 +170,7 @@ defmodule FastestMCP.Authorization do
     %Check{kind: :scopes, value: normalize_oauth_tokens!(scopes, "required scopes")}
   end
 
+  @doc "`require_scopes/1` of `[first_scope | more_scopes]`."
   def require_scopes(first_scope, more_scopes) do
     require_scopes([first_scope | List.wrap(more_scopes)])
   end
@@ -180,6 +184,7 @@ defmodule FastestMCP.Authorization do
     %Check{kind: :capabilities, value: required}
   end
 
+  @doc "`require_capabilities/1` of `[first_capability | more_capabilities]`."
   def require_capabilities(first_capability, more_capabilities) do
     require_capabilities([first_capability | List.wrap(more_capabilities)])
   end
@@ -251,25 +256,13 @@ defmodule FastestMCP.Authorization do
   end
 
   defp evaluate_check(%Check{kind: :scopes, value: value}, context, result) do
-    case resolve_required_scopes(value, context) do
-      {:ok, required} ->
-        available =
-          if context.authenticated do
-            normalize_oauth_tokens!(context.verified_scopes, "verified scopes")
-          else
-            MapSet.new()
-          end
-
-        missing = MapSet.difference(required, available)
-        %{result | missing_scopes: MapSet.union(result.missing_scopes, missing)}
-
-      :error ->
-        %{result | opaque_denial?: true}
+    with {:ok, required} <- resolve_required_scopes(value, context),
+         {:ok, available} <- verified_scopes(context) do
+      missing = MapSet.difference(required, available)
+      %{result | missing_scopes: MapSet.union(result.missing_scopes, missing)}
+    else
+      _invalid -> %{result | opaque_denial?: true}
     end
-  rescue
-    _error -> %{result | opaque_denial?: true}
-  catch
-    _kind, _reason -> %{result | opaque_denial?: true}
   end
 
   defp evaluate_check(%Check{kind: :capabilities, value: required}, context, result) do
@@ -289,7 +282,7 @@ defmodule FastestMCP.Authorization do
   defp resolve_required_scopes(%MapSet{} = required, _context), do: {:ok, required}
 
   defp resolve_required_scopes({:resolver, resolver}, context) do
-    {:ok, normalize_oauth_tokens!(List.wrap(resolver.(context)), "resolved required scopes")}
+    resolver.(context) |> List.wrap() |> oauth_tokens("resolved required scopes")
   rescue
     _error -> :error
   catch
@@ -342,35 +335,34 @@ defmodule FastestMCP.Authorization do
     _kind, _reason -> false
   end
 
-  defp normalize_oauth_tokens!(tokens, label) when is_list(tokens) do
-    normalized = Enum.map(tokens, &normalize_oauth_token!/1)
+  defp verified_scopes(%Context{authenticated: true, verified_scopes: scopes}),
+    do: oauth_tokens(scopes, "verified scopes")
 
-    Enum.each(normalized, fn token ->
-      unless valid_oauth_scope_token?(token) do
-        raise ArgumentError, "#{label} must contain valid non-empty OAuth scope tokens"
-      end
-    end)
+  defp verified_scopes(%Context{}), do: {:ok, MapSet.new()}
 
-    MapSet.new(normalized)
+  defp normalize_oauth_tokens!(tokens, label) do
+    case oauth_tokens(tokens, label) do
+      {:ok, tokens} -> tokens
+      {:error, message} -> raise ArgumentError, message
+    end
   end
 
-  defp valid_oauth_scope_token?(token) when is_binary(token) and token != "" do
-    token
-    |> :binary.bin_to_list()
-    |> Enum.all?(fn byte -> byte == 0x21 or byte in 0x23..0x5B or byte in 0x5D..0x7E end)
+  defp oauth_tokens(tokens, label) when is_list(tokens) do
+    if Enum.all?(tokens, &(is_binary(&1) or is_atom(&1))) do
+      tokens = Enum.map(tokens, &if(is_atom(&1), do: Atom.to_string(&1), else: &1))
+
+      if Enum.all?(tokens, &URIPolicy.scope_token?/1),
+        do: {:ok, MapSet.new(tokens)},
+        else: {:error, "#{label} must contain valid non-empty OAuth scope tokens"}
+    else
+      {:error, "OAuth scope tokens must be strings or atoms"}
+    end
   end
 
-  defp valid_oauth_scope_token?(_token), do: false
-
-  defp normalize_oauth_token!(token) when is_binary(token), do: token
-  defp normalize_oauth_token!(token) when is_atom(token), do: Atom.to_string(token)
-
-  defp normalize_oauth_token!(_token) do
-    raise ArgumentError, "OAuth scope tokens must be strings or atoms"
-  end
+  defp oauth_tokens(_tokens, label), do: {:error, "#{label} must be a list"}
 
   defp generic_denial_message(component) do
-    "not authorized to access #{Component.type(component)} #{inspect(Component.identifier(component))}"
+    "not authorized to access #{Component.kind(component)} #{inspect(Component.identifier(component))}"
   end
 
   defp merge_checks(normalized, _existing, :replace), do: normalized

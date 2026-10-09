@@ -113,8 +113,10 @@ server =
   )
 ```
 
-In this example, callers must send `query`. The remaining fields are optional
-and can default inside your schema or inside the handler.
+In this example, callers must send `query`. The remaining fields are optional.
+Validation never casts or fills values, so a schema `default` is only
+advertised to clients: apply defaults in the handler, for example
+`Map.get(arguments, "max_results", 10)`.
 
 ## Tool Argument Completion
 
@@ -172,7 +174,7 @@ FastestMCP.complete!(
   %{"type" => "ref/tool", "name" => "deploy"},
   %{"name" => "environment", "value" => "prev"}
 )
-# => %{values: ["preview"], total: 1}
+# => %{values: ["preview"], total: 1, has_more: false}
 ```
 
 Completion providers stay server-side. They are stripped from public tool
@@ -215,7 +217,7 @@ FastestMCP.call_tool!("tool-injection", "whoami", %{"value" => 7}, session_id: "
 
 The injection contract is explicit:
 
-- injected keys are removed from public schemas and list metadata
+- injected keys never appear in public schemas or list metadata
 - caller-supplied values for injected keys are ignored
 - injected values are resolved from `%FastestMCP.Context{}`
 - injected keys cannot overlap with declared public tool arguments
@@ -388,8 +390,8 @@ FastestMCP.call_tool!("tool-results", "get_user_data", %{"user_id" => "42"})
 ```
 
 Transport normalization also handles common JSON-safe Elixir shapes such as
-lists, tuples, dates, URIs, maps, `MapSet`, and finite enumerable structs such
-as ranges:
+lists, tuples, dates, URIs, maps, `MapSet`, and `Range`; other structs are
+encoded as maps of their fields:
 
 ```elixir
 FastestMCP.server("tool-results")
@@ -441,8 +443,10 @@ server =
 - `meta` carries result-level metadata
 - `is_error` marks the result as an MCP tool error
 
-If you pass only `structured_content`, FastestMCP derives readable text content
-from that structure automatically so transport responses stay complete.
+If you pass only `structured_content` (`Result.new(nil, structured_content:
+data)`), FastestMCP derives readable text content from that structure so
+transport responses stay complete. A map with a `type` key would be read as a
+content block, so pass explicit content for such data.
 
 ## Content Blocks and Media
 
@@ -490,8 +494,8 @@ block; do not nest them under `resource` or a FastestMCP extension:
 }
 ```
 
-Content-level `_meta` is preserved. Only FastestMCP-specific fields are moved
-beneath `_meta.fastestmcp` during serialization.
+Content-level `_meta` is preserved. Keys that are not standard MCP
+content-block fields are dropped during serialization.
 
 ## Error Handling
 
@@ -575,8 +579,11 @@ server =
   )
 ```
 
-FastestMCP does not infer output schemas from Elixir types. Input and output
-schemas must both declare `type: "object"` at the root, as required by MCP.
+FastestMCP does not infer output schemas from Elixir types. Input schemas must
+declare `type: "object"` at the root, as MCP requires. Output schemas may
+describe any JSON value; the `2025-11-25` wire omits a non-object
+`outputSchema` and non-object `structuredContent`, while `2026-07-28` keeps
+both.
 When `output_schema` is present, the tool must return structured content and
 FastestMCP validates it before serialization. Invalid declarations fail while
 the component is built; invalid results fail as internal tool errors.
@@ -719,12 +726,13 @@ server =
 ```
 
 Server-scoped visibility is authoritative. A legacy session can narrow the
-visible set further, but it cannot re-expose a tool that the server already
-disabled.
+visible set further, but it cannot re-expose a tool hidden by a server-scoped
+rule (`FastestMCP.disable_components/2`). A session enable rule does re-expose
+a tool declared `enabled: false` or disabled through the component manager.
 
-When the visible tool list changes, legacy initialized sessions receive
-`notifications/tools/list_changed`. Modern listeners receive it only when
-their acknowledged subscription filter includes tool-list changes.
+Visibility changes send `notifications/tools/list_changed` to legacy
+initialized sessions. Modern listeners receive it only when their acknowledged
+subscription filter includes tool-list changes.
 
 See [Versioning and Visibility](versioning-and-visibility.md) for selectors,
 version targeting, and session behavior.
@@ -771,10 +779,10 @@ server =
     %{rows: 42, source: "warehouse"}
   end)
   |> FastestMCP.add_tool("process_data", fn %{"data_uri" => data_uri}, ctx ->
-    :ok = Context.info(ctx, "Processing data from #{data_uri}")
+    Context.info(ctx, "Processing data from #{data_uri}")
 
     data = Context.read_resource(ctx, data_uri)
-    :ok = Context.report_progress(ctx, 50, 100, "Loaded resource")
+    Context.report_progress(ctx, 50, 100, "Loaded resource")
 
     %{
       request_id: ctx.request_id,
@@ -848,7 +856,8 @@ provide stable tie-breaks. Injected parameters, nested properties, defaults,
 examples, enums, references, and output schemas are not indexed. `max_scan`
 bounds raw candidates and the returned `truncated` flag reports when that bound
 was reached.
-Providers with `list_component_page/5` are read in bounded pages. A legacy
+Providers with `list_component_page/5` and no transforms are read in bounded
+pages. A legacy
 provider that implements only `list_components/3` must materialize its own
 catalog because that older callback cannot expose a page boundary. ToolSearch
 then consumes that returned order directly only up to `max_scan`; it does not
@@ -907,10 +916,11 @@ If tools are added, removed, enabled, disabled, or hidden, FastestMCP can emit
 On `2025-11-25`, that path is session-aware:
 
 - it is delivered through one active HTTP or stdio session output sink
-- it is emitted only when the visible tool set actually changes for that
-  session
-- session visibility changes can trigger it even when the global registry did
-  not change
+- server-wide changes (component-manager mutations and every
+  `enable_components/2` or `disable_components/2` call) notify every listening
+  session, even when its visible set did not change
+- a session-scoped visibility change notifies only that session, and only when
+  its visible set changed
 
 On `2026-07-28`, a long-lived `subscriptions/listen` request receives the
 notification only when its acknowledged filter includes tool-list changes.

@@ -38,7 +38,8 @@ Connected clients use the same option:
 
 ```elixir
 FastestMCP.Client.call_tool!(client, "calc", %{}, version: "1.0.0")
-# => %FastestMCP.Client.ToolResult{structured_content: 1, ...}
+# => %FastestMCP.Client.ToolResult{structured_content: 1, ...} on 2026-07-28;
+#    2025-11-25 drops a non-object structuredContent
 ```
 
 On the wire, FastestMCP sends the version through `_meta.fastestmcp.version`, so
@@ -51,7 +52,9 @@ FastestMCP keeps version rules strict:
 - the highest visible version wins by default
 - exact versions remain callable
 - version strings cannot contain `@`
-- you cannot mix versioned and unversioned definitions for the same identifier
+- one registry (a server definition, the component manager, or a provider)
+  cannot mix versioned and unversioned definitions of an identifier; across
+  sources the highest visible version wins
 
 If the newest version is globally hidden, default resolution falls back to the
 highest version that is still visible.
@@ -125,7 +128,9 @@ That means:
 
 - a session can narrow the globally visible set
 - a session can allowlist within the globally visible set
-- a session cannot re-expose a component the server already disabled
+- a session cannot re-expose a component hidden by a server-scoped rule
+  (`FastestMCP.disable_components/2`); it can re-expose one declared
+  `enabled: false` or disabled through the component manager
 
 This matters most for versioned tools. If version `2.0.0` is globally hidden,
 default resolution falls back to the highest visible version instead of letting
@@ -133,7 +138,8 @@ the session re-enable `2.0.0`.
 
 ## Notifications
 
-FastestMCP emits list-changed notifications when the visible catalog changes:
+FastestMCP emits list-changed notifications when components or visibility
+rules change:
 
 - `notifications/tools/list_changed`
 - `notifications/resources/list_changed`
@@ -143,7 +149,10 @@ Legacy notifications are delivered through connected initialized HTTP or
 stdio session output sinks. Modern notifications are delivered through
 `subscriptions/listen` only when its acknowledged filter includes the matching
 list-change category. Server-scoped visibility updates feed both paths;
-session-specific visibility exists only on the legacy profile.
+session-specific visibility exists only on the legacy profile. A server-wide
+change notifies every listening session, even when its visible set did not
+change; a session-scoped change notifies only that session, and only when its
+visible set changed.
 
 ## When To Use These Features
 

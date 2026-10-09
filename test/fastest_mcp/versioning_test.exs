@@ -1,21 +1,45 @@
 defmodule FastestMCP.VersioningTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
+  alias FastestMCP.Apps
   alias FastestMCP.Error
+  alias FastestMCP.Operation
   alias FastestMCP.OperationPipeline
+  alias FastestMCP.Protocol.Extensions
   alias FastestMCP.Providers.Local
+  alias FastestMCP.TaskBackend.Memory
+  alias FastestMCP.Tools.Result, as: ToolResult
   alias FastestMCP.Transport.Engine
   alias FastestMCP.Transport.Request
+
+  defmodule DescriptorlessTaskBackend do
+    @moduledoc false
+    # Keeps tasks without the descriptor of the component that ran them.
+    @behaviour FastestMCP.TaskBackend
+
+    @impl true
+    defdelegate init(opts), to: Memory
+
+    @impl true
+    def put_task(table, task), do: Memory.put_task(table, %{task | component_descriptor: nil})
+
+    @impl true
+    defdelegate fetch_task(table, task_id), to: Memory
+
+    @impl true
+    defdelegate delete_task(table, task_id), to: Memory
+
+    @impl true
+    defdelegate list_tasks(table), to: Memory
+  end
 
   test "highest version wins by default and exact versions remain callable" do
     server_name = "versioning-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("calc", fn _args, _ctx -> 1 end, version: "1.0")
-      |> FastestMCP.add_tool("calc", fn _args, _ctx -> 2 end, version: "2.0")
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("calc", fn _args, _ctx -> 1 end, version: "1.0")
+    |> FastestMCP.add_tool("calc", fn _args, _ctx -> 2 end, version: "2.0")
+    |> start_server!()
 
     assert 2 == FastestMCP.call_tool!(server_name, "calc", %{})
     assert 1 == FastestMCP.call_tool!(server_name, "calc", %{}, version: "1.0")
@@ -45,15 +69,13 @@ defmodule FastestMCP.VersioningTest do
       end
     end
 
-    server =
-      FastestMCP.server(server_name, transforms: [transform])
-      |> FastestMCP.add_provider(provider)
+    FastestMCP.server(server_name, transforms: [transform])
+    |> FastestMCP.add_provider(provider)
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
-
-    assert {1, %{name: "calc", version: "1.0.0", enabled: true}} =
-             OperationPipeline.call_tool_with_component(server_name, "calc", %{})
+    assert {:ok,
+            %Operation{result: 1, component: %{name: "calc", version: "1.0.0", enabled: true}}} =
+             OperationPipeline.invoke(server_name, :tool, "calc", %{}, [])
 
     assert_receive {:transformed, "2.0.0"}
     assert_receive {:transformed, "1.0.0"}
@@ -63,31 +85,28 @@ defmodule FastestMCP.VersioningTest do
   test "unversioned resolution falls back past unauthorized tools and templates" do
     server_name = "authorization-version-fallback-#{System.unique_integer([:positive])}"
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("secure", fn _args, _ctx -> "tool_v1" end,
-        version: "1.0.0",
-        auth: fn _context -> true end
-      )
-      |> FastestMCP.add_tool("secure", fn _args, _ctx -> "tool_v2" end,
-        version: "2.0.0",
-        auth: fn _context -> false end
-      )
-      |> FastestMCP.add_resource_template(
-        "secure://items/{id}",
-        fn %{"id" => id}, _ctx -> "template_v1:#{id}" end,
-        version: "1.0.0",
-        auth: fn _context -> :ok end
-      )
-      |> FastestMCP.add_resource_template(
-        "secure://items/{id}",
-        fn %{"id" => id}, _ctx -> "template_v2:#{id}" end,
-        version: "2.0.0",
-        auth: fn _context -> nil end
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("secure", fn _args, _ctx -> "tool_v1" end,
+      version: "1.0.0",
+      auth: fn _context -> true end
+    )
+    |> FastestMCP.add_tool("secure", fn _args, _ctx -> "tool_v2" end,
+      version: "2.0.0",
+      auth: fn _context -> false end
+    )
+    |> FastestMCP.add_resource_template(
+      "secure://items/{id}",
+      fn %{"id" => id}, _ctx -> "template_v1:#{id}" end,
+      version: "1.0.0",
+      auth: fn _context -> :ok end
+    )
+    |> FastestMCP.add_resource_template(
+      "secure://items/{id}",
+      fn %{"id" => id}, _ctx -> "template_v2:#{id}" end,
+      version: "2.0.0",
+      auth: fn _context -> nil end
+    )
+    |> start_server!()
 
     assert "tool_v1" == FastestMCP.call_tool!(server_name, "secure", %{})
     assert "template_v1:42" == FastestMCP.read_resource!(server_name, "secure://items/42")
@@ -131,8 +150,7 @@ defmodule FastestMCP.VersioningTest do
 
     server = FastestMCP.server(server_name) |> FastestMCP.add_provider(provider)
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
     :ok =
       FastestMCP.disable_components!(server_name,
@@ -140,11 +158,17 @@ defmodule FastestMCP.VersioningTest do
         components: [:resource, :resource_template]
       )
 
-    assert {"resource_v1", %{uri: "memo://config", version: "1.0.0"}} =
-             OperationPipeline.read_resource_with_component(server_name, "memo://config")
+    assert {:ok,
+            %Operation{
+              result: "resource_v1",
+              component: %{uri: "memo://config", version: "1.0.0"}
+            }} = OperationPipeline.invoke(server_name, :resource, "memo://config", %{}, [])
 
-    assert {"template_v1:42", %{uri_template: "memo://users/{id}", version: "1.0.0"}} =
-             OperationPipeline.read_resource_with_component(server_name, "memo://users/42")
+    assert {:ok,
+            %Operation{
+              result: "template_v1:42",
+              component: %{uri_template: "memo://users/{id}", version: "1.0.0"}
+            }} = OperationPipeline.invoke(server_name, :resource, "memo://users/42", %{}, [])
   end
 
   test "mounted candidates preserve lower-version fallback without list resolution" do
@@ -177,12 +201,9 @@ defmodule FastestMCP.VersioningTest do
         else: component
     end
 
-    server =
-      FastestMCP.server(server_name, transforms: [disable_v2])
-      |> FastestMCP.mount(child, namespace: "child")
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name, transforms: [disable_v2])
+    |> FastestMCP.mount(child, namespace: "child")
+    |> start_server!()
 
     assert 1 == FastestMCP.call_tool!(server_name, "child_calc", %{})
     assert "resource_v1" == FastestMCP.read_resource!(server_name, "memo://child/config")
@@ -214,13 +235,10 @@ defmodule FastestMCP.VersioningTest do
     server_name =
       "versioning-transport-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("calc", fn _args, _ctx -> 1 end, version: "1.0.0")
-      |> FastestMCP.add_tool("calc", fn _args, _ctx -> 2 end, version: "2.0.0")
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("calc", fn _args, _ctx -> 1 end, version: "1.0.0")
+    |> FastestMCP.add_tool("calc", fn _args, _ctx -> 2 end, version: "2.0.0")
+    |> start_server!()
 
     :ok =
       FastestMCP.disable_components!(server_name,
@@ -278,19 +296,16 @@ defmodule FastestMCP.VersioningTest do
     server_name =
       "versioning-vendor-meta-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("calc", fn _args, _ctx -> 1 end, version: "1.0.0")
-      |> FastestMCP.add_tool("calc", fn _args, _ctx -> 2 end, version: "2.0.0")
-      |> FastestMCP.add_resource("memo://config", fn _args, _ctx -> %{version: "1.0.0"} end,
-        version: "1.0.0"
-      )
-      |> FastestMCP.add_resource("memo://config", fn _args, _ctx -> %{version: "2.0.0"} end,
-        version: "2.0.0"
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("calc", fn _args, _ctx -> 1 end, version: "1.0.0")
+    |> FastestMCP.add_tool("calc", fn _args, _ctx -> 2 end, version: "2.0.0")
+    |> FastestMCP.add_resource("memo://config", fn _args, _ctx -> %{version: "1.0.0"} end,
+      version: "1.0.0"
+    )
+    |> FastestMCP.add_resource("memo://config", fn _args, _ctx -> %{version: "2.0.0"} end,
+      version: "2.0.0"
+    )
+    |> start_server!()
 
     assert_scalar_tool_result(
       Engine.dispatch!(server_name, %Request{
@@ -320,27 +335,24 @@ defmodule FastestMCP.VersioningTest do
     server_name =
       "resource-versioning-transport-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_resource("memo://config", fn _args, _ctx -> %{version: "1.0.0"} end,
-        version: "1.0.0"
-      )
-      |> FastestMCP.add_resource("memo://config", fn _args, _ctx -> %{version: "2.0.0"} end,
-        version: "2.0.0"
-      )
-      |> FastestMCP.add_resource_template(
-        "memo://users/{id}",
-        fn %{"id" => id}, _ctx -> %{id: id, version: "1.0.0"} end,
-        version: "1.0.0"
-      )
-      |> FastestMCP.add_resource_template(
-        "memo://users/{id}",
-        fn %{"id" => id}, _ctx -> %{id: id, version: "2.0.0"} end,
-        version: "2.0.0"
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_resource("memo://config", fn _args, _ctx -> %{version: "1.0.0"} end,
+      version: "1.0.0"
+    )
+    |> FastestMCP.add_resource("memo://config", fn _args, _ctx -> %{version: "2.0.0"} end,
+      version: "2.0.0"
+    )
+    |> FastestMCP.add_resource_template(
+      "memo://users/{id}",
+      fn %{"id" => id}, _ctx -> %{id: id, version: "1.0.0"} end,
+      version: "1.0.0"
+    )
+    |> FastestMCP.add_resource_template(
+      "memo://users/{id}",
+      fn %{"id" => id}, _ctx -> %{id: id, version: "2.0.0"} end,
+      version: "2.0.0"
+    )
+    |> start_server!()
 
     :ok =
       FastestMCP.disable_components!(server_name,
@@ -447,6 +459,49 @@ defmodule FastestMCP.VersioningTest do
                method: "resources/templates/list",
                transport: :stdio
              })
+  end
+
+  # Version 2.0.0 is forbidden to every caller. Version 1.0.0 is an MCP Apps
+  # tool, so its descriptor requires a content fallback the empty result
+  # lacks: the fallback error shows which descriptor serialized the result.
+  test "tool results serialize with the highest version the caller may use" do
+    server_name = unique_name("descriptor")
+
+    FastestMCP.server(server_name, extensions: %{Extensions.apps() => %{}})
+    |> FastestMCP.add_tool("report", fn _args, _ctx -> ToolResult.from(%{content: []}) end,
+      version: "1.0.0",
+      task: true,
+      meta: Apps.tool_meta("ui://report/view")
+    )
+    |> FastestMCP.add_tool("report", fn _args, _ctx -> "forbidden" end,
+      version: "2.0.0",
+      task: true,
+      auth: fn _context -> false end
+    )
+    |> start_server!(task_backend: {DescriptorlessTaskBackend, []})
+
+    {session_id, _initialize, _initialized} = ProtocolTest.initialize_http(server_name)
+    {connection_id, _initialize} = ProtocolTest.initialize_stdio(server_name)
+    call = %{"name" => "report", "arguments" => %{}}
+
+    http = ProtocolTest.http_request(server_name, session_id, 2, "tools/call", call)
+    assert JSON.decode!(http.resp_body)["error"]["message"] =~ "non-empty content fallback"
+
+    stdio = ProtocolTest.stdio_request(server_name, connection_id, 2, "tools/call", call)
+    assert stdio["error"]["message"] =~ "non-empty content fallback"
+
+    # The task store lost the descriptor, so the result resolves it again.
+    task_call = Map.put(call, "task", %{"ttl" => 30_000})
+    created = ProtocolTest.http_request(server_name, session_id, 3, "tools/call", task_call)
+    %{"result" => %{"task" => %{"taskId" => task_id}}} = JSON.decode!(created.resp_body)
+    FastestMCP.await_task!(server_name, task_id, 1_000, session_id: session_id)
+
+    result =
+      ProtocolTest.http_request(server_name, session_id, 4, "tasks/result", %{
+        "taskId" => task_id
+      })
+
+    assert JSON.decode!(result.resp_body)["error"]["message"] =~ "non-empty content fallback"
   end
 
   defp assert_scalar_tool_result(result, expected) do

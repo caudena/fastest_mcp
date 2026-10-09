@@ -17,9 +17,14 @@ defmodule FastestMCP.Prompts.Message do
   ```elixir
   FastestMCP.Prompts.Message.new("Summarize the diff")
   FastestMCP.Prompts.Message.new("Done.", role: :assistant)
-  FastestMCP.Prompts.Message.new(%{type: "resource", resource: %{uri: "file:///tmp/out.txt"}})
+  FastestMCP.Prompts.Message.new(%{
+    type: "resource",
+    resource: %{uri: "file:///tmp/out.txt", mimeType: "text/plain", text: "Done"}
+  })
   ```
   """
+
+  import FastestMCP.Util, only: [maybe_put: 3, optional_map!: 2, string_keys: 1]
 
   alias FastestMCP.JSONValue
 
@@ -38,23 +43,20 @@ defmodule FastestMCP.Prompts.Message do
     %__MODULE__{
       role: normalize_role(Keyword.get(opts, :role, "user")),
       content: normalize_content(content),
-      meta: normalize_optional_map(Keyword.get(opts, :meta))
+      meta: optional_map!(Keyword.get(opts, :meta), "prompt message meta")
     }
   end
 
   @doc "Normalizes a message-like value into `%FastestMCP.Prompts.Message{}`."
   def from(%__MODULE__{} = message), do: message
 
+  # Application code gives messages with atom or string keys.
   def from(%{} = message) do
-    new(
-      Map.get(message, :content, Map.get(message, "content", "")),
-      role: Map.get(message, :role, Map.get(message, "role", "user")),
-      meta:
-        Map.get(
-          message,
-          :_meta,
-          Map.get(message, "_meta", Map.get(message, :meta, Map.get(message, "meta")))
-        )
+    message = string_keys(message)
+
+    new(Map.get(message, "content", ""),
+      role: Map.get(message, "role", "user"),
+      meta: Map.get(message, "_meta", message["meta"])
     )
   end
 
@@ -80,29 +82,12 @@ defmodule FastestMCP.Prompts.Message do
     raise ArgumentError, "prompt message role must be :user or :assistant, got #{inspect(other)}"
   end
 
-  defp normalize_content(%{} = content) do
-    type = Map.get(content, :type, Map.get(content, "type"))
-
-    if is_binary(type) do
-      Map.new(content)
-    else
-      %{type: "text", text: JSONValue.encode!(content)}
-    end
-  end
-
+  # A content map keeps the application's keys until it is serialized.
+  defp normalize_content(%{type: type} = content) when is_binary(type), do: content
+  defp normalize_content(%{"type" => type} = content) when is_binary(type), do: content
   defp normalize_content(content) when is_binary(content), do: %{type: "text", text: content}
 
   defp normalize_content(content) do
     %{type: "text", text: JSONValue.encode!(content)}
   end
-
-  defp normalize_optional_map(nil), do: nil
-  defp normalize_optional_map(map) when is_map(map), do: Map.new(map)
-
-  defp normalize_optional_map(other) do
-    raise ArgumentError, "prompt message meta must be a map, got #{inspect(other)}"
-  end
-
-  defp maybe_put(map, _key, nil), do: map
-  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 end

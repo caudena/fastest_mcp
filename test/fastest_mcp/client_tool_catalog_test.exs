@@ -1,11 +1,13 @@
 defmodule FastestMCP.ClientToolCatalogTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   import Plug.Conn
 
   alias FastestMCP.Client
   alias FastestMCP.Client.ProtocolError
+  alias FastestMCP.Client.ToolCatalog
   alias FastestMCP.Error
+  alias FastestMCP.Middleware
 
   defmodule CatalogPlug do
     import Plug.Conn
@@ -159,7 +161,8 @@ defmodule FastestMCP.ClientToolCatalogTest do
     second = Task.async(fn -> Client.call_tool!(client, "echo", %{"value" => 2}) end)
 
     assert_receive {:catalog_first_page, loader_pid}, 1_000
-    Process.sleep(50)
+    # The second caller joins the load in flight instead of listing again.
+    refute_receive {:catalog_first_page, _second_loader}, 50
     assert Agent.get(state, & &1.list_requests) == 1
     send(loader_pid, :release_catalog)
 
@@ -222,14 +225,14 @@ defmodule FastestMCP.ClientToolCatalogTest do
 
     assert Agent.get(state, & &1.list_requests) == 1
 
-    assert :ok = Client.set_access_token!(client, "beta")
+    assert :ok = Client.set_auth!(client, access_token: "beta")
 
     assert %{structured_content: %{"value" => 3}} =
              Client.call_tool!(client, "beta_tool", %{"value" => 3})
 
     assert Agent.get(state, & &1.list_requests) == 2
 
-    assert :ok = Client.set_auth_input!(client, authorization: "Bearer gamma")
+    assert :ok = Client.set_auth!(client, authorization: "Bearer gamma")
 
     assert %{structured_content: %{"value" => 4}} =
              Client.call_tool!(client, "gamma_tool", %{"value" => 4})
@@ -237,25 +240,136 @@ defmodule FastestMCP.ClientToolCatalogTest do
     assert Agent.get(state, & &1.list_requests) == 3
   end
 
+  test "listing and execution reuse one compiled catalog while it is fresh" do
+    parent = self()
+    name = unique_name("catalog-reuse")
+
+    FastestMCP.server(name)
+    |> FastestMCP.add_middleware(fn operation, next ->
+      if operation.method == "tools/list", do: send(parent, :catalog_loaded)
+      next.(operation)
+    end)
+    |> FastestMCP.add_tool("echo", fn arguments, _ -> arguments end)
+    |> start_server!()
+
+    client = connect!({:in_process, name}, protocol_version: "2025-11-25")
+
+    assert {:ok, [%{"name" => "echo"}]} = Client.list_all_tools(client)
+    assert_receive :catalog_loaded
+    assert {:ok, %Client.ToolResult{structured_content: %{}}} = Client.call_tool(client, "echo")
+    assert {:ok, [%{"name" => "echo"}]} = Client.list_all_tools(client)
+    refute_receive :catalog_loaded
+    assert :ok = Client.set_auth(client, [])
+    assert {:ok, _} = Client.list_all_tools(client)
+    assert_receive :catalog_loaded
+  end
+
+  test "per-call authentication discovery does not replace the connection catalog" do
+    parent = self()
+    name = unique_name("catalog-per-call-auth")
+
+    server =
+      FastestMCP.server(name)
+      |> FastestMCP.add_auth(fn input, _ ->
+        token =
+          case input["authorization"] do
+            "Bearer " <> token -> token
+            _ -> input["token"]
+          end
+
+        {:ok, %{principal: token}}
+      end)
+      |> FastestMCP.add_middleware(fn operation, next ->
+        result = next.(operation)
+
+        if operation.method == "tools/list" do
+          send(parent, {:catalog_for, operation.context.principal})
+
+          Middleware.map_result(result, fn tools ->
+            Enum.filter(tools, &(&1.name == operation.context.principal))
+          end)
+        else
+          result
+        end
+      end)
+      |> FastestMCP.add_tool("alpha", fn _, _ -> %{} end)
+      |> FastestMCP.add_tool("beta", fn _, _ -> %{} end)
+
+    start_server!(server)
+
+    client =
+      connect!({:in_process, name},
+        auth_input: %{token: "alpha"},
+        protocol_version: "2025-11-25"
+      )
+
+    assert {:ok, [%{"name" => "alpha"}]} = Client.list_all_tools(client)
+    assert_receive {:catalog_for, "alpha"}
+
+    assert {:ok, [%{"name" => "beta"}]} =
+             Client.list_all_tools(client, auth_input: %{token: "beta"})
+
+    assert_receive {:catalog_for, "beta"}
+
+    assert {:ok, [%{"name" => "alpha"}]} = Client.list_all_tools(client)
+    refute_receive {:catalog_for, _}
+
+    assert {:error, %Error{code: :invalid_params}} =
+             Client.list_all_tools(client, access_token: "beta")
+
+    %{url: url} = start_http!(name)
+    http_client = connect!(url, access_token: "alpha", protocol_version: "2026-07-28")
+    assert {:ok, [%{"name" => "alpha"}]} = Client.list_all_tools(http_client)
+    assert_receive {:catalog_for, "alpha"}
+
+    for options <- [
+          [access_token: "beta"],
+          [authorization: "Bearer beta"],
+          [headers: [{"authorization", "Bearer beta"}]]
+        ] do
+      assert {:ok, [%{"name" => "beta"}]} = Client.list_all_tools(http_client, options)
+      assert_receive {:catalog_for, "beta"}
+    end
+
+    assert {:ok, [%{"name" => "alpha"}]} = Client.list_all_tools(http_client)
+    # The modern server advertises ttlMs: 0, so its default identity is fetched again.
+    assert_receive {:catalog_for, "alpha"}
+  end
+
+  test "invalid preferred descriptors do not fall back to older valid versions" do
+    descriptor = fn version, schema ->
+      %{
+        "name" => "versioned",
+        "inputSchema" => schema,
+        "_meta" => %{"fastestmcp" => %{"version" => version}}
+      }
+    end
+
+    catalog =
+      ToolCatalog.build(
+        [
+          descriptor.("1.0.0", %{"type" => "object"}),
+          descriptor.("2.0.0", %{"type" => "not-a-json-type"})
+        ],
+        3,
+        []
+      )
+
+    assert {:ok, %{version: "1.0.0"}} = ToolCatalog.lookup(catalog, "versioned", "1.0.0")
+    assert {:error, _} = ToolCatalog.lookup(catalog, "versioned")
+    assert {:error, _} = ToolCatalog.lookup(catalog, "versioned", "2.0.0")
+  end
+
   defp start_client(mode, opts \\ []) do
     state = start_supervised!({Agent, fn -> %{mode: mode, list_requests: 0, calls: []} end})
 
-    bandit =
-      start_supervised!(
-        {Bandit, plug: {CatalogPlug, state: state, test_pid: self()}, scheme: :http, port: 0}
-      )
-
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+    %{url: url} = serve!({CatalogPlug, state: state, test_pid: self()})
 
     client =
-      Client.connect!(
-        "http://127.0.0.1:#{port}/mcp",
+      connect!(
+        url,
         Keyword.merge([protocol_version: "2025-11-25"], opts)
       )
-
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect!(client)
-    end)
 
     {client, state}
   end

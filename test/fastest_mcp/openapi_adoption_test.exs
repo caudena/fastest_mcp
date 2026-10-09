@@ -1,5 +1,5 @@
 defmodule FastestMCP.OpenAPIAdoptionTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.{Error, Schema}
   alias FastestMCP.Providers.OpenAPI
@@ -222,8 +222,7 @@ defmodule FastestMCP.OpenAPIAdoptionTest do
   defp start_body(body, opts \\ []) do
     name = "openapi-adoption-#{System.unique_integer([:positive])}"
     server = FastestMCP.from_openapi(spec(body, opts), name: name, requester: requester())
-    assert {:ok, _} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(name) end)
+    start_server!(server)
     server
   end
 

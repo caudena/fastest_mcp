@@ -1,8 +1,10 @@
 defmodule FastestMCP.TransportSerializerContractTest do
-  use ExUnit.Case, async: true
+  use FastestMCP.Case, async: true
 
+  alias FastestMCP.Component
+  alias FastestMCP.Components.Tool
   alias FastestMCP.Error
-  alias FastestMCP.ResultNormalizer
+  alias FastestMCP.Protocol.Schema, as: ProtocolSchema
   alias FastestMCP.Schema
   alias FastestMCP.TaskWire
   alias FastestMCP.Transport.Serializer
@@ -151,8 +153,8 @@ defmodule FastestMCP.TransportSerializerContractTest do
   end
 
   test "structuredContent preserves JSON values while the protocol profile owns wire constraints" do
-    assert %{structuredContent: ["not", "an", "object"]} =
-             ResultNormalizer.normalize_tool(%{
+    assert {:ok, %{structuredContent: ["not", "an", "object"]}} =
+             Component.normalize_result(%Tool{}, %{
                content: "valid text",
                structuredContent: ["not", "an", "object"]
              })
@@ -198,7 +200,7 @@ defmodule FastestMCP.TransportSerializerContractTest do
     legacy_envelope = %{"jsonrpc" => "2.0", "id" => "call-1", "result" => array_result}
 
     assert {:error, %Schema.Error{}} =
-             Schema.validate_protocol(
+             ProtocolSchema.validate(
                "2025-11-25",
                :server_to_client,
                :response,
@@ -210,7 +212,7 @@ defmodule FastestMCP.TransportSerializerContractTest do
       put_in(legacy_envelope, ["result"], Map.put(array_result, "resultType", "complete"))
 
     assert {:ok, ^modern_envelope} =
-             Schema.validate_protocol(
+             ProtocolSchema.validate(
                "2026-07-28",
                :server_to_client,
                :response,
@@ -338,15 +340,14 @@ defmodule FastestMCP.TransportSerializerContractTest do
 
     payload = TaskWire.task(task)
 
-    refute Map.has_key?(payload, :elicitation)
+    refute Map.has_key?(payload, "elicitation")
 
-    assert get_in(payload, [:_meta, "fastestmcp", "elicitation"]) == %{
-             requestId: "request-1",
-             message: "Choose",
-             requestedSchema: %{"type" => "string"}
+    assert get_in(payload, ["_meta", "fastestmcp", "elicitation"]) == %{
+             "requestId" => "request-1",
+             "message" => "Choose",
+             "requestedSchema" => %{"type" => "string"}
            }
 
-    assert %{tasks: [^payload]} = TaskWire.task_list(%{tasks: [task], next_cursor: nil})
-    refute Map.has_key?(TaskWire.task_list(%{tasks: [task], next_cursor: nil}), :nextCursor)
+    assert TaskWire.task_list(%{tasks: [task], next_cursor: nil}) == %{"tasks" => [payload]}
   end
 end

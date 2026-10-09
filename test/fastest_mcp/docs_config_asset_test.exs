@@ -1,5 +1,5 @@
 defmodule FastestMCP.DocsConfigAssetTest do
-  use ExUnit.Case, async: true
+  use FastestMCP.Case, async: true
 
   # Regression: ISSUE-001 — generated docs site requested docs_config.js but did not ship it
   # Found by /qa on 2026-04-11

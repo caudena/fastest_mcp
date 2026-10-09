@@ -1,56 +1,57 @@
 defmodule FastestMCP.ProviderTransforms.ToolTransform do
-  @behaviour FastestMCP.ProviderTransform
   @moduledoc """
-  Renames provider tools while preserving reverse lookup back to the source name.
+  A provider transform that renames provider tools. Clients see the new name,
+  and calls to it reach the source tool.
 
-  Provider transforms sit between a provider and the runtime-facing view of
-  its components. They rewrite identifiers as components are listed, then
-  translate those identifiers back when a request needs to resolve the
-  original backing component.
-
-  Keeping the transform logic isolated here lets naming and namespacing stay
-  orthogonal to the provider implementation itself.
+      provider
+      |> FastestMCP.add_provider_transform(
+        FastestMCP.ProviderTransforms.ToolTransform.new(%{"dynamic_echo" => %{name: "echo"}})
+      )
   """
 
+  use FastestMCP.ProviderTransform
+
   alias FastestMCP.Components.Tool
-  alias FastestMCP.ProviderTransforms.ToolTransformConfig
 
-  defstruct mappings: %{}, reverse_names: %{}
+  defstruct names: %{}, reverse_names: %{}
 
-  @doc "Builds a new value for this module from the supplied options."
+  @doc """
+  Builds the transform from a map of source tool names to `%{name: new_name}`
+  (or `[name: new_name]`). A mapping without `:name`, or two tools renamed to
+  the same name, raises `ArgumentError`.
+  """
   def new(mappings) when is_map(mappings) do
-    normalized =
-      Enum.into(mappings, %{}, fn {source_name, config} ->
-        {to_string(source_name), ToolTransformConfig.new(config)}
-      end)
+    names =
+      Map.new(mappings, fn {source, config} -> {to_string(source), name!(source, config)} end)
 
     reverse_names =
-      Enum.reduce(normalized, %{}, fn {source_name, %ToolTransformConfig{name: target_name}},
-                                      acc ->
-        target_name = to_string(target_name)
+      Enum.reduce(names, %{}, fn {source, target}, acc ->
+        if Map.has_key?(acc, target),
+          do: raise(ArgumentError, "duplicate target name #{inspect(target)} in tool transform")
 
-        if Map.has_key?(acc, target_name) do
-          raise ArgumentError, "duplicate target name #{inspect(target_name)} in tool transform"
-        end
-
-        Map.put(acc, target_name, source_name)
+        Map.put(acc, target, source)
       end)
 
-    %__MODULE__{mappings: normalized, reverse_names: reverse_names}
+    %__MODULE__{names: names, reverse_names: reverse_names}
   end
 
-  @doc "Transforms a component before it is exposed."
+  defp name!(source, config) when is_map(config) or is_list(config) do
+    case Map.new(config)[:name] do
+      nil -> raise ArgumentError, "tool transform for #{inspect(to_string(source))} needs :name"
+      name -> to_string(name)
+    end
+  end
+
   @impl FastestMCP.ProviderTransform
-  def transform_component(%__MODULE__{mappings: mappings}, %Tool{} = component, _operation) do
-    case Map.get(mappings, component.name) do
-      %ToolTransformConfig{name: target_name} -> %Tool{component | name: to_string(target_name)}
-      nil -> component
+  def transform_component(%__MODULE__{names: names}, %Tool{} = component, _operation) do
+    case Map.fetch(names, component.name) do
+      {:ok, name} -> %{component | name: name}
+      :error -> component
     end
   end
 
   def transform_component(%__MODULE__{}, component, _operation), do: component
 
-  @doc "Maps an exposed identifier back to the source identifier."
   @impl FastestMCP.ProviderTransform
   def reverse_identifier(%__MODULE__{reverse_names: reverse_names}, :tool, identifier, _operation) do
     {:ok, Map.get(reverse_names, to_string(identifier), to_string(identifier))}

@@ -1,1088 +1,495 @@
 defmodule FastestMCP.Client.HTTP do
   @moduledoc false
+  # Streamable HTTP I/O of the client. Workers run requests and the session
+  # stream with a `FastestMCP.Client.TransportSnapshot` and report to the
+  # connection (`state.client_pid`) only by message:
+  #
+  #     {:http, ref, {:started, request_ref} | {:notification, message} |
+  #                  {:server_request, message} | {:done, result}}
+  #     {:session_stream, ref, {:started, request_ref} | :opened |
+  #                  {:notification, message} | {:server_request, message} |
+  #                  {:invalid, error, message} | {:failed, error}}
+  #
+  # A session stream whose session expired asks the connection for a
+  # recovered snapshot with a `{:session_stream, ref, {:recover, session_id,
+  # error}}` call.
+
+  import FastestMCP.Util, only: [maybe_put: 3]
+  import FastestMCP.Protocol.Version
+
+  alias FastestMCP.Client.Auth
   alias FastestMCP.Client.OAuth
-  alias FastestMCP.Client.OAuth.Error, as: OAuthError
-  alias FastestMCP.Client.ProtocolError
-  alias FastestMCP.Client.Transport.StreamableHTTP, as: HTTPClientTransport
+  alias FastestMCP.Client.Spec
+  alias FastestMCP.Client.Wire
+  alias FastestMCP.Deadline
   alias FastestMCP.Error
-  alias FastestMCP.ErrorExposure
   alias FastestMCP.MIME
-  alias FastestMCP.Schema
+  alias FastestMCP.Protocol.HTTPHeaders
   alias FastestMCP.Transport.JSONRPC
   alias FastestMCP.Transport.SSEDecoder
 
-  @max_terminal_response_probe_bytes 16 * 1024 * 1024
+  @post_headers [
+    {"accept", "application/json, text/event-stream"},
+    {"content-type", "application/json"},
+    {"connection", "close"}
+  ]
 
-  def run_http_request(
-        request,
-        method,
-        normalizer,
-        timeout_ms,
-        state,
-        opts,
-        request_started
-      ) do
-    run_http_request(
-      request,
-      method,
-      normalizer,
-      timeout_ms,
-      state,
-      opts,
-      request_started,
-      0
-    )
+  # Returns `{:ok, result, session_id, cache_hint}`, `{:error, error}`,
+  # `{:missing_session, error, session_id, generation}`, or
+  # `{:modern_subscription_terminated, error, retry_ms}`.
+  def request(state, ref, request, %Spec{} = spec) do
+    ctx = %{
+      state: state,
+      tag: :http,
+      ref: ref,
+      request: request,
+      id: request["id"],
+      method: request["method"],
+      version: spec.protocol_version,
+      task_augmented: Wire.task_augmented?(request["params"]),
+      normalizer: spec.normalizer,
+      deadline: spec.deadline,
+      spec: spec
+    }
+
+    run(ctx, 0)
   end
 
-  def run_http_request(
-        request,
-        method,
-        normalizer,
-        timeout_ms,
-        state,
-        opts,
-        request_started,
-        auth_attempt
-      ) do
-    deadline =
-      opts |> FastestMCP.Deadline.from_options(timeout_ms) |> FastestMCP.Deadline.cap(timeout_ms)
+  def session_stream(state, stream_ref) do
+    ctx = %{state: state, tag: :session_stream, ref: stream_ref}
+    stream_session(ctx, new_decoder(state), 0, false, false)
+  end
 
-    opts =
-      opts |> Keyword.put(:deadline, deadline) |> Keyword.put(:request_started, request_started)
-
-    with {:ok, timeout_ms} <- FastestMCP.Deadline.check(deadline, method),
-         :ok <- FastestMCP.Client.Connection.ensure_http_apps() do
-      case FastestMCP.Client.HTTP.stream_http_request(request, method, timeout_ms, state, opts) do
-        {:ok, result, headers} ->
-          with {:ok, normalized_result} <-
-                 FastestMCP.Client.Connection.normalize_response_result(normalizer, result) do
-            {:ok, normalized_result, headers,
-             FastestMCP.Client.Connection.response_cache_hint(result)}
-          end
-
-        {:modern_subscription_terminated, %Error{} = error, retry_delay} ->
-          {:modern_subscription_terminated, error, retry_delay}
-
-        {:http_error, status, headers, _body, %Error{} = error} ->
-          cond do
-            FastestMCP.Client.Connection.recoverable_missing_http_session?(state, method, status) ->
-              {:missing_session, error, state.session_id, state.lifecycle.session_generation}
-
-            oauth_retry?(state, status, auth_attempt) ->
-              case OAuth.handle_unauthorized(
-                     state.oauth.pid,
-                     state.oauth.resource,
-                     headers,
-                     attempt: auth_attempt + 1
-                   ) do
-                {:ok, _authorization_header} ->
-                  run_http_request(
-                    request,
-                    method,
-                    normalizer,
-                    timeout_ms,
-                    state,
-                    opts,
-                    request_started,
-                    auth_attempt + 1
-                  )
-
-                {:error, %OAuthError{} = oauth_error} ->
-                  {:error, FastestMCP.Client.Codec.oauth_client_error(oauth_error)}
-              end
-
-            true ->
-              {:error, error}
-          end
-
-        {:error, error} ->
-          {:error, error}
+  def send_notification(message, state, opts) do
+    timeout =
+      case Keyword.fetch(opts, :deadline) do
+        {:ok, deadline} -> Deadline.remaining(deadline)
+        :error -> Keyword.get(opts, :timeout_ms, state.timeout_ms)
       end
+
+    if timeout == 0 do
+      {:error, %Error{code: :timeout, message: "notification deadline elapsed"}}
+    else
+      case post(message, state, headers(@post_headers, state, opts, timeout, message), timeout) do
+        {:ok, status, _body} when status in 200..299 ->
+          :ok
+
+        {:ok, status, body} ->
+          error = Wire.http_error(body, status, "HTTP notification failed")
+          report_stale_session(state, message["method"], status, error)
+          {:error, error}
+
+        {:error, reason} ->
+          {:error, failure("HTTP notification failed", reason)}
+      end
+    end
+  end
+
+  # Answers a server request with the credentials and parameter headers of the
+  # request whose response stream carried it, if any.
+  def post_response(payload, state, origin) do
+    {auth, parameter_headers} =
+      case origin do
+        %Spec{} -> {origin.auth, origin.http_parameter_headers}
+        nil -> {[], %{}}
+      end
+
+    headers = headers(@post_headers, state, auth, state.timeout_ms, payload, parameter_headers)
+
+    case post(payload, state, headers, state.timeout_ms) do
+      {:ok, status, _body} when status in 200..299 ->
+        :ok
+
+      {:ok, status, body} ->
+        {:error,
+         %Error{
+           code: :internal_error,
+           message: "client callback response was rejected",
+           details: %{status: status, body: Wire.decode_json(body)}
+         }}
+
+      {:error, reason} ->
+        {:error, failure("failed to POST client callback response", reason)}
+    end
+  end
+
+  def terminate_session(
+        %{transport: %{type: :streamable_http, base_url: url}, session_id: session_id} = state
+      )
+      when is_binary(session_id) and session_id != "" do
+    timeout = min(state.timeout_ms, 1000)
+
+    headers =
+      headers([{"accept", "application/json"}, {"connection", "close"}], state, [], timeout)
+
+    _ = FastestMCP.HTTP.request(:delete, url, headers: headers, timeout_ms: timeout)
+
+    :ok
+  end
+
+  def terminate_session(_state), do: :ok
+
+  def cancel(request_ref), do: FastestMCP.HTTP.cancel_request(request_ref)
+
+  ## Requests
+
+  defp run(ctx, auth_attempt) do
+    with {:ok, timeout_ms} <- Deadline.check(ctx.deadline, ctx.method),
+         :ok <- ensure_apps() do
+      case post_request(Map.merge(ctx, %{timeout_ms: timeout_ms, attempt: 0})) do
+        {:ok, result, session_id} ->
+          with {:ok, value} <- Wire.normalize(ctx.normalizer, result),
+               do: {:ok, value, session_id, Wire.cache_hint(result)}
+
+        {:http_error, 404, _headers, error}
+        when ctx.method != "initialize" and is_binary(ctx.state.session_id) and
+               ctx.state.session_id != "" ->
+          {:missing_session, error, ctx.state.session_id, ctx.state.session_generation}
+
+        {:http_error, status, headers, error} ->
+          if oauth_retry?(ctx.state, status, auth_attempt),
+            do: reauthorize(ctx, headers, auth_attempt + 1),
+            else: {:error, error}
+
+        other ->
+          other
+      end
+    end
+  end
+
+  # The coordinator answers within the request's deadline; its flow goes on.
+  defp reauthorize(ctx, headers, attempt) do
+    %{pid: pid, resource: resource} = ctx.state.oauth
+    opts = [attempt: attempt, timeout_ms: Deadline.remaining(ctx.deadline)]
+
+    case OAuth.handle_unauthorized(pid, resource, headers, opts) do
+      {:ok, _authorization} ->
+        run(ctx, attempt)
+
+      {:error, error} ->
+        with {:ok, _remaining} <- Deadline.check(ctx.deadline, ctx.method) do
+          details = %{stage: error.stage, reason: error.reason}
+          {:error, %Error{code: :unauthorized, message: error.message, details: details}}
+        end
     end
   end
 
   defp oauth_retry?(%{oauth: %{max_auth_attempts: max_attempts}}, status, attempt)
-       when status in [401, 403] do
-    attempt < max_attempts
-  end
+       when status in [401, 403],
+       do: attempt < max_attempts
 
-  defp oauth_retry?(_state, _status, _attempt) do
-    false
-  end
+  defp oauth_retry?(_state, _status, _attempt), do: false
 
-  def enqueue_recovery_operation(state, operation) do
-    if state.lifecycle.recovery &&
-         length(state.lifecycle.recovery.queue) < state.max_recovery_queue do
-      {:noreply, update_in(state.lifecycle.recovery.queue, &[operation | &1])}
-    else
-      error = %Error{
-        code: :overloaded,
-        message: "client recovery queue is full",
-        details: %{max_queue: state.max_recovery_queue}
-      }
+  defp post_request(ctx) do
+    state = ctx.state
 
-      fail_queued_recovery_operation(operation, error)
-      {:noreply, state}
-    end
-  end
+    decoder =
+      SSEDecoder.new(max_event_bytes: min(state.max_sse_event_bytes, state.max_response_bytes))
 
-  def flush_recovery_queue(state, []) do
-    state
-  end
-
-  def flush_recovery_queue(state, [operation | rest]) do
-    state =
-      case operation do
-        {:notification, from, method, params, opts} ->
-          with :ok <- FastestMCP.Client.Connection.validate_request_budget({:sync, from}, opts),
-               :ok <-
-                 FastestMCP.Client.Connection.validate_outbound_notification_lifecycle(
-                   state,
-                   method
-                 ) do
-            GenServer.reply(
-              from,
-              FastestMCP.Client.Requests.send_client_notification(state, method, params, opts)
-            )
-          else
-            {:error, error} -> GenServer.reply(from, {:error, error})
-          end
-
-          state
-
-        {:request, from, method, params, normalizer, opts} ->
-          case FastestMCP.Client.Connection.start_outbound_request(
-                 state,
-                 method,
-                 params,
-                 normalizer,
-                 opts,
-                 {:sync, from}
-               ) do
-            {:ok, _ref, _request_id, _task_augmented, next_state} ->
-              next_state
-
-            {:cached, result, next_state} ->
-              GenServer.reply(from, {:ok, result})
-              next_state
-
-            {:error, error, next_state} ->
-              GenServer.reply(from, {:error, error})
-              next_state
-          end
-
-        {:request_async, from, owner, method, params, normalizer, opts} ->
-          case FastestMCP.Client.Connection.start_outbound_request(
-                 state,
-                 method,
-                 params,
-                 normalizer,
-                 opts,
-                 {:async, owner}
-               ) do
-            {:ok, ref, request_id, task_augmented, next_state} ->
-              GenServer.reply(from, {:ok, ref, request_id, task_augmented})
-              next_state
-
-            {:error, error, next_state} ->
-              GenServer.reply(from, {:error, error})
-              next_state
-          end
-      end
-
-    flush_recovery_queue(state, rest)
-  end
-
-  def fail_queued_recovery_operation({:notification, from, _method, _params, _opts}, error) do
-    GenServer.reply(from, {:error, error})
-  end
-
-  def fail_queued_recovery_operation(
-        {:request, from, _method, _params, _normalizer, _opts},
-        error
-      ) do
-    GenServer.reply(from, {:error, error})
-  end
-
-  def fail_queued_recovery_operation(
-        {:request_async, from, _owner, _method, _params, _normalizer, _opts},
-        error
-      ) do
-    GenServer.reply(from, {:error, error})
-  end
-
-  def maybe_reopen_recovered_session_stream(state, false) do
-    state
-  end
-
-  def maybe_reopen_recovered_session_stream(state, true) do
-    parent = self()
-    stream_ref = make_ref()
-
-    snapshot = FastestMCP.Client.TransportSnapshot.new(state)
-
-    {pid, monitor_ref} =
-      FastestMCP.Client.Workers.start_monitored!(state.worker_supervisor, fn ->
-        run_session_stream(parent, stream_ref, snapshot)
-      end)
-
-    %{
-      state
-      | session_stream: %{
-          pid: pid,
-          monitor_ref: monitor_ref,
-          stream_ref: stream_ref,
-          request_ref: nil,
-          started?: false,
-          waiters: []
-        }
-    }
-  end
-
-  def original_request_not_replayed(%Error{} = error) do
-    %{
-      error
-      | details:
-          Map.merge(error.details || %{}, %{
-            session_recovered: true,
-            original_request_replayed: false
-          })
-    }
-  end
-
-  def stream_http_request(request, method, timeout_ms, state, opts) do
-    decoder = SSEDecoder.new(max_event_bytes: response_event_limit(state))
-
-    opts =
-      opts
-      |> Keyword.put(
-        :task_augmented,
-        FastestMCP.Client.Connection.task_augmented_params?(request["params"])
+    headers =
+      headers(
+        @post_headers,
+        state,
+        ctx.spec.auth,
+        ctx.timeout_ms,
+        ctx.request,
+        ctx.spec.http_parameter_headers
       )
-      |> maybe_put_sse_deadline(timeout_ms)
 
-    case start_stream_http_request(request, timeout_ms, state, opts) do
+    case open(state, :post, headers, json: ctx.request, timeout_ms: ctx.timeout_ms) do
       {:ok, request_ref} ->
-        try do
-          receive_stream_events(
-            request_ref,
-            request["id"],
-            method,
-            timeout_ms,
-            {:pending, decoder},
-            nil,
-            state,
-            opts
-          )
-        after
-          _ = HTTPClientTransport.cancel_request(request_ref)
-          FastestMCP.Client.HTTP.flush_http_messages(request_ref)
-        end
+        consume(ctx, request_ref, &receive_response(ctx, &1, {:pending, decoder}, nil))
 
-      {:error, %Error{} = error} ->
-        if modern_subscription_stream?(method, opts) do
-          {:modern_subscription_terminated, error, sse_retry_delay(decoder, state.sse_reconnect)}
-        else
-          {:error, error}
-        end
+      {:error, reason} ->
+        error = transport_error(ctx, reason, "HTTP stream request failed")
+
+        if subscription?(ctx),
+          do: {:modern_subscription_terminated, error, retry_delay(decoder, state.sse_reconnect)},
+          else: {:error, error}
     end
   end
 
-  defp receive_stream_events(
-         request_ref,
-         original_id,
-         method,
-         timeout_ms,
-         response_body,
-         headers,
-         state,
-         opts
-       ) do
+  defp receive_response(ctx, request_ref, body, headers) do
     receive do
       {:http, {^request_ref, :stream_start, response_headers}} ->
-        case streamed_response_body(response_headers, response_body) do
-          {:ok, next_response_body} ->
-            receive_stream_events(
-              request_ref,
-              original_id,
-              method,
-              timeout_ms,
-              next_response_body,
-              response_headers,
-              state,
-              opts
-            )
-
-          {:error, %Error{} = error} ->
-            {:error, error}
-        end
+        with {:ok, body} <- response_body(response_headers, body),
+             do: receive_response(ctx, request_ref, body, response_headers)
 
       {:http, {^request_ref, :stream, chunk}} ->
-        case feed_streamed_response(response_body, chunk, state.max_response_bytes) do
-          {:ok, {:sse, next_decoder}, events} ->
-            case handle_stream_events(events, original_id, method, state, opts) do
-              {:ok, result} ->
-                {:ok, result, FastestMCP.Client.Codec.normalize_httpc_headers(headers)}
-
-              :continue ->
-                receive_stream_events(
-                  request_ref,
-                  original_id,
-                  method,
-                  timeout_ms,
-                  {:sse, next_decoder},
-                  headers,
-                  state,
-                  opts
-                )
-
-              {:error, error} when is_exception(error) ->
-                {:error, error}
+        case feed(body, chunk, ctx.state.max_response_bytes) do
+          {:ok, {:sse, _decoder} = body, events} ->
+            case handle_events(ctx, events) do
+              :continue -> receive_response(ctx, request_ref, body, headers)
+              {:ok, result} -> {:ok, result, session_id(headers)}
+              {:error, error} -> {:error, error}
             end
 
-          {:ok, {:json, chunks, bytes}, []} ->
-            receive_stream_events(
-              request_ref,
-              original_id,
-              method,
-              timeout_ms,
-              {:json, chunks, bytes},
-              headers,
-              state,
-              opts
-            )
+          {:ok, body, []} ->
+            receive_response(ctx, request_ref, body, headers)
 
-          {:error, %Error{} = error} ->
-            {:error, annotate_sse_terminal_response(error, original_id)}
+          {:error, error} ->
+            {:error, annotate_terminal(error, ctx.id)}
         end
 
-      {:http, {^request_ref, :stream_end, _response_headers}} ->
-        finish_streamed_response(
-          response_body,
-          headers,
-          original_id,
-          method,
-          timeout_ms,
-          state,
-          opts
-        )
+      {:http, {^request_ref, :stream_end, _headers}} ->
+        finish(ctx, body, headers)
 
-      {:http, {^request_ref, {{_version, status, _reason}, response_headers, body}}}
-      when status in 200..299 ->
-        with :ok <- validate_complete_response_size(body, state.max_response_bytes, method),
-             :ok <- FastestMCP.Client.Codec.validate_json_response_content_type(response_headers),
-             {:ok, result} <-
-               decode_jsonrpc_response(
-                 body,
-                 original_id,
-                 method,
-                 Keyword.get(opts, :task_augmented, false),
-                 Keyword.fetch!(opts, :protocol_version)
-               ) do
-          {:ok, result, FastestMCP.Client.Codec.normalize_httpc_headers(response_headers)}
-        end
+      {:http, {^request_ref, {{_version, status, reason}, response_headers, response_body}}} ->
+        max_bytes = ctx.state.max_response_bytes
+        bytes = IO.iodata_length(response_body)
 
-      {:http, {^request_ref, {{_version, status, reason}, response_headers, body}}} ->
-        headers = FastestMCP.Client.Codec.normalize_httpc_headers(response_headers)
+        error =
+          if bytes <= max_bytes,
+            do:
+              Wire.http_error(
+                response_body,
+                status,
+                "HTTP client request failed with HTTP #{status} #{reason}"
+              ),
+            else: Wire.response_too_large(ctx.method, bytes, max_bytes, status, true)
 
-        case validate_complete_response_size(body, state.max_response_bytes, method, status) do
-          :ok ->
-            {:http_error, status, headers, body,
-             FastestMCP.Client.Codec.decode_http_error(
-               body,
-               status,
-               "HTTP client request failed with HTTP #{status} #{reason}"
-             )}
-
-          {:error, %Error{} = error} ->
-            {:http_error, status, headers, nil, error}
-        end
+        {:http_error, status, normalize_headers(response_headers), error}
 
       {:http, {^request_ref, {:error, reason}}} ->
-        resume_or_fail_streamed_response(
-          response_body,
-          headers,
-          original_id,
-          method,
-          timeout_ms,
-          state,
-          opts,
-          http_stream_transport_error(
-            method,
-            reason,
-            timeout_ms,
-            "HTTP client request failed"
-          )
-        )
+        resume_or_fail(ctx, body, transport_error(ctx, reason, "HTTP client request failed"))
     after
-      stream_timeout_remaining(opts, timeout_ms) ->
+      Deadline.remaining(ctx.deadline) ->
         {:error,
          %Error{
            code: :timeout,
-           message: "#{method} timed out",
-           details: %{timeout_ms: timeout_ms}
+           message: "#{ctx.method} timed out",
+           details: %{timeout_ms: ctx.timeout_ms}
          }}
     end
   end
 
-  defp streamed_response_body(headers, {_mode, decoder}) do
-    case FastestMCP.Client.Codec.singleton_response_header(headers, "content-type") do
-      {:ok, content_type} ->
+  defp handle_events(_ctx, []), do: :continue
+
+  defp handle_events(ctx, [event | events]) do
+    case JSONRPC.decode(event, direction: :server_to_client, protocol_version: ctx.version) do
+      {:ok, {:response, response_id, response}} ->
+        Wire.result(response_id, response, ctx.id, ctx.method, ctx.task_augmented, ctx.version)
+
+      {:ok, {:request, _method, _params, nil}} ->
+        report(ctx, {:notification, event})
+        handle_events(ctx, events)
+
+      {:ok, {:request, _method, _params, _id}} when is_modern(ctx.version) ->
+        {:error,
+         %Error{
+           code: :invalid_request,
+           message: "modern MCP responses must not contain an independent server request"
+         }}
+
+      {:ok, {:request, _method, _params, _id}} ->
+        report(ctx, {:server_request, event})
+        handle_events(ctx, events)
+
+      {:error, %Error{} = error} ->
+        {:error, error}
+    end
+  end
+
+  defp response_body(headers, {_mode, decoder}) do
+    case content_type(headers) do
+      {:ok, type} ->
         cond do
-          MIME.content_type?(content_type, "application/json") -> {:ok, {:json, [], 0}}
-          MIME.content_type?(content_type, "text/event-stream") -> {:ok, {:sse, decoder}}
-          true -> {:error, FastestMCP.Client.Codec.invalid_http_response_media_type(content_type)}
+          MIME.content_type?(type, "application/json") -> {:ok, {:json, [], 0}}
+          MIME.content_type?(type, "text/event-stream") -> {:ok, {:sse, decoder}}
+          true -> {:error, invalid_media_type(type)}
         end
 
       {:error, value} ->
-        {:error, FastestMCP.Client.Codec.invalid_http_response_media_type(value)}
+        {:error, invalid_media_type(value)}
     end
   end
 
-  defp feed_streamed_response({:pending, decoder}, chunk, _max_bytes) do
-    feed_streamed_response({:sse, decoder}, chunk, nil)
+  defp feed({:sse, decoder}, chunk, _max_bytes) do
+    with {:ok, events, decoder} <- SSEDecoder.feed(decoder, chunk),
+         do: {:ok, {:sse, decoder}, events}
   end
 
-  defp feed_streamed_response({:sse, decoder}, chunk, _max_bytes) do
-    case SSEDecoder.feed(decoder, chunk) do
-      {:ok, events, next_decoder} -> {:ok, {:sse, next_decoder}, events}
-      {:error, error} when is_exception(error) -> {:error, error}
-    end
-  end
-
-  defp feed_streamed_response({:json, chunks, bytes}, chunk, max_bytes) do
+  defp feed({:json, chunks, bytes}, chunk, max_bytes) do
     chunk = IO.iodata_to_binary(chunk)
-    next_bytes = bytes + byte_size(chunk)
+    bytes = bytes + byte_size(chunk)
 
-    if next_bytes <= max_bytes do
-      {:ok, {:json, [chunk | chunks], next_bytes}, []}
-    else
-      {:error, response_too_large_error("HTTP", next_bytes, max_bytes)}
+    if bytes <= max_bytes,
+      do: {:ok, {:json, [chunk | chunks], bytes}, []},
+      else: {:error, Wire.response_too_large("HTTP", bytes, max_bytes)}
+  end
+
+  defp finish(ctx, {:json, chunks, _bytes}, headers) do
+    body = chunks |> Enum.reverse() |> IO.iodata_to_binary()
+
+    with {:ok, result} <-
+           Wire.decode_response(body, ctx.id, ctx.method, ctx.task_augmented, ctx.version),
+         do: {:ok, result, session_id(headers)}
+  end
+
+  defp finish(ctx, {_mode, decoder} = body, _headers) do
+    with :ok <- SSEDecoder.finish(decoder) do
+      error = %Error{code: :internal_error, message: "stream ended before delivering a result"}
+      resume_or_fail(ctx, body, error)
     end
   end
 
-  defp response_event_limit(state) do
-    min(state.max_sse_event_bytes, state.max_response_bytes)
-  end
+  # An interrupted SSE response resumes from its last event id within the
+  # request deadline; a modern subscription is reopened by the connection.
+  defp resume_or_fail(ctx, {mode, decoder}, error) when mode in [:pending, :sse] do
+    delay = retry_delay(decoder, ctx.state.sse_reconnect)
+    remaining = Deadline.remaining(ctx.deadline)
+    last_event_id = SSEDecoder.last_event_id(decoder)
 
-  defp validate_complete_response_size(body, max_bytes, method, status \\ nil) do
-    bytes = IO.iodata_length(body)
+    cond do
+      subscription?(ctx) ->
+        {:modern_subscription_terminated, error, delay}
 
-    if bytes <= max_bytes do
-      :ok
-    else
-      {:error, response_too_large_error(method, bytes, max_bytes, status, true)}
+      ctx.attempt < ctx.state.sse_reconnect.max_attempts and is_binary(last_event_id) and
+        last_event_id != "" and is_integer(delay) and delay <= remaining ->
+        Process.sleep(delay)
+        resume(%{ctx | attempt: ctx.attempt + 1}, decoder, last_event_id)
+
+      is_integer(delay) and delay > remaining ->
+        {:error,
+         %Error{
+           code: :timeout,
+           message: "#{ctx.method} timed out before the server retry delay elapsed",
+           details: %{timeout_ms: ctx.timeout_ms, retry_ms: delay}
+         }}
+
+      true ->
+        {:error, error}
     end
   end
 
-  defp response_too_large_error(
-         method,
-         observed_bytes,
-         max_bytes,
-         status \\ nil,
-         terminal_response_observed \\ false
-       ) do
-    details = %{
-      method: method,
-      observed_bytes: observed_bytes,
-      max_response_bytes: max_bytes,
-      terminal_response_observed: terminal_response_observed
-    }
+  defp resume_or_fail(_ctx, _body, error), do: {:error, error}
 
-    details =
-      if is_integer(status) do
-        Map.put(details, :http_status, status)
-      else
-        details
-      end
+  defp resume(ctx, decoder, last_event_id) do
+    headers =
+      headers(
+        [
+          {"accept", "text/event-stream"},
+          {"last-event-id", last_event_id},
+          {"connection", "close"}
+        ],
+        ctx.state,
+        ctx.spec.auth,
+        Deadline.remaining(ctx.deadline),
+        nil,
+        ctx.spec.http_parameter_headers
+      )
 
-    %Error{
-      code: :bad_request,
-      message: "MCP response exceeds configured size limit",
-      details: details
-    }
+    case open(ctx.state, :get, headers, timeout_ms: ctx.state.timeout_ms) do
+      {:ok, request_ref} ->
+        consume(
+          ctx,
+          request_ref,
+          &receive_response(ctx, &1, {:sse, SSEDecoder.resume(decoder)}, nil)
+        )
+
+      {:error, reason} ->
+        {:error, failure("HTTP SSE resume request failed", reason)}
+    end
   end
 
-  defp annotate_sse_terminal_response(
+  defp subscription?(ctx), do: ctx.method == "subscriptions/listen" and is_modern(ctx.version)
+
+  defp annotate_terminal(
          %Error{message: "SSE event exceeds configured size limit", details: details} = error,
-         original_id
+         id
        )
        when is_map(details) do
-    terminal? =
-      details[:frame_complete] == true and Map.fetch(details, :response_id) == {:ok, original_id}
-
+    terminal? = details[:frame_complete] == true and Map.fetch(details, :response_id) == {:ok, id}
     %{error | details: Map.put(details, :terminal_response_observed, terminal?)}
   end
 
-  defp annotate_sse_terminal_response(%Error{} = error, _original_id) do
-    error
+  defp annotate_terminal(error, _id), do: error
+
+  defp transport_error(ctx, reason, message) do
+    if timeout?(reason),
+      do: %Error{
+        code: :timeout,
+        message: "#{ctx.method} timed out",
+        details: %{timeout_ms: ctx.timeout_ms}
+      },
+      else: failure(message, reason)
   end
 
-  defp finish_streamed_response(
-         {:json, chunks, _bytes},
-         headers,
-         original_id,
-         method,
-         _timeout_ms,
-         _state,
-         opts
-       ) do
-    body = chunks |> Enum.reverse() |> IO.iodata_to_binary()
+  defp timeout?(%Mint.TransportError{reason: :timeout}), do: true
+  defp timeout?(reason), do: reason == :timeout or match?({:timeout, _detail}, reason)
 
-    case decode_jsonrpc_response(
-           body,
-           original_id,
-           method,
-           Keyword.get(opts, :task_augmented, false),
-           Keyword.fetch!(opts, :protocol_version)
-         ) do
-      {:ok, result} -> {:ok, result, FastestMCP.Client.Codec.normalize_httpc_headers(headers)}
-      {:error, error} when is_exception(error) -> {:error, error}
-    end
-  end
+  ## Session stream
 
-  defp finish_streamed_response(
-         {_mode, decoder} = response_body,
-         headers,
-         original_id,
-         method,
-         timeout_ms,
-         state,
-         opts
-       ) do
-    case SSEDecoder.finish(decoder) do
-      :ok ->
-        resume_or_fail_streamed_response(
-          response_body,
-          headers,
-          original_id,
-          method,
-          timeout_ms,
-          state,
-          opts,
-          %Error{code: :internal_error, message: "stream ended before delivering a result"}
-        )
+  defp stream_session(ctx, decoder, attempt, opened?, recovered?) do
+    last_event_id = if opened?, do: SSEDecoder.last_event_id(decoder)
 
-      {:error, %Error{} = error} ->
-        {:error, error}
-    end
-  end
-
-  defp resume_or_fail_streamed_response(
-         {mode, decoder},
-         _headers,
-         original_id,
-         method,
-         timeout_ms,
-         state,
-         opts,
-         fallback_error
-       )
-       when mode in [:pending, :sse] do
-    retry_delay = sse_retry_delay(decoder, state.sse_reconnect)
-
-    if modern_subscription_stream?(method, opts) do
-      {:modern_subscription_terminated, fallback_error, retry_delay}
-    else
-      reconnect_attempt = Keyword.get(opts, :sse_reconnect_attempt, 0)
-      last_event_id = SSEDecoder.last_event_id(decoder)
-      remaining = stream_timeout_remaining(opts, timeout_ms)
-
-      if reconnect_attempt < state.sse_reconnect.max_attempts and
-           is_binary(last_event_id) and last_event_id != "" and
-           is_integer(retry_delay) and retry_delay <= remaining do
-        Process.sleep(retry_delay)
-
-        next_opts = Keyword.put(opts, :sse_reconnect_attempt, reconnect_attempt + 1)
-
-        with {:ok, request_ref} <-
-               start_resume_stream_http_request(state, next_opts, last_event_id) do
-          try do
-            receive_stream_events(
-              request_ref,
-              original_id,
-              method,
-              timeout_ms,
-              {:sse, SSEDecoder.resume(decoder)},
-              nil,
-              state,
-              next_opts
-            )
-          after
-            _ = HTTPClientTransport.cancel_request(request_ref)
-            FastestMCP.Client.HTTP.flush_http_messages(request_ref)
-          end
-        end
-      else
-        if is_integer(retry_delay) and retry_delay > remaining do
-          {:error,
-           %Error{
-             code: :timeout,
-             message: "#{method} timed out before the server retry delay elapsed",
-             details: %{timeout_ms: timeout_ms, retry_ms: retry_delay}
-           }}
-        else
-          {:error, fallback_error}
-        end
-      end
-    end
-  end
-
-  defp resume_or_fail_streamed_response(
-         _response_body,
-         _headers,
-         _original_id,
-         _method,
-         _timeout_ms,
-         _state,
-         _opts,
-         fallback_error
-       ) do
-    {:error, fallback_error}
-  end
-
-  defp modern_subscription_stream?("subscriptions/listen", opts) do
-    Keyword.get(opts, :protocol_version) == "2026-07-28"
-  end
-
-  defp modern_subscription_stream?(_method, _opts) do
-    false
-  end
-
-  defp sse_retry_delay(decoder, reconnect) do
-    case SSEDecoder.retry_ms(decoder) do
-      nil ->
-        reconnect.default_retry_ms
-        |> max(reconnect.min_retry_ms)
-        |> min(reconnect.max_retry_ms)
-
-      :infinity ->
-        :infinity
-
-      retry_ms ->
-        retry_ms
-    end
-  end
-
-  defp stream_timeout_remaining(opts, fallback) do
-    case Keyword.get(opts, :sse_deadline_ms) do
-      deadline when is_integer(deadline) ->
-        max(deadline - System.monotonic_time(:millisecond), 0)
-
-      _other ->
-        fallback
-    end
-  end
-
-  defp maybe_put_sse_deadline(opts, :infinity) do
-    opts
-  end
-
-  defp maybe_put_sse_deadline(opts, timeout_ms) when is_integer(timeout_ms) do
-    Keyword.put_new(opts, :sse_deadline_ms, System.monotonic_time(:millisecond) + timeout_ms)
-  end
-
-  defp start_resume_stream_http_request(state, opts, last_event_id) do
     headers =
-      [{"accept", "text/event-stream"}, {"last-event-id", last_event_id}, {"connection", "close"}]
-      |> FastestMCP.Client.HTTP.transport_headers(state, opts)
+      if last_event_id in [nil, ""],
+        do: [{"accept", "text/event-stream"}],
+        else: [{"accept", "text/event-stream"}, {"last-event-id", last_event_id}]
 
-    case HTTPClientTransport.stream_request(:get, state.transport.base_url,
-           headers: headers,
-           live_stream: true,
-           timeout_ms: state.timeout_ms,
-           request_timeout_ms: :infinity,
-           request_started: Keyword.fetch!(opts, :request_started)
-         ) do
+    headers = headers(headers, ctx.state, [], ctx.state.timeout_ms)
+
+    case open(ctx.state, :get, headers, timeout_ms: ctx.state.timeout_ms) do
       {:ok, request_ref} ->
-        {:ok, request_ref}
+        session_id = ctx.state.session_id
 
-      {:error, reason} ->
-        {:error,
-         %Error{
-           code: :internal_error,
-           message: "HTTP SSE resume request failed",
-           details: %{reason: inspect(reason)}
-         }}
-    end
-  end
+        case consume(ctx, request_ref, &receive_events(ctx, &1, decoder, opened?)) do
+          {:reconnect, decoder, error} ->
+            reconnect(ctx, decoder, attempt, error, recovered?)
 
-  defp handle_stream_events([], _original_id, _method, _state, _opts) do
-    :continue
-  end
+          {:missing_session, error}
+          when not recovered? and is_binary(session_id) and session_id != "" ->
+            recover(ctx, error)
 
-  defp handle_stream_events([event | rest], original_id, method, state, opts) do
-    protocol_version = Keyword.fetch!(opts, :protocol_version)
-
-    case JSONRPC.decode(event, direction: :server_to_client, protocol_version: protocol_version) do
-      {:ok, {:response, response_id, response}} ->
-        decode_jsonrpc_response(
-          response_id,
-          response,
-          original_id,
-          method,
-          Keyword.get(opts, :task_augmented, false),
-          protocol_version
-        )
-
-      {:ok, {:request, _method, _params, nil}} ->
-        FastestMCP.Client.Connection.dispatch_notification_on_owner(event, state)
-        handle_stream_events(rest, original_id, method, state, opts)
-
-      {:ok, {:request, _method, _params, _request_id}} ->
-        if protocol_version == "2026-07-28" do
-          {:error,
-           %Error{
-             code: :invalid_request,
-             message: "modern MCP responses must not contain an independent server request"
-           }}
-        else
-          case FastestMCP.Client.Connection.handle_server_request(event, state, opts) do
-            {:ok, next_state} -> handle_stream_events(rest, original_id, method, next_state, opts)
-            {:error, %Error{} = error} -> {:error, error}
-          end
+          {_missing_session_or_stop, error} ->
+            report(ctx, {:failed, error})
         end
 
-      {:error, %Error{} = error} ->
-        {:error, error}
-    end
-  end
-
-  def decode_jsonrpc_response(body, expected_id, method, task_augmented, protocol_version)
-      when is_binary(body) do
-    case JSON.decode(body) do
-      {:ok, payload} ->
-        FastestMCP.Client.Connection.decode_jsonrpc_response_payload(
-          payload,
-          expected_id,
-          method,
-          task_augmented,
-          protocol_version
-        )
-
       {:error, reason} ->
-        {:error,
-         JSONRPC.parse_error("invalid JSON-RPC response JSON", %{reason: inspect(reason)})}
+        error = failure("HTTP session stream request failed", reason)
+
+        if opened?,
+          do: reconnect(ctx, decoder, attempt, error, recovered?),
+          else: report(ctx, {:failed, error})
     end
   end
 
-  def decode_jsonrpc_response(
-        response_id,
-        response,
-        expected_id,
-        method,
-        task_augmented,
-        protocol_version
-      ) do
-    with :ok <- validate_jsonrpc_response_id(response_id, expected_id),
-         :ok <-
-           validate_server_method_response(response, method, task_augmented, protocol_version) do
-      case response do
-        %{"result" => result} -> {:ok, result}
-        %{"error" => error} -> {:error, jsonrpc_error(error)}
-      end
-    end
-  end
-
-  defp validate_server_method_response(response, method, task_augmented, protocol_version) do
-    if Map.has_key?(response, "error") do
-      validate_server_error_response(response, method, protocol_version)
-    else
-      validate_server_result_response(response, method, task_augmented, protocol_version)
-    end
-  end
-
-  defp validate_server_error_response(response, method, protocol_version) do
-    case Schema.validate_protocol(
-           protocol_version,
-           :server_to_client,
-           :error_response,
-           response
-         ) do
-      {:ok, ^response} ->
-        :ok
-
-      {:error, %FastestMCP.Schema.Error{} = error} ->
-        {:error,
-         ProtocolError.new(
-           method,
-           :server_to_client,
-           :error_response,
-           error.violations,
-           response["id"]
-         )}
-    end
-  end
-
-  defp validate_server_result_response(response, method, task_augmented, protocol_version) do
-    if Schema.built_in_method?(method) do
-      validate_built_in_server_result_response(
-        response,
-        method,
-        task_augmented,
-        protocol_version
-      )
-    else
-      JSONRPC.validate_generic_server_response(response, protocol_version)
-    end
-  end
-
-  defp validate_built_in_server_result_response(
-         response,
-         method,
-         task_augmented,
-         protocol_version
-       ) do
-    task_response? =
-      if protocol_version == "2026-07-28" do
-        match?(%{"resultType" => "task"}, response["result"])
-      else
-        task_augmented
-      end
-
-    kind =
-      if task_response? and Map.has_key?(response, "result") and
-           Schema.protocol_supported?(
-             protocol_version,
-             :server_to_client,
-             :task_response,
-             method
-           ) do
-        :task_response
-      else
-        :response
-      end
-
-    case Schema.validate_protocol(protocol_version, :server_to_client, kind, method, response) do
-      {:ok, ^response} ->
-        :ok
-
-      {:error, %FastestMCP.Schema.Error{} = error} ->
-        {:error,
-         ProtocolError.new(
-           method,
-           :server_to_client,
-           kind,
-           error.violations,
-           response["id"]
-         )}
-    end
-  end
-
-  defp validate_jsonrpc_response_id(expected_id, expected_id) do
-    :ok
-  end
-
-  defp validate_jsonrpc_response_id(response_id, expected_id) do
-    {:error,
-     %Error{
-       code: :invalid_request,
-       message: "JSON-RPC response id does not match the request",
-       details: %{expected_id: expected_id, response_id: response_id}
-     }}
-  end
-
-  def jsonrpc_error(%{"message" => message} = error) do
-    data = Map.get(error, "data", %{})
-
-    fastestmcp =
-      if is_map(data) do
-        Map.get(data, "fastestmcp", %{})
-      else
-        %{}
-      end
-
-    details =
-      fastestmcp
-      |> Map.get("details", data)
-      |> case do
-        %{} = details -> Map.put_new(details, :jsonrpc_code, Map.get(error, "code"))
-        other -> %{data: other, jsonrpc_code: Map.get(error, "code")}
-      end
-
-    %Error{
-      code:
-        JSONRPC.decode_error_code(
-          Map.get(fastestmcp, "code"),
-          Map.get(error, "code")
-        ),
-      message: to_string(message),
-      details: details
-    }
-  end
-
-  def callback_error_data(%Error{code: code, details: details}) do
-    details =
-      if is_map(details) do
-        details
-      else
-        %{}
-      end
-
-    Map.put(details, "fastestmcp", %{"code" => to_string(code)})
-  end
-
-  def callback_failure(target, code, message, details) do
-    %Error{
-      code: code,
-      message: message,
-      details: details,
-      exposure: %{
-        mask_error_details: true,
-        component_type: :callback_task,
-        identifier: target
-      }
-    }
-  end
-
-  def public_callback_error(%Error{} = error, method) do
-    ErrorExposure.public_error(
-      error,
-      mask_error_details: true,
-      component_type: :callback_task,
-      target: method
-    )
-  end
-
-  def run_session_stream(parent, stream_ref, state) do
-    decoder = SSEDecoder.new(max_event_bytes: state.max_sse_event_bytes)
-    run_session_stream_connection(parent, stream_ref, state, decoder, 0, false, false)
-  end
-
-  defp run_session_stream_connection(
-         parent,
-         stream_ref,
-         state,
-         decoder,
-         reconnect_attempt,
-         opened?,
-         session_recovery_attempted?
-       ) do
-    last_event_id =
-      if(opened?) do
-        SSEDecoder.last_event_id(decoder)
-      end
-
-    case start_session_stream_request(state, last_event_id) do
-      {:ok, request_ref} ->
-        send(parent, {:session_stream_request_started, stream_ref, self(), request_ref})
-
-        outcome =
-          try do
-            receive_session_stream_events(parent, stream_ref, request_ref, decoder, opened?)
-          after
-            _ = HTTPClientTransport.cancel_request(request_ref)
-            FastestMCP.Client.HTTP.flush_http_messages(request_ref)
-          end
-
-        case outcome do
-          {:reconnect, next_decoder, %Error{} = error} ->
-            reconnect_session_stream(
-              parent,
-              stream_ref,
-              state,
-              next_decoder,
-              reconnect_attempt,
-              error,
-              session_recovery_attempted?
-            )
-
-          {:missing_session, %Error{} = error}
-          when not session_recovery_attempted? and is_binary(state.session_id) and
-                 state.session_id != "" ->
-            recover_session_stream_session(parent, stream_ref, state, error)
-
-          {:missing_session, %Error{} = error} ->
-            send(parent, {:session_stream_failed, stream_ref, error})
-
-          {:stop, %Error{} = error} ->
-            send(parent, {:session_stream_failed, stream_ref, error})
-        end
-
-      {:error, %Error{} = error} when opened? ->
-        reconnect_session_stream(
-          parent,
-          stream_ref,
-          state,
-          decoder,
-          reconnect_attempt,
-          error,
-          session_recovery_attempted?
-        )
-
-      {:error, %Error{} = error} ->
-        send(parent, {:session_stream_failed, stream_ref, error})
-    end
-  end
-
-  defp reconnect_session_stream(
-         parent,
-         stream_ref,
-         state,
-         decoder,
-         reconnect_attempt,
-         error,
-         session_recovery_attempted?
-       ) do
-    if reconnect_attempt < state.sse_reconnect.max_attempts do
-      case sse_retry_delay(decoder, state.sse_reconnect) do
+  defp reconnect(ctx, decoder, attempt, error, recovered?) do
+    if attempt < ctx.state.sse_reconnect.max_attempts do
+      case retry_delay(decoder, ctx.state.sse_reconnect) do
         :infinity ->
-          send(parent, {:session_stream_failed, stream_ref, error})
+          report(ctx, {:failed, error})
 
-        retry_delay ->
-          Process.sleep(retry_delay)
-
-          run_session_stream_connection(
-            parent,
-            stream_ref,
-            state,
-            SSEDecoder.resume(decoder),
-            reconnect_attempt + 1,
-            true,
-            session_recovery_attempted?
-          )
+        delay ->
+          Process.sleep(delay)
+          stream_session(ctx, SSEDecoder.resume(decoder), attempt + 1, true, recovered?)
       end
     else
-      send(
-        parent,
-        {:session_stream_failed, stream_ref,
+      report(
+        ctx,
+        {:failed,
          %Error{
            code: :internal_error,
            message: "session stream reconnect attempts exhausted",
-           details: %{
-             reconnect_attempts: reconnect_attempt,
-             last_error: error.message
-           }
+           details: %{reconnect_attempts: attempt, last_error: error.message}
          }}
       )
     end
   end
 
-  defp recover_session_stream_session(parent, stream_ref, state, original_error) do
-    stale_session_id = state.session_id
+  defp recover(ctx, original_error) do
+    stale_session_id = ctx.state.session_id
+    message = {:session_stream, ctx.ref, {:recover, stale_session_id, original_error}}
 
-    case GenServer.call(
-           parent,
-           {:recover_stream_session, stream_ref, stale_session_id, original_error},
-           state.timeout_ms + 1000
-         ) do
-      {:ok, recovered_state} ->
-        decoder = SSEDecoder.new(max_event_bytes: state.max_sse_event_bytes)
-
-        run_session_stream_connection(
-          parent,
-          stream_ref,
-          recovered_state,
-          decoder,
-          0,
-          false,
-          true
-        )
+    case GenServer.call(ctx.state.client_pid, message, ctx.state.timeout_ms + 1000) do
+      {:ok, state} ->
+        stream_session(%{ctx | state: state}, new_decoder(state), 0, false, true)
 
       {:error, %Error{} = recovery_error} ->
-        send(
-          parent,
-          {:session_stream_failed, stream_ref,
+        report(
+          ctx,
+          {:failed,
            %Error{
              code: :internal_error,
              message: "HTTP MCP session recovery failed",
@@ -1096,533 +503,220 @@ defmodule FastestMCP.Client.HTTP do
     end
   end
 
-  defp start_stream_http_request(request, timeout_ms, state, opts) do
-    opts = Keyword.put(opts, :request, request)
-
-    headers =
-      FastestMCP.Client.HTTP.transport_headers(
-        [
-          {"accept", "application/json, text/event-stream"},
-          {"content-type", "application/json"},
-          {"connection", "close"}
-        ],
-        state,
-        opts
-      )
-
-    case HTTPClientTransport.stream_request(:post, state.transport.base_url,
-           json: request,
-           headers: headers,
-           live_stream: true,
-           timeout_ms: timeout_ms,
-           request_timeout_ms: :infinity,
-           request_started: Keyword.fetch!(opts, :request_started)
-         ) do
-      {:ok, request_ref} ->
-        {:ok, request_ref}
-
-      {:error, reason} ->
-        {:error,
-         http_stream_transport_error(
-           request["method"],
-           reason,
-           timeout_ms,
-           "HTTP stream request failed"
-         )}
-    end
-  end
-
-  defp http_stream_transport_error(method, reason, timeout_ms, fallback_message) do
-    if http_transport_timeout?(reason) do
-      %Error{
-        code: :timeout,
-        message: "#{method} timed out",
-        details: %{timeout_ms: timeout_ms}
-      }
-    else
-      %Error{
-        code: :internal_error,
-        message: fallback_message,
-        details: %{reason: inspect(reason)}
-      }
-    end
-  end
-
-  defp http_transport_timeout?(%Mint.TransportError{reason: :timeout}) do
-    true
-  end
-
-  defp http_transport_timeout?(:timeout) do
-    true
-  end
-
-  defp http_transport_timeout?({:timeout, _detail}) do
-    true
-  end
-
-  defp http_transport_timeout?(_reason) do
-    false
-  end
-
-  defp start_session_stream_request(state, last_event_id) do
-    headers =
-      [{"accept", "text/event-stream"}]
-      |> maybe_put_header("last-event-id", last_event_id)
-      |> FastestMCP.Client.HTTP.transport_headers(state, [])
-
-    case HTTPClientTransport.stream_request(:get, state.transport.base_url,
-           headers: headers,
-           live_stream: true,
-           timeout_ms: state.timeout_ms,
-           request_timeout_ms: :infinity
-         ) do
-      {:ok, request_ref} ->
-        {:ok, request_ref}
-
-      {:error, reason} ->
-        {:error,
-         %Error{
-           code: :internal_error,
-           message: "HTTP session stream request failed",
-           details: %{reason: inspect(reason)}
-         }}
-    end
-  end
-
-  defp maybe_put_header(headers, _name, nil) do
-    headers
-  end
-
-  defp maybe_put_header(headers, _name, "") do
-    headers
-  end
-
-  defp maybe_put_header(headers, name, value) do
-    [{name, value} | headers]
-  end
-
-  defp receive_session_stream_events(parent, stream_ref, request_ref, decoder, opened?) do
+  defp receive_events(ctx, request_ref, decoder, opened?) do
     receive do
-      {:http, {^request_ref, :stream_start, response_headers}} ->
-        case FastestMCP.Client.Codec.singleton_response_header(response_headers, "content-type") do
-          {:ok, content_type} ->
-            if MIME.content_type?(content_type, "text/event-stream") do
-              if not opened? do
-                send(parent, {:session_stream_opened, stream_ref})
-              end
-
-              receive_session_stream_events(parent, stream_ref, request_ref, decoder, true)
+      {:http, {^request_ref, :stream_start, headers}} ->
+        case content_type(headers) do
+          {:ok, type} ->
+            if MIME.content_type?(type, "text/event-stream") do
+              unless opened?, do: report(ctx, :opened)
+              receive_events(ctx, request_ref, decoder, true)
             else
-              {:stop, FastestMCP.Client.Codec.invalid_http_response_media_type(content_type)}
+              {:stop, invalid_media_type(type)}
             end
 
           {:error, value} ->
-            {:stop, FastestMCP.Client.Codec.invalid_http_response_media_type(value)}
+            {:stop, invalid_media_type(value)}
         end
 
       {:http, {^request_ref, :stream, chunk}} ->
         case SSEDecoder.feed(decoder, chunk) do
-          {:ok, events, next_decoder} ->
+          {:ok, events, decoder} ->
             Enum.each(events, fn event ->
-              send(parent, {:session_stream_event, stream_ref, event})
+              case Wire.classify(event) do
+                :ignore -> :ok
+                message -> report(ctx, message)
+              end
             end)
 
-            receive_session_stream_events(parent, stream_ref, request_ref, next_decoder, true)
+            receive_events(ctx, request_ref, decoder, true)
 
           {:error, %Error{} = error} ->
             {:stop, error}
         end
 
-      {:http, {^request_ref, :stream_end, _response_headers}} ->
+      {:http, {^request_ref, :stream_end, _headers}} ->
         case SSEDecoder.finish(decoder) do
           :ok when opened? ->
             {:reconnect, decoder,
              %Error{code: :internal_error, message: "session stream disconnected"}}
 
           :ok ->
-            {:stop,
-             %Error{
-               code: :internal_error,
-               message: "session stream ended before opening"
-             }}
+            {:stop, %Error{code: :internal_error, message: "session stream ended before opening"}}
 
           {:error, %Error{} = error} ->
             {:stop, error}
         end
 
-      {:http, {^request_ref, {{_version, 404, reason}, _headers, body}}} ->
-        {:missing_session,
-         FastestMCP.Client.Codec.session_stream_response_error(404, reason, body)}
-
       {:http, {^request_ref, {{_version, status, reason}, _headers, body}}} ->
-        {:stop, FastestMCP.Client.Codec.session_stream_response_error(status, reason, body)}
+        error = Wire.session_stream_error(status, reason, body)
+        if status == 404, do: {:missing_session, error}, else: {:stop, error}
 
       {:http, {^request_ref, {:error, reason}}} ->
-        error = %Error{
-          code: :internal_error,
-          message: "session stream request failed",
-          details: %{reason: inspect(reason)}
-        }
-
-        if opened? do
-          {:reconnect, decoder, error}
-        else
-          {:stop, error}
-        end
+        error = failure("session stream request failed", reason)
+        if opened?, do: {:reconnect, decoder, error}, else: {:stop, error}
     end
   end
 
-  def classify_stream_message(message) do
-    case JSONRPC.decode(message, direction: :server_to_client, protocol_version: "2025-11-25") do
-      {:ok, {:request, _method, _params, nil}} -> {:notification, message}
-      {:ok, {:request, _method, _params, _id}} -> {:server_request, message}
-      {:ok, {:response, _id, _response}} -> :ignore
-      {:error, %Error{} = error} -> {:error, error, message}
+  defp new_decoder(state), do: SSEDecoder.new(max_event_bytes: state.max_sse_event_bytes)
+
+  ## Transport
+
+  defp open(state, method, headers, opts) do
+    FastestMCP.HTTP.stream_request(
+      method,
+      state.transport.base_url,
+      [headers: headers, live_stream: true, request_timeout_ms: :infinity] ++ opts
+    )
+  end
+
+  # Reports the request handle, runs `fun`, and always releases the request.
+  defp consume(ctx, request_ref, fun) do
+    report(ctx, {:started, request_ref})
+
+    try do
+      fun.(request_ref)
+    after
+      cancel(request_ref)
+      flush(request_ref)
     end
   end
 
-  def handle_connected_transport_data(state, data) do
-    state = %{
-      state
-      | stdio: %{state.stdio | pending_stdio_buffer: state.stdio.pending_stdio_buffer <> data}
-    }
-
-    case drain_stdio_buffer(state) do
-      {:ok, next_state} ->
-        {:noreply, next_state}
-
-      {:error, %Error{} = error, next_state} ->
-        {:stop, :normal,
-         FastestMCP.Client.Connection.fail_connected_transport_requests(next_state, error)}
-    end
-  end
-
-  defp drain_stdio_buffer(%{stdio: %{pending_stdio_buffer: buffer}} = state) do
-    case :binary.match(buffer, "\n") do
-      {line_bytes, 1} when line_bytes > state.max_response_bytes ->
-        line = binary_part(buffer, 0, line_bytes)
-
-        {:error,
-         response_too_large_error(
-           "stdio",
-           line_bytes,
-           state.max_response_bytes,
-           nil,
-           stdio_terminal_response?(state, line)
-         ), %{state | stdio: %{state.stdio | pending_stdio_buffer: ""}}}
-
-      {line_bytes, 1} ->
-        <<line::binary-size(^line_bytes), "\n", rest::binary>> = buffer
-
-        next_state =
-          if String.trim(line) == "" do
-            %{state | stdio: %{state.stdio | pending_stdio_buffer: rest}}
-          else
-            state
-            |> put_in([Access.key(:stdio), Access.key(:pending_stdio_buffer)], rest)
-            |> handle_stdio_line(line)
-          end
-
-        drain_stdio_buffer(next_state)
-
-      :nomatch when byte_size(buffer) > state.max_response_bytes ->
-        {:error,
-         response_too_large_error(
-           "stdio",
-           byte_size(buffer),
-           state.max_response_bytes
-         ), %{state | stdio: %{state.stdio | pending_stdio_buffer: ""}}}
-
-      :nomatch ->
-        {:ok, state}
-    end
-  end
-
-  defp stdio_terminal_response?(state, line)
-       when byte_size(line) <= @max_terminal_response_probe_bytes do
-    with {:ok, %{"jsonrpc" => "2.0", "id" => id} = payload} <- JSON.decode(line),
-         true <- Map.has_key?(payload, "result") or Map.has_key?(payload, "error"),
-         {_ref, _entry} <- FastestMCP.Client.Connection.find_outbound_request_by_id(state, id) do
-      true
-    else
-      _other -> false
-    end
-  end
-
-  defp stdio_terminal_response?(_state, _line) do
-    false
-  end
-
-  defp handle_stdio_line(state, line) do
-    case JSON.decode(line) do
-      {:ok, payload} ->
-        state
-        |> reset_stdio_restart_attempt()
-        |> handle_decoded_stdio_message(payload)
-
-      {:error, error} ->
-        fail_pending_stdio_request(
-          state,
-          FastestMCP.Client.Codec.json_decode_error_message(error),
-          %{line: line}
-        )
-    end
-  end
-
-  defp reset_stdio_restart_attempt(%{stdio: %{stdio_restart_attempt: attempt}} = state)
-       when attempt > 0 do
-    %{state | stdio: %{state.stdio | stdio_restart_attempt: 0}}
-  end
-
-  defp reset_stdio_restart_attempt(state) do
-    state
-  end
-
-  defp handle_decoded_stdio_message(state, payload) do
-    protocol_version = state.selected_protocol_version || "2025-11-25"
-
-    case JSONRPC.decode(payload, direction: :server_to_client, protocol_version: protocol_version) do
-      {:ok, {:request, _method, _params, nil}} ->
-        FastestMCP.Client.Connection.route_server_notification(payload, state)
-
-      {:ok, {:request, _method, _params, _id}} ->
-        if protocol_version == "2026-07-28" do
-          state
-        else
-          case FastestMCP.Client.Connection.process_server_request(
-                 payload,
-                 FastestMCP.Client.Connection.expire_callback_tasks(state),
-                 []
-               ) do
-            {:ok, next_state} -> next_state
-            {:error, _error} -> state
-          end
-        end
-
-      {:ok, {:response, id, response}} ->
-        complete_stdio_response(state, id, response)
-
-      {:error, %Error{} = error} ->
-        fail_pending_stdio_request(state, error.message, error.details)
-    end
-  end
-
-  defp complete_stdio_response(state, id, response) do
-    ref =
-      Map.get(state.stdio.pending_stdio_refs, to_string(id)) ||
-        Map.get(state.stdio.pending_stdio_refs, id)
-
-    case Map.get(state.pending.in_flight, ref) do
-      %{
-        request_id: ^id,
-        normalizer: normalizer,
-        method: method,
-        task_augmented: task_augmented,
-        protocol_version: protocol_version
-      } ->
-        {normalized_result, cache_hint} =
-          normalize_stdio_method_response(
-            response,
-            method,
-            task_augmented,
-            normalizer,
-            protocol_version
-          )
-
-        finish_stdio_request(state, ref, normalized_result, cache_hint)
-
-      _other ->
-        # A timed-out response can arrive after the next request was issued.
-        # IDs, not arrival order, determine which request a response completes.
-        state
-    end
-  end
-
-  defp normalize_stdio_method_response(
-         response,
-         method,
-         task_augmented,
-         normalizer,
-         protocol_version
-       ) do
-    case validate_server_method_response(response, method, task_augmented, protocol_version) do
-      :ok ->
-        case response do
-          %{"result" => value} ->
-            {FastestMCP.Client.Connection.normalize_response_result(normalizer, value),
-             FastestMCP.Client.Connection.response_cache_hint(value)}
-
-          %{"error" => error} ->
-            {{:error, jsonrpc_error(error)}, nil}
-        end
-
-      {:error, _reason} = error ->
-        {error, nil}
-    end
-  end
-
-  # Malformed or uncorrelated input cannot safely be assigned to one of several
-  # concurrent stdio requests. Keep every correlated request alive; a caller's
-  # own timeout remains its failure boundary.
-  defp fail_pending_stdio_request(state, _message, _details) do
-    state
-  end
-
-  def finish_stdio_request(state, ref, result) do
-    finish_stdio_request(state, ref, result, nil)
-  end
-
-  def finish_stdio_request(state, ref, result, cache_hint) do
-    case Map.pop(state.pending.in_flight, ref) do
-      {nil, _in_flight} ->
-        state
-
-      {%{timer_ref: timer_ref, normalizer: normalizer} = entry, in_flight} ->
-        FastestMCP.Client.RequestOwnership.cancel_timer(timer_ref)
-
-        state =
-          FastestMCP.Client.Connection.maybe_store_response_cache(
-            state,
-            entry,
-            result,
-            cache_hint
-          )
-
-        state = FastestMCP.Client.Connection.retain_task_progress(state, entry, result)
-        FastestMCP.Client.RequestOwnership.reply_request_entry(entry, result)
-
-        %{
-          state
-          | initialize_result:
-              FastestMCP.Client.Codec.initialize_result_for(
-                normalizer,
-                result,
-                state.initialize_result
-              ),
-            pending: %{
-              state.pending
-              | in_flight: in_flight,
-                request_owner_refs:
-                  FastestMCP.Client.RequestOwnership.drop_owner_ref(
-                    state.pending.request_owner_refs,
-                    entry.owner_ref
-                  )
-            },
-            stdio: %{
-              state.stdio
-              | pending_stdio_ref: nil,
-                pending_stdio_refs: Map.delete(state.stdio.pending_stdio_refs, entry.request_id)
-            }
-        }
-    end
-  end
-
-  def send_notification(message, state, opts) do
-    timeout =
-      case Keyword.fetch(opts, :deadline) do
-        {:ok, deadline} -> FastestMCP.Deadline.remaining(deadline)
-        :error -> Keyword.get(opts, :timeout_ms, state.timeout_ms)
-      end
-
-    if timeout == 0 do
-      {:error, %Error{code: :timeout, message: "notification deadline elapsed"}}
-    else
-      do_send_notification(message, state, Keyword.put(opts, :timeout_ms, timeout))
-    end
-  end
-
-  defp do_send_notification(message, state, opts) do
-    opts = Keyword.put(opts, :request, message)
-
-    case HTTPClientTransport.request(:post, state.transport.base_url,
-           json: message,
-           headers:
-             transport_headers(
-               [
-                 {"accept", "application/json, text/event-stream"},
-                 {"content-type", "application/json"},
-                 {"connection", "close"}
-               ],
-               state,
-               opts
-             ),
-           timeout_ms: Keyword.get(opts, :timeout_ms, state.timeout_ms)
-         ) do
-      {:ok, status, _headers, _body} when status in 200..299 ->
-        :ok
-
-      {:ok, status, _headers, body} ->
-        error =
-          FastestMCP.Client.Codec.decode_http_error(body, status, "HTTP notification failed")
-
-        FastestMCP.Client.Connection.maybe_report_stale_session(
-          state,
-          message["method"],
-          status,
-          error
-        )
-
-        {:error, error}
-
-      {:error, reason} ->
-        {:error,
-         %Error{
-           code: :internal_error,
-           message: "HTTP notification failed",
-           details: %{reason: inspect(reason)}
-         }}
-    end
-  end
-
-  def flush_http_messages(request_ref) do
+  defp flush(request_ref) do
     receive do
-      {:http, {^request_ref, _message}} -> flush_http_messages(request_ref)
+      {:http, {^request_ref, _message}} -> flush(request_ref)
     after
       0 -> :ok
     end
   end
 
-  def cancel_http_request(nil) do
-    :ok
+  defp report(ctx, event), do: send(ctx.state.client_pid, {ctx.tag, ctx.ref, event})
+
+  defp post(message, state, headers, timeout_ms) do
+    case FastestMCP.HTTP.request(:post, state.transport.base_url,
+           json: message,
+           headers: headers,
+           timeout_ms: timeout_ms
+         ) do
+      {:ok, status, _headers, body} -> {:ok, status, body}
+      {:error, reason} -> {:error, reason}
+    end
   end
 
-  def cancel_http_request(request_ref) do
-    _ = HTTPClientTransport.cancel_request(request_ref)
-    :ok
+  # Only snapshots of the connection's own sends carry its phase, so only the
+  # notifications it sends report a stale session.
+  defp report_stale_session(
+         %{session_id: session_id, phase: :initialized} = state,
+         method,
+         404,
+         error
+       )
+       when is_binary(session_id) and session_id != "" and
+              method not in ["initialize", "notifications/initialized"] do
+    send(state.client_pid, {:stale_session_detected, error, session_id, state.session_generation})
   end
 
-  def transport_headers(default_headers, state, opts) do
-    headers =
-      default_headers
-      |> FastestMCP.Client.Codec.normalize_header_map()
-      |> FastestMCP.Client.Codec.merge_header_maps(
-        FastestMCP.Client.Codec.request_auth_input(state, opts)
-        |> Map.get("headers", %{})
-      )
-      |> FastestMCP.Client.Connection.maybe_put_oauth_authorization(state)
-      |> FastestMCP.Client.Codec.maybe_put("mcp-session-id", state.session_id)
-      |> FastestMCP.Client.Codec.maybe_put(
-        "mcp-protocol-version",
-        FastestMCP.Client.Codec.request_protocol_version(state, opts)
-      )
+  defp report_stale_session(_state, _method, _status, _error), do: :ok
 
-    headers =
-      case Keyword.get(opts, :request) do
-        %{"method" => method, "params" => params} ->
-          headers
-          |> FastestMCP.Client.Codec.maybe_put("mcp-method", method)
-          |> FastestMCP.Client.Codec.maybe_put_encoded_name(
-            "mcp-name",
-            FastestMCP.Client.Codec.request_header_name(method, params)
-          )
-
-        _other ->
-          headers
-      end
-
-    headers =
-      Map.merge(headers, Keyword.get(opts, :http_parameter_headers, %{}))
-
-    Enum.into(headers, [])
+  defp ensure_apps do
+    with {:ok, _ssl} <- Application.ensure_all_started(:ssl),
+         {:ok, _inets} <- Application.ensure_all_started(:inets),
+         do: :ok
   end
+
+  defp retry_delay(decoder, reconnect) do
+    case SSEDecoder.retry_ms(decoder) do
+      nil ->
+        reconnect.default_retry_ms |> max(reconnect.min_retry_ms) |> min(reconnect.max_retry_ms)
+
+      retry_ms ->
+        retry_ms
+    end
+  end
+
+  defp failure(message, reason),
+    do: %Error{code: :internal_error, message: message, details: %{reason: inspect(reason)}}
+
+  ## Headers
+
+  # `timeout` bounds the wait for an OAuth token.
+  defp headers(defaults, state, auth, timeout, message \\ nil, parameter_headers \\ %{}) do
+    defaults
+    |> Map.new()
+    |> Map.merge(Auth.headers(state, auth, timeout))
+    |> maybe_put("mcp-session-id", state.session_id)
+    |> maybe_put("mcp-protocol-version", protocol_version(state, message))
+    |> put_method_headers(message)
+    |> Map.merge(parameter_headers)
+    |> Map.to_list()
+  end
+
+  defp protocol_version(state, %{"params" => params}) do
+    get_in(params, ["_meta", "io.modelcontextprotocol/protocolVersion"]) ||
+      protocol_version(state, nil)
+  end
+
+  defp protocol_version(state, _message) do
+    case state do
+      %{selected_protocol_version: version} when is_binary(version) -> version
+      %{protocol_preference: version} when is_binary(version) -> version
+      %{phase: :initializing} -> legacy()
+      _state -> nil
+    end
+  end
+
+  defp put_method_headers(headers, %{"method" => method, "params" => params}) do
+    headers
+    |> maybe_put("mcp-method", method)
+    |> put_name(header_name(method, params))
+  end
+
+  defp put_method_headers(headers, _message), do: headers
+
+  defp header_name(method, params) when method in ["tools/call", "prompts/get"],
+    do: Map.get(params, "name")
+
+  defp header_name("resources/read", params), do: Map.get(params, "uri")
+
+  defp header_name(method, params) when method in ["tasks/get", "tasks/update", "tasks/cancel"],
+    do: Map.get(params, "taskId")
+
+  defp header_name(_method, _params), do: nil
+
+  defp put_name(headers, nil), do: headers
+
+  defp put_name(headers, name) when is_binary(name) do
+    {:ok, encoded} = HTTPHeaders.encode_value(name)
+    Map.put(headers, "mcp-name", encoded)
+  end
+
+  defp content_type(headers) do
+    values =
+      for {key, value} <- headers || [],
+          String.downcase(to_string(key)) == "content-type",
+          do: to_string(value)
+
+    case values do
+      [value] -> {:ok, value}
+      [] -> {:error, nil}
+      duplicates -> {:error, duplicates}
+    end
+  end
+
+  defp invalid_media_type(content_type) do
+    %Error{
+      code: :bad_request,
+      message: "HTTP MCP response has an unsupported Content-Type",
+      details: %{content_type: content_type, accepted: ["application/json", "text/event-stream"]}
+    }
+  end
+
+  defp session_id(headers) do
+    Enum.find_value(headers || [], fn {key, value} ->
+      if String.downcase(to_string(key)) == "mcp-session-id", do: to_string(value)
+    end)
+  end
+
+  defp normalize_headers(headers),
+    do: Enum.map(headers || [], fn {key, value} -> {to_string(key), to_string(value)} end)
 end

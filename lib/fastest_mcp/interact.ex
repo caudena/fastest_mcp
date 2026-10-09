@@ -13,6 +13,8 @@ defmodule FastestMCP.Interact do
       end
   """
 
+  import FastestMCP.Util, only: [maybe_put: 3, stringify_keys: 1]
+
   alias FastestMCP.Context
   alias FastestMCP.Elicitation.Accepted
   alias FastestMCP.Elicitation.Cancelled
@@ -36,7 +38,7 @@ defmodule FastestMCP.Interact do
     end
   end
 
-  @doc "Extracts or requests plain text for this interaction."
+  @doc "Asks for one text value: `{:ok, text}`, `:declined`, or `:cancelled`."
   def text(context, message, opts \\ []) do
     field = Keyword.get(opts, :field, :value)
 
@@ -51,7 +53,7 @@ defmodule FastestMCP.Interact do
     end
   end
 
-  @doc "Requests a confirmation response."
+  @doc "Asks a yes/no question: `{:ok, boolean}`, `:declined`, or `:cancelled`."
   def confirm(context, message, opts \\ []) do
     field = Keyword.get(opts, :field, :confirmed)
 
@@ -66,10 +68,7 @@ defmodule FastestMCP.Interact do
     end
   end
 
-  @doc "Requests an approval response."
-  def approve(context, message, opts \\ []), do: confirm(context, message, opts)
-
-  @doc "Selects one option from an elicitation result."
+  @doc "Asks the user to pick one of `choices`: `{:ok, choice}`, `:declined`, or `:cancelled`."
   def choose(context, message, choices, opts \\ []) do
     field = Keyword.get(opts, :field, :choice)
     normalized = normalize_choices(choices)
@@ -98,7 +97,7 @@ defmodule FastestMCP.Interact do
     end
   end
 
-  @doc "Requests a structured form response."
+  @doc "Asks for a form described by a schema or a field list: `{:ok, data}`, `:declined`, or `:cancelled`."
   def form(context, message, schema_or_fields, opts \\ []) do
     schema = normalize_schema(schema_or_fields)
 
@@ -303,14 +302,4 @@ defmodule FastestMCP.Interact do
 
   defp choice_label(value) when is_binary(value), do: value
   defp choice_label(value) when is_integer(value), do: Integer.to_string(value)
-
-  defp stringify_keys(map) when is_map(map) do
-    Map.new(map, fn {key, value} -> {to_string(key), stringify_keys(value)} end)
-  end
-
-  defp stringify_keys(list) when is_list(list), do: Enum.map(list, &stringify_keys/1)
-  defp stringify_keys(other), do: other
-
-  defp maybe_put(map, _key, nil), do: map
-  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 end

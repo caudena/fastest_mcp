@@ -1,5 +1,5 @@
 defmodule FastestMCP.AuthorizationTransformTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Authorization
   alias FastestMCP.Error
@@ -29,15 +29,12 @@ defmodule FastestMCP.AuthorizationTransformTest do
   test "authorization transform can globally filter and enforce access" do
     server_name = "authz-transform-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_auth(ScopeAuth)
-      |> FastestMCP.add_transform(Authorization.transform(Authorization.require_scopes("api")))
-      |> FastestMCP.add_tool("public_tool", fn -> "public" end)
-      |> FastestMCP.add_tool("other_tool", fn -> "other" end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_auth(ScopeAuth)
+    |> FastestMCP.add_transform(Authorization.transform(Authorization.require_scopes("api")))
+    |> FastestMCP.add_tool("public_tool", fn -> "public" end)
+    |> FastestMCP.add_tool("other_tool", fn -> "other" end)
+    |> start_server!()
 
     assert [] == FastestMCP.list_tools!(server_name)
 
@@ -64,17 +61,14 @@ defmodule FastestMCP.AuthorizationTransformTest do
     server_name =
       "authz-transform-tagged-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_auth(ScopeAuth)
-      |> FastestMCP.add_transform(
-        Authorization.transform(Authorization.restrict_tag("admin", scopes: ["admin"]))
-      )
-      |> FastestMCP.add_tool("public_tool", fn -> "public" end)
-      |> FastestMCP.add_tool("admin_tool", fn -> "admin" end, tags: ["admin"])
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_auth(ScopeAuth)
+    |> FastestMCP.add_transform(
+      Authorization.transform(Authorization.restrict_tag("admin", scopes: ["admin"]))
+    )
+    |> FastestMCP.add_tool("public_tool", fn -> "public" end)
+    |> FastestMCP.add_tool("admin_tool", fn -> "admin" end, tags: ["admin"])
+    |> start_server!()
 
     assert ["public_tool"] ==
              server_name
@@ -100,16 +94,13 @@ defmodule FastestMCP.AuthorizationTransformTest do
     server_name =
       "authz-transform-compose-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_auth(ScopeAuth)
-      |> FastestMCP.add_transform(Authorization.transform(Authorization.require_scopes("api")))
-      |> FastestMCP.add_tool("write_tool", fn -> "write" end,
-        auth: Authorization.require_scopes("write")
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_auth(ScopeAuth)
+    |> FastestMCP.add_transform(Authorization.transform(Authorization.require_scopes("api")))
+    |> FastestMCP.add_tool("write_tool", fn -> "write" end,
+      auth: Authorization.require_scopes("write")
+    )
+    |> start_server!()
 
     assert [] == FastestMCP.list_tools!(server_name)
     assert [] == FastestMCP.list_tools!(server_name, auth_input: %{"token" => "api-token"})
@@ -136,18 +127,15 @@ defmodule FastestMCP.AuthorizationTransformTest do
     server_name =
       "authz-transform-replace-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_auth(ScopeAuth)
-      |> FastestMCP.add_transform(
-        Authorization.transform(Authorization.require_scopes("api"), mode: :replace)
-      )
-      |> FastestMCP.add_tool("write_tool", fn -> "write" end,
-        auth: Authorization.require_scopes("write")
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_auth(ScopeAuth)
+    |> FastestMCP.add_transform(
+      Authorization.transform(Authorization.require_scopes("api"), mode: :replace)
+    )
+    |> FastestMCP.add_tool("write_tool", fn -> "write" end,
+      auth: Authorization.require_scopes("write")
+    )
+    |> start_server!()
 
     assert [%{name: "write_tool"}] =
              FastestMCP.list_tools!(server_name, auth_input: %{"token" => "api-token"})

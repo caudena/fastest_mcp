@@ -158,7 +158,9 @@ resource_task =
   )
 ```
 
-List and cancel tasks from the same runtime:
+List tasks, newest first, and cancel a running one from the same runtime
+(cancelling a finished task is a `:bad_request` error). `page_size:` returns
+one page; pass its `next_cursor` back as `cursor:` for the next:
 
 ```elixir
 %{tasks: tasks, next_cursor: next_cursor} =
@@ -182,35 +184,26 @@ end
 FastestMCP.cancel_task!(task)
 ```
 
-## Explicit `task_meta:` and TTL
+## Task TTL
 
-Use `task_meta:` when you want direct control over task creation metadata
-without changing the component declaration.
+A finished task is kept for its TTL, 60 seconds unless the request sets one,
+and then removed. Local calls set it with `task_ttl_ms:`, fractional values
+rounding up to whole milliseconds:
 
 ```elixir
-alias FastestMCP.TaskMeta
-
 task =
   FastestMCP.call_tool!(
     MyApp.MCPServer,
     "slow_report",
     %{"id" => 42},
-    task_meta: TaskMeta.new(ttl: 30_000)
+    task: true,
+    task_ttl_ms: 30_000
   )
 ```
 
-Keyword and map input are supported too:
-
-```elixir
-FastestMCP.read_resource!(
-  MyApp.MCPServer,
-  "memo://release",
-  task_meta: [ttl: 15_000]
-)
-```
-
 This is useful when one handler starts another task-capable operation and wants
-the child task to inherit a specific TTL in an Elixir-first way.
+the child task to keep its result for a specific time. Over MCP, a `2025-11-25`
+client sets it with the request's `task.ttl`.
 
 ## Progress and Status
 
@@ -223,7 +216,8 @@ FastestMCP.Context.report_progress(ctx, 3, 3, "Published report")
 ```
 
 That progress is reflected in task state and can be delivered to subscribed
-clients over `notifications/tasks/status`.
+clients as `notifications/tasks/status` (`2025-11-25`) or `notifications/tasks`
+(`2026-07-28`).
 
 The task object also carries the server-suggested poll interval configured by
 `task: [poll_interval_ms: ...]`.
@@ -266,16 +260,20 @@ For connected legacy clients, the flow is:
 3. let the server relay `elicitation/create` or `sampling/createMessage`
 4. receive the final result on the same request
 
-FastestMCP exposes an Elixir-only input API for local integrations:
+FastestMCP exposes an Elixir-only input API for local integrations. Input is
+accepted once the task waits for it (`FastestMCP.fetch_task!(task).status ==
+:input_required`); a scalar elicitation such as `:boolean` answers in a
+`"value"` field:
 
 ```elixir
 task = FastestMCP.call_tool!(MyApp.MCPServer, "approve_release", %{}, task: true)
 
+# once the task's status is :input_required
 FastestMCP.send_task_input!(
   MyApp.MCPServer,
   task.task_id,
   :accept,
-  %{"confirmed" => true}
+  %{"value" => true}
 )
 ```
 
@@ -311,19 +309,16 @@ Terminal task outcomes are mapped deliberately:
 Failed task status messages prefer tool error text when one exists, otherwise
 the `FastestMCP.Error` message.
 
-Successful `tasks/result` payloads carry
-`_meta["io.modelcontextprotocol/related-task"]` so the final result stays tied
-to the originating task:
+Locally, `FastestMCP.task_result!/1` returns the handler's result, such as
+`%{id: 42, status: "ready"}`. On the wire, successful `tasks/result` payloads
+carry `_meta["io.modelcontextprotocol/related-task"]` so the final result stays
+tied to the originating task:
 
-```elixir
-result = FastestMCP.task_result!(task)
-
-%{
-  structuredContent: %{id: 42, status: "ready"},
-  _meta: %{
-    "io.modelcontextprotocol/related-task" => %{taskId: task.task_id}
-  }
-} = result
+```json
+{
+  "structuredContent": {"id": 42, "status": "ready"},
+  "_meta": {"io.modelcontextprotocol/related-task": {"taskId": "..."}}
+}
 ```
 
 Request-level task failures preserve the same related-task metadata on the wire
@@ -361,8 +356,10 @@ a sanitized hashed identity.
 This implementation is intentionally OTP-first and single-node for now:
 
 - task orchestration lives in supervised Elixir processes
-- task state is stored in ETS through the configured `TaskBackend`
-- TTL expiry is enforced inside the runtime
+- task records are stored through the configured `FastestMCP.TaskBackend`,
+  by default an ETS table owned by the server's task store
+- each finished task expires on its own timer, and expired tasks are hidden
+  from reads until they are removed
 - legacy session streams and modern subscribers stay inside the server
   supervision tree
 

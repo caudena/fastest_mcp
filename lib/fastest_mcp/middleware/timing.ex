@@ -1,71 +1,67 @@
 defmodule FastestMCP.Middleware.Timing do
-  @moduledoc """
-  Middleware that logs request timings.
-
-  Middleware modules in FastestMCP are configured as explicit structs that
-  carry immutable configuration. Dispatch calls the module with that configuration;
-  runtime state is owned separately by the server.
-
-  Most applications reach this module through `FastestMCP.Middleware` helper
-  functions or by adding the configured struct directly with
-  `FastestMCP.Server.add_middleware/2`.
-  """
+  @moduledoc false
 
   require Logger
 
   @behaviour FastestMCP.Middleware
 
+  alias FastestMCP.Component
   alias FastestMCP.Operation
 
   defstruct [:log_fn, label: nil, log_level: :info]
 
-  @doc "Builds a new value for this module from the supplied options."
   def new(opts \\ []) do
-    middleware = %__MODULE__{
-      log_fn: Keyword.get(opts, :log_fn, &default_log/2),
+    %__MODULE__{
+      log_fn: Keyword.get(opts, :log_fn, &Logger.log/2),
       label: Keyword.get(opts, :label),
       log_level: Keyword.get(opts, :log_level, :info)
     }
-
-    middleware
   end
 
-  @doc "Runs the middleware around the next operation."
   @impl FastestMCP.Middleware
   def call(%__MODULE__{} = middleware, %Operation{} = operation, next)
       when is_function(next, 1) do
     started_at = System.monotonic_time()
+    label = label(middleware.label, operation)
+    result = next.(operation)
 
-    label =
-      if middleware.label, do: middleware.label.(operation), else: "Request #{operation.method}"
+    outcome =
+      case result do
+        {:ok, _operation} ->
+          "completed in #{elapsed_ms(started_at)}ms"
 
-    try do
-      result = next.(operation)
+        {:error, error} ->
+          "failed after #{elapsed_ms(started_at)}ms: #{Exception.message(error)}"
+      end
 
-      middleware.log_fn.(
-        middleware.log_level,
-        "#{label} completed in #{format_duration(started_at)}ms"
-      )
-
-      result
-    rescue
-      error ->
-        middleware.log_fn.(
-          middleware.log_level,
-          "#{label} failed after #{format_duration(started_at)}ms: #{Exception.message(error)}"
-        )
-
-        reraise error, __STACKTRACE__
-    end
+    middleware.log_fn.(middleware.log_level, "#{label} #{outcome}")
+    result
   end
 
-  defp format_duration(started_at) do
-    System.monotonic_time()
-    |> Kernel.-(started_at)
+  # Milliseconds since the native monotonic `started_at`, rounded to 0.01.
+  def elapsed_ms(started_at) do
+    (System.monotonic_time() - started_at)
     |> System.convert_time_unit(:native, :microsecond)
     |> Kernel./(1_000)
     |> Float.round(2)
   end
 
-  defp default_log(level, message), do: Logger.log(level, message)
+  defp label(nil, operation), do: "Request #{operation.method}"
+  defp label(label, operation) when is_function(label, 1), do: label.(operation)
+
+  defp label(:detailed, %Operation{method: method, target: target}) do
+    cond do
+      kind = Component.call_kind(method) ->
+        "#{String.capitalize(Component.label(kind))} '#{target}'"
+
+      kind = Component.list_kind(method) ->
+        "List #{kind |> Component.collection() |> Atom.to_string() |> String.replace("_", " ")}"
+
+      method in ["initialize", "ping"] ->
+        String.capitalize(method)
+
+      true ->
+        "Request #{method}"
+    end
+  end
 end

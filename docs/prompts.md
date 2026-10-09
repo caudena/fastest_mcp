@@ -112,7 +112,7 @@ FastestMCP.complete!(
   %{"type" => "ref/prompt", "name" => "generate_code_request"},
   %{"name" => "language", "value" => "py"}
 )
-# => %{values: ["python"], total: 1}
+# => %{values: ["python"], total: 1, has_more: false}
 ```
 
 ## Return Values
@@ -148,12 +148,16 @@ alias FastestMCP.Prompts.Message
 
 Message.new("Explain the main risks in this diff")
 Message.new("I found three areas to review closely.", role: :assistant)
-Message.new(%{type: "resource", resource: %{uri: "file:///tmp/report.md"}}, role: :assistant)
+Message.new(
+  %{type: "resource", resource: %{uri: "file:///tmp/report.md", mimeType: "text/markdown", text: "# Report"}},
+  role: :assistant
+)
 ```
 
 Each prompt message carries exactly one valid content block and a canonical
 `user` or `assistant` role. Return multiple messages when the prompt needs
-multiple blocks; a content array on one prompt message is rejected.
+multiple blocks: `Message.new/2` encodes a list as JSON text, not as several
+blocks. An embedded resource needs `text` or `blob` content.
 
 Use `FastestMCP.Prompts.Result` when the prompt needs multiple messages or
 result-level metadata:
@@ -168,7 +172,13 @@ server =
     Result.new(
       [
         Message.new("Review the following #{language} code for correctness, clarity, and edge cases."),
-        Message.new(%{type: "resource", resource: %{uri: "file:///tmp/report.md"}}, role: :assistant)
+        Message.new(
+          %{
+            type: "resource",
+            resource: %{uri: "file:///tmp/report.md", mimeType: "text/markdown", text: "# Report"}
+          },
+          role: :assistant
+        )
       ],
       description: "Reusable code review prompt",
       meta: %{source: "review-workflow"}
@@ -259,7 +269,9 @@ server =
   |> FastestMCP.add_prompt("welcome", fn _arguments, _ctx -> "second" end)
 
 FastestMCP.render_prompt!("prompt-duplicates", "welcome", %{})
-# => "second"
+# => %FastestMCP.Prompts.Result{
+#      messages: [%FastestMCP.Prompts.Message{role: "user", content: %{type: "text", text: "second"}}]
+#    }
 ```
 
 ## Runtime Change Notifications
@@ -272,8 +284,9 @@ On `2025-11-25`, prompt changes can emit
 sessions. On `2026-07-28`, the notification is routed only to long-lived
 listeners whose acknowledged filter includes prompt-list changes.
 
-The notification is only emitted when the visible prompt set actually changes
-for that session.
+Server-wide changes notify every listening session, even when its visible
+prompt set did not change; a session-scoped visibility change notifies only
+that session, and only when its visible set changed.
 
 ## Background Tasks
 
@@ -292,9 +305,9 @@ server =
 ```
 
 Call `FastestMCP.render_prompt!/4` with `task: true` to create that local task.
-Remote MCP `prompts/get` requests are synchronous in 0.2; task metadata on that
-wire method is rejected because MCP `2025-11-25` task augmentation is
-tool-only.
+Remote MCP `prompts/get` requests always run synchronously: task metadata on
+that method is ignored, because FastestMCP accepts wire task augmentation for
+`tools/call` only.
 
 ## Runtime Changes
 

@@ -64,20 +64,15 @@ session or task coordination.
 
 ### Background Task State
 
-Background task state lives in the task runtime owned by the server runtime,
-with storage delegated to `FastestMCP.TaskBackend`.
+Background tasks run in the task runtime owned by the server runtime, with
+task records kept in a `FastestMCP.TaskBackend`.
 
-The backend stores:
+A record holds the task's status, result or error, progress, and outstanding
+input requests. The supervised task store owns everything around it: workers,
+waiters, client interactions, expiry timers, and notification fanout.
 
-- task status
-- result
-- progress
-- interactive input requirements
-
-The supervised task store owns workers, waiters, subscribers, and notification
-fanout around those persisted records.
-
-By default, FastestMCP starts one ETS-backed backend per running server:
+By default, each running server keeps its records in an ETS table owned by its
+task store:
 
 - `FastestMCP.TaskBackend.Memory`
 
@@ -89,17 +84,48 @@ FastestMCP.start_server(server,
 )
 ```
 
-Custom backends implement the public `FastestMCP.TaskBackend` contract. In
-0.2.0, `fetch_task/3` returns `{:ok, task}` or `{:error, reason}`, while
-`expire_tasks/2` returns `{:ok, task_ids}` or `{:error, reason}`. Backends written
-for 0.1.x must update the old `:error` and bare-list return shapes.
+A custom backend implements the public `FastestMCP.TaskBackend` behaviour: plain
+functions over its own state, which `init/1` builds from the options above and
+every write returns. All callbacks run in the task store process.
+
+```elixir
+defmodule MyApp.CustomTaskBackend do
+  @behaviour FastestMCP.TaskBackend
+
+  @impl true
+  def init(_opts), do: {:ok, %{}}
+
+  @impl true
+  def put_task(tasks, task), do: {:ok, Map.put(tasks, task.id, task)}
+
+  @impl true
+  def fetch_task(tasks, task_id) do
+    case Map.fetch(tasks, task_id) do
+      {:ok, task} -> {:ok, task}
+      :error -> {:error, :not_found}
+    end
+  end
+
+  @impl true
+  def delete_task(tasks, task_id), do: {:ok, Map.delete(tasks, task_id)}
+
+  @impl true
+  def list_tasks(tasks), do: {:ok, Map.values(tasks)}
+end
+```
 
 The split is intentional:
 
-- `FastestMCP.BackgroundTaskStore` keeps OTP coordination, waiters, and relay
-  logic
-- `FastestMCP.TaskBackend` owns persistence, expiry, fetch, and cursor paging
-- `FastestMCP.EventBus` stays the notification fanout path
+- the server's task store keeps OTP coordination, waiters, relays, session and
+  owner scoping, and expiry; `FastestMCP.list_tasks/2` and `tasks/list` page
+  its newest-first listing
+- `FastestMCP.TaskBackend` stores, fetches, lists, and deletes task records
+- the runtime's event bus stays the notification fanout path
+
+A finished task is deleted when its TTL elapses; until then expired records are
+hidden from reads. When a server starts, the tasks its backend still holds are
+reconciled: tasks a previous runtime left running fail with
+`:runtime_restarted`, and expired ones are deleted.
 
 ### Auth State
 
@@ -116,8 +142,8 @@ are not persisted in runtime state.
 ### Response Cache
 
 The built-in response caching middleware uses local ETS-backed state owned by
-the middleware process. It is fast and simple, but it is not a distributed
-cache.
+a process each server starts for it. It is fast and simple, but it is not a
+distributed cache.
 
 ## What Has A Public Backend API
 
@@ -130,7 +156,7 @@ That split is deliberate:
 
 - session lifecycle still belongs to the runtime
 - session values can move behind a backend abstraction
-- task storage can move behind a backend abstraction
+- task records can move behind a backend abstraction
 - task orchestration and caches still stay runtime-owned
 
 ## What This Means Operationally
@@ -148,7 +174,7 @@ not a general distributed persistence layer.
 
 ## What Is Still Local-Only
 
-The following remain runtime-local in v0.2:
+The following remain runtime-local:
 
 - background task orchestration
 - middleware cache state
@@ -166,12 +192,12 @@ coordination.
 
 ## Bounded Session Defaults
 
-All correctness and overload limits are explicit runtime/server options. No
-environment variable changes protocol behavior.
+All correctness and overload limits are explicit runtime, server, or
+transport options. No environment variable changes protocol behavior.
 
 | Resource | Default | Option |
 | --- | ---: | --- |
-| Request/callback timeout | 60 seconds | `request_timeout_ms:` / `stream_request_timeout_ms:` |
+| Request/callback timeout | 60 seconds | `request_timeout_ms:` (runtime) / `stream_request_timeout_ms:` (HTTP transport) |
 | Used request ids | 100,000 per direction and session | `max_request_ids:` |
 | Reused client request ids | accepted with a warning | `strict_request_ids:` (default `false`) |
 | Pending peer callbacks | 128 per session; 10,000 per runtime | `max_pending_requests:` / `max_runtime_pending_requests:` |
@@ -199,10 +225,10 @@ requests are sessionless and never consult the ledger.
 
 Active callbacks, requests, peer tasks, background tasks, and attached output
 sinks hold the session open. Replay records by themselves do not prevent idle
-expiry. Runtime quotas monitor session owners, so abnormal session termination
-releases its claims rather than leaking capacity. Peer-task status callbacks
-monitor the registering caller and are removed when that caller dies or the
-task reaches a terminal status.
+expiry. A session releases its runtime quota claims when it stops, also after
+a crash; only a session killed with `:kill` keeps them until the server
+restarts. Peer-task status callbacks monitor the registering caller and are
+removed when that caller dies or the task reaches a terminal status.
 
 Schema, cursor, progress, logging, URL-elicitation, and SSE-decoder limits are
 documented with their owning features:
@@ -232,7 +258,7 @@ It is not a complete answer when you need:
 - distributed cache invalidation
 - distributed session visibility and subscription tracking
 
-Those are still outside the public v0.2 scope.
+Those are still outside the public scope.
 
 ## Why This Shape
 

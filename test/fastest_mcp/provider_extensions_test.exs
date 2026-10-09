@@ -1,8 +1,9 @@
 defmodule FastestMCP.ProviderExtensionsTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
   alias FastestMCP.{Client, Provider, ServerExtension}
 
   defmodule BundledProvider do
+    use FastestMCP.Provider
     defstruct extensions: []
     def required_extensions(provider), do: provider.extensions
     def list_components(_, _, _), do: []
@@ -40,7 +41,7 @@ defmodule FastestMCP.ProviderExtensionsTest do
 
     middle = FastestMCP.server("bundle-middle") |> FastestMCP.mount(child, namespace: "inner")
 
-    for name <- ["bundle-root-one", "bundle-root-two"] do
+    for name <- [unique_name("bundle-root-one"), unique_name("bundle-root-two")] do
       server =
         FastestMCP.server(name, lifespan: fn _ -> %{"private_parent" => true} end)
         |> FastestMCP.add_extension(
@@ -48,7 +49,7 @@ defmodule FastestMCP.ProviderExtensionsTest do
         )
         |> FastestMCP.mount(middle, namespace: "outer")
 
-      assert {:ok, _} = FastestMCP.start_server(server)
+      start_server!(server)
       assert_receive {:entered, ^name}
       refute_receive {:entered, ^name}
       client = Client.connect!({:in_process, name}, extensions: %{id => %{}})
@@ -78,12 +79,15 @@ defmodule FastestMCP.ProviderExtensionsTest do
     first = ServerExtension.new(id, auto_register: true, settings: %{version: 1})
     second = ServerExtension.new(id, auto_register: true, settings: %{version: 2})
     provider = %BundledProvider{extensions: [first, second]}
-    server = FastestMCP.server("bundle-conflict") |> FastestMCP.add_provider(provider)
+
+    server =
+      FastestMCP.server(unique_name("bundle-conflict")) |> FastestMCP.add_provider(provider)
+
     assert {:error, %ArgumentError{message: message}} = FastestMCP.start_server(server)
     assert message =~ "conflicting provider extension"
 
     for first? <- [true, false] do
-      name = "bundle-explicit-#{first?}"
+      name = unique_name("bundle-explicit-#{first?}")
       root = FastestMCP.server(name)
 
       root =
@@ -91,10 +95,9 @@ defmodule FastestMCP.ProviderExtensionsTest do
           do: root |> FastestMCP.add_extension(second) |> FastestMCP.add_provider(provider),
           else: root |> FastestMCP.add_provider(provider) |> FastestMCP.add_extension(second)
 
-      assert {:ok, _} = FastestMCP.start_server(root)
+      start_server!(root)
       assert {:ok, runtime} = FastestMCP.ServerRuntime.fetch(name)
       assert [%{settings: %{"version" => 2}}] = runtime.server.active_extensions
-      FastestMCP.stop_server(name)
     end
   end
 
@@ -116,7 +119,7 @@ defmodule FastestMCP.ProviderExtensionsTest do
       )
 
     server =
-      FastestMCP.server("bundled-rollback")
+      FastestMCP.server(unique_name("bundled-rollback"))
       |> FastestMCP.add_provider(%BundledProvider{extensions: [first, broken]})
 
     assert {:error, _} = FastestMCP.start_server(server)

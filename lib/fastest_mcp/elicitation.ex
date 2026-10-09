@@ -1,43 +1,41 @@
 defmodule FastestMCP.Elicitation do
-  @moduledoc """
-  Background-task elicitation helpers and result structs.
+  @moduledoc false
 
-  This module keeps one focused piece of FastestMCP behavior in a dedicated
-  place so builders, runtimes, transports, and providers can share the same
-  rules without duplicating logic.
-
-  Unless you are extending FastestMCP itself, you will usually meet this
-  module indirectly through higher-level APIs rather than calling it first.
-  """
+  import FastestMCP.Util, only: [stringify_keys: 1]
 
   alias FastestMCP.Error
   alias FastestMCP.Protocol.Redactor
+  alias FastestMCP.Protocol.Schema, as: ProtocolSchema
   alias FastestMCP.Schema
 
   defmodule Accepted do
     @moduledoc """
-    Accepted elicitation response carrying validated data.
+    The user accepted an elicitation. From `FastestMCP.Context.elicit/4`,
+    `data` is the answer, validated against and shaped like the requested
+    response type; from `FastestMCP.Context.elicit_url/4`, it is
+    `%{elicitation_id: id, url: url}`.
     """
     defstruct [:data]
+    @type t :: %__MODULE__{data: term()}
   end
 
   defmodule Declined do
-    @moduledoc """
-    Declined elicitation response.
-    """
+    @moduledoc "The user declined a `FastestMCP.Context.elicit/4` or `FastestMCP.Context.elicit_url/4` request."
     defstruct []
+    @type t :: %__MODULE__{}
   end
 
   defmodule Cancelled do
     @moduledoc """
-    Cancelled elicitation response.
+    A `FastestMCP.Context.elicit/4` or `FastestMCP.Context.elicit_url/4` request was cancelled: the
+    user dismissed it without choosing, or it ended without an answer.
     """
     defstruct []
+    @type t :: %__MODULE__{}
   end
 
   @default_timeout_ms 60_000
 
-  @doc "Builds an elicitation request."
   def request(message, response_type, opts \\ []) when is_binary(message) and message != "" do
     {requested_schema, validator} = normalize_response_type(response_type)
     requested_schema = apply_response_metadata(requested_schema, response_type, opts)
@@ -52,7 +50,6 @@ defmodule FastestMCP.Elicitation do
     }
   end
 
-  @doc "Resolves the given input into the normalized runtime shape for this module."
   def resolve(%{validator: validator}, action, content) when action in [:accept, "accept"] do
     if is_map(content) do
       case validator.(content) do
@@ -268,9 +265,16 @@ defmodule FastestMCP.Elicitation do
             "elicitation requestedSchema must use the restricted, non-nested form schema"
     end
 
-    compiled = Schema.compile_protocol_definition!("ElicitRequestFormParams")
+    {:ok, compiled} =
+      ProtocolSchema.compile_definition(
+        FastestMCP.Protocol.current_version(),
+        "ElicitRequestFormParams"
+      )
 
-    case Schema.validate(compiled, %{"message" => "elicitation", "requestedSchema" => schema}) do
+    case Schema.validate_inline(compiled, %{
+           "message" => "elicitation",
+           "requestedSchema" => schema
+         }) do
       {:ok, _value} ->
         :ok
 
@@ -417,11 +421,4 @@ defmodule FastestMCP.Elicitation do
     |> inspect(limit: 10, printable_limit: 300)
     |> String.slice(0, 300)
   end
-
-  defp stringify_keys(value) when is_map(value) do
-    Map.new(value, fn {key, nested} -> {to_string(key), stringify_keys(nested)} end)
-  end
-
-  defp stringify_keys(value) when is_list(value), do: Enum.map(value, &stringify_keys/1)
-  defp stringify_keys(value), do: value
 end

@@ -1,13 +1,9 @@
 defmodule FastestMCP.Schema.Resolver do
-  @moduledoc """
-  Bounded adapter for explicitly supplied application JSON Schema resolvers.
-
-  Application resolver functions receive one absolute URI and return
-  `{:ok, schema}` or `{:error, reason}`. Resolver modules using the
-  `JSV.Resolver` contract are accepted as well. Every successfully resolved
-  resource is checked against the same source, nesting, reference, dialect,
-  and resource-count limits as the root schema.
-  """
+  @moduledoc false
+  # Adapter for application JSON Schema resolvers: a function from one absolute
+  # URI to `{:ok, schema}` or `{:error, reason}`, or a `JSV.Resolver` module.
+  # Each resolved resource gets the source, nesting, reference, dialect, and
+  # resource-count limits of the root schema.
 
   @behaviour JSV.Resolver
   alias FastestMCP.Schema.Policy
@@ -17,19 +13,25 @@ defmodule FastestMCP.Schema.Resolver do
 
   @impl true
   def resolve(uri, opts) when is_binary(uri) and is_list(opts) do
-    with {:ok, schema} <- invoke_resolver(uri, Keyword.get(opts, :resolver)),
-         {:ok, normalized} <- normalize_remote_schema(uri, schema, opts) do
-      {:normal, normalized}
-    end
+    guard(fn ->
+      with {:ok, schema} <- invoke_resolver(uri, Keyword.get(opts, :resolver)),
+           {:ok, normalized} <- normalize_remote_schema(uri, schema, opts) do
+        {:normal, normalized}
+      end
+    end)
+  end
+
+  def resolve(uri, _opts), do: {:error, {:invalid_remote_schema_uri, uri}}
+
+  # Turns a failing resolver into a resolution error naming only its kind.
+  def guard(resolve) do
+    resolve.()
   rescue
     error -> {:error, {:resolver_exception, error.__struct__}}
   catch
     kind, _reason -> {:error, {:resolver_failure, kind}}
   end
 
-  def resolve(uri, _opts), do: {:error, {:invalid_remote_schema_uri, uri}}
-
-  @doc false
   def normalize_remote_schema(uri, schema, opts)
       when is_binary(uri) and (is_map(schema) or is_boolean(schema)) and is_list(opts) do
     with {:ok, normalized} <- normalize(schema),

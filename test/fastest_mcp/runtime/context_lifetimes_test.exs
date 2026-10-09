@@ -1,27 +1,25 @@
 defmodule FastestMCP.Runtime.ContextLifetimesTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Context
 
   test "session state persists while request state stays request-local" do
     server_name = "context-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("remember", fn %{"trace" => trace}, ctx ->
-        count = Context.get_session_state(ctx, :count, 0) + 1
-        :ok = Context.put_session_state(ctx, :count, count)
-        :ok = Context.put_request_state(ctx, :trace, trace)
-        %{count: count, trace: Context.get_request_state(ctx, :trace)}
-      end)
-      |> FastestMCP.add_tool("peek", fn _args, ctx ->
-        %{
-          count: Context.get_session_state(ctx, :count, 0),
-          trace: Context.get_request_state(ctx, :trace, :missing)
-        }
-      end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("remember", fn %{"trace" => trace}, ctx ->
+      count = Context.get_session_state(ctx, :count, 0) + 1
+      :ok = Context.put_session_state(ctx, :count, count)
+      :ok = Context.put_request_state(ctx, :trace, trace)
+      %{count: count, trace: Context.get_request_state(ctx, :trace)}
+    end)
+    |> FastestMCP.add_tool("peek", fn _args, ctx ->
+      %{
+        count: Context.get_session_state(ctx, :count, 0),
+        trace: Context.get_request_state(ctx, :trace, :missing)
+      }
+    end)
+    |> start_server!()
 
     session_a = [session_id: "session-a"]
     session_b = [session_id: "session-b"]

@@ -15,6 +15,8 @@ defmodule FastestMCP.Resources.Content do
   handling for data that happens to be valid UTF-8.
   """
 
+  import FastestMCP.Util, only: [optional_map!: 2]
+
   alias FastestMCP.JSONValue
   alias FastestMCP.MIME
 
@@ -35,7 +37,7 @@ defmodule FastestMCP.Resources.Content do
       uri: normalize_optional_uri(Keyword.get(opts, :uri)),
       content: normalized_content,
       mime_type: Keyword.get(opts, :mime_type, inferred_mime_type),
-      meta: normalize_optional_map(Keyword.get(opts, :meta))
+      meta: optional_map!(Keyword.get(opts, :meta), "resource content meta")
     }
   end
 
@@ -45,7 +47,7 @@ defmodule FastestMCP.Resources.Content do
 
   @doc "Returns whether the content should be encoded as text in the transport payload."
   def textual?(%__MODULE__{content: content, mime_type: mime_type}) when is_binary(content) do
-    String.valid?(content) and not binary_mime_type?(mime_type)
+    String.valid?(content) and not MIME.binary?(mime_type)
   end
 
   def textual?(%__MODULE__{}), do: false
@@ -69,19 +71,10 @@ defmodule FastestMCP.Resources.Content do
     {JSONValue.encode!(content), "application/json"}
   end
 
-  defp normalize_optional_map(nil), do: nil
-  defp normalize_optional_map(map) when is_map(map), do: Map.new(map)
-
-  defp normalize_optional_map(other) do
-    raise ArgumentError, "resource content meta must be a map, got #{inspect(other)}"
-  end
-
   defp normalize_optional_uri(nil), do: nil
   defp normalize_optional_uri(uri) when is_binary(uri) and uri != "", do: uri
 
   defp normalize_optional_uri(other) do
     raise ArgumentError, "resource content uri must be a non-empty string, got #{inspect(other)}"
   end
-
-  defp binary_mime_type?(mime_type), do: MIME.binary?(mime_type)
 end

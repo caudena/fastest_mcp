@@ -1,14 +1,13 @@
 defmodule FastestMCP.Elicitation.URL do
-  @moduledoc """
-  Validation and state transitions for MCP URL-mode elicitation.
+  @moduledoc false
+  # Pure value rules of URL-mode elicitation; `FastestMCP.Session` holds the
+  # mutable ownership and the atomic claim. Records are bound to the MCP session
+  # and a server-verified principal, because a session ID is not a user identity.
 
-  The mutable ownership and atomic claim live in `FastestMCP.Session`; this
-  module deliberately keeps the security-sensitive value rules pure. Records
-  are bound to both the MCP session and a server-verified principal, because a
-  session ID by itself is not a user identity.
-  """
+  import FastestMCP.Util, only: [secure_equal?: 2]
 
   alias FastestMCP.Error
+  alias FastestMCP.URIPolicy
 
   @default_ttl_ms 15 * 60 * 1_000
   @max_ttl_ms 24 * 60 * 60 * 1_000
@@ -71,7 +70,6 @@ defmodule FastestMCP.Elicitation.URL do
           purpose: purpose()
         }
 
-  @doc "Builds a URL elicitation after validating identity, ownership, URL, and expiry."
   def new(message, url_or_builder, opts) when is_list(opts) do
     now_ms = Keyword.get(opts, :now_ms, System.system_time(:millisecond))
     elicitation_id = Keyword.get_lazy(opts, :elicitation_id, &generate_id/0)
@@ -99,7 +97,6 @@ defmodule FastestMCP.Elicitation.URL do
     end
   end
 
-  @doc "Builds a URL elicitation, raising `ArgumentError` on invalid input."
   def new!(message, url_or_builder, opts) do
     case new(message, url_or_builder, opts) do
       {:ok, elicitation} -> elicitation
@@ -107,7 +104,6 @@ defmodule FastestMCP.Elicitation.URL do
     end
   end
 
-  @doc "Returns the canonical `elicitation/create` URL-mode parameters."
   def to_params(%__MODULE__{} = elicitation) do
     %{
       "mode" => "url",
@@ -117,12 +113,10 @@ defmodule FastestMCP.Elicitation.URL do
     }
   end
 
-  @doc "Returns error data for the standard `-32042` URL-elicitation-required error."
   def required_error_data(elicitations) when is_list(elicitations) and elicitations != [] do
     %{"elicitations" => Enum.map(elicitations, &to_params/1)}
   end
 
-  @doc "Builds the symbolic error consumed by the shared JSON-RPC serializer."
   def required_error(elicitations, message \\ "This request requires more information.")
       when is_binary(message) and message != "" do
     %Error{
@@ -132,7 +126,6 @@ defmodule FastestMCP.Elicitation.URL do
     }
   end
 
-  @doc "Records the client's consent action for a URL elicitation."
   def respond(elicitation, action, content \\ nil, now_ms \\ System.system_time(:millisecond))
 
   def respond(%__MODULE__{} = elicitation, action, content, now_ms) do
@@ -144,7 +137,6 @@ defmodule FastestMCP.Elicitation.URL do
     end
   end
 
-  @doc "Marks the out-of-band interaction complete for the bound user and session."
   def complete(
         %__MODULE__{} = elicitation,
         session_id,
@@ -158,11 +150,9 @@ defmodule FastestMCP.Elicitation.URL do
     end
   end
 
-  @doc "Returns whether the elicitation's bounded lifetime has elapsed."
   def expired?(%__MODULE__{expires_at: expires_at}, now_ms \\ System.system_time(:millisecond)),
     do: now_ms >= expires_at
 
-  @doc false
   def validate_allowed_hosts(hosts) do
     case normalize_allowed_hosts(hosts) do
       {:ok, allowed_hosts} -> {:ok, allowed_hosts |> MapSet.to_list() |> Enum.sort()}
@@ -170,12 +160,10 @@ defmodule FastestMCP.Elicitation.URL do
     end
   end
 
-  @doc "Returns the externally useful state without discarding consent/completion races."
   def state(%__MODULE__{completed_at: completed_at}) when is_integer(completed_at), do: :completed
   def state(%__MODULE__{action: nil}), do: :pending
   def state(%__MODULE__{action: action}), do: action
 
-  @doc "Returns the completion notification parameters after completion."
   def completion_params(%__MODULE__{completed_at: completed_at, elicitation_id: id})
       when is_integer(completed_at),
       do: {:ok, %{"elicitationId" => id}}
@@ -284,29 +272,23 @@ defmodule FastestMCP.Elicitation.URL do
       not MapSet.member?(allowed_hosts, host) -> {:error, :url_host_not_allowed}
       not is_nil(uri.userinfo) -> {:error, :url_userinfo_forbidden}
       not is_nil(uri.fragment) -> {:error, :url_fragment_forbidden}
-      not valid_percent_encoding?(uri.path) -> {:error, :invalid_url}
-      not valid_percent_encoding?(uri.query) -> {:error, :invalid_url}
+      not URIPolicy.valid_percent_encoding?(uri.path) -> {:error, :invalid_url}
+      not URIPolicy.valid_percent_encoding?(uri.query) -> {:error, :invalid_url}
       sensitive_query?(uri.query) -> {:error, :sensitive_url_data}
       true -> {:ok, URI.to_string(uri)}
     end
   end
 
-  defp valid_percent_encoding?(nil), do: true
-
-  defp valid_percent_encoding?(value) do
-    not Regex.match?(~r/%(?![0-9A-Fa-f]{2})/, value)
-  end
-
   defp sensitive_query?(nil), do: false
 
+  # A query that cannot be decoded counts as sensitive.
   defp sensitive_query?(query) do
-    query
-    |> URI.query_decoder()
-    |> Enum.any?(fn {key, _value} ->
-      MapSet.member?(@sensitive_query_keys, String.downcase(key))
-    end)
-  rescue
-    ArgumentError -> true
+    not URIPolicy.valid_percent_encoding?(query) or
+      query
+      |> URI.query_decoder()
+      |> Enum.any?(fn {key, _value} ->
+        MapSet.member?(@sensitive_query_keys, String.downcase(key))
+      end)
   end
 
   defp ensure_active(elicitation, now_ms) do
@@ -346,12 +328,6 @@ defmodule FastestMCP.Elicitation.URL do
     do: {:error, :declined}
 
   defp ensure_completable(%__MODULE__{}), do: :ok
-
-  defp secure_equal?(left, right) when is_binary(left) and is_binary(right) do
-    byte_size(left) == byte_size(right) and Plug.Crypto.secure_compare(left, right)
-  end
-
-  defp secure_equal?(_left, _right), do: false
 
   defp format_reason({:missing_verified_identity, key}), do: "#{key} is required"
   defp format_reason({:url_builder_failed, reason}), do: "URL builder failed: #{reason}"

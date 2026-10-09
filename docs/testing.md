@@ -102,7 +102,7 @@ capability metadata on each stateless request. Each POST contains one JSON-RPC
 message rather than a batch in either profile.
 
 The repository's `test/support/raw_peer.ex` is a minimal legacy spec-shaped
-peer used by `raw_peer_acceptance_matrix_test.exs` to run roots, sampling,
+peer used by `bidirectional_transport_test.exs` to run roots, sampling,
 form/URL elicitation, requester-task, and ping workflows over unprotected HTTP
 JSON + GET SSE, unprotected POST SSE, protected-resource HTTP JSON + GET SSE,
 and stdio. Separate modern raw-peer tests cover request-scoped MRTR,
@@ -126,11 +126,13 @@ Interactive tasks can be driven by sending task input:
 ```elixir
 task = FastestMCP.call_tool!(MyApp.MCPServer, "approve_release", %{}, task: true)
 
+# wait until FastestMCP.fetch_task!(task).status == :input_required, then
+# answer the `Context.elicit(ctx, "Deploy to production?", :boolean)` request
 FastestMCP.send_task_input!(
   MyApp.MCPServer,
   task.task_id,
   :accept,
-  %{"confirmed" => true}
+  %{"value" => true}
 )
 
 assert %{approved: true} = FastestMCP.await_task!(task, 1_000)
@@ -217,18 +219,18 @@ go through an external inspector or network boundary.
 ## Index scaling measurements
 
 Run `mix run scripts/benchmark_indexes.exs` separately from correctness tests.
-The script warms each path and measures 300 registry lookups and 500 client
-catalog lookups at each size. It does not enforce timing thresholds.
+The script starts a server with 100, 1,000 and 10,000 tools, warms each path,
+and measures 300 component-index lookups and 500 client catalog lookups at each
+size. It does not enforce timing thresholds.
 
 On the local Elixir 1.20.4 / OTP 29 checkout, the 0.4 implementation measured:
 
-| Unrelated components / catalog tools | Registry default reads | Registry exact reads | Catalog preferred reads |
+| Components / catalog tools | Index default reads | Index exact reads | Catalog preferred reads |
 | --- | --- | --- | --- |
-| 100 | 0.316 ms | 0.116 ms | 0.038 ms |
-| 1,000 | 0.324 ms | 0.123 ms | 0.037 ms |
-| 10,000 | 0.356 ms | 0.150 ms | 0.046 ms |
+| 100 | 0.282 ms | 0.278 ms | 0.039 ms |
+| 1,000 | 0.294 ms | 0.280 ms | 0.040 ms |
+| 10,000 | 0.346 ms | 0.308 ms | 0.049 ms |
 
 These isolate lookup cost, excluding construction, network traffic, and handler
 execution. They establish scaling behavior for this machine, not an end-to-end
-latency guarantee. HTTP workers receive bounded transport snapshots without
-copying the connection's catalog or pending-request indexes.
+latency guarantee.

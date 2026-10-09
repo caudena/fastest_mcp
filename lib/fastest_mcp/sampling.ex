@@ -30,6 +30,8 @@ defmodule FastestMCP.Sampling do
   it just makes the existing runtime sampling path easier to call from handlers.
   """
 
+  import FastestMCP.Util, only: [maybe_put: 3, stringify_keys: 1]
+
   alias FastestMCP.Components.Tool
   alias FastestMCP.Context
   alias FastestMCP.Error
@@ -40,9 +42,7 @@ defmodule FastestMCP.Sampling do
   @max_tool_rounds 8
 
   defmodule Response do
-    @moduledoc """
-    Normalized sampling response.
-    """
+    @moduledoc false
 
     defstruct [:text, :content, :raw]
 
@@ -55,7 +55,15 @@ defmodule FastestMCP.Sampling do
 
   @type run_opts :: keyword()
 
-  @doc "Runs the main entrypoint for this module."
+  @doc """
+  Sends a sampling request through the context's client and returns
+  `{:ok, response}` or `{:error, error}`.
+
+  `prompt_or_messages` is a prompt string, a message list, or a keyword list
+  with `:prompt` or `:messages` and the options. With `tools:`, tool calls the
+  model makes run locally for up to `:max_tool_rounds` rounds (default 8).
+  Other options are passed to `FastestMCP.Context.sample/3`.
+  """
   def run(%Context{} = context, prompt_or_messages, opts \\ []) do
     {:ok, run!(context, prompt_or_messages, opts)}
   rescue
@@ -87,7 +95,7 @@ defmodule FastestMCP.Sampling do
     }
   end
 
-  @doc "Extracts or requests plain text for this interaction."
+  @doc "Returns the text of a sampling response or of a raw sampling result."
   def text(%Response{text: text}), do: text
   def text(raw), do: raw |> response() |> Map.fetch!(:text)
 
@@ -156,26 +164,20 @@ defmodule FastestMCP.Sampling do
 
   defp normalize_sampling_input(input) when is_list(input), do: normalize_messages(input)
 
-  defp extract_tool_uses(%{"content" => content}), do: tool_uses_from_content(content)
-  defp extract_tool_uses(%{content: content}), do: tool_uses_from_content(content)
-  defp extract_tool_uses(_raw), do: []
+  # Sampling results arrive in wire form, with string keys.
+  defp extract_tool_uses(%{"content" => content}),
+    do: content |> List.wrap() |> Enum.filter(&match?(%{"type" => "tool_use"}, &1))
 
-  defp tool_uses_from_content(content) do
-    content
-    |> List.wrap()
-    |> Enum.filter(fn block ->
-      is_map(block) and Map.get(block, "type", Map.get(block, :type)) == "tool_use"
-    end)
-  end
+  defp extract_tool_uses(_raw), do: []
 
   defp validate_tool_uses!(tool_uses, tools, seen_tool_use_ids) do
     known = Map.new(tools, &{&1.name, &1})
 
     Enum.reduce(tool_uses, seen_tool_use_ids, fn tool_use, seen_ids ->
-      id = Map.get(tool_use, "id", Map.get(tool_use, :id))
-      name = Map.get(tool_use, "name", Map.get(tool_use, :name))
-      input = Map.get(tool_use, "input", Map.get(tool_use, :input))
-      meta = Map.get(tool_use, "_meta", Map.get(tool_use, :_meta))
+      id = tool_use["id"]
+      name = tool_use["name"]
+      input = tool_use["input"]
+      meta = tool_use["_meta"]
 
       cond do
         not is_binary(id) or id == "" ->
@@ -214,9 +216,7 @@ defmodule FastestMCP.Sampling do
   end
 
   defp execute_tool_use(tool_use, tools) do
-    id = Map.get(tool_use, "id", Map.get(tool_use, :id))
-    name = Map.get(tool_use, "name", Map.get(tool_use, :name))
-    input = Map.get(tool_use, "input", Map.get(tool_use, :input))
+    %{"id" => id, "name" => name, "input" => input} = tool_use
     tool = Enum.find(tools, &(&1.name == name))
 
     payload =
@@ -245,14 +245,14 @@ defmodule FastestMCP.Sampling do
       "toolUseId" => id,
       "content" => Map.get(payload, "content", [])
     }
-    |> maybe_put_map("structuredContent", Map.get(payload, "structuredContent"))
-    |> maybe_put_map("isError", Map.get(payload, "isError"))
-    |> maybe_put_map("_meta", merged_tool_result_meta(payload, tool_use))
+    |> maybe_put("structuredContent", Map.get(payload, "structuredContent"))
+    |> maybe_put("isError", Map.get(payload, "isError"))
+    |> maybe_put("_meta", merged_tool_result_meta(payload, tool_use))
   end
 
   defp merged_tool_result_meta(payload, tool_use) do
     result_meta = Map.get(payload, "_meta")
-    tool_use_meta = Map.get(tool_use, "_meta", Map.get(tool_use, :_meta))
+    tool_use_meta = tool_use["_meta"]
 
     case {result_meta, tool_use_meta} do
       {nil, nil} ->
@@ -269,11 +269,8 @@ defmodule FastestMCP.Sampling do
   defp normalize_meta(meta), do: JSONValue.stringify_keys(meta)
 
   defp assistant_tool_message(raw) do
-    %{
-      "role" => Map.get(raw, "role", Map.get(raw, :role, "assistant")),
-      "content" => Map.get(raw, "content", Map.get(raw, :content, []))
-    }
-    |> maybe_put_map("_meta", Map.get(raw, "_meta", Map.get(raw, :_meta)))
+    %{"role" => Map.get(raw, "role", "assistant"), "content" => Map.get(raw, "content", [])}
+    |> maybe_put("_meta", raw["_meta"])
   end
 
   defp normalize_runtime_tools(nil), do: []
@@ -300,9 +297,6 @@ defmodule FastestMCP.Sampling do
       do: Keyword.put(opts, :tool_choice, :auto),
       else: opts
   end
-
-  defp maybe_put_map(map, _key, nil), do: map
-  defp maybe_put_map(map, key, value), do: Map.put(map, key, value)
 
   defp normalize_run_input(opts, []) when is_list(opts) do
     if Keyword.keyword?(opts) do
@@ -401,11 +395,4 @@ defmodule FastestMCP.Sampling do
     raise ArgumentError,
           "expected SamplingTool, tool metadata, FastestMCP tool, function capture, or {fun, opts} tuple, got: #{inspect(other)}"
   end
-
-  defp stringify_keys(map) when is_map(map) do
-    Map.new(map, fn {key, value} -> {to_string(key), stringify_keys(value)} end)
-  end
-
-  defp stringify_keys(list) when is_list(list), do: Enum.map(list, &stringify_keys/1)
-  defp stringify_keys(other), do: other
 end

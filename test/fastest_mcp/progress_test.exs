@@ -1,5 +1,5 @@
 defmodule FastestMCP.ProgressTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.BackgroundTask
   alias FastestMCP.Context
@@ -36,7 +36,7 @@ defmodule FastestMCP.ProgressTest do
         }
       end)
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    start_server!(server)
 
     assert %{current: 3, total: 10, message: "Testing"} ==
              FastestMCP.call_tool!(server_name, "track", %{})
@@ -59,7 +59,7 @@ defmodule FastestMCP.ProgressTest do
           receive do
             :allow_message -> :ok
           after
-            1_000 -> raise "timed out waiting to continue progress helper test"
+            5_000 -> raise "timed out waiting to continue progress helper test"
           end
 
           progress = Progress.set_message(progress, "Step 1")
@@ -73,13 +73,13 @@ defmodule FastestMCP.ProgressTest do
                 message: Progress.message(progress)
               }
           after
-            1_000 -> raise "timed out waiting to release progress helper test task"
+            5_000 -> raise "timed out waiting to release progress helper test task"
           end
         end,
         task: true
       )
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    start_server!(server)
     assert {:ok, runtime} = ServerRuntime.fetch(server_name)
     :ok = FastestMCP.EventBus.subscribe(runtime.event_bus, server_name)
 
@@ -90,9 +90,9 @@ defmodule FastestMCP.ProgressTest do
                     notification},
                    1_000
 
-    assert notification.notification.params.taskId == handle.task_id
-    assert notification.notification.params.status == "working"
-    assert notification.notification.params.statusMessage == "Task submitted"
+    assert notification.notification["params"]["taskId"] == handle.task_id
+    assert notification.notification["params"]["status"] == "working"
+    assert notification.notification["params"]["statusMessage"] == "Task submitted"
 
     assert_receive {:progress_phase, :incremented, worker_pid}, 1_000
 
@@ -112,10 +112,10 @@ defmodule FastestMCP.ProgressTest do
                     message_notification},
                    1_000
 
-    assert message_notification.notification.params.taskId == handle.task_id
-    assert message_notification.notification.params.status == "working"
-    assert message_notification.notification.params.statusMessage == "Step 1"
-    refute Map.has_key?(message_notification.notification, :_meta)
+    assert message_notification.notification["params"]["taskId"] == handle.task_id
+    assert message_notification.notification["params"]["status"] == "working"
+    assert message_notification.notification["params"]["statusMessage"] == "Step 1"
+    refute Map.has_key?(message_notification.notification, "_meta")
 
     send(worker_pid, :release)
 

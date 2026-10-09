@@ -18,7 +18,7 @@ failure handling, and integration native to Elixir and OTP.
 | Server startup | `use FastestMCP.ServerModule` with generated `child_spec/1`, `start_link/1`, and `base_server/1` |
 | Runtime model | OTP-first with per-server runtime trees, supervised workers, and crash isolation |
 | Context access | explicit `%FastestMCP.Context{}` passed to handlers |
-| HTTP integration | Plug-first via `FastestMCP.http_app/2` and transport child specs |
+| HTTP integration | Plug-first via `FastestMCP.Transport.HTTPApp`, `FastestMCP.Transport.WellKnownHTTP`, and transport child specs |
 | Protocol boundary | MCP `2026-07-28` and `2025-11-25` over strict JSON-RPC 2.0 at one configured `/mcp` endpoint |
 | Client shape | connected `FastestMCP.Client` GenServer with latest-first negotiation and legacy session ownership |
 | Dynamic components | internal `FastestMCP.ComponentManager` GenServer provider |

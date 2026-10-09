@@ -1,5 +1,5 @@
 defmodule FastestMCP.ComponentManagerTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.ComponentManager
   alias FastestMCP.Error
@@ -8,8 +8,7 @@ defmodule FastestMCP.ComponentManagerTest do
     server_name =
       "component-manager-tools-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    assert {:ok, _pid} = FastestMCP.start_server(FastestMCP.server(server_name))
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(FastestMCP.server(server_name))
 
     manager = FastestMCP.component_manager!(server_name)
 
@@ -85,8 +84,7 @@ defmodule FastestMCP.ComponentManagerTest do
     server_name =
       "component-manager-surface-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    assert {:ok, _pid} = FastestMCP.start_server(FastestMCP.server(server_name))
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(FastestMCP.server(server_name))
 
     manager = FastestMCP.component_manager!(server_name)
 
@@ -172,12 +170,9 @@ defmodule FastestMCP.ComponentManagerTest do
     server_name =
       "component-manager-tool-collision-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("echo", fn _arguments, _ctx -> %{source: :static} end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("echo", fn _arguments, _ctx -> %{source: :static} end)
+    |> start_server!()
 
     manager = FastestMCP.component_manager!(server_name)
 
@@ -206,12 +201,9 @@ defmodule FastestMCP.ComponentManagerTest do
       "component-manager-resource-collision-" <>
         Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_resource("config://runtime", fn _arguments, _ctx -> %{source: :static} end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_resource("config://runtime", fn _arguments, _ctx -> %{source: :static} end)
+    |> start_server!()
 
     manager = FastestMCP.component_manager!(server_name)
 
@@ -241,14 +233,11 @@ defmodule FastestMCP.ComponentManagerTest do
       "component-manager-template-collision-" <>
         Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_resource_template("users://{id}", fn %{"id" => id}, _ctx ->
-        %{id: id, source: :static}
-      end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_resource_template("users://{id}", fn %{"id" => id}, _ctx ->
+      %{id: id, source: :static}
+    end)
+    |> start_server!()
 
     manager = FastestMCP.component_manager!(server_name)
 

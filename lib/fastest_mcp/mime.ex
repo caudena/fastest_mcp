@@ -1,14 +1,10 @@
 defmodule FastestMCP.MIME do
-  @moduledoc """
-  Shared MIME-type normalization and classification helpers.
-
-  Parameters such as charsets are ignored when classifying a media type, and
-  comparisons are case-insensitive.
-  """
+  @moduledoc false
+  # Media-type parameters such as charset are ignored when classifying, and
+  # comparisons are case-insensitive.
 
   alias Plug.Conn.Utils, as: PlugConnUtils
 
-  @doc "Returns the normalized media type without parameters."
   def normalize(value) when is_binary(value) do
     value
     |> String.split(";", parts: 2)
@@ -19,7 +15,6 @@ defmodule FastestMCP.MIME do
 
   def normalize(value), do: value |> to_string() |> normalize()
 
-  @doc "Returns whether the media type is JSON or uses a structured `+json` suffix."
   def json?(value) when is_binary(value) do
     case parse_content_type(value) do
       {:ok, type, subtype, _params} ->
@@ -34,7 +29,6 @@ defmodule FastestMCP.MIME do
 
   def json?(_value), do: false
 
-  @doc "Returns whether an HTTP Accept header explicitly permits the media type."
   def accepts?(header_values, media_type) do
     case parse_content_type(to_string(media_type)) do
       {:ok, expected_type, expected_subtype, _params} ->
@@ -51,7 +45,6 @@ defmodule FastestMCP.MIME do
     end
   end
 
-  @doc "Returns whether a Content-Type value is exactly the expected concrete media type."
   def content_type?(value, expected) when is_binary(value) and is_binary(expected) do
     with {:ok, actual_type, actual_subtype, _actual_params} <-
            parse_content_type(value),
@@ -65,7 +58,6 @@ defmodule FastestMCP.MIME do
 
   def content_type?(_value, _expected), do: false
 
-  @doc "Returns whether a value is a syntactically valid concrete MIME type."
   def valid?(value) when is_binary(value) do
     case parse_content_type(value) do
       {:ok, type, subtype, _params} ->
@@ -79,7 +71,6 @@ defmodule FastestMCP.MIME do
 
   def valid?(_value), do: false
 
-  @doc "Returns whether a concrete MIME type belongs to the expected top-level type."
   def type?(value, expected_type) when is_binary(value) and is_binary(expected_type) do
     expected_type = String.downcase(expected_type)
 
@@ -94,7 +85,6 @@ defmodule FastestMCP.MIME do
 
   def type?(_value, _expected_type), do: false
 
-  @doc "Returns whether a MIME type should be transported as textual content."
   def textual?(value) when is_binary(value) do
     normalized = normalize(value)
     String.starts_with?(normalized, "text/") or json?(normalized)
@@ -102,7 +92,6 @@ defmodule FastestMCP.MIME do
 
   def textual?(_value), do: false
 
-  @doc "Returns whether a MIME type should be transported as binary content."
   def binary?(nil), do: false
   def binary?(value), do: not textual?(value)
 

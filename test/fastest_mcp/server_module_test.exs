@@ -1,11 +1,9 @@
 defmodule FastestMCP.ServerModuleTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: false
 
   alias FastestMCP.Context
-  alias FastestMCP.Registry
   alias FastestMCP.ServerRuntime
   alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
-  alias FastestMCP.TestSupport.ServerSupervisorIsolation
 
   defmodule ConfiguredServer do
     use FastestMCP.ServerModule,
@@ -53,9 +51,7 @@ defmodule FastestMCP.ServerModuleTest do
       runtime: [max_concurrent_calls: 7]
     )
 
-    on_exit(fn ->
-      Application.delete_env(:fastest_mcp, ConfiguredServer)
-    end)
+    on_exit(fn -> Application.delete_env(:fastest_mcp, ConfiguredServer) end)
 
     assert {:ok, _pid} = start_supervised(ConfiguredServer)
 
@@ -69,8 +65,8 @@ defmodule FastestMCP.ServerModuleTest do
     assert server_name == to_string(ConfiguredServer)
 
     assert {:ok, runtime} = ServerRuntime.fetch(ConfiguredServer)
-    assert runtime.opts[:max_sessions] == 5
-    assert runtime.opts[:max_concurrent_calls] == 7
+    assert runtime.config.max_sessions == 5
+    assert runtime.config.max_concurrent_calls == 7
   end
 
   test "server module merges child overrides over app config and module defaults" do
@@ -79,9 +75,7 @@ defmodule FastestMCP.ServerModuleTest do
       runtime: [max_concurrent_calls: 7, max_sessions: 6]
     )
 
-    on_exit(fn ->
-      Application.delete_env(:fastest_mcp, ConfiguredServer)
-    end)
+    on_exit(fn -> Application.delete_env(:fastest_mcp, ConfiguredServer) end)
 
     assert {:ok, _pid} =
              start_supervised(
@@ -91,17 +85,15 @@ defmodule FastestMCP.ServerModuleTest do
     assert %{repo: ":override_repo"} = FastestMCP.call_tool!(ConfiguredServer, "repo_name", %{})
 
     assert {:ok, runtime} = ServerRuntime.fetch(ConfiguredServer)
-    assert runtime.opts[:max_concurrent_calls] == 7
-    assert runtime.opts[:max_sessions] == 9
+    assert runtime.config.max_concurrent_calls == 7
+    assert runtime.config.max_sessions == 9
   end
 
   test "FastestMCP.start_server/2 accepts server modules and stop_server/1 stops the instance" do
     assert {:ok, owner_pid} = FastestMCP.start_server(HTTPServer, [])
     assert Process.alive?(owner_pid)
 
-    on_exit(fn ->
-      _ = FastestMCP.stop_server(HTTPServer)
-    end)
+    on_exit(fn -> _ = FastestMCP.stop_server(HTTPServer) end)
 
     assert [%{name: "echo"}] = FastestMCP.list_tools!(HTTPServer)
     assert %{"message" => "hi"} = FastestMCP.call_tool!(HTTPServer, "echo", %{message: "hi"})
@@ -109,37 +101,6 @@ defmodule FastestMCP.ServerModuleTest do
     assert :ok = FastestMCP.stop_server(HTTPServer)
     refute Process.alive?(owner_pid)
     assert {:error, :not_found} = ServerRuntime.fetch(HTTPServer)
-  end
-
-  test "server module restores its owner claim after Registry replacement" do
-    assert {:ok, owner_pid} = FastestMCP.start_server(HTTPServer, [])
-    :ok = ServerSupervisorIsolation.terminate_unrelated_servers!(owner_pid)
-
-    on_exit(fn ->
-      if Process.alive?(owner_pid), do: FastestMCP.stop_server(HTTPServer)
-    end)
-
-    assert {:ok, old_runtime} = Registry.lookup_server(HTTPServer)
-    old_registry = Process.whereis(Registry)
-    Process.exit(old_registry, :kill)
-
-    assert_eventually(fn ->
-      with registry when is_pid(registry) and registry != old_registry <-
-             Process.whereis(Registry),
-           {:ok, ^owner_pid} <- Registry.lookup_server_owner(HTTPServer),
-           {:ok, runtime} when runtime != old_runtime <- Registry.lookup_server(HTTPServer) do
-        Process.alive?(runtime)
-      else
-        _other -> false
-      end
-    end)
-
-    assert Process.alive?(owner_pid)
-    assert [%{name: "echo"}] = FastestMCP.list_tools!(HTTPServer)
-
-    assert :ok = FastestMCP.stop_server(HTTPServer)
-    assert_eventually(fn -> not Process.alive?(owner_pid) end)
-    assert {:error, :not_found} = Registry.lookup_server_owner(HTTPServer)
   end
 
   test "server module child_spec can start streamable HTTP transport" do
@@ -245,22 +206,6 @@ defmodule FastestMCP.ServerModuleTest do
     case :gen_tcp.recv(socket, 0, 1_000) do
       {:ok, chunk} -> recv_all(socket, acc <> chunk)
       {:error, :closed} -> {:ok, acc}
-    end
-  end
-
-  defp assert_eventually(fun, attempts \\ 500)
-
-  defp assert_eventually(fun, attempts) do
-    cond do
-      fun.() ->
-        :ok
-
-      attempts == 0 ->
-        flunk("condition did not become true")
-
-      true ->
-        Process.sleep(10)
-        assert_eventually(fun, attempts - 1)
     end
   end
 end

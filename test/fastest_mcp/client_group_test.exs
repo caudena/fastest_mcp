@@ -1,5 +1,5 @@
 defmodule FastestMCP.ClientGroupTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
   alias FastestMCP.{Client, ClientGroup, Error}
 
   test "an explicit refresh cannot inherit weaker cache semantics from cold routing" do
@@ -42,7 +42,7 @@ defmodule FastestMCP.ClientGroupTest do
         _ -> nil
       end)
 
-    await_waiters(coordinator, 2, System.monotonic_time(:millisecond) + 2_000)
+    await_waiters(coordinator, 2)
     send(first_handler, :release)
     assert_receive {:listing, refresh_handler}, 1_000
     send(refresh_handler, :release)
@@ -102,7 +102,7 @@ defmodule FastestMCP.ClientGroupTest do
         _ -> nil
       end)
 
-    await_waiters(coordinator, 2, System.monotonic_time(:millisecond) + 2_000)
+    await_waiters(coordinator, 2)
     refute_receive :second_listing
     send(handler, :release)
     assert Enum.map(Task.await(first), & &1["name"]) == ["a_echo", "b_echo"]
@@ -160,18 +160,16 @@ defmodule FastestMCP.ClientGroupTest do
     assert %{structured_content: %{}} = ClientGroup.call_tool!(group, "one_echo")
   end
 
-  defp await_waiters(coordinator, count, deadline) do
-    case :sys.get_state(coordinator) do
-      %{load: %{waiters: waiters}} when length(waiters) == count ->
-        :ok
-
-      _ ->
-        if System.monotonic_time(:millisecond) >= deadline,
-          do: flunk("refresh callers did not arrive")
-
-        Process.sleep(1)
-        await_waiters(coordinator, count, deadline)
-    end
+  defp await_waiters(coordinator, count) do
+    assert_eventually(
+      fn ->
+        match?(
+          %{load: %{waiters: waiters}} when length(waiters) == count,
+          :sys.get_state(coordinator)
+        )
+      end,
+      2_000
+    )
   end
 
   test "mixed-era members negotiate independently and borrowed clients outlive the group" do
@@ -234,7 +232,7 @@ defmodule FastestMCP.ClientGroupTest do
     assert_receive :listed
     assert %{structured_content: %{}} = ClientGroup.call_tool!(group, "one_echo")
     refute_receive :listed
-    Client.set_auth_input!(ClientGroup.client!(group, "one"), %{token: "changed"})
+    Client.set_auth!(ClientGroup.client!(group, "one"), auth_input: %{token: "changed"})
     assert %{structured_content: %{}} = ClientGroup.call_tool!(group, "one_echo")
     assert_receive :listed
     refute_receive :listed
@@ -300,7 +298,7 @@ defmodule FastestMCP.ClientGroupTest do
 
   test "group task-result handles are owned by the caller and preserve cancellation" do
     parent = self()
-    name = unique_name()
+    name = unique_name("group-server")
 
     server =
       FastestMCP.server(name)
@@ -312,8 +310,7 @@ defmodule FastestMCP.ClientGroupTest do
         end
       end)
 
-    assert {:ok, _} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(name) end)
+    start_server!(server)
 
     group =
       start_supervised!({ClientGroup, clients: %{"one" => [target: {:in_process, name}]}})
@@ -322,8 +319,8 @@ defmodule FastestMCP.ClientGroupTest do
     request = ClientGroup.start_tool_result!(group, "one_wait")
     assert request.owner == self()
     assert_receive :entered_tool
-    Client.cancel_tool_result!(request, "test")
-    assert_raise Error, fn -> Client.await_tool_result!(request, 1_000) end
+    Client.ToolResultRequest.cancel!(request, "test")
+    assert_raise Error, fn -> Client.ToolResultRequest.await!(request, 1_000) end
   end
 
   test "failed startup removes owned clients without disconnecting borrowed clients" do
@@ -345,16 +342,71 @@ defmodule FastestMCP.ClientGroupTest do
     Client.disconnect!(borrowed)
   end
 
+  test "an elapsed group deadline is a timeout, and readiness waits as the client does" do
+    group =
+      start_supervised!(
+        {ClientGroup, clients: %{"one" => [target: {:in_process, server(["echo"])}]}}
+      )
+      |> ClientGroup.handle!()
+
+    for result <- [
+          ClientGroup.list_tools(group, timeout_ms: 0),
+          ClientGroup.resolve_tool(group, "one_echo", timeout_ms: 0),
+          ClientGroup.call_tool(group, "one_echo", %{}, timeout_ms: 0),
+          ClientGroup.start_tool_result(group, "one_echo", %{}, timeout_ms: 0),
+          ClientGroup.start_link(clients: %{"one" => {:existing, :unused}}, timeout_ms: 0)
+        ] do
+      assert {:error, %Error{code: :timeout, message: "client group timed out"}} = result
+    end
+
+    assert :ok = ClientGroup.await_ready(group, 0)
+    assert :ok = ClientGroup.await_ready(group, :infinity)
+    assert {:ok, [%{"name" => "one_echo"}]} = ClientGroup.list_tools(group, timeout_ms: :infinity)
+  end
+
+  test "disconnect stops a connected group and its owned clients, and is idempotent" do
+    {:ok, group} =
+      ClientGroup.connect(clients: %{"one" => [target: {:in_process, server(["echo"])}]})
+
+    owned = ClientGroup.client!(group, "one")
+    assert :ok = ClientGroup.disconnect(group)
+    refute Client.connected?(owned)
+    assert :ok = ClientGroup.disconnect(group)
+    assert :ok = ClientGroup.disconnect!(group)
+  end
+
+  test "unnamed handles and named coordinators share tagged group operations" do
+    name = server(["echo"])
+    {:ok, group} = ClientGroup.connect(clients: %{"local" => [target: {:in_process, name}]})
+    assert {:ok, [%{"name" => "local_echo"}]} = ClientGroup.list_tools(group)
+    assert {:ok, %Client.ToolResult{}} = ClientGroup.call_tool(group, "local_echo")
+    assert :ok = ClientGroup.disconnect(group)
+    assert {:error, %Error{code: :not_found}} = ClientGroup.list_tools(group)
+
+    registered = {:global, {__MODULE__, make_ref()}}
+
+    start_supervised!(
+      {ClientGroup, name: registered, clients: %{"local" => [target: {:in_process, name}]}}
+    )
+
+    assert {:ok, [%{"name" => "local_echo"}]} = ClientGroup.list_tools(registered)
+  end
+
+  test "invalid member options raise in the caller before the group starts" do
+    name = server(["echo"])
+
+    assert_raise ArgumentError, ~r/unknown keys \[:timeout\]/, fn ->
+      ClientGroup.start_link(clients: %{"a" => [target: {:in_process, name}, timeout: 5]})
+    end
+  end
+
   test "versions of one member tool share a route and retain exact selection" do
-    name = unique_name()
+    name = unique_name("group-server")
 
-    definition =
-      FastestMCP.server(name)
-      |> FastestMCP.add_tool("echo", fn _, _ -> %{version: 1} end, version: "1.0.0")
-      |> FastestMCP.add_tool("echo", fn _, _ -> %{version: 2} end, version: "2.0.0")
-
-    {:ok, _} = FastestMCP.start_server(definition)
-    on_exit(fn -> FastestMCP.stop_server(name) end)
+    FastestMCP.server(name)
+    |> FastestMCP.add_tool("echo", fn _, _ -> %{version: 1} end, version: "1.0.0")
+    |> FastestMCP.add_tool("echo", fn _, _ -> %{version: 2} end, version: "2.0.0")
+    |> start_server!()
 
     group =
       start_supervised!({ClientGroup, clients: %{"member" => [target: {:in_process, name}]}})
@@ -375,20 +427,17 @@ defmodule FastestMCP.ClientGroupTest do
   end
 
   defp server(tools, opts \\ []) do
-    name = unique_name()
+    name = unique_name("group-server")
 
     server =
       Enum.reduce(tools, FastestMCP.server(name), fn tool, server ->
         FastestMCP.add_tool(server, tool, fn args, _ -> args end)
       end)
 
-    server =
+    start_server!(
       if opts[:middleware], do: FastestMCP.add_middleware(server, opts[:middleware]), else: server
+    )
 
-    assert {:ok, _} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(name) end)
     name
   end
-
-  defp unique_name, do: "group-server-#{System.unique_integer([:positive])}"
 end

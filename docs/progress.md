@@ -99,8 +99,9 @@ client =
   )
 ```
 
-This is the cleanest way to watch long-running work from integration tests or
-local tooling.
+It sees progress only for requests that carry a progress token: pass
+`progress_token:` or a per-call `progress_handler:` to the operation. Without a
+token, `Context.report_progress/4` on the server has nowhere to send progress.
 
 For one operation, pass `progress_handler:` directly to the client helper:
 

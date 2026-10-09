@@ -1,31 +1,28 @@
 defmodule FastestMCP.InteractTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Interact
 
   test "confirm builds a boolean form and returns accepted boolean values" do
     server_name = "interact-confirm-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool(
-        "confirm",
-        fn _arguments, ctx ->
-          case Interact.confirm(ctx, "Proceed?") do
-            {:ok, true} -> "approved"
-            {:ok, false} -> "rejected"
-            :declined -> "declined"
-            :cancelled -> "cancelled"
-          end
-        end,
-        task: true
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool(
+      "confirm",
+      fn _arguments, ctx ->
+        case Interact.confirm(ctx, "Proceed?") do
+          {:ok, true} -> "approved"
+          {:ok, false} -> "rejected"
+          :declined -> "declined"
+          :cancelled -> "cancelled"
+        end
+      end,
+      task: true
+    )
+    |> start_server!()
 
     approved = FastestMCP.call_tool!(server_name, "confirm", %{}, task: true)
-    :ok = wait_for_input_required(server_name, approved.task_id)
+    await_task_status(server_name, approved.task_id, :input_required)
 
     assert %{
              "type" => "object",
@@ -39,7 +36,7 @@ defmodule FastestMCP.InteractTest do
     assert FastestMCP.await_task!(approved, 1_000) == "approved"
 
     rejected = FastestMCP.call_tool!(server_name, "confirm", %{}, task: true)
-    :ok = wait_for_input_required(server_name, rejected.task_id)
+    await_task_status(server_name, rejected.task_id, :input_required)
 
     _ =
       FastestMCP.send_task_input!(server_name, rejected.task_id, :accept, %{"confirmed" => false})
@@ -50,25 +47,22 @@ defmodule FastestMCP.InteractTest do
   test "choose maps keyword choices back to Elixir values" do
     server_name = "interact-choose-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool(
-        "pick",
-        fn _arguments, ctx ->
-          case Interact.choose(ctx, "Pick a color", red: "r", blue: "b") do
-            {:ok, value} -> value
-            :declined -> "declined"
-            :cancelled -> "cancelled"
-          end
-        end,
-        task: true
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool(
+      "pick",
+      fn _arguments, ctx ->
+        case Interact.choose(ctx, "Pick a color", red: "r", blue: "b") do
+          {:ok, value} -> value
+          :declined -> "declined"
+          :cancelled -> "cancelled"
+        end
+      end,
+      task: true
+    )
+    |> start_server!()
 
     handle = FastestMCP.call_tool!(server_name, "pick", %{}, task: true)
-    :ok = wait_for_input_required(server_name, handle.task_id)
+    await_task_status(server_name, handle.task_id, :input_required)
 
     assert %{
              "type" => "object",
@@ -127,11 +121,10 @@ defmodule FastestMCP.InteractTest do
         task: true
       )
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
     ask_name = FastestMCP.call_tool!(server_name, "ask_name", %{}, task: true)
-    :ok = wait_for_input_required(server_name, ask_name.task_id)
+    await_task_status(server_name, ask_name.task_id, :input_required)
 
     assert %{
              "type" => "object",
@@ -149,7 +142,7 @@ defmodule FastestMCP.InteractTest do
     assert FastestMCP.await_task!(ask_name, 1_000) == "Alice"
 
     profile = FastestMCP.call_tool!(server_name, "profile", %{}, task: true)
-    :ok = wait_for_input_required(server_name, profile.task_id)
+    await_task_status(server_name, profile.task_id, :input_required)
 
     assert %{
              "type" => "object",
@@ -169,26 +162,5 @@ defmodule FastestMCP.InteractTest do
       )
 
     assert %{name: "Alice", age: 34} = FastestMCP.await_task!(profile, 1_000)
-  end
-
-  defp wait_for_input_required(server_name, task_id, timeout \\ 1_000) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-    do_wait_for_input_required(server_name, task_id, deadline)
-  end
-
-  defp do_wait_for_input_required(server_name, task_id, deadline) do
-    task = FastestMCP.fetch_task!(server_name, task_id)
-
-    cond do
-      task.status == :input_required ->
-        :ok
-
-      System.monotonic_time(:millisecond) >= deadline ->
-        flunk("timed out waiting for task #{inspect(task_id)} to reach input_required")
-
-      true ->
-        Process.sleep(10)
-        do_wait_for_input_required(server_name, task_id, deadline)
-    end
   end
 end

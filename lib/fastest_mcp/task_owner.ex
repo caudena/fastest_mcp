@@ -1,6 +1,7 @@
 defmodule FastestMCP.TaskOwner do
   @moduledoc false
 
+  alias FastestMCP.Auth
   alias FastestMCP.Context
 
   @sensitive_key_fragments [
@@ -37,8 +38,11 @@ defmodule FastestMCP.TaskOwner do
 
   defp auth_fingerprint_from_values(principal, auth) do
     auth = normalize_optional_map(auth)
-    client_id = auth_client_id_from_values(principal, auth)
-    subject = auth_subject_from_values(principal, auth)
+
+    client_id =
+      Auth.claim(auth, [:client_id, :clientId]) || Auth.claim(principal, [:client_id, :clientId])
+
+    subject = Auth.claim(auth, [:sub, :subject]) || Auth.claim(principal, [:sub, :subject])
 
     cond do
       present?(client_id) and present?(subject) -> "#{client_id}|#{subject}"
@@ -46,20 +50,6 @@ defmodule FastestMCP.TaskOwner do
       present?(subject) -> to_string(subject)
       true -> nil
     end
-  end
-
-  defp auth_client_id_from_values(principal, auth) do
-    map_value(auth, :client_id) ||
-      map_value(auth, :clientId) ||
-      map_value(principal, :client_id) ||
-      map_value(principal, :clientId)
-  end
-
-  defp auth_subject_from_values(principal, auth) do
-    map_value(auth, :sub) ||
-      map_value(auth, :subject) ||
-      map_value(principal, :sub) ||
-      map_value(principal, :subject)
   end
 
   defp hashed_identity(principal, auth) do
@@ -126,12 +116,6 @@ defmodule FastestMCP.TaskOwner do
   defp normalize_key(key) when is_atom(key), do: Atom.to_string(key)
   defp normalize_key(key) when is_binary(key), do: String.downcase(key)
   defp normalize_key(key), do: key |> to_string() |> String.downcase()
-
-  defp map_value(value, key) when is_map(value) do
-    Map.get(value, key, Map.get(value, to_string(key)))
-  end
-
-  defp map_value(_value, _key), do: nil
 
   defp present?(value), do: not is_nil(value) and to_string(value) != ""
 end

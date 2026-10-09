@@ -25,8 +25,9 @@ shim in the release gate.
 - deprecated surfaces are not revived without a current Elixir use case
 - public Elixir APIs should stay idiomatic while preserving the underlying MCP
   contract
-- optional capabilities are derived from implemented handlers and runtime
-  configuration; caller-supplied maps cannot advertise unsupported behavior
+- core capabilities are derived from implemented handlers and runtime
+  configuration; the open `extensions:` and `experimental_capabilities:` maps
+  are advertised as configured and execute nothing
 - non-standard wire metadata is never an authentication channel by default
 
 ## Included Surface

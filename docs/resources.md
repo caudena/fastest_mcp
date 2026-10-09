@@ -74,7 +74,7 @@ FastestMCP.read_resource!("resources", "weather://london/current")
 FastestMCP currently supports:
 
 - path placeholders such as `{id}`
-- hyphenated path placeholders such as `{user-id}`
+- dotted variable names such as `{user.id}`
 - wildcard path placeholders such as `{path*}`
 - optional query variables such as `{?format,limit}`
 - reserved expansions such as `{+path}`
@@ -242,7 +242,7 @@ FastestMCP.complete!(
   %{"type" => "ref/resource", "uri" => "repos://{owner}/{repo}"},
   %{"name" => "owner", "value" => "pre"}
 )
-# => %{values: ["prefecthq"], total: 1}
+# => %{values: ["prefecthq"], total: 1, has_more: false}
 ```
 
 Completion providers stay server-side. They are not leaked into public list
@@ -261,8 +261,9 @@ them automatically. When you need more control, use the helper structs:
 - `FastestMCP.Resources.Text`
 - `FastestMCP.Resources.Binary`
 
-Plain maps, lists, tuples, dates, URIs, `MapSet`, and safe finite enumerable
-values such as ranges are encoded as JSON resource bodies:
+Plain maps, lists, tuples, `MapSet`, and ranges are encoded as JSON resource
+bodies; dates and URIs inside them become JSON strings, and a date or URI
+returned on its own is served as its plain string:
 
 ```elixir
 FastestMCP.server("resources")
@@ -303,22 +304,23 @@ server =
 
 ```elixir
 FastestMCP.read_resource!("resource-results", "reports://daily")
-# => %{
+# => %FastestMCP.Resources.Result{
 #      contents: [
-#        %{
+#        %FastestMCP.Resources.Content{
 #          uri: "reports://daily/summary",
 #          content: "Daily report is ready",
 #          mime_type: "text/plain",
 #          meta: %{slot: "summary"}
 #        },
-#        %{
+#        %FastestMCP.Resources.Content{
 #          uri: "reports://daily/attachment",
 #          content: <<0, 1, 2>>,
 #          mime_type: "application/octet-stream",
 #          meta: %{slot: "attachment"}
 #        }
 #      ],
-#      meta: %{source: "reporting"}
+#      meta: %{source: "reporting"},
+#      extra: %{}
 #    }
 ```
 
@@ -372,6 +374,14 @@ server =
     FastestMCP.Resources.HTTP.read(resource)
   end)
 ```
+
+`FastestMCP.Resources.HTTP` handles:
+
+- text or binary content chosen from the response media type, or `mime_type:`
+- `method:` and `body:` for non-GET requests
+- bounded reads: `timeout_ms:` (default 5 seconds) and `max_body_bytes:`
+  (default 10 MiB)
+- normalized read errors
 
 Directory-backed resources:
 
@@ -435,8 +445,9 @@ server =
 Transport metadata uses the same source options, but exposes them in the MCP
 shape clients expect:
 
-- direct Elixir list APIs keep `meta`, `tags`, `version`, and local `task`
-  configuration on the resource or template struct
+- direct Elixir list APIs return plain metadata maps that keep `meta`,
+  `version`, `tags` (a sorted list), and the local `task` configuration
+  (`%{mode: ..., poll_interval_ms: ...}`)
 - transport list APIs merge `tags` and `version` into `_meta.fastestmcp`
 - resource and resource-template task configuration is not advertised as a
   remote request capability; MCP `2025-11-25` task augmentation is tool-only
@@ -565,7 +576,7 @@ FastestMCP.await_task!(task, 5_000)
 
 Use this when the read itself may block inside an Elixir-owned workflow. Remote
 MCP `resources/read` requests are synchronous; task metadata on that wire method
-is rejected. See [Background Tasks](background-tasks.md) for the local/remote
+is ignored, because only `tools/call` accepts wire task augmentation. See [Background Tasks](background-tasks.md) for the local/remote
 boundary.
 
 ## Runtime Changes
@@ -592,9 +603,11 @@ manager = FastestMCP.component_manager!("dynamic-resources")
   )
 ```
 
-Dynamic entries take precedence over static startup entries for the same URI or
-URI template until the dynamic version is disabled or removed. That keeps
-runtime patches explicit without mutating the original server definition.
+Startup and runtime entries for the same URI or URI template coexist: the
+highest visible version wins, and on a tie the startup entry wins. Give a
+runtime patch a higher `version:` to override a startup entry; disabling or
+removing that version falls back to it. That keeps runtime patches explicit
+without mutating the original server definition.
 
 ## Errors and Duplicate Behavior
 
@@ -631,7 +644,7 @@ Read failures still surface as normal `FastestMCP.Error` values:
 
 - nonexistent URI or unmatched template -> `:not_found`
 - disabled resource or template version -> `:disabled`
-- parameter validation failure -> `:invalid_params`
+- parameter validation failure -> `:bad_request` (JSON-RPC `-32602` on the wire)
 - handler-raised application errors -> the raised `FastestMCP.Error`
 
 ## Subscriptions and Update Notifications
@@ -653,9 +666,13 @@ longer needed. On `2025-11-25`, subscriptions are session-scoped and target
 one concrete resource URI:
 
 ```elixir
-client = FastestMCP.Client.connect!("http://127.0.0.1:4100/mcp", session_stream: true)
+client =
+  FastestMCP.Client.connect!("http://127.0.0.1:4100/mcp",
+    protocol_version: "2025-11-25",
+    session_stream: true
+  )
 
-%{} = FastestMCP.Client.subscribe_resource!(client, "config://release")
+:ok = FastestMCP.Client.subscribe_resource!(client, "config://release")
 ```
 
 Resource templates remain available for discovery and reads, but their

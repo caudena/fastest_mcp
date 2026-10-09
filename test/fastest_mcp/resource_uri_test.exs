@@ -1,5 +1,5 @@
 defmodule FastestMCP.ResourceURITest do
-  use ExUnit.Case, async: true
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Protocol.URI, as: ProtocolURI
 

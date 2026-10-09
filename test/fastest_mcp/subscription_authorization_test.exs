@@ -1,5 +1,5 @@
 defmodule FastestMCP.SubscriptionAuthorizationTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Auth.Result, as: AuthResult
   alias FastestMCP.Client
@@ -15,13 +15,11 @@ defmodule FastestMCP.SubscriptionAuthorizationTest do
     parent = self()
 
     client =
-      Client.connect!(
+      connect!(
         {:stdio, elixir, stdio_server_args(server_name)},
         protocol_version: @modern_version,
         max_in_flight: 4
       )
-
-    on_exit(fn -> if Client.connected?(client), do: Client.disconnect!(client) end)
 
     listener =
       Client.listen!(
@@ -62,20 +60,18 @@ defmodule FastestMCP.SubscriptionAuthorizationTest do
                     }},
                    2_000
 
-    assert :ok = Client.cancel!(listener, "test complete")
+    assert :ok = Client.Request.cancel!(listener, "test complete")
   end
 
   test "acknowledges only advertised list changes and readable resource URIs" do
     server_name = unique_name("subscription-resource-auth")
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_resource("memo://visible", fn _arguments, _context -> "visible" end)
-      |> FastestMCP.add_resource("memo://hidden", fn _arguments, _context -> "hidden" end,
-        auth: fn _context -> false end
-      )
-
-    start_server!(server_name, server)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_resource("memo://visible", fn _arguments, _context -> "visible" end)
+    |> FastestMCP.add_resource("memo://hidden", fn _arguments, _context -> "hidden" end,
+      auth: fn _context -> false end
+    )
+    |> start_server!()
 
     request =
       modern_request("subscriptions/listen", %{
@@ -91,7 +87,7 @@ defmodule FastestMCP.SubscriptionAuthorizationTest do
         }
       })
 
-    assert {:ok, subscriber, ^request} =
+    assert {:ok, subscriber} =
              Engine.start_subscription(server_name, request, owner: self(), target: self())
 
     assert_receive {:fastest_mcp_subscription_notification,
@@ -126,7 +122,7 @@ defmodule FastestMCP.SubscriptionAuthorizationTest do
         task: [mode: :optional, poll_interval_ms: 10]
       )
 
-    start_server!(server_name, server)
+    start_server!(server)
 
     alpha_auth = auth_result("client", "alpha")
     beta_auth = auth_result("client", "beta")
@@ -164,7 +160,7 @@ defmodule FastestMCP.SubscriptionAuthorizationTest do
         alpha_auth
       )
 
-    assert {:ok, subscriber, ^listen} =
+    assert {:ok, subscriber} =
              Engine.start_subscription(server_name, listen, owner: self(), target: self())
 
     assert_receive {:fastest_mcp_subscription_notification,
@@ -184,7 +180,7 @@ defmodule FastestMCP.SubscriptionAuthorizationTest do
                     %{"method" => "notifications/tasks", "params" => params}},
                    1_000
 
-    assert (params["taskId"] || params[:taskId]) == alpha_id
+    assert params["taskId"] == alpha_id
     GenServer.stop(subscriber)
   end
 
@@ -260,12 +256,4 @@ defmodule FastestMCP.SubscriptionAuthorizationTest do
 
     Enum.flat_map(code_paths, fn path -> ["-pa", path] end) ++ ["-e", code]
   end
-
-  defp start_server!(server_name, server) do
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
-  end
-
-  defp unique_name(prefix),
-    do: prefix <> "-" <> Integer.to_string(System.unique_integer([:positive]))
 end

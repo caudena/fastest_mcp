@@ -1,5 +1,5 @@
 defmodule FastestMCP.ClientToolResultTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Client
   alias FastestMCP.Client.ToolResult
@@ -52,26 +52,17 @@ defmodule FastestMCP.ClientToolResultTest do
         })
       end)
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    start_server!(server)
 
-    client =
-      Client.connect!({:in_process, server_name}, protocol_version: "2026-07-28")
+    client = connect!({:in_process, server_name}, protocol_version: "2026-07-28")
 
-    legacy_client =
-      Client.connect!({:in_process, server_name}, protocol_version: "2025-11-25")
+    legacy_client = connect!({:in_process, server_name}, protocol_version: "2025-11-25")
 
     bounded_client =
-      Client.connect!({:in_process, server_name},
+      connect!({:in_process, server_name},
         protocol_version: "2026-07-28",
         max_response_bytes: 16_384
       )
-
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect!(client)
-      if Client.connected?(legacy_client), do: Client.disconnect!(legacy_client)
-      if Client.connected?(bounded_client), do: Client.disconnect!(bounded_client)
-      FastestMCP.stop_server(server_name)
-    end)
 
     assert %ToolResult{
              content: [],
@@ -135,11 +126,81 @@ defmodule FastestMCP.ClientToolResultTest do
 
     request = Client.start_tool_result!(legacy_client, "blocked")
     assert_receive {:blocked_tool_started, blocked_tool}, 1_000
-    assert :ok = Client.cancel_tool_result!(request, "test cancellation")
+    assert :ok = Client.ToolResultRequest.cancel!(request, "test cancellation")
 
-    error = assert_raise FastestMCP.Error, fn -> Client.await_tool_result!(request, 1_000) end
+    error =
+      assert_raise FastestMCP.Error, fn -> Client.ToolResultRequest.await!(request, 1_000) end
+
     assert error.code == :cancelled
     monitor = Process.monitor(blocked_tool)
     assert_receive {:DOWN, ^monitor, :process, ^blocked_tool, _reason}, 1_000
+  end
+
+  test "tagged and bang calls preserve plain maps, explicit envelopes, text and null" do
+    name = unique_name("tool-result-shapes")
+
+    data = %{
+      "content" => [],
+      "structuredContent" => false,
+      "isError" => true,
+      "messages" => [],
+      "contents" => []
+    }
+
+    FastestMCP.server(name)
+    |> FastestMCP.add_tool("data", fn _, _ -> data end)
+    |> FastestMCP.add_tool("text", fn _, _ -> "false" end)
+    |> FastestMCP.add_tool("envelope", fn _, _ ->
+      FastestMCP.Tools.Result.from_raw(%{
+        "content" => [],
+        "structuredContent" => nil,
+        "vendor" => %{"future" => 1}
+      })
+    end)
+    |> FastestMCP.add_tool("error", fn _, _ ->
+      FastestMCP.Tools.Result.new("declined", is_error: true)
+    end)
+    |> FastestMCP.add_resource("data://plain", fn _, _ -> data end)
+    |> FastestMCP.add_prompt("plain", fn _, _ -> data end)
+    |> start_server!()
+
+    client = connect!({:in_process, name})
+
+    assert {:ok, ^data} = FastestMCP.call_tool(name, "data")
+
+    assert {:ok, %ToolResult{structured_content: ^data, is_error: false}} =
+             Client.call_tool(client, "data")
+
+    assert %ToolResult{
+             content: [%{"type" => "text", "text" => "false"}],
+             structured_content_present?: false
+           } =
+             Client.call_tool!(client, "text")
+
+    assert {:ok,
+            %ToolResult{
+              structured_content: nil,
+              structured_content_present?: true,
+              raw: %{"vendor" => %{"future" => 1}}
+            }} =
+             Client.call_tool(client, "envelope")
+
+    assert {:ok, %ToolResult{is_error: true}} = Client.call_tool(client, "error")
+
+    assert {:error, %FastestMCP.Error{code: :method_not_found}} =
+             Client.call_tool(client, "missing")
+
+    assert_raise FastestMCP.Error, fn -> Client.call_tool!(client, "missing") end
+    assert {:error, %FastestMCP.Error{}} = FastestMCP.call_tool(name, "missing")
+
+    assert {:ok, %{"contents" => [%{"text" => resource_text}]}} =
+             Client.request(client, "resources/read", %{"uri" => "data://plain"})
+
+    assert JSON.decode!(resource_text) == data
+
+    assert {:ok, %{"messages" => [%{"content" => %{"text" => prompt_text}}]}} =
+             Client.render_prompt(client, "plain")
+
+    assert JSON.decode!(prompt_text) == data
   end
 end

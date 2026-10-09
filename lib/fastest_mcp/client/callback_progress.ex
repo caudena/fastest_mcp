@@ -1,5 +1,8 @@
 defmodule FastestMCP.Client.CallbackProgress do
   @moduledoc false
+
+  import FastestMCP.Util, only: [maybe_put: 3]
+
   alias FastestMCP.Client.CallbackContext
   alias FastestMCP.Error
   alias FastestMCP.Protocol.Progress, as: ProtocolProgress
@@ -39,7 +42,7 @@ defmodule FastestMCP.Client.CallbackProgress do
 
   defp callback_progress_owner(state, %CallbackContext{task_id: task_id})
        when is_binary(task_id) do
-    case Map.get(state.callback_tasks, task_id) do
+    case Map.get(state.tasks, task_id) do
       %{status: :working} = task -> {:ok, task}
       %{status: :cancelled} -> {:error, cancelled_callback_error()}
       _other -> {:error, inactive_callback_error()}
@@ -47,7 +50,7 @@ defmodule FastestMCP.Client.CallbackProgress do
   end
 
   defp callback_progress_owner(state, %CallbackContext{request_id: request_id}) do
-    case Map.get(state.callback_requests, request_id) do
+    case Map.get(state.requests, request_id) do
       %{cancelled?: false} = request -> {:ok, request}
       %{cancelled?: true} -> {:error, cancelled_callback_error()}
       _other -> {:error, inactive_callback_error()}
@@ -63,11 +66,11 @@ defmodule FastestMCP.Client.CallbackProgress do
        when is_binary(task_id) do
     state
     |> put_in(
-      [Access.key(:callback_tasks), task_id, :last_progress],
+      [Access.key(:tasks), task_id, :last_progress],
       progress
     )
     |> put_in(
-      [Access.key(:callback_tasks), task_id, :progress_total],
+      [Access.key(:tasks), task_id, :progress_total],
       progress_total
     )
   end
@@ -80,11 +83,11 @@ defmodule FastestMCP.Client.CallbackProgress do
        ) do
     state
     |> put_in(
-      [Access.key(:callback_requests), request_id, :last_progress],
+      [Access.key(:requests), request_id, :last_progress],
       progress
     )
     |> put_in(
-      [Access.key(:callback_requests), request_id, :progress_total],
+      [Access.key(:requests), request_id, :progress_total],
       progress_total
     )
   end
@@ -141,7 +144,4 @@ defmodule FastestMCP.Client.CallbackProgress do
   defp inactive_callback_error do
     %Error{code: :bad_request, message: "client callback is no longer active"}
   end
-
-  defp maybe_put(map, _key, nil), do: map
-  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 end

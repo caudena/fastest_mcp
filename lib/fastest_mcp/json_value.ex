@@ -1,7 +1,6 @@
 defmodule FastestMCP.JSONValue do
   @moduledoc false
 
-  @doc "Normalizes an Elixir value into a deterministic JSON-compatible value."
   def normalize(nil), do: nil
   def normalize(value) when is_boolean(value), do: value
 
@@ -46,14 +45,12 @@ defmodule FastestMCP.JSONValue do
   def normalize(value) when is_atom(value), do: value
   def normalize(value), do: value
 
-  @doc "Normalizes a value and converts all object keys to strings for wire payloads."
   def stringify_keys(value) do
     value
     |> normalize()
-    |> do_stringify_keys()
+    |> FastestMCP.Util.stringify_keys()
   end
 
-  @doc "Encodes an Elixir value after JSON normalization."
   def encode!(value), do: value |> normalize() |> JSON.encode!()
 
   defp normalize_key(key)
@@ -61,13 +58,6 @@ defmodule FastestMCP.JSONValue do
        do: key
 
   defp normalize_key(key), do: inspect(key)
-
-  defp do_stringify_keys(value) when is_map(value) do
-    Map.new(value, fn {key, item} -> {to_string(key), do_stringify_keys(item)} end)
-  end
-
-  defp do_stringify_keys(value) when is_list(value), do: Enum.map(value, &do_stringify_keys/1)
-  defp do_stringify_keys(value), do: value
 
   defp stable_sort_key(value), do: JSON.encode!(value)
 end

@@ -872,13 +872,16 @@ defmodule FastestMCP.TestSupport.ConformanceFixture do
         next.(operation)
 
       _missing_or_invalid ->
-        InputRequiredResult.new(
-          %{
-            "user_name" =>
-              elicitation_request("What is your name?", %{"name" => %{"type" => "string"}})
-          },
-          request_state: "task-conformance-user-name"
-        )
+        input_required =
+          InputRequiredResult.new(
+            %{
+              "user_name" =>
+                elicitation_request("What is your name?", %{"name" => %{"type" => "string"}})
+            },
+            request_state: "task-conformance-user-name"
+          )
+
+        {:ok, %{operation | result: input_required}}
     end
   end
 

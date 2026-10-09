@@ -16,7 +16,8 @@ Both exist because composition creates two different needs:
 
 Server transforms are added with `FastestMCP.add_transform/2`.
 
-They receive the component plus the current operation and can:
+They receive the component (a `FastestMCP.Components.Tool`, `Resource`,
+`ResourceTemplate`, or `Prompt` struct) plus the current operation and can:
 
 - return the component unchanged
 - return a modified component
@@ -24,12 +25,9 @@ They receive the component plus the current operation and can:
 - mark it disabled so later policy rejects it
 
 ```elixir
-transform = fn component, _operation ->
-  if FastestMCP.Component.identifier(component) == "internal" do
-    %{component | enabled: false}
-  else
-    component
-  end
+transform = fn
+  %FastestMCP.Components.Tool{name: "internal"} = tool, _operation -> %{tool | enabled: false}
+  component, _operation -> component
 end
 
 server =
@@ -122,6 +120,29 @@ provider =
 
 That pattern is useful when you want collision safety first and a curated public
 name second.
+
+## Custom Provider Transforms
+
+A provider transform is a struct whose module calls
+`use FastestMCP.ProviderTransform`. Override `transform_component/3` to rewrite
+a component as the provider exposes it, or to drop it by returning `nil`, and
+`reverse_identifier/4` to map an exposed identifier back to the source one
+(`{:ok, identifier}`, or `:error` when it cannot come from this provider):
+
+```elixir
+defmodule MyApp.HideInternal do
+  use FastestMCP.ProviderTransform
+
+  defstruct prefix: "internal_"
+
+  @impl FastestMCP.ProviderTransform
+  def transform_component(%__MODULE__{prefix: prefix}, component, _operation) do
+    if String.starts_with?(Map.get(component, :name) || "", prefix), do: nil, else: component
+  end
+end
+
+FastestMCP.add_provider_transform(provider, %MyApp.HideInternal{})
+```
 
 ## Tool-only Clients
 

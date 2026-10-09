@@ -1,5 +1,5 @@
 defmodule FastestMCP.ProxyProviderTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Apps
   alias FastestMCP.Client
@@ -19,10 +19,6 @@ defmodule FastestMCP.ProxyProviderTest do
   alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
   alias FastestMCP.Tools.Result, as: ToolResult
   alias FastestMCP.Transport.HTTPApp
-
-  def handle_telemetry(event, measurements, metadata, pid) do
-    send(pid, {:proxy_auth_telemetry, event, measurements, metadata})
-  end
 
   defmodule CapturePlug do
     @behaviour Plug
@@ -391,6 +387,33 @@ defmodule FastestMCP.ProxyProviderTest do
            end)
   end
 
+  test "proxied resource contents keep their own MIME types" do
+    upstream =
+      FastestMCP.server(unique_name("proxy-mime-upstream"))
+      |> FastestMCP.add_resource(
+        "memo://mixed",
+        fn _arguments, _context ->
+          ResourceResult.new([
+            ResourceContent.new("# Notes", uri: "memo://notes", mime_type: "text/markdown"),
+            ResourceContent.new(~s({"a":1}), uri: "memo://data", mime_type: "application/json")
+          ])
+        end,
+        mime_type: "text/plain"
+      )
+
+    front_name = upstream |> start_http_server!() |> start_proxy_server!()
+
+    result =
+      modern_result(front_name, 1, "resources/read", %{"uri" => "memo://mixed"},
+        name: "memo://mixed"
+      )
+
+    assert Enum.map(result["contents"], &{&1["uri"], &1["mimeType"]}) == [
+             {"memo://notes", "text/markdown"},
+             {"memo://data", "application/json"}
+           ]
+  end
+
   test "forwards input-required state and the frontend's latest input responses exactly" do
     upstream_name = unique_name("proxy-upstream-mrtr")
 
@@ -567,13 +590,8 @@ defmodule FastestMCP.ProxyProviderTest do
   end
 
   test "walks every upstream page and preserves an empty-string cursor" do
-    bandit =
-      start_supervised!(
-        {Bandit, plug: {PagedCatalogPlug, test_pid: self()}, scheme: :http, port: 0}
-      )
-
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
-    endpoint = "http://127.0.0.1:#{port}/mcp"
+    %{url: url} = serve!({PagedCatalogPlug, test_pid: self()})
+    endpoint = url
     front_name = start_proxy_server!(endpoint)
 
     assert [%{"name" => "first"}, %{"name" => "second"}] =
@@ -584,13 +602,8 @@ defmodule FastestMCP.ProxyProviderTest do
   end
 
   test "rejects ToolSearch composition before opening a proxy connection" do
-    bandit =
-      start_supervised!(
-        {Bandit, plug: {UnexpectedConnectionPlug, test_pid: self()}, scheme: :http, port: 0}
-      )
-
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
-    endpoint = "http://127.0.0.1:#{port}/mcp"
+    %{url: url} = serve!({UnexpectedConnectionPlug, test_pid: self()})
+    endpoint = url
     proxy = Proxy.new(endpoint)
 
     proxy_server =
@@ -659,12 +672,12 @@ defmodule FastestMCP.ProxyProviderTest do
     endpoint = start_http_server!(upstream)
     proxy = Proxy.new(endpoint)
 
-    assert {:ok, context} =
-             Context.build("proxy-cleanup-front",
-               state_scope: :request,
-               negotiated_protocol_version: "2026-07-28",
-               client_capabilities: %{}
-             )
+    context =
+      Context.new(test_runtime("proxy-cleanup-front"),
+        state_scope: :request,
+        negotiated_protocol_version: "2026-07-28",
+        client_capabilities: %{}
+      )
 
     operation = %Operation{
       server_name: "proxy-cleanup-front",
@@ -685,14 +698,14 @@ defmodule FastestMCP.ProxyProviderTest do
         pid
       end)
 
-    refute Process.alive?(client_pid)
+    assert_down(client_pid)
 
-    assert {:ok, failing_context} =
-             Context.build("proxy-cleanup-front",
-               state_scope: :request,
-               negotiated_protocol_version: "2026-07-28",
-               client_capabilities: %{}
-             )
+    failing_context =
+      Context.new(test_runtime("proxy-cleanup-front"),
+        state_scope: :request,
+        negotiated_protocol_version: "2026-07-28",
+        client_capabilities: %{}
+      )
 
     failing_operation = %{operation | context: failing_context}
 
@@ -706,7 +719,7 @@ defmodule FastestMCP.ProxyProviderTest do
     end
 
     assert_receive {:failing_client, failing_client_pid}
-    refute Process.alive?(failing_client_pid)
+    assert_down(failing_client_pid)
   end
 
   test "bridges upstream progress through the frontend request token" do
@@ -811,12 +824,12 @@ defmodule FastestMCP.ProxyProviderTest do
 
     proxy = Proxy.new(endpoint)
 
-    assert {:ok, context} =
-             Context.build("proxy-missing-capability",
-               state_scope: :request,
-               negotiated_protocol_version: "2026-07-28",
-               client_capabilities: %{}
-             )
+    context =
+      Context.new(test_runtime("proxy-missing-capability"),
+        state_scope: :request,
+        negotiated_protocol_version: "2026-07-28",
+        client_capabilities: %{}
+      )
 
     operation = %Operation{
       server_name: "proxy-missing-capability",
@@ -832,13 +845,8 @@ defmodule FastestMCP.ProxyProviderTest do
   end
 
   test "strips Tasks negotiation and rejects an unexpected upstream task envelope" do
-    bandit =
-      start_supervised!(
-        {Bandit, plug: {TaskEnvelopePlug, test_pid: self()}, scheme: :http, port: 0}
-      )
-
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
-    endpoint = "http://127.0.0.1:#{port}/mcp"
+    %{url: url} = serve!({TaskEnvelopePlug, test_pid: self()})
+    endpoint = url
     front_name = start_proxy_server!(endpoint)
 
     error =
@@ -865,21 +873,11 @@ defmodule FastestMCP.ProxyProviderTest do
   end
 
   test "does not forward authorization by default and forwards only to an exact trusted origin" do
-    telemetry_handler =
-      "proxy-auth-telemetry-#{System.unique_integer([:positive])}"
-
-    :telemetry.attach_many(
-      telemetry_handler,
-      [
-        [:fastest_mcp, :operation, :start],
-        [:fastest_mcp, :operation, :stop],
-        [:fastest_mcp, :operation, :exception]
-      ],
-      &__MODULE__.handle_telemetry/4,
-      self()
-    )
-
-    on_exit(fn -> :telemetry.detach(telemetry_handler) end)
+    attach_telemetry([
+      [:fastest_mcp, :operation, :start],
+      [:fastest_mcp, :operation, :stop],
+      [:fastest_mcp, :operation, :exception]
+    ])
 
     secret = "Bearer proxy-secret-value"
     upstream_name = unique_name("proxy-upstream-auth")
@@ -949,11 +947,9 @@ defmodule FastestMCP.ProxyProviderTest do
 
     mounted_root_name = unique_name("mounted-proxy-root")
 
-    mounted_root =
-      FastestMCP.server(mounted_root_name)
-      |> FastestMCP.mount(mounted_child, namespace: "child")
-
-    start_server!(mounted_root)
+    FastestMCP.server(mounted_root_name)
+    |> FastestMCP.mount(mounted_child, namespace: "child")
+    |> start_server!()
 
     assert [%{"name" => "child_echo"}, %{"name" => "child_reflect_error"}] =
              modern_result(mounted_root_name, 33, "tools/list", %{},
@@ -983,14 +979,14 @@ defmodule FastestMCP.ProxyProviderTest do
         trusted_origins: [origin(endpoint)]
       )
 
-    assert {:ok, context} =
-             Context.build("proxy-auth-error",
-               state_scope: :request,
-               transport: :in_process,
-               negotiated_protocol_version: "2026-07-28",
-               client_capabilities: %{},
-               request_metadata: %{headers: %{"authorization" => secret}}
-             )
+    context =
+      Context.new(test_runtime("proxy-auth-error"),
+        state_scope: :request,
+        transport: :in_process,
+        negotiated_protocol_version: "2026-07-28",
+        client_capabilities: %{},
+        request_metadata: %{headers: %{"authorization" => secret}}
+      )
 
     operation = %Operation{
       server_name: "proxy-auth-error",
@@ -1005,7 +1001,18 @@ defmodule FastestMCP.ProxyProviderTest do
       end
 
     refute inspect(error) =~ "proxy-secret-value"
-    refute inspect(collect_proxy_auth_telemetry()) =~ "proxy-secret-value"
+
+    telemetry =
+      collect_proxy_auth_telemetry([
+        upstream_name,
+        default_front,
+        forwarding_front,
+        mounted_root_name,
+        mounted_child.name,
+        "proxy-auth-error"
+      ])
+
+    refute inspect(telemetry) =~ "proxy-secret-value"
   end
 
   test "validates protocol selection and authorization forwarding boundaries" do
@@ -1068,11 +1075,10 @@ defmodule FastestMCP.ProxyProviderTest do
     {front_extensions, proxy_opts} = Keyword.pop(opts, :front_extensions, %{})
     proxy = Proxy.new(endpoint, proxy_opts)
 
-    server =
-      FastestMCP.server(server_name, extensions: front_extensions)
-      |> FastestMCP.add_provider(proxy)
+    FastestMCP.server(server_name, extensions: front_extensions)
+    |> FastestMCP.add_provider(proxy)
+    |> start_server!()
 
-    start_server!(server)
     server_name
   end
 
@@ -1091,9 +1097,8 @@ defmodule FastestMCP.ProxyProviderTest do
         test_pid -> {CapturePlug, test_pid: test_pid, http_app_opts: http_app_opts}
       end
 
-    bandit = start_supervised!({Bandit, plug: plug, scheme: :http, port: 0})
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
-    "http://127.0.0.1:#{port}/mcp"
+    %{url: url} = serve!(plug)
+    url
   end
 
   defp collect_upstream_requests(acc \\ []) do
@@ -1105,13 +1110,22 @@ defmodule FastestMCP.ProxyProviderTest do
     end
   end
 
-  defp collect_proxy_auth_telemetry(acc \\ []) do
+  # Other tests' events are left in the mailbox.
+  defp collect_proxy_auth_telemetry(server_names),
+    do: Enum.flat_map(server_names, &collect_server_telemetry(&1, []))
+
+  defp collect_server_telemetry(server_name, acc) do
     receive do
-      {:proxy_auth_telemetry, event, measurements, metadata} ->
-        collect_proxy_auth_telemetry([{event, measurements, metadata} | acc])
+      {:telemetry, event, measurements, %{server_name: ^server_name} = metadata} ->
+        collect_server_telemetry(server_name, [{event, measurements, metadata} | acc])
     after
       50 -> Enum.reverse(acc)
     end
+  end
+
+  defp assert_down(pid) do
+    ref = Process.monitor(pid)
+    assert_receive {:DOWN, ^ref, :process, ^pid, _reason}
   end
 
   defp stdio_server_args(server_name) do
@@ -1141,16 +1155,6 @@ defmodule FastestMCP.ProxyProviderTest do
     "#{uri.scheme}://#{uri.host}:#{uri.port}"
   end
 
-  defp start_server!(server) do
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-
-    on_exit(fn ->
-      _ = FastestMCP.stop_server(server.name)
-    end)
-
-    server
-  end
-
   defp modern_result(server_name, id, method, params, opts \\ []) do
     headers =
       case Keyword.get(opts, :name) do
@@ -1177,6 +1181,4 @@ defmodule FastestMCP.ProxyProviderTest do
     {:ok, encoded} = HTTPHeaders.encode_value(to_string(value))
     encoded
   end
-
-  defp unique_name(prefix), do: "#{prefix}-#{System.unique_integer([:positive])}"
 end

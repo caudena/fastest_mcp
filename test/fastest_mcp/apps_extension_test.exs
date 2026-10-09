@@ -1,5 +1,5 @@
 defmodule FastestMCP.AppsExtensionTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Apps
   alias FastestMCP.Client
@@ -95,14 +95,11 @@ defmodule FastestMCP.AppsExtensionTest do
   test "Apps metadata requires server opt-in as well as client MIME support" do
     server_name = unique_name("apps-server-gating")
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("plain", fn _arguments, _context -> "ok" end,
-        meta: Apps.tool_meta("ui://missing/not-enabled")
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("plain", fn _arguments, _context -> "ok" end,
+      meta: Apps.tool_meta("ui://missing/not-enabled")
+    )
+    |> start_server!()
 
     result = Engine.dispatch!(server_name, modern_request("tools/list", %{}, apps_caps()))
     [tool] = fetch(result, :tools)
@@ -135,7 +132,7 @@ defmodule FastestMCP.AppsExtensionTest do
           server
         end
 
-      assert {:ok, _pid} = FastestMCP.start_server(server)
+      start_server!(server)
 
       assert_raise FastestMCP.Error, ~r/unavailable UI resource/, fn ->
         Engine.dispatch!(server_name, modern_request("tools/list", %{}, apps_caps()))
@@ -144,8 +141,6 @@ defmodule FastestMCP.AppsExtensionTest do
       plain = Engine.dispatch!(server_name, modern_request("tools/list", %{}, %{}))
       [plain_tool] = fetch(plain, :tools)
       refute Map.has_key?(fetch(plain_tool, :_meta), "ui")
-
-      FastestMCP.stop_server(server_name)
     end
   end
 
@@ -195,23 +190,20 @@ defmodule FastestMCP.AppsExtensionTest do
     server_name = unique_name("apps-envelope")
     uri = "ui://invalid/envelope"
 
-    server =
-      FastestMCP.server(server_name, extensions: %{Extensions.apps() => %{}})
-      |> FastestMCP.add_resource(
-        uri,
-        fn _arguments, _context ->
-          Result.new([
-            Content.new("<!doctype html><html></html>",
-              uri: uri,
-              mime_type: "text/html"
-            )
-          ])
-        end,
-        mime_type: Apps.mime_type()
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name, extensions: %{Extensions.apps() => %{}})
+    |> FastestMCP.add_resource(
+      uri,
+      fn _arguments, _context ->
+        Result.new([
+          Content.new("<!doctype html><html></html>",
+            uri: uri,
+            mime_type: "text/html"
+          )
+        ])
+      end,
+      mime_type: Apps.mime_type()
+    )
+    |> start_server!()
 
     assert_raise FastestMCP.Error, ~r/invalid UI content envelope/, fn ->
       Engine.dispatch!(
@@ -232,28 +224,25 @@ defmodule FastestMCP.AppsExtensionTest do
     uri = "ui://reports/summary"
     html = "<!doctype html><html><body><main>Report</main></body></html>"
 
-    server =
-      FastestMCP.server(server_name,
-        extensions: %{Extensions.apps() => %{}}
-      )
-      |> FastestMCP.add_tool(
-        "show_report",
-        fn _arguments, _context ->
-          FastestMCP.Tools.Result.from(%{content: [%{type: "text", text: "Report is ready"}]})
-        end,
-        meta: Apps.tool_meta(uri)
-      )
-      |> FastestMCP.add_resource(
-        uri,
-        fn _arguments, _context ->
-          Apps.result(uri, html, csp: %{"connectDomains" => ["https://api.example.com"]})
-        end,
-        mime_type: Apps.mime_type(),
-        meta: Apps.resource_meta(prefers_border: true)
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name,
+      extensions: %{Extensions.apps() => %{}}
+    )
+    |> FastestMCP.add_tool(
+      "show_report",
+      fn _arguments, _context ->
+        FastestMCP.Tools.Result.from(%{content: [%{type: "text", text: "Report is ready"}]})
+      end,
+      meta: Apps.tool_meta(uri)
+    )
+    |> FastestMCP.add_resource(
+      uri,
+      fn _arguments, _context ->
+        Apps.result(uri, html, csp: %{"connectDomains" => ["https://api.example.com"]})
+      end,
+      mime_type: Apps.mime_type(),
+      meta: Apps.resource_meta(prefers_border: true)
+    )
+    |> start_server!()
 
     plain_tools = Engine.dispatch!(server_name, modern_request("tools/list", %{}, %{}))
     apps_tools = Engine.dispatch!(server_name, modern_request("tools/list", %{}, apps_caps()))
@@ -289,57 +278,43 @@ defmodule FastestMCP.AppsExtensionTest do
     html = "<!doctype html><html><body><section>Echo</section></body></html>"
     external_html = "<!doctype html><html><body><section>External</section></body></html>"
 
-    server =
-      FastestMCP.server(server_name, extensions: %{Extensions.apps() => %{}})
-      |> FastestMCP.add_tool("echo_widget", fn arguments, _context -> arguments end,
-        meta: Apps.tool_meta(uri)
-      )
-      |> FastestMCP.add_resource(
-        uri,
-        fn _arguments, _context ->
-          Apps.result(uri, html)
-        end,
-        mime_type: Apps.mime_type(),
-        meta: Apps.resource_meta()
-      )
-      |> FastestMCP.add_resource(
-        metadata_free_uri,
-        fn _arguments, _context ->
-          Result.new([
-            Content.new(external_html,
-              uri: metadata_free_uri,
-              mime_type: Apps.mime_type()
-            )
-          ])
-        end,
-        mime_type: Apps.mime_type()
-      )
+    FastestMCP.server(server_name, extensions: %{Extensions.apps() => %{}})
+    |> FastestMCP.add_tool("echo_widget", fn arguments, _context -> arguments end,
+      meta: Apps.tool_meta(uri)
+    )
+    |> FastestMCP.add_resource(
+      uri,
+      fn _arguments, _context ->
+        Apps.result(uri, html)
+      end,
+      mime_type: Apps.mime_type(),
+      meta: Apps.resource_meta()
+    )
+    |> FastestMCP.add_resource(
+      metadata_free_uri,
+      fn _arguments, _context ->
+        Result.new([
+          Content.new(external_html,
+            uri: metadata_free_uri,
+            mime_type: Apps.mime_type()
+          )
+        ])
+      end,
+      mime_type: Apps.mime_type()
+    )
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-
-    bandit =
-      start_supervised!(
-        {Bandit,
-         plug:
-           {FastestMCP.Transport.HTTPApp,
-            server_name: server_name, path: "/mcp", allowed_hosts: ["127.0.0.1", "localhost"]},
-         scheme: :http,
-         port: 0}
-      )
-
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
-
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    %{url: url} = start_http!(server_name, allowed_hosts: ["127.0.0.1", "localhost"])
 
     for protocol_version <- ["2026-07-28", "2025-11-25"] do
       client =
-        Client.connect!("http://127.0.0.1:#{port}/mcp",
+        Client.connect!(url,
           client_info: @client_info,
           protocol_version: protocol_version,
           extensions: %{Extensions.apps() => Apps.client_settings()}
         )
 
-      assert get_in(Client.capabilities!(client), ["extensions", Extensions.apps()]) == %{}
+      assert get_in(Client.info!(client).capabilities, ["extensions", Extensions.apps()]) == %{}
       assert %{items: [tool]} = Client.list_tools!(client)
       assert Apps.resource_uri(fetch(tool, :_meta)) == uri
 
@@ -378,7 +353,4 @@ defmodule FastestMCP.AppsExtensionTest do
   end
 
   defp fetch(map, key), do: Map.get(map, key, Map.get(map, to_string(key), %{}))
-
-  defp unique_name(prefix),
-    do: prefix <> "-" <> Integer.to_string(System.unique_integer([:positive]))
 end

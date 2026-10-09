@@ -23,6 +23,18 @@ defmodule FastestMCP.TraceTestHelper do
     end
   end
 
+  # Drains spans until one matching `fun` has arrived, then any that follow.
+  def drain_spans_until(fun, acc \\ []) do
+    receive do
+      {:span, span_record} ->
+        if fun.(span_record),
+          do: Enum.reverse([span_record | acc], drain_spans()),
+          else: drain_spans_until(fun, [span_record | acc])
+    after
+      1_000 -> raise "expected span not exported, got #{inspect(Enum.map(acc, &span_name/1))}"
+    end
+  end
+
   def find_span!(spans, name) do
     Enum.find(spans, &(span_name(&1) == name)) ||
       raise "expected span #{inspect(name)}, got #{inspect(Enum.map(spans, &span_name/1))}"

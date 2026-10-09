@@ -1,15 +1,19 @@
 defmodule FastestMCP.Deadline do
   @moduledoc false
+  # An absolute monotonic deadline in milliseconds, or :infinity. Option
+  # values are validated where they are read; a zero timeout is a deadline
+  # that has already passed.
   alias FastestMCP.Error
 
   def new(:infinity), do: :infinity
 
-  def new(timeout) when is_integer(timeout) and timeout > 0,
+  def new(timeout) when is_integer(timeout) and timeout >= 0,
     do: System.monotonic_time(:millisecond) + timeout
 
   def new(other),
-    do: raise(ArgumentError, "timeout must be positive or :infinity, got: #{inspect(other)}")
+    do: raise(ArgumentError, "timeout must be non-negative or :infinity, got: #{inspect(other)}")
 
+  # The `:deadline` in `opts`, else `:timeout_ms` (or `default`) from now.
   def from_options(opts, default),
     do: Keyword.get_lazy(opts, :deadline, fn -> new(Keyword.get(opts, :timeout_ms, default)) end)
 
@@ -21,29 +25,13 @@ defmodule FastestMCP.Deadline do
     end
   end
 
-  def request_options(opts, default, operation) do
-    timeout = Keyword.get(opts, :timeout_ms, default)
-    deadline = opts |> from_options(default) |> cap(timeout)
-
-    opts
-    |> Keyword.put(:deadline, deadline)
-    |> Keyword.put(:timeout_ms, remaining!(deadline, operation))
-  end
-
   def remaining(:infinity), do: :infinity
   def remaining(deadline), do: max(deadline - System.monotonic_time(:millisecond), 0)
 
   def check(deadline, operation) do
     case remaining(deadline) do
-      0 -> {:error, %Error{code: :timeout, message: "#{operation} timed out"}}
+      0 -> {:error, Error.timeout(operation)}
       remaining -> {:ok, remaining}
-    end
-  end
-
-  def remaining!(deadline, operation) do
-    case check(deadline, operation) do
-      {:ok, remaining} -> remaining
-      {:error, error} -> raise error
     end
   end
 end

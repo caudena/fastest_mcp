@@ -1,5 +1,5 @@
 defmodule FastestMCP.OpenAPIProviderEdgeCasesTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   test "provider can be built with requester only and empty paths" do
     spec = %{
@@ -16,8 +16,7 @@ defmodule FastestMCP.OpenAPIProviderEdgeCasesTest do
         end
       )
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server.name) end)
+    start_server!(server)
     assert FastestMCP.list_tools!(server.name) == []
   end
 
@@ -59,17 +58,13 @@ defmodule FastestMCP.OpenAPIProviderEdgeCasesTest do
 
     server_name = "openapi-errors-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.from_openapi(spec,
-        name: server_name,
-        requester: fn _method, _url, _opts ->
-          {:ok, 404, [{"content-type", "application/json"}],
-           JSON.encode!(%{"detail" => "missing"})}
-        end
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.from_openapi(spec,
+      name: server_name,
+      requester: fn _method, _url, _opts ->
+        {:ok, 404, [{"content-type", "application/json"}], JSON.encode!(%{"detail" => "missing"})}
+      end
+    )
+    |> start_server!()
 
     error =
       assert_raise FastestMCP.Error, fn ->
@@ -136,8 +131,7 @@ defmodule FastestMCP.OpenAPIProviderEdgeCasesTest do
     end
 
     server = FastestMCP.from_openapi(spec, name: server_name, requester: requester)
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
     assert %{"ok" => true} ==
              FastestMCP.call_tool!(server_name, "send_json", %{"name" => "Ada"})
@@ -252,8 +246,7 @@ defmodule FastestMCP.OpenAPIProviderEdgeCasesTest do
     assert tool.output_schema["type"] == "object"
     assert get_in(tool.output_schema, ["properties", "result", "type"]) == "array"
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
     assert %{"result" => [1, 2, 3]} ==
              FastestMCP.call_tool!(server_name, "list_values", %{})
@@ -294,17 +287,14 @@ defmodule FastestMCP.OpenAPIProviderEdgeCasesTest do
 
     server_name = "openapi-overrides-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.from_openapi(spec,
-        name: server_name,
-        requester: fn method, url, opts ->
-          send(parent, {:request, method, url, opts})
-          {:ok, 200, [{"content-type", "application/json"}], JSON.encode!(%{"ok" => true})}
-        end
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.from_openapi(spec,
+      name: server_name,
+      requester: fn method, url, opts ->
+        send(parent, {:request, method, url, opts})
+        {:ok, 200, [{"content-type", "application/json"}], JSON.encode!(%{"ok" => true})}
+      end
+    )
+    |> start_server!()
 
     [tool] = FastestMCP.list_tools!(server_name)
     assert Map.keys(tool.input_schema["properties"]) == ["query"]
@@ -385,17 +375,14 @@ defmodule FastestMCP.OpenAPIProviderEdgeCasesTest do
 
     server_name = "openapi-styles-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.from_openapi(spec,
-        name: server_name,
-        requester: fn method, url, opts ->
-          send(parent, {:request, method, url, opts})
-          {:ok, 200, [{"content-type", "application/json"}], JSON.encode!(%{"ok" => true})}
-        end
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.from_openapi(spec,
+      name: server_name,
+      requester: fn method, url, opts ->
+        send(parent, {:request, method, url, opts})
+        {:ok, 200, [{"content-type", "application/json"}], JSON.encode!(%{"ok" => true})}
+      end
+    )
+    |> start_server!()
 
     assert %{"ok" => true} ==
              FastestMCP.call_tool!(server_name, "styled", %{
@@ -454,17 +441,14 @@ defmodule FastestMCP.OpenAPIProviderEdgeCasesTest do
 
     server_name = "openapi-raw-body-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.from_openapi(spec,
-        name: server_name,
-        requester: fn method, url, opts ->
-          send(parent, {:request, method, url, opts})
-          {:ok, 200, [{"content-type", "application/json"}], JSON.encode!(%{"ok" => true})}
-        end
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.from_openapi(spec,
+      name: server_name,
+      requester: fn method, url, opts ->
+        send(parent, {:request, method, url, opts})
+        {:ok, 200, [{"content-type", "application/json"}], JSON.encode!(%{"ok" => true})}
+      end
+    )
+    |> start_server!()
 
     assert %{"ok" => true} ==
              FastestMCP.call_tool!(server_name, "send_array", %{"body" => [1, 2, 3]})
@@ -506,8 +490,7 @@ defmodule FastestMCP.OpenAPIProviderEdgeCasesTest do
         end
       )
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
     assert ~s({"looks":"json"}) == FastestMCP.call_tool!(server_name, "text", %{})
     assert %{"decoded" => true} == FastestMCP.call_tool!(server_name, "problem", %{})

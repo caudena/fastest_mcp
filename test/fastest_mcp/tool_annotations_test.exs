@@ -1,5 +1,5 @@
 defmodule FastestMCP.ToolAnnotationsTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Client
   alias FastestMCP.Transport.Engine
@@ -15,15 +15,12 @@ defmodule FastestMCP.ToolAnnotationsTest do
       destructiveHint: false
     }
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end,
-        annotations: annotations,
-        task: true
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end,
+      annotations: annotations,
+      task: true
+    )
+    |> start_server!()
 
     [tool] = FastestMCP.list_tools!(server_name)
     assert tool.annotations == Map.new(annotations)
@@ -60,19 +57,16 @@ defmodule FastestMCP.ToolAnnotationsTest do
   test "transport metadata emits fastestmcp _meta and strips internal fastestmcp fields" do
     server_name = "tool-meta-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end,
-        tags: ["utility", "math"],
-        version: "2.0.0",
-        meta: %{
-          "vendor" => %{"stable" => true},
-          "fastestmcp" => %{"hint" => "keep", "_private" => "drop"}
-        }
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end,
+      tags: ["utility", "math"],
+      version: "2.0.0",
+      meta: %{
+        "vendor" => %{"stable" => true},
+        "fastestmcp" => %{"hint" => "keep", "_private" => "drop"}
+      }
+    )
+    |> start_server!()
 
     assert %{
              tools: [
@@ -98,43 +92,24 @@ defmodule FastestMCP.ToolAnnotationsTest do
   test "connected clients preserve tool _meta from tools/list" do
     server_name = "tool-meta-client-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end,
-        tags: ["utility", "math"],
-        version: "2.0.0",
-        meta: %{
-          "vendor" => %{"stable" => true},
-          "fastestmcp" => %{"hint" => "keep", "_private" => "drop"}
-        }
-      )
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end,
+      tags: ["utility", "math"],
+      version: "2.0.0",
+      meta: %{
+        "vendor" => %{"stable" => true},
+        "fastestmcp" => %{"hint" => "keep", "_private" => "drop"}
+      }
+    )
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-
-    bandit =
-      start_supervised!(
-        {Bandit,
-         plug:
-           {FastestMCP.Transport.HTTPApp,
-            server_name: server_name,
-            path: "/mcp",
-            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
-         scheme: :http,
-         port: 0}
-      )
-
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+    %{url: url} =
+      start_http!(server_name, allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"])
 
     client =
-      Client.connect!("http://127.0.0.1:#{port}/mcp",
+      connect!(url,
         client_info: %{"name" => "tool-meta-client", "version" => "1.0.0"}
       )
-
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect!(client)
-      if Process.alive?(bandit), do: Supervisor.stop(bandit)
-      FastestMCP.stop_server(server_name)
-    end)
 
     assert %{
              items: [
@@ -157,39 +132,34 @@ defmodule FastestMCP.ToolAnnotationsTest do
   test "resource metadata emits execution and fastestmcp _meta consistently" do
     server_name = "resource-meta-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_resource("memo://report", fn _arguments, _ctx -> %{ok: true} end,
-        tags: ["utility", "docs"],
-        version: "2.0.0",
-        task: true,
-        meta: %{
-          "vendor" => %{"stable" => true},
-          "fastestmcp" => %{"hint" => "keep", "_private" => "drop"}
-        }
-      )
-      |> FastestMCP.add_resource("memo://sync", fn _arguments, _ctx -> %{ok: true} end,
-        task: false
-      )
-      |> FastestMCP.add_resource_template(
-        "memo://users/{id}",
-        fn arguments, _ctx -> arguments end,
-        tags: ["utility", "docs"],
-        version: "2.0.0",
-        task: true,
-        meta: %{
-          "vendor" => %{"stable" => true},
-          "fastestmcp" => %{"hint" => "keep", "_private" => "drop"}
-        }
-      )
-      |> FastestMCP.add_resource_template(
-        "memo://sync/{id}",
-        fn arguments, _ctx -> arguments end,
-        task: false
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_resource("memo://report", fn _arguments, _ctx -> %{ok: true} end,
+      tags: ["utility", "docs"],
+      version: "2.0.0",
+      task: true,
+      meta: %{
+        "vendor" => %{"stable" => true},
+        "fastestmcp" => %{"hint" => "keep", "_private" => "drop"}
+      }
+    )
+    |> FastestMCP.add_resource("memo://sync", fn _arguments, _ctx -> %{ok: true} end, task: false)
+    |> FastestMCP.add_resource_template(
+      "memo://users/{id}",
+      fn arguments, _ctx -> arguments end,
+      tags: ["utility", "docs"],
+      version: "2.0.0",
+      task: true,
+      meta: %{
+        "vendor" => %{"stable" => true},
+        "fastestmcp" => %{"hint" => "keep", "_private" => "drop"}
+      }
+    )
+    |> FastestMCP.add_resource_template(
+      "memo://sync/{id}",
+      fn arguments, _ctx -> arguments end,
+      task: false
+    )
+    |> start_server!()
 
     assert %{resources: resources} =
              Engine.dispatch!(server_name, %Request{

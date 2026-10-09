@@ -1,5 +1,5 @@
 defmodule FastestMCP.Protocol.SamplingTest do
-  use ExUnit.Case, async: true
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Context
   alias FastestMCP.Error

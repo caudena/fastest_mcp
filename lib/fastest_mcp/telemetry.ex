@@ -1,16 +1,7 @@
 defmodule FastestMCP.Telemetry do
-  @moduledoc """
-  OpenTelemetry helpers for FastestMCP server and connected-client tracing.
-  The runtime keeps emitting `:telemetry` events as its stable internal signal,
-  while this module adds OpenTelemetry spans and W3C trace propagation on top.
-
-  This module keeps one focused piece of FastestMCP behavior in a dedicated
-  place so builders, runtimes, transports, and providers can share the same
-  rules without duplicating logic.
-
-  Unless you are extending FastestMCP itself, you will usually meet this
-  module indirectly through higher-level APIs rather than calling it first.
-  """
+  @moduledoc false
+  # OpenTelemetry spans and W3C trace propagation on top of the runtime's
+  # `:telemetry` events.
 
   require OpenTelemetry.Tracer, as: Tracer
 
@@ -24,24 +15,18 @@ defmodule FastestMCP.Telemetry do
   @traceparent_key "traceparent"
   @tracestate_key "tracestate"
 
-  @doc "Returns the instrumentation name used by telemetry."
   def instrumentation_name, do: @instrumentation_name
-  @doc "Returns the metadata key used for the W3C `traceparent` header."
   def traceparent_key, do: @traceparent_key
-  @doc "Returns the metadata key used for the W3C `tracestate` header."
   def tracestate_key, do: @tracestate_key
 
-  @doc "Returns the active OpenTelemetry tracer."
   def get_tracer do
     OpenTelemetry.get_tracer(:fastest_mcp)
   end
 
-  @doc "Returns the current tracing context."
   def current_context do
     Ctx.get_current()
   end
 
-  @doc "Runs the given function inside the supplied tracing context."
   def with_context(context, fun) when is_function(fun, 0) do
     token = Ctx.attach(context)
 
@@ -52,7 +37,6 @@ defmodule FastestMCP.Telemetry do
     end
   end
 
-  @doc "Runs the given function inside a server-operation span."
   def with_server_span(%Operation{} = operation, fun, opts \\ []) when is_function(fun, 0) do
     parent_context =
       if Keyword.get(opts, :extract_parent?, true) do
@@ -71,7 +55,6 @@ defmodule FastestMCP.Telemetry do
     end
   end
 
-  @doc "Runs the given function inside a provider-delegate span."
   def with_delegate_span(name, provider_type, component_key, fun) when is_function(fun, 0) do
     Tracer.with_span "delegate " <> to_string(name),
                      %{
@@ -86,26 +69,23 @@ defmodule FastestMCP.Telemetry do
     end
   end
 
-  @doc "Adds operation metadata to the current span."
   def annotate_span(%Operation{} = operation) do
     Tracer.set_attributes(span_attributes(operation))
   end
 
-  @doc "Records an exception on the current span."
   def record_error(exception, stacktrace, attrs \\ %{}) do
     attrs = clean_attributes(attrs)
     Tracer.record_exception(exception, stacktrace, Map.to_list(attrs))
 
     Tracer.set_attributes(
       attrs
-      |> Map.put_new("error.type", exception_name(exception))
+      |> Map.put_new("error.type", inspect(exception.__struct__))
     )
 
     Tracer.set_status(:error, Exception.message(exception))
     :ok
   end
 
-  @doc "Extracts trace context from metadata."
   def extract_trace_context(nil), do: current_context()
   def extract_trace_context(metadata) when metadata == %{}, do: current_context()
 
@@ -120,7 +100,6 @@ defmodule FastestMCP.Telemetry do
     end
   end
 
-  @doc "Injects trace context into metadata."
   def inject_trace_context(metadata \\ %{})
 
   def inject_trace_context(metadata) when is_list(metadata) do
@@ -136,7 +115,6 @@ defmodule FastestMCP.Telemetry do
     Map.merge(normalize_binary_map(metadata), headers)
   end
 
-  @doc "Injects an explicit trace context into MCP `_meta` without rewriting other JSON values."
   def inject_mcp_trace_context(metadata, context \\ current_context()) when is_map(metadata) do
     carrier =
       context
@@ -152,7 +130,6 @@ defmodule FastestMCP.Telemetry do
     if map_size(carrier) == 0, do: metadata, else: Map.merge(metadata, carrier)
   end
 
-  @doc false
   def start_client_span(parent_context, method, target, attrs \\ %{}) do
     attrs =
       %{
@@ -180,52 +157,22 @@ defmodule FastestMCP.Telemetry do
     }
   end
 
-  @doc false
-  def with_client_span(method, target, attrs, fun) when is_function(fun, 1) do
-    with_client_span(current_context(), method, target, attrs, fun)
-  end
-
-  @doc false
-  def with_client_span(parent_context, method, target, attrs, fun) when is_function(fun, 1) do
-    trace = start_client_span(parent_context, method, target, attrs)
-
-    with_context(trace.context, fn ->
-      try do
-        result = fun.(trace)
-        finish_client_span(trace, :ok)
-        result
-      rescue
-        error ->
-          finish_client_span(trace, {:error, error})
-          reraise error, __STACKTRACE__
-      catch
-        kind, reason ->
-          finish_client_span(trace, {:error, {kind, reason}})
-          :erlang.raise(kind, reason, __STACKTRACE__)
-      end
-    end)
-  end
-
-  @doc false
   def annotate_client_span(%{span_ctx: span_ctx}, attrs) when is_map(attrs) do
     _ = Span.set_attributes(span_ctx, clean_attributes(attrs))
     :ok
   end
 
-  @doc false
   def add_client_span_event(%{span_ctx: span_ctx}, name, attrs \\ %{}) do
     _ = Span.add_event(span_ctx, name, clean_attributes(Map.new(attrs)))
     :ok
   end
 
-  @doc false
   def mark_client_tool_error(%{span_ctx: span_ctx}) do
     _ = Span.set_attribute(span_ctx, "error.type", "tool_error")
     _ = :otel_span.set_status(span_ctx, :error, "MCP tool returned an error result")
     :ok
   end
 
-  @doc false
   def finish_client_span(%{span_ctx: span_ctx}, outcome) do
     case outcome do
       :ok ->
@@ -254,14 +201,12 @@ defmodule FastestMCP.Telemetry do
     :ok
   end
 
-  @doc "Builds the span name for the given operation."
   def span_name(%Operation{method: "resources/read"}), do: "resources/read"
   def span_name(%Operation{method: method, target: nil}), do: method
 
   def span_name(%Operation{method: method, target: target}),
     do: method <> " " <> to_string(target)
 
-  @doc "Builds the span attributes for the given operation."
   def span_attributes(%Operation{} = operation) do
     %{
       "rpc.system" => "mcp",
@@ -284,8 +229,6 @@ defmodule FastestMCP.Telemetry do
     |> clean_attributes()
   end
 
-  defp exception_name(%module{}), do: module |> inspect() |> String.trim_leading("Elixir.")
-
   defp clean_attributes(attrs) do
     attrs
     |> Enum.reject(fn {_key, value} -> is_nil(value) end)
@@ -299,19 +242,11 @@ defmodule FastestMCP.Telemetry do
     do: Atom.to_string(type)
 
   defp component_type(%Operation{component: component}),
-    do: component |> Component.type() |> Atom.to_string()
+    do: component |> Component.kind() |> Atom.to_string()
 
-  defp component_key(%Operation{component: nil, component_type: :tool, target: target})
-       when is_binary(target),
-       do: "tool:#{target}@"
-
-  defp component_key(%Operation{component: nil, component_type: :prompt, target: target})
-       when is_binary(target),
-       do: "prompt:#{target}@"
-
-  defp component_key(%Operation{component: nil, component_type: :resource, target: target})
-       when is_binary(target),
-       do: "resource:#{target}@"
+  defp component_key(%Operation{component: nil, component_type: kind, target: target})
+       when kind in [:tool, :prompt, :resource] and is_binary(target),
+       do: Component.key(kind, target, nil)
 
   defp component_key(%Operation{component: component}) when not is_nil(component),
     do: Component.key(component)
@@ -349,7 +284,6 @@ defmodule FastestMCP.Telemetry do
   defp candidate_carriers(metadata) do
     [
       get_in(metadata, [:jsonrpc_envelope, "params", "_meta"]),
-      get_in(metadata, ["jsonrpc_envelope", "params", "_meta"]),
       metadata,
       Map.get(metadata, :headers),
       Map.get(metadata, "headers")
@@ -410,7 +344,7 @@ defmodule FastestMCP.Telemetry do
 
   defp map_string(map, key) when is_map(map) do
     Map.get(map, key) ||
-      case existing_atom_key(key) do
+      case FastestMCP.Util.existing_atom(key) do
         nil -> nil
         atom_key -> Map.get(map, atom_key)
       end
@@ -427,10 +361,4 @@ defmodule FastestMCP.Telemetry do
   end
 
   defp map_list(_other, _key), do: []
-
-  defp existing_atom_key(key) do
-    String.to_existing_atom(key)
-  rescue
-    ArgumentError -> nil
-  end
 end

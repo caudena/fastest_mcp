@@ -1,5 +1,5 @@
 defmodule FastestMCP.ClientTaskTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Client
   alias FastestMCP.Client.Task, as: RemoteTask
@@ -9,21 +9,13 @@ defmodule FastestMCP.ClientTaskTest do
   test "remote task handles cache terminal status and final result" do
     server_name = "client-task-cache-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("echo", fn %{"value" => value}, _ctx -> %{value: value} end,
-        task: [mode: :optional, poll_interval_ms: 50]
-      )
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("echo", fn %{"value" => value}, _ctx -> %{value: value} end,
+      task: [mode: :optional, poll_interval_ms: 50]
+    )
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
-
-    bandit = start_http_transport!(server_name)
-    client = connect_client!(bandit)
-
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect!(client)
-    end)
+    client = connect_client!(server_name)
 
     assert %RemoteTask{task_id: task_id, kind: :tool, target: "echo"} =
              task = Client.call_tool_task!(client, "echo", %{"value" => "cached"})
@@ -38,28 +30,24 @@ defmodule FastestMCP.ClientTaskTest do
   end
 
   test "remote task handles retry tasks/result after transient request failures" do
+    parent = self()
     server_name = "client-task-retry-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool(
-        "slow",
-        fn _args, _ctx ->
-          Process.sleep(150)
-          %{ok: true}
-        end,
-        task: true
-      )
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool(
+      "slow",
+      fn _args, _ctx ->
+        send(parent, {:slow_started, self()})
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+        receive do
+          :release -> %{ok: true}
+        end
+      end,
+      task: true
+    )
+    |> start_server!()
 
-    bandit = start_http_transport!(server_name)
-    client = connect_client!(bandit)
-
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect!(client)
-    end)
+    client = connect_client!(server_name)
 
     assert %RemoteTask{task_id: task_id} =
              task = Client.call_tool_task!(client, "slow", %{}, task: true)
@@ -70,6 +58,8 @@ defmodule FastestMCP.ClientTaskTest do
       end
 
     assert timeout_error.code == :timeout
+    assert_receive {:slow_started, slow}, 1_000
+    send(slow, :release)
     assert %{"taskId" => _, "status" => "completed"} = RemoteTask.wait!(task, timeout_ms: 2_000)
 
     assert_tool_result(
@@ -79,6 +69,7 @@ defmodule FastestMCP.ClientTaskTest do
     )
   end
 
+  @tag :capture_log
   test "task handle callbacks fan out, survive callback failures, and stay isolated per task" do
     parent = self()
 
@@ -101,19 +92,12 @@ defmodule FastestMCP.ClientTaskTest do
         task: true
       )
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
-
-    bandit = start_http_transport!(server_name)
+    start_server!(server)
 
     client =
-      connect_client!(bandit,
+      connect_client!(server_name,
         session_stream: true
       )
-
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect!(client)
-    end)
 
     assert %RemoteTask{task_id: task_one_id} =
              task_one = Client.call_tool_task!(client, "wait", %{"label" => "one"}, task: true)
@@ -152,23 +136,15 @@ defmodule FastestMCP.ClientTaskTest do
   test "remote task augmentation is limited to tools/call" do
     server_name = "client-task-kinds-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("echo", fn %{"value" => value}, _ctx -> %{value: value} end,
-        task: true
-      )
-      |> FastestMCP.add_prompt("draft", fn _args, _ctx -> "hello from prompt" end, task: true)
-      |> FastestMCP.add_resource("memo://config", fn _args, _ctx -> %{env: "dev"} end, task: true)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("echo", fn %{"value" => value}, _ctx -> %{value: value} end,
+      task: true
+    )
+    |> FastestMCP.add_prompt("draft", fn _args, _ctx -> "hello from prompt" end, task: true)
+    |> FastestMCP.add_resource("memo://config", fn _args, _ctx -> %{env: "dev"} end, task: true)
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
-
-    bandit = start_http_transport!(server_name)
-    client = connect_client!(bandit)
-
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect!(client)
-    end)
+    client = connect_client!(server_name)
 
     assert %RemoteTask{kind: :tool, task_id: task_id} =
              tool_task =
@@ -192,25 +168,20 @@ defmodule FastestMCP.ClientTaskTest do
     parent = self()
     server_name = "client-task-relay-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool(
-        "ask_name",
-        fn _args, ctx ->
-          case Context.elicit(ctx, "What is your name?", :string) do
-            %Accepted{data: name} -> %{name: name}
-          end
-        end,
-        task: true
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
-
-    bandit = start_http_transport!(server_name)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool(
+      "ask_name",
+      fn _args, ctx ->
+        case Context.elicit(ctx, "What is your name?", :string) do
+          %Accepted{data: name} -> %{name: name}
+        end
+      end,
+      task: true
+    )
+    |> start_server!()
 
     client =
-      connect_client!(bandit,
+      connect_client!(server_name,
         session_stream: false,
         elicitation_handler: fn message, params ->
           send(parent, {:elicitation_handler_called, message, params})
@@ -218,17 +189,13 @@ defmodule FastestMCP.ClientTaskTest do
         end
       )
 
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect!(client)
-    end)
-
     assert %RemoteTask{task_id: task_id} =
              task = Client.call_tool_task!(client, "ask_name", %{}, task: true)
 
     result_task = Task.async(fn -> RemoteTask.result!(task) end)
 
     assert_receive {:elicitation_handler_called, "What is your name?", _params}, 2_000
-    assert Client.session_stream_open?(client)
+    assert Client.info!(client).session_stream_open?
 
     assert_tool_result(Task.await(result_task, 6_000), task_id, %{"name" => "Alice"})
     assert_tool_result(RemoteTask.result!(task), task_id, %{"name" => "Alice"})
@@ -246,25 +213,10 @@ defmodule FastestMCP.ClientTaskTest do
     assert JSON.decode!(text) == structured_content
   end
 
-  defp start_http_transport!(server_name) do
-    start_supervised!(
-      {Bandit,
-       plug:
-         {FastestMCP.Transport.HTTPApp,
-          server_name: server_name,
-          path: "/mcp",
-          allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
-       scheme: :http,
-       port: 0}
-    )
-  end
+  defp connect_client!(server_name, opts \\ []) do
+    %{url: url} =
+      start_http!(server_name, allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"])
 
-  defp connect_client!(bandit, opts \\ []) do
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
-
-    Client.connect!(
-      "http://127.0.0.1:#{port}/mcp",
-      Keyword.put_new(opts, :protocol_version, "2025-11-25")
-    )
+    connect!(url, Keyword.put_new(opts, :protocol_version, "2025-11-25"))
   end
 end

@@ -1,311 +1,247 @@
 defmodule FastestMCP.Session do
-  @moduledoc """
-  Stores per-session lifecycle metadata with idle expiry.
+  @moduledoc false
+  # Coordinates one legacy (`2025-11-25`) MCP session: its lifecycle, request
+  # correlation in both directions, progress, output streams (`Session.Outbox`),
+  # server notifications, peer tasks, URL elicitations, resource
+  # subscriptions, and idle expiry. User-facing session values live in the
+  # `FastestMCP.SessionStateStore`.
 
-  This module owns one piece of the running OTP topology. Keeping the
-  stateful runtime split across small processes makes failure handling
-  explicit and avoids mixing transport, registry, and execution concerns
-  into one large server.
-
-  Applications usually reach it indirectly through higher-level APIs such as
-  `FastestMCP.start_server/2`, request context helpers, or task utilities.
-
-  User-facing session values are stored in the configured
-  `FastestMCP.SessionStateStore` backend. This process keeps the parts that are
-  inherently local to the runtime:
-
-    * session registration
-    * idle expiry and touch timestamps
-    * negotiated client info
-    * exact resource subscriptions
-  """
-
-  use GenServer
+  use GenServer, restart: :transient
+  import FastestMCP.Util, only: [maybe_put: 3]
+  import FastestMCP.Protocol.Version
 
   alias FastestMCP.Elicitation.URL, as: URLElicitation
   alias FastestMCP.Error
+  alias FastestMCP.EventBus
+  alias FastestMCP.Middleware.RateLimiting.SlidingWindow
+  alias FastestMCP.Notifications
+  alias FastestMCP.Options
   alias FastestMCP.Protocol
   alias FastestMCP.Protocol.Meta
-  alias FastestMCP.Protocol.Progress, as: ProtocolProgress
-  alias FastestMCP.Protocol.RateWindow
   alias FastestMCP.Protocol.Redactor
   alias FastestMCP.Protocol.Sampling, as: ProtocolSampling
+  alias FastestMCP.Protocol.Schema, as: ProtocolSchema
   alias FastestMCP.Registry
   alias FastestMCP.Root
   alias FastestMCP.RuntimeQuota
-  alias FastestMCP.Schema
+  alias FastestMCP.Session.Outbox
+  alias FastestMCP.Session.Progress
   alias FastestMCP.SessionStateStore
   alias FastestMCP.SSEReplay
 
   require Logger
 
-  @supported_protocol_version "2025-11-25"
   @termination_timeout 5_000
-  @default_max_request_ids 100_000
-  @default_request_timeout_ms 60_000
-  @default_max_pending_requests 128
-  @default_max_active_requests 128
-  @default_max_peer_tasks 128
-  @default_max_peer_task_callbacks 128
-  @default_max_queued_messages 1_024
-  @default_max_queued_bytes 16 * 1_024 * 1_024
-  @default_max_progress_per_second 20
-  @default_max_inbound_progress_per_second 100
-  @default_max_logs_per_second 100
-  @logging_levels ~w(debug info notice warning error critical alert emergency)
+  @request_timeout_ms 60_000
+  @replay_options %{
+    sse_replay_max_events: :max_events,
+    sse_replay_max_stream_bytes: :max_stream_bytes,
+    sse_replay_max_total_bytes: :max_total_bytes,
+    sse_replay_ttl_ms: :ttl_ms
+  }
 
-  @doc "Starts the process owned by this module."
+  # Field defaults are the session defaults; `ServerRuntime.Config` validates
+  # the runtime options that override them.
+  defstruct [
+    :server_name,
+    :session_id,
+    :session_state_store,
+    :runtime_quota,
+    :task_supervisor,
+    :protocol_version,
+    :client_capabilities,
+    :server_capabilities,
+    :client_info,
+    :roots,
+    :replay,
+    :log_rate,
+    :peer_progress_rate,
+    event_bus: %EventBus{},
+    idle_ttl_ms: :infinity,
+    max_request_ids: 100_000,
+    max_pending_requests: 128,
+    max_active_requests: 128,
+    max_peer_tasks: 128,
+    max_peer_task_callbacks: 128,
+    max_queued_messages: 1_024,
+    max_queued_bytes: 16 * 1_024 * 1_024,
+    request_timeout_ms: @request_timeout_ms,
+    max_progress_per_second: 20,
+    max_inbound_progress_per_second: 100,
+    max_logs_per_second: 100,
+    redaction_opts: [],
+    lifecycle_state: :new,
+    auth_identity: :unbound,
+    logging_level: "info",
+    client_request_ids: MapSet.new(),
+    server_request_ids: MapSet.new(),
+    resource_subscriptions: MapSet.new(),
+    sinks: %{},
+    sink_monitors: %{},
+    stream_owners: %{},
+    queued_messages: :queue.new(),
+    queued_bytes: 0,
+    pending_requests: %{},
+    pending_monitors: %{},
+    active_requests: %{},
+    active_monitors: %{},
+    receiver_tasks: %{},
+    receiver_task_requests: %{},
+    progress_tokens: %{},
+    peer_progress_tokens: %{},
+    peer_tasks: %{},
+    peer_task_callbacks: %{},
+    peer_task_callback_monitors: %{},
+    url_elicitations: %{}
+  ]
+
+  def start_link(opts, {server_name, session_id}) when is_map(opts),
+    do: start_link(Map.merge(opts, %{server_name: server_name, session_id: session_id}))
+
   def start_link(%{server_name: server_name, session_id: session_id} = opts) do
-    GenServer.start_link(
-      __MODULE__,
-      {server_name, session_id, Map.get(opts, :idle_ttl_ms, :infinity),
-       Map.fetch!(opts, :session_state_store),
-       Map.get(opts, :max_request_ids, @default_max_request_ids), opts}
+    opts = %{opts | server_name: to_string(server_name), session_id: to_string(session_id)}
+
+    GenServer.start_link(__MODULE__, opts,
+      name: Registry.via({:session, opts.server_name, opts.session_id})
     )
   end
 
-  @doc false
   def attach_sink(server_name, session_id, sink_pid, opts \\ [])
       when is_pid(sink_pid) and is_list(opts) do
-    session_call(server_name, session_id, {:attach_sink, sink_pid, opts})
+    kind = Keyword.get(opts, :kind, :get)
+
+    unless kind in [:post, :get, :stdio],
+      do: raise(ArgumentError, "sink kind must be :post, :get, or :stdio, got: #{inspect(kind)}")
+
+    call(server_name, session_id, {:attach_sink, sink_pid, opts})
   end
 
-  @doc false
-  def detach_sink(server_name, session_id, sink_ref) when is_reference(sink_ref) do
-    session_call(server_name, session_id, {:detach_sink, sink_ref})
-  end
+  def detach_sink(server_name, session_id, sink_ref) when is_reference(sink_ref),
+    do: call(server_name, session_id, {:detach_sink, sink_ref})
 
-  @doc false
-  def deliverable?(server_name, session_id) do
-    case session_call(server_name, session_id, :deliverable?) do
-      true -> true
-      _other -> false
-    end
-  end
+  def deliverable?(server_name, session_id),
+    do: call(server_name, session_id, :deliverable?) == true
 
-  @doc false
   def send_notification(server_name, session_id, method, params \\ %{}, opts \\ [])
       when is_binary(method) and is_map(params) and is_list(opts) do
-    envelope = %{"jsonrpc" => "2.0", "method" => method, "params" => params}
-    session_call(server_name, session_id, {:send_notification, envelope, opts})
+    opts = Keyword.put_new(opts, :queue, true)
+    send_envelope(server_name, session_id, notification(method, params), opts)
   end
 
-  @doc false
   def send_envelope(server_name, session_id, envelope, opts \\ [])
-      when is_map(envelope) and is_list(opts) do
-    session_call(server_name, session_id, {:send_envelope, envelope, opts})
-  end
+      when is_map(envelope) and is_list(opts),
+      do: call(server_name, session_id, {:send_envelope, envelope, opts})
 
-  @doc false
   def request_peer(server_name, session_id, method, params \\ %{}, opts \\ [])
       when is_binary(method) and is_map(params) and is_list(opts) do
-    with {:ok, pid} <- Registry.lookup_session(server_name, session_id) do
-      GenServer.call(pid, {:request_peer, method, params, opts}, :infinity)
-    end
+    if Keyword.has_key?(opts, :timeout_ms),
+      do: Options.check!(opts[:timeout_ms], :pos_integer, :timeout_ms)
+
+    # The session replies by the request's own timeout at the latest.
+    call(server_name, session_id, {:request_peer, method, params, opts}, :infinity)
   end
 
-  @doc false
   def resolve_peer_response(server_name, session_id, request_id, payload)
-      when (is_binary(request_id) or is_integer(request_id)) and is_map(payload) do
-    session_call(server_name, session_id, {:resolve_peer_response, request_id, payload})
-  end
+      when (is_binary(request_id) or is_integer(request_id)) and is_map(payload),
+      do: call(server_name, session_id, {:resolve_peer_response, request_id, payload})
 
-  @doc false
   def register_inbound_request(server_name, session_id, request_id, worker_pid, opts \\ [])
       when (is_binary(request_id) or is_integer(request_id)) and is_pid(worker_pid) and
-             is_list(opts) do
-    session_call(
-      server_name,
-      session_id,
-      {:register_inbound_request, request_id, worker_pid, opts}
-    )
-  end
+             is_list(opts),
+      do: call(server_name, session_id, {:register_inbound_request, request_id, worker_pid, opts})
 
-  @doc false
-  def finish_inbound_request(server_name, session_id, request_id) do
-    session_call(server_name, session_id, {:finish_inbound_request, request_id})
-  end
+  def finish_inbound_request(server_name, session_id, request_id),
+    do: call(server_name, session_id, {:finish_inbound_request, request_id})
 
-  @doc false
   def receiver_task_started(server_name, session_id, task_id, request_id, progress_token)
       when is_binary(task_id) and task_id != "" and
              (is_binary(request_id) or is_integer(request_id)) do
-    session_call(
-      server_name,
-      session_id,
-      {:receiver_task_started, task_id, request_id, progress_token}
-    )
+    message = {:receiver_task_started, task_id, request_id, progress_token}
+    call(server_name, session_id, message)
   end
 
-  @doc false
   def receiver_task_finished(server_name, session_id, task_id)
-      when is_binary(task_id) and task_id != "" do
-    session_call(server_name, session_id, {:receiver_task_finished, task_id})
-  end
+      when is_binary(task_id) and task_id != "",
+      do: call(server_name, session_id, {:receiver_task_finished, task_id})
 
-  @doc false
-  def cancel_inbound_request(server_name, session_id, request_id, reason \\ nil) do
-    session_call(server_name, session_id, {:cancel_inbound_request, request_id, reason})
-  end
+  def cancel_inbound_request(server_name, session_id, request_id),
+    do: call(server_name, session_id, {:cancel_inbound_request, request_id})
 
-  @doc false
-  def receive_peer_progress(server_name, session_id, params) when is_map(params) do
-    session_call(server_name, session_id, {:receive_peer_progress, params})
-  end
+  def receive_peer_progress(server_name, session_id, params) when is_map(params),
+    do: call(server_name, session_id, {:receive_peer_progress, params})
 
-  @doc false
-  def report_progress(server_name, session_id, request_id, params) when is_map(params) do
-    session_call(server_name, session_id, {:report_progress, request_id, params})
-  end
+  def report_progress(server_name, session_id, request_id, params) when is_map(params),
+    do: call(server_name, session_id, {:report_progress, request_id, params})
 
-  @doc false
-  def set_logging_level(server_name, session_id, level) do
-    session_call(server_name, session_id, {:set_logging_level, to_string(level)})
-  end
+  def set_logging_level(server_name, session_id, level),
+    do: call(server_name, session_id, {:set_logging_level, to_string(level)})
 
-  @doc false
-  def log(server_name, session_id, level, data, opts \\ []) when is_list(opts) do
-    session_call(server_name, session_id, {:log, to_string(level), data, opts})
-  end
+  def log(server_name, session_id, level, data, opts \\ []) when is_list(opts),
+    do: call(server_name, session_id, {:log, to_string(level), data, opts})
 
-  @doc false
-  def cached_roots(server_name, session_id) do
-    session_call(server_name, session_id, :cached_roots)
-  end
+  def cached_roots(server_name, session_id), do: call(server_name, session_id, :cached_roots)
 
-  @doc false
-  def cache_roots(server_name, session_id, roots) when is_list(roots) do
-    session_call(server_name, session_id, {:cache_roots, roots})
-  end
+  def cache_roots(server_name, session_id, roots) when is_list(roots),
+    do: call(server_name, session_id, {:cache_roots, roots})
 
-  @doc false
-  def roots_changed(server_name, session_id) do
-    session_call(server_name, session_id, :roots_changed)
-  end
+  def roots_changed(server_name, session_id), do: call(server_name, session_id, :roots_changed)
 
-  @doc false
-  def register_url_elicitation(server_name, session_id, %URLElicitation{} = elicitation) do
-    session_call(server_name, session_id, {:register_url_elicitation, elicitation})
-  end
+  def register_url_elicitation(server_name, session_id, %URLElicitation{} = elicitation),
+    do: call(server_name, session_id, {:register_url_elicitation, elicitation})
 
-  @doc false
-  def url_elicitation(server_name, session_id, elicitation_id) do
-    session_call(server_name, session_id, {:url_elicitation, elicitation_id})
-  end
-
-  @doc false
   def resolve_url_elicitation(server_name, session_id, elicitation_id, action, content \\ nil) do
-    session_call(
-      server_name,
-      session_id,
-      {:resolve_url_elicitation, elicitation_id, action, content}
-    )
+    message = {:resolve_url_elicitation, elicitation_id, action, content}
+    call(server_name, session_id, message)
   end
 
-  @doc false
-  def complete_url_elicitation(
-        server_name,
-        session_id,
-        elicitation_id,
-        principal_fingerprint
-      ) do
-    session_call(
-      server_name,
-      session_id,
-      {:complete_url_elicitation, elicitation_id, principal_fingerprint}
-    )
+  def complete_url_elicitation(server_name, session_id, elicitation_id, principal_fingerprint) do
+    message = {:complete_url_elicitation, elicitation_id, principal_fingerprint}
+    call(server_name, session_id, message)
   end
 
-  @doc false
-  def peer_task_fetch(server_name, session_id, task_id, opts) when is_list(opts) do
-    request_peer(
-      server_name,
-      session_id,
-      "tasks/get",
-      %{"taskId" => task_id},
-      opts
-    )
-  end
+  def peer_task_fetch(server_name, session_id, task_id, opts) when is_list(opts),
+    do: request_peer(server_name, session_id, "tasks/get", %{"taskId" => task_id}, opts)
 
-  @doc false
-  def peer_task_result(server_name, session_id, task_id, opts) when is_list(opts) do
-    request_peer(
-      server_name,
-      session_id,
-      "tasks/result",
-      %{"taskId" => task_id},
-      opts
-    )
-  end
+  def peer_task_result(server_name, session_id, task_id, opts) when is_list(opts),
+    do: request_peer(server_name, session_id, "tasks/result", %{"taskId" => task_id}, opts)
 
-  @doc false
-  def peer_task_cancel(server_name, session_id, task_id, opts) when is_list(opts) do
-    request_peer(
-      server_name,
-      session_id,
-      "tasks/cancel",
-      %{"taskId" => task_id},
-      opts
-    )
-  end
+  def peer_task_cancel(server_name, session_id, task_id, opts) when is_list(opts),
+    do: request_peer(server_name, session_id, "tasks/cancel", %{"taskId" => task_id}, opts)
 
-  @doc false
   def peer_task_wait(server_name, session_id, task_id, opts) when is_list(opts) do
-    timeout_ms = positive_timeout(Keyword.get(opts, :timeout_ms, @default_request_timeout_ms))
-    poll_interval = positive_timeout(Keyword.get(opts, :poll_interval_ms, 500))
+    timeout_ms = Keyword.get(opts, :timeout_ms, @request_timeout_ms)
+    poll_ms = Keyword.get(opts, :poll_interval_ms, 500)
+    Options.check!(timeout_ms, :pos_integer, :timeout_ms)
+    Options.check!(poll_ms, :pos_integer, :poll_interval_ms)
     deadline = System.monotonic_time(:millisecond) + timeout_ms
-    do_peer_task_wait(server_name, session_id, task_id, opts, poll_interval, deadline)
+    do_peer_task_wait(server_name, session_id, task_id, opts, poll_ms, deadline)
   end
 
-  @doc false
   def peer_task_on_status_change(server_name, session_id, task_id, callback)
-      when is_function(callback, 1) do
-    session_call(
-      server_name,
-      session_id,
-      {:peer_task_on_status_change, task_id, callback}
-    )
-  end
+      when is_function(callback, 1),
+      do: call(server_name, session_id, {:peer_task_on_status_change, task_id, callback})
 
-  @doc false
-  def receive_peer_task_status(server_name, session_id, params) when is_map(params) do
-    session_call(server_name, session_id, {:receive_peer_task_status, params})
-  end
+  def receive_peer_task_status(server_name, session_id, params) when is_map(params),
+    do: call(server_name, session_id, {:receive_peer_task_status, params})
 
-  @doc "Reads a value from the backing store."
   def get(server_name, session_id, key, default \\ nil) do
-    case Registry.lookup_session(server_name, session_id) do
-      {:ok, pid} ->
-        case GenServer.call(pid, {:get_state, key, default}) do
-          {:ok, value} -> value
-          :error -> default
-          {:error, %Error{} = error} -> raise error
-        end
-
-      _other ->
-        default
+    case call(server_name, session_id, {:state_store, :get, [key]}) do
+      {:ok, value} -> value
+      {:error, %Error{} = error} -> raise error
+      _missing -> default
     end
   end
 
-  @doc "Stores a value in the backing store."
-  def put(server_name, session_id, key, value) do
-    with {:ok, pid} <- Registry.lookup_session(server_name, session_id) do
-      pid
-      |> GenServer.call({:put_state, key, value})
-      |> unwrap_state_store_write!()
-    end
+  def put(server_name, session_id, key, value),
+    do: write_state(server_name, session_id, {:state_store, :put, [key, value]})
+
+  def delete(server_name, session_id, key),
+    do: write_state(server_name, session_id, {:state_store, :delete, [key]})
+
+  defp write_state(server_name, session_id, message) do
+    with {:error, %Error{} = error} <- call(server_name, session_id, message), do: raise(error)
   end
 
-  @doc "Deletes a value from the backing store."
-  def delete(server_name, session_id, key) do
-    with {:ok, pid} <- Registry.lookup_session(server_name, session_id) do
-      pid
-      |> GenServer.call({:delete_state, key})
-      |> unwrap_state_store_write!()
-    end
-  end
-
-  @doc false
   def close(pid) when is_pid(pid) do
     monitor = Process.monitor(pid)
 
@@ -332,523 +268,173 @@ defmodule FastestMCP.Session do
     end
   end
 
-  @doc "Subscribes the session to updates for one concrete URI."
-  def subscribe_resource(server_name, session_id, uri) do
-    with {:ok, pid} <- Registry.lookup_session(server_name, session_id) do
-      GenServer.call(pid, {:subscribe_resource, to_string(uri)})
-    end
-  end
+  def subscribe_resource(server_name, session_id, uri),
+    do: call(server_name, session_id, {:subscribe_resource, to_string(uri)})
 
-  @doc "Removes one resource subscription from the session."
-  def unsubscribe_resource(server_name, session_id, uri) do
-    with {:ok, pid} <- Registry.lookup_session(server_name, session_id) do
-      GenServer.call(pid, {:unsubscribe_resource, to_string(uri)})
-    end
-  end
+  def unsubscribe_resource(server_name, session_id, uri),
+    do: call(server_name, session_id, {:unsubscribe_resource, to_string(uri)})
 
-  @doc "Returns whether the session is subscribed to the given concrete URI."
-  def subscribed_to_resource?(server_name, session_id, uri) do
-    case Registry.lookup_session(server_name, session_id) do
-      {:ok, pid} -> GenServer.call(pid, {:subscribed_to_resource?, to_string(uri)})
-      _ -> false
-    end
-  end
+  def set_client_info(server_name, session_id, client_info),
+    do: call(server_name, session_id, {:set_client_info, client_info})
 
-  @doc "Lists resource subscriptions for the given session."
-  def subscribed_resources(server_name, session_id) do
-    case Registry.lookup_session(server_name, session_id) do
-      {:ok, pid} -> GenServer.call(pid, :subscribed_resources)
-      _ -> []
-    end
-  end
-
-  @doc "Stores negotiated client info for the given session."
-  def set_client_info(server_name, session_id, client_info) do
-    with {:ok, pid} <- Registry.lookup_session(server_name, session_id) do
-      GenServer.call(pid, {:set_client_info, client_info})
-    end
-  end
-
-  @doc "Returns negotiated client info for the given session."
   def client_info(server_name, session_id) do
-    case Registry.lookup_session(server_name, session_id) do
-      {:ok, pid} -> GenServer.call(pid, :client_info)
-      _ -> nil
+    case lifecycle(server_name, session_id) do
+      {:ok, lifecycle} -> lifecycle.client_info
+      {:error, :not_found} -> nil
     end
   end
 
-  @doc "Begins MCP initialization and records the negotiated client metadata."
-  def begin_initialization(
-        server_name,
-        session_id,
-        protocol_version,
-        client_capabilities,
-        client_info
-      ) do
-    begin_initialization(
-      server_name,
-      session_id,
-      protocol_version,
-      client_capabilities,
-      client_info,
-      :unbound,
-      %{}
-    )
+  def begin_initialization(server_name, session_id, opts) when is_list(opts) do
+    opts =
+      Keyword.validate!(opts, [
+        :client_capabilities,
+        :client_info,
+        auth_identity: :unbound,
+        server_capabilities: %{}
+      ])
+
+    call(server_name, session_id, {:begin_initialization, opts})
   end
 
-  @doc false
-  def begin_initialization(
-        server_name,
-        session_id,
-        protocol_version,
-        client_capabilities,
-        client_info,
-        auth_identity
-      ) do
-    begin_initialization(
-      server_name,
-      session_id,
-      protocol_version,
-      client_capabilities,
-      client_info,
-      auth_identity,
-      %{}
-    )
-  end
+  def verify_identity(server_name, session_id, identity),
+    do: call(server_name, session_id, {:verify_identity, identity})
 
-  @doc false
-  def begin_initialization(
-        server_name,
-        session_id,
-        protocol_version,
-        client_capabilities,
-        client_info,
-        auth_identity,
-        server_capabilities
-      ) do
-    with {:ok, pid} <- Registry.lookup_session(server_name, session_id) do
-      GenServer.call(
-        pid,
-        {:begin_initialization, protocol_version, client_capabilities, client_info, auth_identity,
-         server_capabilities}
-      )
-    end
-  end
-
-  @doc false
-  def verify_identity(server_name, session_id, identity) do
-    with {:ok, pid} <- Registry.lookup_session(server_name, session_id) do
-      GenServer.call(pid, {:verify_identity, identity})
-    end
-  end
-
-  @doc false
   def claim_request_id(server_name, session_id, direction, request_id)
       when direction in [:client, :server] and
-             (is_binary(request_id) or is_integer(request_id)) do
-    with {:ok, pid} <- Registry.lookup_session(server_name, session_id) do
-      GenServer.call(pid, {:claim_request_id, direction, request_id})
-    end
-  end
+             (is_binary(request_id) or is_integer(request_id)),
+      do: call(server_name, session_id, {:claim_request_id, direction, request_id})
 
-  @doc "Marks a session initialized after the client initialization notification."
-  def mark_initialized(server_name, session_id) do
-    with {:ok, pid} <- Registry.lookup_session(server_name, session_id) do
-      GenServer.call(pid, :mark_initialized)
-    end
-  end
+  def mark_initialized(server_name, session_id),
+    do: call(server_name, session_id, :mark_initialized)
 
-  @doc "Returns the session lifecycle and negotiated initialization fields."
-  def lifecycle(server_name, session_id) do
+  def lifecycle(server_name, session_id), do: call(server_name, session_id, :lifecycle)
+
+  # Every client function goes through here: a session that is gone, or stops
+  # while handling the call, is `{:error, :not_found}`.
+  defp call(server_name, session_id, message, timeout \\ 5_000) do
     with {:ok, pid} <- Registry.lookup_session(server_name, session_id) do
-      GenServer.call(pid, :lifecycle)
+      GenServer.call(pid, message, timeout)
     end
+  catch
+    :exit, {reason, _call} when reason in [:noproc, :normal, :shutdown] -> {:error, :not_found}
+    :exit, {{:shutdown, _reason}, _call} -> {:error, :not_found}
   end
 
   @impl true
-  @doc "Initializes the state used by this module before it starts processing work."
-  def init({server_name, session_id, idle_ttl_ms, session_state_store, max_request_ids, opts}) do
+  def init(opts) do
     Process.flag(:trap_exit, true)
-    generation = make_ref()
+    {replay_opts, opts} = Map.split(opts, Map.keys(@replay_options))
+    state = struct!(__MODULE__, opts)
 
-    case Registry.register_session(server_name, session_id, self(), generation) do
-      :ok ->
-        state =
-          %{
-            server_name: to_string(server_name),
-            session_id: to_string(session_id),
-            session_state_store: session_state_store,
-            generation: generation,
-            lifecycle_state: :new,
-            protocol_version: nil,
-            client_capabilities: nil,
-            server_capabilities: nil,
-            client_info: nil,
-            auth_identity: :unbound,
-            client_request_ids: MapSet.new(),
-            server_request_ids: MapSet.new(),
-            max_request_ids: max_request_ids,
-            max_pending_requests:
-              positive_option(opts, :max_pending_requests, @default_max_pending_requests),
-            max_active_requests:
-              positive_option(opts, :max_active_requests, @default_max_active_requests),
-            max_peer_tasks: positive_option(opts, :max_peer_tasks, @default_max_peer_tasks),
-            max_peer_task_callbacks:
-              positive_option(
-                opts,
-                :max_peer_task_callbacks,
-                @default_max_peer_task_callbacks
-              ),
-            max_queued_messages:
-              positive_option(opts, :max_queued_messages, @default_max_queued_messages),
-            max_queued_bytes: positive_option(opts, :max_queued_bytes, @default_max_queued_bytes),
-            request_timeout_ms:
-              positive_option(opts, :request_timeout_ms, @default_request_timeout_ms),
-            max_progress_per_second:
-              positive_option(
-                opts,
-                :max_progress_per_second,
-                @default_max_progress_per_second
-              ),
-            runtime_quota: Map.fetch!(opts, :runtime_quota),
-            task_supervisor: Map.get(opts, :task_supervisor),
-            sinks: %{},
-            sink_monitors: %{},
-            stream_owners: %{},
-            queued_messages: :queue.new(),
-            queued_bytes: 0,
-            pending_requests: %{},
-            pending_monitors: %{},
-            active_requests: %{},
-            active_monitors: %{},
-            receiver_tasks: %{},
-            receiver_task_requests: %{},
-            progress_tokens: %{},
-            peer_progress_tokens: %{},
-            logging_level: "info",
-            log_rate:
-              RateWindow.new(
-                limit: positive_option(opts, :max_logs_per_second, @default_max_logs_per_second)
-              ),
-            peer_progress_rate:
-              RateWindow.new(
-                limit:
-                  positive_option(
-                    opts,
-                    :max_inbound_progress_per_second,
-                    @default_max_inbound_progress_per_second
-                  )
-              ),
-            redaction_opts: Map.get(opts, :redaction_opts, []),
-            roots: nil,
-            roots_generation: 0,
-            peer_tasks: %{},
-            peer_task_callbacks: %{},
-            peer_task_callback_monitors: %{},
-            url_elicitations: %{},
-            replay:
-              SSEReplay.new(
-                max_events: Map.get(opts, :sse_replay_max_events, 256),
-                max_stream_bytes: Map.get(opts, :sse_replay_max_stream_bytes, 4 * 1_024 * 1_024),
-                max_total_bytes: Map.get(opts, :sse_replay_max_total_bytes, 64 * 1_024 * 1_024),
-                ttl_ms: Map.get(opts, :sse_replay_ttl_ms, 5 * 60_000)
-              ),
-            resource_subscriptions: %{},
-            inserted_at: System.system_time(:millisecond),
-            last_touched_at: System.monotonic_time(:millisecond),
-            idle_ttl_ms: idle_ttl_ms,
-            timer_ref: nil,
-            expiry_generation: nil
-          }
-          |> schedule_expiry()
+    state = %{
+      state
+      | replay:
+          SSEReplay.new(
+            Enum.map(replay_opts, fn {key, value} -> {@replay_options[key], value} end)
+          ),
+        log_rate: per_second(state.max_logs_per_second),
+        peer_progress_rate: per_second(state.max_inbound_progress_per_second)
+    }
 
-        {:ok, state}
-
-      {:error, reason} ->
-        {:stop, reason}
-    end
+    {:ok, state, idle_timeout(state)}
   end
 
   @impl true
-  @doc "Processes synchronous GenServer calls for the state owned by this module."
-  def handle_call({:attach_sink, sink_pid, opts}, _from, state) do
-    kind = normalize_sink_kind(Keyword.get(opts, :kind, :get))
-    last_event_id = Keyword.get(opts, :last_event_id)
-    origin_request_id = Keyword.get(opts, :origin_request_id)
-    {replay, stream_id, replayed, resume_status} = SSEReplay.open(state.replay, last_event_id)
-    state = put_replay!(state, replay)
-    emit_replay_reset(state, resume_status)
+  def handle_call({:attach_sink, pid, opts}, _from, state),
+    do: reply_outcome(Outbox.attach(state, pid, opts))
 
-    case resume_status do
-      status when status in [:fresh, :resumed] ->
-        sink_ref = make_ref()
-        monitor = Process.monitor(sink_pid)
-        state = if kind == :get, do: replace_sink_kind(state, :get), else: state
+  def handle_call({:detach_sink, sink_ref}, _from, state),
+    do: reply(:ok, Outbox.detach(state, sink_ref))
 
-        sink = %{
-          ref: sink_ref,
-          pid: sink_pid,
-          monitor: monitor,
-          kind: kind,
-          stream_id: stream_id,
-          origin_request_id: origin_request_id,
-          inserted_at: System.monotonic_time(:millisecond)
-        }
+  def handle_call(:deliverable?, _from, state),
+    do: reply(Outbox.deliverable?(state, nil) and state.lifecycle_state == :initialized, state)
 
-        state = %{
-          state
-          | sinks: Map.put(state.sinks, sink_ref, sink),
-            sink_monitors: Map.put(state.sink_monitors, monitor, sink_ref)
-        }
-
-        state = claim_stream_owner(state, sink)
-
-        Enum.each(replayed, fn
-          %{kind: :cursor, id: event_id} ->
-            send(sink_pid, {:fastest_mcp_session_cursor, sink_ref, event_id})
-
-          %{id: event_id, envelope: envelope} ->
-            send(sink_pid, {:fastest_mcp_session_message, sink_ref, event_id, envelope})
-        end)
-
-        state = prime_http_sink_cursor(state, sink)
-
-        {state, queued_count} = flush_queued_to_sink(state, sink)
-
-        reply = %{
-          sink_ref: sink_ref,
-          stream_id: stream_id,
-          resumed?: resume_status == :resumed,
-          replayed: length(replayed),
-          queued: queued_count
-        }
-
-        {:reply, {:ok, reply}, touch(state)}
-
-      {:error, reason} ->
-        {:reply, {:error, {:last_event_id, reason}}, touch(state)}
-    end
-  end
-
-  def handle_call({:detach_sink, sink_ref}, _from, state) do
-    {:reply, :ok, state |> drop_sink(sink_ref) |> touch()}
-  end
-
-  def handle_call(:deliverable?, _from, state) do
-    {:reply, map_size(state.stream_owners) > 0 and state.lifecycle_state == :initialized,
-     touch(state)}
-  end
-
-  def handle_call({:send_notification, envelope, opts}, _from, state) do
-    case emit_envelope(state, envelope, Keyword.put_new(opts, :queue, true)) do
-      {:ok, state, delivery} -> {:reply, {:ok, delivery}, touch(state)}
-      {:error, reason, state} -> {:reply, {:error, reason}, touch(state)}
-    end
-  end
-
-  def handle_call({:send_envelope, envelope, opts}, _from, state) do
-    case emit_envelope(state, envelope, opts) do
-      {:ok, state, delivery} -> {:reply, {:ok, delivery}, touch(state)}
-      {:error, reason, state} -> {:reply, {:error, reason}, touch(state)}
-    end
-  end
+  def handle_call({:send_envelope, envelope, opts}, _from, state),
+    do: reply_outcome(Outbox.emit(state, envelope, opts))
 
   def handle_call({:request_peer, method, params, opts}, from, state) do
-    timeout_ms = positive_timeout(Keyword.get(opts, :timeout_ms, state.request_timeout_ms))
-    sink_ref = Keyword.get(opts, :sink_ref)
-    progress_token = Keyword.get(opts, :progress_token)
+    with :ok <- check_peer_request(state, method, params, opts),
+         :ok <- RuntimeQuota.claim(state.runtime_quota, :pending_requests),
+         {:ok, request_id, state} <- next_server_request_id(state),
+         {envelope, state} = put_pending(state, request_id, from, method, params, opts),
+         {:ok, state} <- send_peer_request(state, request_id, envelope, opts) do
+      noreply(state)
+    else
+      :request_ids_exhausted ->
+        RuntimeQuota.release(state.runtime_quota, :pending_requests)
+        reply({:error, request_id_capacity_error()}, state)
 
-    cond do
-      state.lifecycle_state != :initialized ->
-        {:reply, {:error, :not_initialized}, touch(state)}
+      {:error, reason} ->
+        reply({:error, reason}, state)
 
-      not Protocol.client_supports_method?(state.client_capabilities, method, params) ->
-        {:reply, {:error, :unsupported_capability}, touch(state)}
-
-      map_size(state.pending_requests) >= state.max_pending_requests ->
-        {:reply, {:error, :overloaded}, touch(state)}
-
-      Map.has_key?(params, "task") and peer_task_capacity_reached?(state) ->
-        {:reply, {:error, :overloaded}, touch(state)}
-
-      not is_nil(progress_token) and Map.has_key?(state.peer_progress_tokens, progress_token) ->
-        {:reply, {:error, :duplicate_progress_token}, touch(state)}
-
-      not sink_available?(state, sink_ref) ->
-        {:reply, {:error, :not_deliverable}, touch(state)}
-
-      true ->
-        case RuntimeQuota.claim(state.runtime_quota, self(), :pending_requests) do
-          :ok ->
-            case next_server_request_id(state) do
-              {:ok, request_id, state} ->
-                caller_pid = elem(from, 0)
-                caller_monitor = Process.monitor(caller_pid)
-
-                timer =
-                  Process.send_after(self(), {:peer_request_timeout, request_id}, timeout_ms)
-
-                params = put_request_progress_token(params, progress_token)
-
-                envelope = %{
-                  "jsonrpc" => "2.0",
-                  "id" => request_id,
-                  "method" => method,
-                  "params" => params
-                }
-
-                pending = %{
-                  from: from,
-                  caller_pid: caller_pid,
-                  caller_monitor: caller_monitor,
-                  timer: timer,
-                  method: method,
-                  task_augmented: Map.has_key?(params, "task"),
-                  peer_task_id: fetch(params, "taskId"),
-                  peer_task_context: peer_task_context(method, params),
-                  sink_ref: sink_ref,
-                  progress_token: progress_token,
-                  on_progress: Keyword.get(opts, :on_progress),
-                  last_progress: nil,
-                  progress_total: nil,
-                  inserted_at: System.monotonic_time(:millisecond)
-                }
-
-                state = %{
-                  state
-                  | pending_requests: Map.put(state.pending_requests, request_id, pending),
-                    pending_monitors: Map.put(state.pending_monitors, caller_monitor, request_id),
-                    peer_progress_tokens:
-                      maybe_put_progress_token(
-                        state.peer_progress_tokens,
-                        progress_token,
-                        {:request, request_id}
-                      )
-                }
-
-                case validate_outbound_peer_request(method, envelope, opts) do
-                  :ok ->
-                    case emit_envelope(state, envelope,
-                           sink_ref: sink_ref,
-                           origin_request_id: Keyword.get(opts, :origin_request_id),
-                           request_id: request_id,
-                           queue: false
-                         ) do
-                      {:ok, state, _delivery} ->
-                        {:noreply, touch(state)}
-
-                      {:error, reason, state} ->
-                        {pending, state} = pop_pending(state, request_id)
-                        cleanup_pending(pending)
-                        {:reply, {:error, reason}, touch(state)}
-                    end
-
-                  {:error, reason} ->
-                    {pending, state} = pop_pending(state, request_id)
-                    cleanup_pending(pending)
-                    {:reply, {:error, reason}, touch(state)}
-                end
-
-              {:error, :overloaded, state} ->
-                :ok = RuntimeQuota.release(state.runtime_quota, self(), :pending_requests)
-                {:reply, {:error, request_id_capacity_error()}, touch(state)}
-            end
-
-          {:error, :overloaded} ->
-            {:reply, {:error, :overloaded}, touch(state)}
-        end
+      {:error, reason, state} ->
+        reply({:error, reason}, state)
     end
   end
 
   def handle_call({:resolve_peer_response, request_id, payload}, _from, state) do
-    case Map.fetch(state.pending_requests, request_id) do
-      :error ->
-        {:reply, :ignored, touch(state)}
+    case pop_pending(state, request_id) do
+      {nil, state} ->
+        reply(:ignored, state)
 
-      {:ok, pending} ->
-        {^pending, state} = pop_pending(state, request_id)
-        cleanup_pending(pending)
-        state = put_replay!(state, SSEReplay.acknowledge(state.replay, request_id))
-
+      {pending, state} ->
+        state = Outbox.acknowledge(state, request_id)
         response = normalize_peer_response(pending, payload, state)
         GenServer.reply(pending.from, response)
-
-        state = maybe_track_peer_task_result(state, pending, payload, response)
-        {:reply, :ok, touch(state)}
+        reply(:ok, maybe_track_peer_task_result(state, pending, payload, response))
     end
   end
 
   def handle_call({:register_inbound_request, request_id, worker_pid, opts}, _from, state) do
     progress_token = Keyword.get(opts, :progress_token)
 
-    cond do
-      map_size(state.active_requests) >= state.max_active_requests ->
-        {:reply, {:error, :overloaded}, touch(state)}
+    with :ok <- check_inbound_request(state, request_id, progress_token),
+         :ok <- RuntimeQuota.claim(state.runtime_quota, :active_requests) do
+      monitor = Process.monitor(worker_pid)
 
-      Map.has_key?(state.active_requests, request_id) ->
-        {:reply, {:error, :duplicate}, touch(state)}
+      max_progress_per_second =
+        Keyword.get(opts, :max_progress_per_second, state.max_progress_per_second)
 
-      not is_nil(progress_token) and Map.has_key?(state.progress_tokens, progress_token) ->
-        {:reply, {:error, :duplicate_progress_token}, touch(state)}
+      active = %{
+        worker_pid: worker_pid,
+        monitor: monitor,
+        method: Keyword.get(opts, :method),
+        cancellable?: Keyword.get(opts, :cancellable, true),
+        task_augmented?: Keyword.get(opts, :task_augmented, false),
+        progress_token: progress_token,
+        last_progress: nil,
+        progress_total: nil,
+        progress_rate: per_second(max_progress_per_second),
+        cancelled?: false
+      }
 
-      true ->
-        case RuntimeQuota.claim(state.runtime_quota, self(), :active_requests) do
-          :ok ->
-            monitor = Process.monitor(worker_pid)
-
-            active = %{
-              worker_pid: worker_pid,
-              monitor: monitor,
-              method: Keyword.get(opts, :method),
-              cancellable?: Keyword.get(opts, :cancellable, true),
-              task_augmented?: Keyword.get(opts, :task_augmented, false),
-              progress_token: progress_token,
-              last_progress: nil,
-              progress_total: nil,
-              progress_rate:
-                RateWindow.new(
-                  limit:
-                    Keyword.get(opts, :max_progress_per_second, state.max_progress_per_second)
-                ),
-              cancelled?: false
-            }
-
-            state = %{
-              state
-              | active_requests: Map.put(state.active_requests, request_id, active),
-                active_monitors: Map.put(state.active_monitors, monitor, request_id),
-                progress_tokens:
-                  maybe_put_progress_token(state.progress_tokens, progress_token, request_id)
-            }
-
-            {:reply, :ok, touch(state)}
-
-          {:error, :overloaded} ->
-            {:reply, {:error, :overloaded}, touch(state)}
-        end
+      reply(:ok, %{
+        state
+        | active_requests: Map.put(state.active_requests, request_id, active),
+          active_monitors: Map.put(state.active_monitors, monitor, request_id),
+          progress_tokens: Progress.put_owner(state.progress_tokens, progress_token, request_id)
+      })
+    else
+      error -> reply(error, state)
     end
   end
 
   def handle_call({:finish_inbound_request, request_id}, _from, state) do
     case pop_active(state, request_id) do
-      {nil, state} -> {:reply, :unknown, touch(state)}
-      {%{cancelled?: true}, state} -> {:reply, :suppress, touch(state)}
-      {_active, state} -> {:reply, :deliver, touch(state)}
+      {nil, state} -> reply(:unknown, state)
+      {%{cancelled?: true}, state} -> reply(:suppress, state)
+      {_active, state} -> reply(:deliver, state)
     end
   end
 
-  def handle_call(
-        {:receiver_task_started, task_id, request_id, progress_token},
-        _from,
-        state
-      ) do
+  def handle_call({:receiver_task_started, task_id, request_id, progress_token}, _from, state) do
     cond do
       Map.has_key?(state.receiver_tasks, task_id) ->
-        {:reply, {:error, :already_started}, touch(state)}
+        reply({:error, :already_started}, state)
 
-      not is_nil(progress_token) and
-          progress_token_owned_by_other_request?(state, progress_token, request_id) ->
-        {:reply, {:error, :duplicate_progress_token}, touch(state)}
+      progress_token != nil and
+          Map.get(state.progress_tokens, progress_token) not in [nil, request_id] ->
+        reply({:error, :duplicate_progress_token}, state)
 
       true ->
         active = Map.get(state.active_requests, request_id)
@@ -859,9 +445,7 @@ defmodule FastestMCP.Session do
           last_progress: active && active.last_progress,
           progress_total: active && active.progress_total,
           progress_rate:
-            (active && active.progress_rate) ||
-              RateWindow.new(limit: state.max_progress_per_second),
-          started_at: System.monotonic_time(:millisecond)
+            (active && active.progress_rate) || per_second(state.max_progress_per_second)
         }
 
         state = %{
@@ -874,135 +458,81 @@ defmodule FastestMCP.Session do
                 MapSet.new([task_id]),
                 &MapSet.put(&1, task_id)
               ),
-            progress_tokens:
-              maybe_put_progress_token(state.progress_tokens, progress_token, request_id)
+            progress_tokens: Progress.put_owner(state.progress_tokens, progress_token, request_id)
         }
 
-        {:reply, :ok, touch(state)}
+        reply(:ok, state)
     end
   end
 
   def handle_call({:receiver_task_finished, task_id}, _from, state) do
     case pop_receiver_task(state, task_id) do
-      {nil, state} -> {:reply, :unknown, touch(state)}
-      {_task, state} -> {:reply, :ok, touch(state)}
+      {nil, state} -> reply(:unknown, state)
+      {_task, state} -> reply(:ok, state)
     end
   end
 
-  def handle_call({:cancel_inbound_request, request_id, _reason}, _from, state) do
+  def handle_call({:cancel_inbound_request, request_id}, _from, state) do
     case Map.get(state.active_requests, request_id) do
-      nil ->
-        {:reply, :ignored, touch(state)}
-
-      %{method: "initialize"} ->
-        {:reply, :ignored, touch(state)}
-
-      %{task_augmented?: true} ->
-        {:reply, :ignored, touch(state)}
-
-      %{cancellable?: false} ->
-        {:reply, :ignored, touch(state)}
-
-      active ->
+      %{method: method, task_augmented?: task?, cancellable?: cancellable?} = active
+      when method != "initialize" and task? != true and cancellable? != false ->
         Process.exit(active.worker_pid, :shutdown)
-        active = %{active | cancelled?: true}
+        reply(:ok, put_in(state.active_requests[request_id].cancelled?, true))
 
-        {:reply, :ok,
-         %{touch(state) | active_requests: Map.put(state.active_requests, request_id, active)}}
+      _not_cancellable ->
+        reply(:ignored, state)
     end
   end
 
   def handle_call({:receive_peer_progress, params}, _from, state) do
-    token = fetch(params, "progressToken")
-
-    case Map.get(state.peer_progress_tokens, token) do
-      nil ->
-        {:reply, :ignored, touch(state)}
-
-      {:request, request_id} ->
-        receive_pending_peer_progress(state, request_id, params)
-
-      {:task, task_id} ->
-        receive_task_peer_progress(state, task_id, params)
-
-      request_id ->
-        receive_pending_peer_progress(state, request_id, params)
+    with path when path != nil <- peer_progress_path(state, params["progressToken"]),
+         %{} = tracker <- get_in(state, path),
+         {:ok, tracker, rate} <- Progress.update(tracker, params, state.peer_progress_rate) do
+      run_callback(state, tracker.on_progress, params)
+      reply(:ok, %{put_in(state, path, tracker) | peer_progress_rate: rate})
+    else
+      {:error, :rate_limited} = error -> reply(error, state)
+      _ignored -> reply(:ignored, state)
     end
   end
 
   def handle_call({:report_progress, request_id, params}, _from, state) do
-    case Map.get(state.active_requests, request_id) do
-      nil ->
-        report_receiver_task_progress(state, request_id, params)
-
-      active ->
-        progress = fetch(params, "progress")
-        total = ProtocolProgress.total(params)
-
-        with {:ok, progress_total} <-
-               ProtocolProgress.validate_update(
-                 progress,
-                 active.last_progress,
-                 total,
-                 active.progress_total
-               ),
-             {:ok, rate} <- allow_rate(active.progress_rate) do
-          token = active.progress_token
-          envelope_params = Map.put(params, "progressToken", token)
-
-          case emit_envelope(
-                 state,
-                 %{
-                   "jsonrpc" => "2.0",
-                   "method" => "notifications/progress",
-                   "params" => envelope_params
-                 },
-                 queue: false
-               ) do
-            {:ok, state, _delivery} ->
-              active = %{
-                active
-                | last_progress: progress,
-                  progress_total: progress_total,
-                  progress_rate: rate
-              }
-
-              state = %{
-                state
-                | active_requests: Map.put(state.active_requests, request_id, active)
-              }
-
-              {:reply, :ok, touch(state)}
-
-            {:error, reason, state} ->
-              {:reply, {:error, reason}, touch(state)}
-          end
-        else
-          {:error, reason} -> {:reply, {:error, reason}, touch(state)}
-        end
+    with path when path != nil <- report_progress_path(state, request_id),
+         tracker = get_in(state, path),
+         {:ok, tracker, rate} <- Progress.update(tracker, params, tracker.progress_rate),
+         params = Map.put(params, "progressToken", tracker.progress_token),
+         notification = notification("notifications/progress", params),
+         {:ok, _delivery, state} <- Outbox.emit(state, notification, queue: false) do
+      reply(:ok, put_in(state, path, %{tracker | progress_rate: rate}))
+    else
+      nil -> reply({:error, :unknown_request}, state)
+      {:error, reason, state} -> reply({:error, reason}, state)
+      {:error, reason} -> reply({:error, reason}, state)
     end
   end
 
   def handle_call({:set_logging_level, level}, _from, state) do
-    if level in @logging_levels do
-      {:reply, :ok, %{touch(state) | logging_level: level}}
+    if Meta.log_level_rank(level) do
+      reply(:ok, %{state | logging_level: level})
     else
-      {:reply, {:error, :invalid_level}, touch(state)}
+      reply({:error, :invalid_level}, state)
     end
   end
 
   def handle_call({:log, level, data, opts}, _from, state) do
-    cond do
-      level not in @logging_levels ->
-        {:reply, {:error, :invalid_level}, touch(state)}
+    rank = Meta.log_level_rank(level)
 
-      logging_level_index(level) < logging_level_index(state.logging_level) ->
-        {:reply, :filtered, touch(state)}
+    cond do
+      is_nil(rank) ->
+        reply({:error, :invalid_level}, state)
+
+      rank < Meta.log_level_rank(state.logging_level) ->
+        reply(:filtered, state)
 
       true ->
-        case RateWindow.allow(state.log_rate) do
-          {:error, :rate_limited, rate} ->
-            {:reply, {:error, :rate_limited}, %{touch(state) | log_rate: rate}}
+        case SlidingWindow.acquire(state.log_rate, System.monotonic_time(:millisecond)) do
+          {:error, _wait_ms, _rate} ->
+            reply({:error, :rate_limited}, state)
 
           {:ok, rate} ->
             params =
@@ -1012,17 +542,11 @@ defmodule FastestMCP.Session do
               }
               |> maybe_put("logger", Keyword.get(opts, :logger))
 
-            envelope = %{
-              "jsonrpc" => "2.0",
-              "method" => "notifications/message",
-              "params" => params
-            }
-
             state = %{state | log_rate: rate}
 
-            case emit_envelope(state, envelope, queue: true) do
-              {:ok, state, _delivery} -> {:reply, :ok, touch(state)}
-              {:error, reason, state} -> {:reply, {:error, reason}, touch(state)}
+            case Outbox.emit(state, notification("notifications/message", params), queue: true) do
+              {:ok, _delivery, state} -> reply(:ok, state)
+              error -> reply_outcome(error)
             end
         end
     end
@@ -1030,157 +554,105 @@ defmodule FastestMCP.Session do
 
   def handle_call({:peer_task_on_status_change, task_id, callback}, from, state) do
     cond do
-      peer_task_callback_count(state) >= state.max_peer_task_callbacks ->
-        {:reply, {:error, :overloaded}, touch(state)}
+      map_size(state.peer_task_callback_monitors) >= state.max_peer_task_callbacks ->
+        reply({:error, :overloaded}, state)
 
       not Map.has_key?(state.peer_tasks, task_id) ->
-        {:reply, {:error, :not_found}, touch(state)}
+        reply({:error, :not_found}, state)
 
       terminal_peer_task?(Map.get(state.peer_tasks, task_id)) ->
-        {:reply, {:error, :task_terminal}, touch(state)}
+        reply({:error, :task_terminal}, state)
 
       true ->
-        owner_pid = elem(from, 0)
-        callback_ref = make_ref()
-        monitor = Process.monitor(owner_pid)
+        {owner, _tag} = from
+        ref = make_ref()
+        monitor = Process.monitor(owner)
+        entry = %{callback: callback, monitor: monitor}
 
-        callback_entry = %{
-          callback: callback,
-          owner_pid: owner_pid,
-          monitor: monitor
-        }
-
-        callbacks =
-          Map.update(
-            state.peer_task_callbacks,
-            task_id,
-            %{callback_ref => callback_entry},
-            &Map.put(&1, callback_ref, callback_entry)
-          )
-
-        callback_monitors =
-          Map.put(state.peer_task_callback_monitors, monitor, {task_id, callback_ref})
-
-        {:reply, :ok,
-         %{
-           touch(state)
-           | peer_task_callbacks: callbacks,
-             peer_task_callback_monitors: callback_monitors
-         }}
+        reply(:ok, %{
+          state
+          | peer_task_callbacks:
+              Map.update(
+                state.peer_task_callbacks,
+                task_id,
+                %{ref => entry},
+                &Map.put(&1, ref, entry)
+              ),
+            peer_task_callback_monitors:
+              Map.put(state.peer_task_callback_monitors, monitor, {task_id, ref})
+        })
     end
   end
 
   def handle_call({:receive_peer_task_status, params}, _from, state) do
-    case fetch(params, "taskId") do
+    case params["taskId"] do
       task_id when is_binary(task_id) and task_id != "" ->
         existing = Map.get(state.peer_tasks, task_id)
 
-        cond do
-          terminal_peer_task?(existing) ->
-            {:reply, :ignored, touch(state)}
+        if is_nil(existing) or terminal_peer_task?(existing) do
+          reply(:ignored, state)
+        else
+          Enum.each(Map.get(state.peer_task_callbacks, task_id, %{}), fn {_ref, entry} ->
+            run_callback(state, entry.callback, params)
+          end)
 
-          is_nil(existing) ->
-            {:reply, :ignored, touch(state)}
-
-          true ->
-            peer_task_context = existing.context
-
-            Enum.each(Map.get(state.peer_task_callbacks, task_id, %{}), fn {
-                                                                             _callback_ref,
-                                                                             entry
-                                                                           } ->
-              run_callback(state, entry.callback, params)
-            end)
-
-            state =
-              track_peer_task(
-                state,
-                params,
-                "notifications/tasks/status",
-                peer_task_context
-              )
-
-            {:reply, :ok, touch(state)}
+          reply(
+            :ok,
+            track_peer_task(state, params, "notifications/tasks/status", existing.context)
+          )
         end
 
       _other ->
-        {:reply, {:error, :invalid_task_status}, touch(state)}
+        reply({:error, :invalid_task_status}, state)
     end
   end
 
-  def handle_call(:cached_roots, _from, state), do: {:reply, state.roots, touch(state)}
+  def handle_call(:cached_roots, _from, state), do: reply(state.roots, state)
 
   def handle_call({:cache_roots, roots}, _from, state) do
     case normalize_roots(roots) do
-      {:ok, roots} ->
-        {:reply, {:ok, roots},
-         %{touch(state) | roots: roots, roots_generation: state.roots_generation + 1}}
-
-      {:error, reason} ->
-        {:reply, {:error, reason}, touch(state)}
+      {:ok, roots} -> reply({:ok, roots}, %{state | roots: roots})
+      {:error, reason} -> reply({:error, reason}, state)
     end
   end
 
   def handle_call(:roots_changed, _from, state) do
-    state = %{state | roots: nil, roots_generation: state.roots_generation + 1}
+    state = %{state | roots: nil}
     maybe_refresh_roots(state)
-    {:reply, :ok, touch(state)}
+    reply(:ok, state)
   end
 
   def handle_call({:register_url_elicitation, elicitation}, _from, state) do
     id = elicitation.elicitation_id
 
     if Map.has_key?(state.url_elicitations, id) do
-      {:reply, {:error, :already_exists}, touch(state)}
+      reply({:error, :already_exists}, state)
     else
-      case Registry.register_url_elicitation(
-             state.server_name,
-             id,
-             state.session_id,
-             self()
-           ) do
-        :ok ->
-          {:reply, :ok,
-           %{touch(state) | url_elicitations: Map.put(state.url_elicitations, id, elicitation)}}
-
-        {:error, :already_exists} ->
-          {:reply, {:error, :already_exists}, touch(state)}
-
-        {:error, reason} ->
-          {:reply, {:error, reason}, touch(state)}
+      case Registry.register_url_elicitation(state.server_name, id, state.session_id) do
+        :ok -> reply(:ok, put_url_elicitation(state, elicitation))
+        {:error, :already_exists} = error -> reply(error, state)
       end
-    end
-  end
-
-  def handle_call({:url_elicitation, id}, _from, state) do
-    case Map.fetch(state.url_elicitations, id) do
-      {:ok, elicitation} -> {:reply, {:ok, elicitation}, touch(state)}
-      :error -> {:reply, {:error, :not_found}, touch(state)}
     end
   end
 
   def handle_call({:resolve_url_elicitation, id, action, content}, _from, state) do
     case Map.fetch(state.url_elicitations, id) do
       :error ->
-        {:reply, {:error, :not_found}, touch(state)}
+        reply({:error, :not_found}, state)
 
       {:ok, elicitation} ->
         case URLElicitation.respond(elicitation, action, content) do
-          {:ok, updated} ->
-            state =
-              if updated.action in [:decline, :cancel] do
-                drop_url_elicitation(state, id)
-              else
-                put_url_elicitation(state, updated)
-              end
+          {:ok, %{action: action} = updated} when action in [:decline, :cancel] ->
+            reply({:ok, updated}, drop_url_elicitation(state, id))
 
-            {:reply, {:ok, updated}, touch(state)}
+          {:ok, updated} ->
+            reply({:ok, updated}, put_url_elicitation(state, updated))
 
           {:error, :expired} ->
-            {:reply, {:error, :expired}, state |> drop_url_elicitation(id) |> touch()}
+            reply({:error, :expired}, drop_url_elicitation(state, id))
 
           {:error, reason} ->
-            {:reply, {:error, reason}, touch(state)}
+            reply({:error, reason}, state)
         end
     end
   end
@@ -1188,173 +660,95 @@ defmodule FastestMCP.Session do
   def handle_call({:complete_url_elicitation, id, principal_fingerprint}, _from, state) do
     case Map.fetch(state.url_elicitations, id) do
       :error ->
-        {:reply, {:error, :not_found}, touch(state)}
+        reply({:error, :not_found}, state)
 
       {:ok, elicitation} ->
-        case URLElicitation.complete(
-               elicitation,
-               state.session_id,
-               principal_fingerprint
-             ) do
+        case URLElicitation.complete(elicitation, state.session_id, principal_fingerprint) do
           {:ok, updated} ->
             state = put_url_elicitation(state, updated)
             {:ok, params} = URLElicitation.completion_params(updated)
 
-            case emit_envelope(
-                   state,
-                   %{
-                     "jsonrpc" => "2.0",
-                     "method" => "notifications/elicitation/complete",
-                     "params" => params
-                   },
-                   queue: true
-                 ) do
-              {:ok, state, _delivery} -> {:reply, {:ok, updated}, touch(state)}
-              {:error, reason, state} -> {:reply, {:error, reason}, touch(state)}
+            notification = notification("notifications/elicitation/complete", params)
+
+            case Outbox.emit(state, notification, queue: true) do
+              {:ok, _delivery, state} -> reply({:ok, updated}, state)
+              error -> reply_outcome(error)
             end
 
           {:error, :expired} ->
-            {:reply, {:error, :expired}, state |> drop_url_elicitation(id) |> touch()}
+            reply({:error, :expired}, drop_url_elicitation(state, id))
 
           {:error, reason} ->
-            {:reply, {:error, normalize_url_completion_error(reason)}, touch(state)}
+            reply({:error, reason}, state)
         end
     end
   end
 
-  def handle_call({:get_state, key, _default}, _from, state) do
-    reply =
-      state_store_call(:get, fn ->
-        SessionStateStore.get(state.session_state_store, state.session_id, key)
-      end)
-
-    {:reply, reply, touch(state)}
-  end
-
-  def handle_call({:put_state, key, value}, _from, state) do
-    reply =
-      state_store_call(:put, fn ->
-        SessionStateStore.put(state.session_state_store, state.session_id, key, value)
-      end)
-
-    {:reply, reply, touch(state)}
-  end
-
-  def handle_call({:delete_state, key}, _from, state) do
-    reply =
-      state_store_call(:delete, fn ->
-        SessionStateStore.delete(state.session_state_store, state.session_id, key)
-      end)
-
-    {:reply, reply, touch(state)}
-  end
+  def handle_call({:state_store, operation, args}, _from, state),
+    do: reply(state_store(state, operation, args), state)
 
   def handle_call(:terminate_session, _from, state) do
-    case delete_session_state(state) do
-      :ok ->
-        {:stop, :normal, :ok, state}
-
-      {:error, %Error{} = error} ->
-        {:reply, {:error, error}, touch(state)}
+    case state_store(state, :delete_session, []) do
+      :ok -> {:stop, :normal, :ok, state}
+      {:error, %Error{}} = error -> reply(error, state)
     end
   end
 
-  def handle_call({:subscribe_resource, uri}, _from, state) do
-    next_state = touch(state)
+  def handle_call({:subscribe_resource, uri}, _from, state),
+    do:
+      reply(:ok, %{state | resource_subscriptions: MapSet.put(state.resource_subscriptions, uri)})
 
-    {:reply, :ok,
-     %{
-       next_state
-       | resource_subscriptions: Map.put(next_state.resource_subscriptions, uri, true)
-     }}
-  end
-
-  def handle_call({:unsubscribe_resource, uri}, _from, state) do
-    next_state = touch(state)
-
-    {:reply, :ok,
-     %{next_state | resource_subscriptions: Map.delete(next_state.resource_subscriptions, uri)}}
-  end
-
-  def handle_call({:subscribed_to_resource?, uri}, _from, state) do
-    {:reply, Map.has_key?(state.resource_subscriptions, uri), touch(state)}
-  end
-
-  def handle_call(:subscribed_resources, _from, state) do
-    {:reply, state.resource_subscriptions |> Map.keys() |> Enum.sort(), touch(state)}
-  end
-
-  def handle_call({:set_client_info, client_info}, _from, state) do
-    normalized =
-      client_info
-      |> Map.new(fn {key, value} -> {to_string(key), value} end)
-
-    {:reply, :ok, %{touch(state) | client_info: normalized}}
-  end
-
-  def handle_call(:client_info, _from, state) do
-    {:reply, state.client_info, touch(state)}
-  end
-
-  def handle_call(
-        {:begin_initialization, _requested_protocol_version, client_capabilities, client_info,
-         auth_identity, server_capabilities},
-        _from,
+  def handle_call({:unsubscribe_resource, uri}, _from, state),
+    do:
+      reply(:ok, %{
         state
-      ) do
-    if state.lifecycle_state != :new do
-      {:reply, {:error, {:invalid_transition, state.lifecycle_state}}, touch(state)}
-    else
-      client_capabilities = normalize_client_capabilities(client_capabilities)
-      server_capabilities = Protocol.normalize_capabilities(server_capabilities)
+        | resource_subscriptions: MapSet.delete(state.resource_subscriptions, uri)
+      })
 
-      next_state = %{
-        touch(state)
-        | lifecycle_state: :initializing,
-          protocol_version: @supported_protocol_version,
-          client_capabilities: client_capabilities,
-          server_capabilities: server_capabilities,
-          client_info: client_info,
-          auth_identity: auth_identity
-      }
+  def handle_call({:set_client_info, client_info}, _from, state),
+    do:
+      reply(:ok, %{state | client_info: Map.new(client_info, fn {k, v} -> {to_string(k), v} end)})
 
-      {:reply, :ok, next_state}
-    end
+  def handle_call({:begin_initialization, opts}, _from, %{lifecycle_state: :new} = state) do
+    reply(:ok, %{
+      state
+      | lifecycle_state: :initializing,
+        protocol_version: legacy(),
+        client_capabilities: normalize_client_capabilities(opts[:client_capabilities]),
+        server_capabilities: Protocol.normalize_capabilities(opts[:server_capabilities]),
+        client_info: opts[:client_info],
+        auth_identity: opts[:auth_identity]
+    })
   end
 
-  def handle_call(:mark_initialized, _from, %{lifecycle_state: :initializing} = state) do
-    {:reply, :ok, %{touch(state) | lifecycle_state: :initialized}}
-  end
+  def handle_call(:mark_initialized, _from, %{lifecycle_state: :initializing} = state),
+    do: reply(:ok, %{state | lifecycle_state: :initialized})
 
-  def handle_call(:mark_initialized, _from, state) do
-    {:reply, {:error, {:invalid_transition, state.lifecycle_state}}, touch(state)}
-  end
+  def handle_call({:begin_initialization, _opts}, _from, state), do: invalid_transition(state)
+  def handle_call(:mark_initialized, _from, state), do: invalid_transition(state)
 
-  def handle_call({:verify_identity, identity}, _from, %{auth_identity: :unbound} = state) do
-    {:reply, :ok, %{touch(state) | auth_identity: identity}}
-  end
+  def handle_call({:verify_identity, identity}, _from, %{auth_identity: :unbound} = state),
+    do: reply(:ok, %{state | auth_identity: identity})
 
-  def handle_call({:verify_identity, identity}, _from, %{auth_identity: identity} = state) do
-    {:reply, :ok, touch(state)}
-  end
+  def handle_call({:verify_identity, identity}, _from, %{auth_identity: identity} = state),
+    do: reply(:ok, state)
 
-  def handle_call({:verify_identity, _identity}, _from, state) do
-    {:reply, {:error, :identity_mismatch}, touch(state)}
-  end
+  def handle_call({:verify_identity, _identity}, _from, state),
+    do: reply({:error, :identity_mismatch}, state)
 
   def handle_call({:claim_request_id, direction, request_id}, _from, state) do
-    key = request_id_set_key(direction)
+    key = if direction == :client, do: :client_request_ids, else: :server_request_ids
     request_ids = Map.fetch!(state, key)
 
     cond do
       MapSet.member?(request_ids, request_id) ->
-        {:reply, {:error, :duplicate}, touch(state)}
+        reply({:error, :duplicate}, state)
 
       MapSet.size(request_ids) >= state.max_request_ids ->
-        {:reply, {:error, :overloaded}, touch(state)}
+        reply({:error, :overloaded}, state)
 
       true ->
-        {:reply, :ok, state |> Map.put(key, MapSet.put(request_ids, request_id)) |> touch()}
+        reply(:ok, Map.put(state, key, MapSet.put(request_ids, request_id)))
     end
   end
 
@@ -1367,158 +761,143 @@ defmodule FastestMCP.Session do
       client_info: state.client_info
     }
 
-    {:reply, {:ok, lifecycle}, touch(state)}
+    reply({:ok, lifecycle}, state)
   end
 
   @impl true
-  @doc "Processes asynchronous messages delivered to the process owned by this module."
   def handle_info({:peer_request_timeout, request_id}, state) do
-    case Map.get(state.pending_requests, request_id) do
-      nil ->
-        {:noreply, state}
+    case pop_pending(state, request_id) do
+      {nil, state} ->
+        noreply(state)
 
-      pending ->
-        {_pending, state} = pop_pending(state, request_id)
-        cleanup_pending(pending, cancel_timer: false)
-
-        state =
-          emit_cancellation(
-            state,
-            request_id,
-            "server request timed out",
-            pending.sink_ref
-          )
-
+      {pending, state} ->
+        state = emit_cancellation(state, request_id, "server request timed out", pending.sink_ref)
         GenServer.reply(pending.from, {:error, :timeout})
-        {:noreply, touch(state)}
+        noreply(state)
     end
   end
 
   def handle_info({:DOWN, monitor, :process, pid, reason}, state) do
     cond do
       sink_ref = Map.get(state.sink_monitors, monitor) ->
-        {:noreply, state |> drop_sink(sink_ref, false) |> touch()}
+        noreply(Outbox.detach(state, sink_ref))
 
       request_id = Map.get(state.pending_monitors, monitor) ->
-        case Map.get(state.pending_requests, request_id) do
-          %{caller_pid: ^pid} = pending ->
-            {_pending, state} = pop_pending(state, request_id)
-            cleanup_pending(pending, monitor: false)
+        {pending, state} = pop_pending(state, request_id)
 
-            state =
-              emit_cancellation(
-                state,
-                request_id,
-                "server request caller terminated",
-                pending.sink_ref
-              )
-
-            {:noreply, touch(state)}
-
-          _other ->
-            {:noreply, state}
-        end
+        noreply(
+          emit_cancellation(
+            state,
+            request_id,
+            "server request caller terminated",
+            pending.sink_ref
+          )
+        )
 
       request_id = Map.get(state.active_monitors, monitor) ->
-        case Map.get(state.active_requests, request_id) do
-          %{worker_pid: ^pid} ->
-            {_active, state} = pop_active(state, request_id, false)
-            {:noreply, touch(state)}
-
-          _other ->
-            {:noreply, state}
-        end
+        {_active, state} = pop_active(state, request_id)
+        noreply(state)
 
       callback_key = Map.get(state.peer_task_callback_monitors, monitor) ->
-        {task_id, callback_ref} = callback_key
-
-        {:noreply,
-         state
-         |> drop_peer_task_callback(task_id, callback_ref, false)
-         |> touch()}
+        noreply(drop_peer_task_callback(state, monitor, callback_key))
 
       true ->
         Logger.debug("session ignored unknown process DOWN: #{inspect({pid, reason})}")
-        {:noreply, state}
+        noreply(state)
     end
   end
 
+  # While a GET or stdio stream listens, server events become notifications.
   def handle_info(
-        {:expire_if_idle, generation},
-        %{idle_ttl_ms: idle_ttl_ms, expiry_generation: generation} = state
-      )
-      when idle_ttl_ms != :infinity do
-    case delete_session_state(state) do
+        {:fastest_mcp_event, _server_name, event_suffix, _measurements, metadata},
+        state
+      ) do
+    if Outbox.listening?(state) do
+      capabilities =
+        if state.lifecycle_state == :initialized, do: state.server_capabilities, else: %{}
+
+      listener =
+        Notifications.session_listener(
+          state.session_id,
+          capabilities || %{},
+          state.resource_subscriptions
+        )
+
+      event_suffix
+      |> Notifications.notifications(metadata, listener)
+      |> Enum.reduce(state, &(&2 |> Outbox.emit(&1, queue: true) |> elem(2)))
+      |> noreply()
+    else
+      noreply(state)
+    end
+  end
+
+  # The idle timeout of `reply/2` and `noreply/1` elapsed.
+  def handle_info(:timeout, state) do
+    case state_store(state, :delete_session, []) do
       :ok ->
-        {:stop, :normal, %{state | timer_ref: nil, expiry_generation: nil}}
+        {:stop, :normal, state}
 
       {:error, %Error{} = error} ->
         Logger.error(
           "session #{inspect(state.session_id)} idle cleanup failed: #{Exception.message(error)}"
         )
 
-        {:noreply, schedule_expiry(%{state | timer_ref: nil, expiry_generation: nil})}
+        noreply(state)
     end
   end
 
-  def handle_info({:expire_if_idle, _stale_generation}, state), do: {:noreply, state}
-
   @impl true
-  @doc "Cleans up module state on shutdown."
-  def terminate(_reason, state) do
-    Enum.each(state.pending_requests, fn {_request_id, pending} ->
-      cleanup_pending(pending)
-      GenServer.reply(pending.from, {:error, :session_terminated})
-    end)
-
-    Enum.each(state.active_requests, fn {_request_id, active} ->
-      Process.demonitor(active.monitor, [:flush])
-
-      if Process.alive?(active.worker_pid) do
-        Process.exit(active.worker_pid, :shutdown)
+  def terminate(reason, state) do
+    # Server shutdown stops sessions with :shutdown; their stored state goes
+    # with them while the state store is still running.
+    if reason == :shutdown or match?({:shutdown, _}, reason) do
+      with {:error, %Error{} = error} <- state_store(state, :delete_session, []) do
+        Logger.error(
+          "failed to delete state for session #{inspect(state.session_id)} during shutdown: " <>
+            Exception.message(error)
+        )
       end
-    end)
+    end
 
-    Enum.each(state.sinks, fn {_sink_ref, sink} ->
-      Process.demonitor(sink.monitor, [:flush])
-      send(sink.pid, {:fastest_mcp_session_terminated, sink.ref})
-    end)
+    for {_request_id, pending} <- state.pending_requests,
+        do: GenServer.reply(pending.from, {:error, :session_terminated})
 
-    Enum.each(state.peer_task_callback_monitors, fn {monitor, _callback_key} ->
-      Process.demonitor(monitor, [:flush])
-    end)
+    for {_request_id, active} <- state.active_requests,
+        do: Process.exit(active.worker_pid, :shutdown)
 
-    Enum.each(state.url_elicitations, fn {elicitation_id, _elicitation} ->
-      Registry.unregister_url_elicitation(
-        state.server_name,
-        elicitation_id,
-        state.session_id,
-        self()
-      )
-    end)
-
-    Registry.unregister_session(
-      state.server_name,
-      state.session_id,
-      self(),
-      state.generation
-    )
-
-    :ok
+    RuntimeQuota.release(state.runtime_quota, :pending_requests, map_size(state.pending_requests))
+    RuntimeQuota.release(state.runtime_quota, :active_requests, map_size(state.active_requests))
+    Outbox.close(state)
   end
 
-  defp delete_session_state(state) do
-    state_store_call(:delete_session, fn ->
-      SessionStateStore.delete_session(state.session_state_store, state.session_id)
+  defp reply(reply, state), do: {:reply, reply, state, idle_timeout(state)}
+  defp noreply(state), do: {:noreply, state, idle_timeout(state)}
+
+  defp reply_outcome({:ok, value, state}), do: reply({:ok, value}, state)
+  defp reply_outcome({:error, reason, state}), do: reply({:error, reason}, state)
+
+  defp invalid_transition(state),
+    do: reply({:error, {:invalid_transition, state.lifecycle_state}}, state)
+
+  # A session expires once it has received no message for `idle_ttl_ms`, but
+  # never while it holds a sink, a request, or an unfinished task.
+  defp idle_timeout(state) do
+    held? =
+      map_size(state.sinks) > 0 or map_size(state.pending_requests) > 0 or
+        map_size(state.active_requests) > 0 or map_size(state.receiver_tasks) > 0 or
+        Enum.any?(state.peer_tasks, fn {_task_id, peer_task} ->
+          not terminal_peer_task?(peer_task)
+        end)
+
+    if held?, do: :infinity, else: state.idle_ttl_ms
+  end
+
+  defp state_store(state, operation, args) do
+    SessionStateStore.call(operation, "session state storage", fn ->
+      apply(SessionStateStore, operation, [state.session_state_store, state.session_id | args])
     end)
   end
-
-  defp state_store_call(operation, fun) do
-    SessionStateStore.call(operation, "session state storage", fun)
-  end
-
-  defp unwrap_state_store_write!(:ok), do: :ok
-  defp unwrap_state_store_write!({:error, %Error{} = error}), do: raise(error)
 
   defp await_termination(pid, monitor) do
     receive do
@@ -1537,341 +916,63 @@ defmodule FastestMCP.Session do
     end
   end
 
-  defp touch(state) do
-    state
-    |> Map.put(:last_touched_at, System.monotonic_time(:millisecond))
-    |> schedule_expiry()
-  end
+  defp check_peer_request(state, method, params, opts) do
+    progress_token = Keyword.get(opts, :progress_token)
 
-  defp schedule_expiry(state) when map_size(state.sinks) > 0,
-    do: cancel_expiry(state)
+    cond do
+      state.lifecycle_state != :initialized ->
+        {:error, :not_initialized}
 
-  defp schedule_expiry(state) when map_size(state.pending_requests) > 0,
-    do: cancel_expiry(state)
+      not Protocol.client_supports_method?(state.client_capabilities, method, params) ->
+        {:error, :unsupported_capability}
 
-  defp schedule_expiry(state) when map_size(state.active_requests) > 0,
-    do: cancel_expiry(state)
+      map_size(state.pending_requests) >= state.max_pending_requests ->
+        {:error, :overloaded}
 
-  defp schedule_expiry(state) when map_size(state.receiver_tasks) > 0,
-    do: cancel_expiry(state)
+      Map.has_key?(params, "task") and peer_task_capacity_reached?(state) ->
+        {:error, :overloaded}
 
-  defp schedule_expiry(state) do
-    if active_peer_tasks?(state.peer_tasks) do
-      cancel_expiry(state)
-    else
-      schedule_unheld_expiry(state)
-    end
-  end
+      progress_token != nil and Map.has_key?(state.peer_progress_tokens, progress_token) ->
+        {:error, :duplicate_progress_token}
 
-  defp schedule_unheld_expiry(%{idle_ttl_ms: :infinity} = state),
-    do: %{state | timer_ref: nil, expiry_generation: nil}
+      not Outbox.deliverable?(state, Keyword.get(opts, :sink_ref)) ->
+        {:error, :not_deliverable}
 
-  defp schedule_unheld_expiry(state) do
-    if state.timer_ref, do: Process.cancel_timer(state.timer_ref, async: true, info: false)
-
-    expiry_generation = make_ref()
-
-    timer_ref =
-      Process.send_after(self(), {:expire_if_idle, expiry_generation}, state.idle_ttl_ms)
-
-    %{state | timer_ref: timer_ref, expiry_generation: expiry_generation}
-  end
-
-  defp cancel_expiry(state) do
-    if state.timer_ref, do: Process.cancel_timer(state.timer_ref, async: true, info: false)
-    %{state | timer_ref: nil, expiry_generation: nil}
-  end
-
-  defp session_call(server_name, session_id, message) do
-    with {:ok, pid} <- Registry.lookup_session(server_name, session_id) do
-      safe_session_call(pid, message)
-    end
-  end
-
-  defp safe_session_call(pid, message) do
-    GenServer.call(pid, message)
-  catch
-    :exit, {:noproc, _call} -> {:error, :not_found}
-    :exit, {:normal, _call} -> {:error, :not_found}
-    :exit, {:shutdown, _call} -> {:error, :not_found}
-    :exit, {{:shutdown, _reason}, _call} -> {:error, :not_found}
-  end
-
-  defp normalize_sink_kind(kind) when kind in [:post, :get, :stdio], do: kind
-
-  defp normalize_sink_kind(other) do
-    raise ArgumentError, "sink kind must be :post, :get, or :stdio, got: #{inspect(other)}"
-  end
-
-  defp replace_sink_kind(state, kind) do
-    state.sinks
-    |> Enum.filter(fn {_ref, sink} -> sink.kind == kind end)
-    |> Enum.reduce(state, fn {ref, sink}, current ->
-      send(sink.pid, {:fastest_mcp_session_replaced, ref})
-      drop_sink(current, ref)
-    end)
-  end
-
-  defp claim_stream_owner(state, sink) do
-    case Map.get(state.stream_owners, sink.stream_id) do
-      nil ->
+      true ->
         :ok
-
-      previous_ref ->
-        case Map.get(state.sinks, previous_ref) do
-          nil -> :ok
-          previous -> send(previous.pid, {:fastest_mcp_session_replaced, previous.ref})
-        end
-    end
-
-    %{state | stream_owners: Map.put(state.stream_owners, sink.stream_id, sink.ref)}
-  end
-
-  defp drop_sink(state, sink_ref, demonitor? \\ true) do
-    case Map.pop(state.sinks, sink_ref) do
-      {nil, _sinks} ->
-        state
-
-      {sink, sinks} ->
-        if demonitor?, do: Process.demonitor(sink.monitor, [:flush])
-
-        stream_owners =
-          case Map.get(state.stream_owners, sink.stream_id) do
-            ^sink_ref -> Map.delete(state.stream_owners, sink.stream_id)
-            _other -> state.stream_owners
-          end
-
-        %{
-          state
-          | sinks: sinks,
-            sink_monitors: Map.delete(state.sink_monitors, sink.monitor),
-            stream_owners: stream_owners
-        }
     end
   end
 
-  defp sink_available?(state, nil), do: map_size(state.stream_owners) > 0
-  defp sink_available?(state, sink_ref), do: Map.has_key?(state.sinks, sink_ref)
-
-  defp emit_envelope(state, envelope, opts) do
-    case select_sink(state, opts) do
-      nil ->
-        if Keyword.get(opts, :queue, false) do
-          queue_envelope(state, envelope, opts)
-        else
-          {:error, :not_deliverable, state}
-        end
-
-      sink ->
-        case record_for_sink(state, sink, envelope, opts) do
-          {:ok, state, event_id} ->
-            delivery_sink = deliver_to_stream_owner(state, sink, event_id, envelope)
-
-            {:ok, state,
-             %{
-               sink_ref: sink.ref,
-               delivery_sink_ref: delivery_sink && delivery_sink.ref,
-               event_id: event_id
-             }}
-
-          {:error, reason, state} ->
-            {:error, reason, state}
-        end
-    end
-  end
-
-  defp deliver_to_stream_owner(state, sink, event_id, envelope) do
-    with owner_ref when is_reference(owner_ref) <- Map.get(state.stream_owners, sink.stream_id),
-         owner when is_map(owner) <- Map.get(state.sinks, owner_ref) do
-      send(owner.pid, {:fastest_mcp_session_message, owner.ref, event_id, envelope})
-      owner
-    else
-      _other -> nil
-    end
-  end
-
-  defp select_sink(state, opts) do
-    requested = Keyword.get(opts, :sink_ref)
-    origin_request_id = Keyword.get(opts, :origin_request_id)
-
+  defp check_inbound_request(state, request_id, progress_token) do
     cond do
-      not is_nil(requested) ->
-        Map.get(state.sinks, requested)
+      map_size(state.active_requests) >= state.max_active_requests ->
+        {:error, :overloaded}
 
-      not is_nil(origin_request_id) ->
-        Enum.find_value(state.sinks, fn {_ref, sink} ->
-          if sink.origin_request_id == origin_request_id, do: sink
-        end) || fallback_sink(state)
+      Map.has_key?(state.active_requests, request_id) ->
+        {:error, :duplicate}
+
+      progress_token != nil and Map.has_key?(state.progress_tokens, progress_token) ->
+        {:error, :duplicate_progress_token}
 
       true ->
-        fallback_sink(state)
+        :ok
     end
-  end
-
-  defp fallback_sink(state) do
-    state.stream_owners
-    |> Map.values()
-    |> Enum.map(&Map.get(state.sinks, &1))
-    |> Enum.reject(&is_nil/1)
-    |> Enum.sort_by(fn sink ->
-      {sink_priority(sink.kind), -sink.inserted_at}
-    end)
-    |> List.first()
-  end
-
-  defp sink_priority(:stdio), do: 0
-  defp sink_priority(:get), do: 1
-  defp sink_priority(:post), do: 2
-
-  defp prime_http_sink_cursor(state, %{kind: :stdio}), do: state
-
-  defp prime_http_sink_cursor(state, sink) do
-    {replay, event_id, retained?} = SSEReplay.record_cursor(state.replay, sink.stream_id)
-
-    if retained? and
-         RuntimeQuota.resize(state.runtime_quota, self(), :sse_replay_bytes, replay.total_bytes) ==
-           :ok do
-      send(sink.pid, {:fastest_mcp_session_cursor, sink.ref, event_id})
-      %{state | replay: replay}
-    else
-      state
-    end
-  end
-
-  defp record_for_sink(state, %{kind: kind}, _envelope, _opts) when kind == :stdio,
-    do: {:ok, state, nil}
-
-  defp record_for_sink(state, sink, envelope, opts) do
-    {replay, event_id, retained?} =
-      SSEReplay.record(state.replay, sink.stream_id, envelope,
-        request_id: Keyword.get(opts, :request_id)
-      )
-
-    resize_result =
-      RuntimeQuota.resize(
-        state.runtime_quota,
-        self(),
-        :sse_replay_bytes,
-        replay.total_bytes
-      )
-
-    case {retained?, resize_result} do
-      {true, :ok} ->
-        {:ok, %{state | replay: replay}, event_id}
-
-      {false, :ok} ->
-        {:error, :sse_replay_unavailable, %{state | replay: replay}}
-
-      {_retained?, {:error, :overloaded}} ->
-        # Re-record against the committed state so the rejected event advances
-        # the stream cursor without consuming replay quota. Authenticated event
-        # IDs include a random nonce, so this untransmitted fallback ID is not
-        # expected to equal the rejected candidate ID.
-        {fallback, _fallback_event_id, false} =
-          SSEReplay.record(state.replay, sink.stream_id, envelope,
-            request_id: Keyword.get(opts, :request_id),
-            retain?: false
-          )
-
-        {:error, :sse_replay_unavailable, put_replay!(state, fallback)}
-    end
-  end
-
-  defp put_replay!(state, replay) do
-    :ok =
-      RuntimeQuota.resize(
-        state.runtime_quota,
-        self(),
-        :sse_replay_bytes,
-        replay.total_bytes
-      )
-
-    %{state | replay: replay}
-  end
-
-  defp emit_replay_reset(state, {status, reason}) when status in [:fresh, :error] do
-    :telemetry.execute(
-      [:fastest_mcp, :sse, :replay_reset],
-      %{count: 1},
-      %{reason: reason, server_name: state.server_name, session_id: state.session_id}
-    )
-
-    :ok
-  end
-
-  defp emit_replay_reset(_state, _status), do: :ok
-
-  defp queue_envelope(state, envelope, opts) do
-    bytes = envelope |> JSON.encode!() |> byte_size()
-
-    cond do
-      :queue.len(state.queued_messages) >= state.max_queued_messages ->
-        {:error, :queue_overloaded, state}
-
-      state.queued_bytes + bytes > state.max_queued_bytes ->
-        {:error, :queue_overloaded, state}
-
-      true ->
-        queued = %{
-          envelope: envelope,
-          bytes: bytes,
-          request_id: Keyword.get(opts, :request_id)
-        }
-
-        {:ok,
-         %{
-           state
-           | queued_messages: :queue.in(queued, state.queued_messages),
-             queued_bytes: state.queued_bytes + bytes
-         }, %{queued: true}}
-    end
-  end
-
-  defp flush_queued_to_sink(state, sink) do
-    queued = :queue.to_list(state.queued_messages)
-
-    state = %{
-      state
-      | queued_messages: :queue.new(),
-        queued_bytes: 0
-    }
-
-    {state, delivered_count} =
-      Enum.reduce(queued, {state, 0}, fn item, {current, delivered_count} ->
-        case record_for_sink(current, sink, item.envelope, request_id: item.request_id) do
-          {:ok, current, event_id} ->
-            send(
-              sink.pid,
-              {:fastest_mcp_session_message, sink.ref, event_id, item.envelope}
-            )
-
-            {current, delivered_count + 1}
-
-          {:error, :sse_replay_unavailable, current} ->
-            {current, delivered_count}
-        end
-      end)
-
-    {state, delivered_count}
   end
 
   defp next_server_request_id(state) do
-    if MapSet.size(state.server_request_ids) >= state.max_request_ids do
-      {:error, :overloaded, state}
-    else
-      request_id = random_request_id()
+    request_id = "srv-" <> Base.url_encode64(:crypto.strong_rand_bytes(16), padding: false)
 
-      if MapSet.member?(state.server_request_ids, request_id) do
+    cond do
+      MapSet.size(state.server_request_ids) >= state.max_request_ids ->
+        :request_ids_exhausted
+
+      MapSet.member?(state.server_request_ids, request_id) ->
         next_server_request_id(state)
-      else
+
+      true ->
         {:ok, request_id,
          %{state | server_request_ids: MapSet.put(state.server_request_ids, request_id)}}
-      end
     end
-  end
-
-  defp random_request_id do
-    "srv-" <> Base.url_encode64(:crypto.strong_rand_bytes(16), padding: false)
   end
 
   defp request_id_capacity_error do
@@ -1883,41 +984,78 @@ defmodule FastestMCP.Session do
     }
   end
 
-  defp pop_pending(state, request_id) do
-    case Map.pop(state.pending_requests, request_id) do
-      {nil, pending_requests} ->
-        {nil, %{state | pending_requests: pending_requests}}
+  # Tracks a peer request until its response, its timeout, or its caller's exit.
+  defp put_pending(state, request_id, {caller_pid, _tag} = from, method, params, opts) do
+    progress_token = Keyword.get(opts, :progress_token)
+    params = put_request_progress_token(params, progress_token)
+    caller_monitor = Process.monitor(caller_pid)
+    timeout_ms = Keyword.get(opts, :timeout_ms, state.request_timeout_ms)
 
-      {pending, pending_requests} ->
-        :ok = RuntimeQuota.release(state.runtime_quota, self(), :pending_requests)
+    pending = %{
+      from: from,
+      caller_monitor: caller_monitor,
+      timer: Process.send_after(self(), {:peer_request_timeout, request_id}, timeout_ms),
+      method: method,
+      task_augmented: Map.has_key?(params, "task"),
+      peer_task_id: params["taskId"],
+      peer_task_context: peer_task_context(method, params),
+      sink_ref: Keyword.get(opts, :sink_ref),
+      progress_token: progress_token,
+      on_progress: Keyword.get(opts, :on_progress),
+      last_progress: nil,
+      progress_total: nil
+    }
 
-        state = %{
-          state
-          | pending_requests: pending_requests,
-            pending_monitors: Map.delete(state.pending_monitors, pending.caller_monitor),
-            peer_progress_tokens:
-              maybe_delete_progress_token(
-                state.peer_progress_tokens,
-                pending.progress_token,
-                {:request, request_id}
-              )
-        }
+    state = %{
+      state
+      | pending_requests: Map.put(state.pending_requests, request_id, pending),
+        pending_monitors: Map.put(state.pending_monitors, caller_monitor, request_id),
+        peer_progress_tokens:
+          Progress.put_owner(state.peer_progress_tokens, progress_token, {:request, request_id})
+    }
 
-        {pending, state}
+    {%{"jsonrpc" => "2.0", "id" => request_id, "method" => method, "params" => params}, state}
+  end
+
+  defp send_peer_request(state, request_id, envelope, opts) do
+    delivery = [
+      sink_ref: Keyword.get(opts, :sink_ref),
+      origin_request_id: Keyword.get(opts, :origin_request_id),
+      request_id: request_id
+    ]
+
+    with :ok <- validate_outbound_peer_request(envelope, opts),
+         {:ok, _delivery, state} <- Outbox.emit(state, envelope, delivery) do
+      {:ok, state}
+    else
+      {:error, reason} -> {:error, reason, elem(pop_pending(state, request_id), 1)}
+      {:error, reason, state} -> {:error, reason, elem(pop_pending(state, request_id), 1)}
     end
   end
 
-  defp cleanup_pending(pending, opts \\ [])
-  defp cleanup_pending(nil, _opts), do: :ok
+  defp pop_pending(state, request_id) do
+    case Map.pop(state.pending_requests, request_id) do
+      {nil, _pending_requests} ->
+        {nil, state}
 
-  defp cleanup_pending(pending, opts) do
-    if Keyword.get(opts, :cancel_timer, true),
-      do: Process.cancel_timer(pending.timer, async: true, info: false)
+      {pending, pending_requests} ->
+        Process.cancel_timer(pending.timer, async: true, info: false)
+        Process.demonitor(pending.caller_monitor, [:flush])
+        RuntimeQuota.release(state.runtime_quota, :pending_requests)
 
-    if Keyword.get(opts, :monitor, true),
-      do: Process.demonitor(pending.caller_monitor, [:flush])
-
-    :ok
+        {pending,
+         %{
+           state
+           | pending_requests: pending_requests,
+             pending_monitors: Map.delete(state.pending_monitors, pending.caller_monitor),
+             peer_progress_tokens:
+               Progress.delete_owner(
+                 state.peer_progress_tokens,
+                 pending.progress_token,
+                 {:request, request_id}
+               )
+         }}
+    end
   end
 
   defp normalize_peer_response(pending, payload, state) do
@@ -1954,22 +1092,22 @@ defmodule FastestMCP.Session do
     kind = if task_augmented, do: :task_response, else: :response
 
     validation =
-      if Schema.protocol_supported?(
-           @supported_protocol_version,
+      if ProtocolSchema.supported?(
+           legacy(),
            :client_to_server,
            kind,
            method
          ) do
-        Schema.validate_protocol(
-          @supported_protocol_version,
+        ProtocolSchema.validate(
+          legacy(),
           :client_to_server,
           kind,
           method,
           payload
         )
       else
-        Schema.validate_protocol(
-          @supported_protocol_version,
+        ProtocolSchema.validate(
+          legacy(),
           :client_to_server,
           :response,
           payload
@@ -2068,7 +1206,7 @@ defmodule FastestMCP.Session do
 
   defp normalize_valid_peer_response(_payload), do: {:error, :invalid_response}
 
-  defp validate_outbound_peer_request(method, envelope, opts) do
+  defp validate_outbound_peer_request(%{"method" => method} = envelope, opts) do
     related_task_id = Keyword.get(opts, :protocol_related_task_id)
 
     allowed_reserved =
@@ -2076,14 +1214,14 @@ defmodule FastestMCP.Session do
 
     with :ok <- validate_protocol_related_task(envelope, related_task_id),
          :ok <- validate_protocol_meta(envelope, :application, allowed_reserved) do
-      if Schema.protocol_supported?(
-           @supported_protocol_version,
+      if ProtocolSchema.supported?(
+           legacy(),
            :server_to_client,
            :request,
            method
          ) do
-        case Schema.validate_protocol(
-               @supported_protocol_version,
+        case ProtocolSchema.validate(
+               legacy(),
                :server_to_client,
                :request,
                method,
@@ -2149,7 +1287,7 @@ defmodule FastestMCP.Session do
         ids =
           case Map.get(meta, "io.modelcontextprotocol/related-task") do
             %{} = related ->
-              [Map.get(related, "taskId", Map.get(related, :taskId)) | ids]
+              [Map.get(related, "taskId") | ids]
 
             _other ->
               ids
@@ -2168,27 +1306,22 @@ defmodule FastestMCP.Session do
   defp collect_related_task_ids(_value, acc), do: acc
 
   defp emit_cancellation(state, request_id, reason, sink_ref) do
-    envelope = %{
-      "jsonrpc" => "2.0",
-      "method" => "notifications/cancelled",
-      "params" => %{"requestId" => request_id, "reason" => reason}
-    }
+    params = %{"requestId" => request_id, "reason" => reason}
 
-    case emit_envelope(state, envelope, sink_ref: sink_ref, queue: false) do
-      {:ok, state, _delivery} -> state
-      {:error, _reason, state} -> state
-    end
+    outcome =
+      Outbox.emit(state, notification("notifications/cancelled", params), sink_ref: sink_ref)
+
+    elem(outcome, 2)
   end
 
-  defp pop_active(state, request_id, demonitor? \\ true) do
+  defp pop_active(state, request_id) do
     case Map.pop(state.active_requests, request_id) do
       {nil, active_requests} ->
         {nil, %{state | active_requests: active_requests}}
 
       {active, active_requests} ->
-        :ok = RuntimeQuota.release(state.runtime_quota, self(), :active_requests)
-
-        if demonitor?, do: Process.demonitor(active.monitor, [:flush])
+        RuntimeQuota.release(state.runtime_quota, :active_requests)
+        Process.demonitor(active.monitor, [:flush])
 
         receiver_task_ids = Map.get(state.receiver_task_requests, request_id, MapSet.new())
         preserve_progress? = MapSet.size(receiver_task_ids) > 0
@@ -2214,7 +1347,7 @@ defmodule FastestMCP.Session do
               if(preserve_progress?,
                 do: state.progress_tokens,
                 else:
-                  maybe_delete_progress_token(
+                  Progress.delete_owner(
                     state.progress_tokens,
                     active.progress_token,
                     request_id
@@ -2226,9 +1359,6 @@ defmodule FastestMCP.Session do
     end
   end
 
-  defp maybe_put_progress_token(tokens, nil, _request_id), do: tokens
-  defp maybe_put_progress_token(tokens, token, request_id), do: Map.put(tokens, token, request_id)
-
   defp put_request_progress_token(params, nil), do: params
 
   defp put_request_progress_token(params, token) do
@@ -2236,162 +1366,6 @@ defmodule FastestMCP.Session do
       meta when is_map(meta) -> Map.put(params, "_meta", Map.put(meta, "progressToken", token))
       _invalid_meta -> params
     end
-  end
-
-  defp maybe_delete_progress_token(tokens, nil, _request_id), do: tokens
-
-  defp maybe_delete_progress_token(tokens, token, request_id) do
-    if Map.get(tokens, token) == request_id, do: Map.delete(tokens, token), else: tokens
-  end
-
-  defp progress_token_owned_by_other_request?(state, token, request_id) do
-    case Map.get(state.progress_tokens, token) do
-      nil -> false
-      ^request_id -> false
-      _other_request_id -> true
-    end
-  end
-
-  defp receive_pending_peer_progress(state, request_id, params) do
-    case Map.get(state.pending_requests, request_id) do
-      nil ->
-        {:reply, :ignored, touch(state)}
-
-      pending ->
-        progress = fetch(params, "progress")
-
-        with {:ok, progress_total} <-
-               ProtocolProgress.validate_update(
-                 progress,
-                 pending.last_progress,
-                 ProtocolProgress.total(params),
-                 pending.progress_total
-               ),
-             {:ok, rate} <- allow_rate(state.peer_progress_rate) do
-          pending = %{
-            pending
-            | last_progress: progress,
-              progress_total: progress_total
-          }
-
-          state = %{
-            state
-            | pending_requests: Map.put(state.pending_requests, request_id, pending),
-              peer_progress_rate: rate
-          }
-
-          run_callback(state, pending.on_progress, params)
-          {:reply, :ok, touch(state)}
-        else
-          {:error, :rate_limited} ->
-            {:reply, {:error, :rate_limited}, touch(state)}
-
-          {:error, _reason} ->
-            {:reply, :ignored, touch(state)}
-        end
-    end
-  end
-
-  defp receive_task_peer_progress(state, task_id, params) do
-    case Map.get(state.peer_tasks, task_id) do
-      nil ->
-        {:reply, :ignored, touch(state)}
-
-      peer_task ->
-        context = peer_task.context
-        progress = fetch(params, "progress")
-
-        with {:ok, progress_total} <-
-               ProtocolProgress.validate_update(
-                 progress,
-                 Map.get(context, :last_progress),
-                 ProtocolProgress.total(params),
-                 Map.get(context, :progress_total)
-               ),
-             {:ok, rate} <- allow_rate(state.peer_progress_rate) do
-          context = %{
-            context
-            | last_progress: progress,
-              progress_total: progress_total
-          }
-
-          peer_task = %{peer_task | context: context}
-
-          state = %{
-            state
-            | peer_tasks: Map.put(state.peer_tasks, task_id, peer_task),
-              peer_progress_rate: rate
-          }
-
-          run_callback(state, Map.get(context, :on_progress), params)
-          {:reply, :ok, touch(state)}
-        else
-          {:error, :rate_limited} ->
-            {:reply, {:error, :rate_limited}, touch(state)}
-
-          {:error, _reason} ->
-            {:reply, :ignored, touch(state)}
-        end
-    end
-  end
-
-  defp report_receiver_task_progress(state, request_id, params) do
-    case receiver_task_for_request(state, request_id) do
-      nil ->
-        {:reply, {:error, :unknown_request}, touch(state)}
-
-      {task_id, task} ->
-        progress = fetch(params, "progress")
-        total = ProtocolProgress.total(params)
-
-        with {:ok, progress_total} <-
-               ProtocolProgress.validate_update(
-                 progress,
-                 task.last_progress,
-                 total,
-                 task.progress_total
-               ),
-             {:ok, rate} <- allow_rate(task.progress_rate) do
-          envelope_params = Map.put(params, "progressToken", task.progress_token)
-
-          case emit_envelope(
-                 state,
-                 %{
-                   "jsonrpc" => "2.0",
-                   "method" => "notifications/progress",
-                   "params" => envelope_params
-                 },
-                 queue: false
-               ) do
-            {:ok, state, _delivery} ->
-              task = %{
-                task
-                | last_progress: progress,
-                  progress_total: progress_total,
-                  progress_rate: rate
-              }
-
-              state = %{state | receiver_tasks: Map.put(state.receiver_tasks, task_id, task)}
-              {:reply, :ok, touch(state)}
-
-            {:error, reason, state} ->
-              {:reply, {:error, reason}, touch(state)}
-          end
-        else
-          {:error, reason} -> {:reply, {:error, reason}, touch(state)}
-        end
-    end
-  end
-
-  defp receiver_task_for_request(state, request_id) do
-    state.receiver_task_requests
-    |> Map.get(request_id, MapSet.new())
-    |> Enum.find_value(fn task_id ->
-      case Map.fetch(state.receiver_tasks, task_id) do
-        {:ok, task} -> {task_id, task}
-        :error -> nil
-      end
-    end)
   end
 
   defp pop_receiver_task(state, task_id) do
@@ -2415,7 +1389,7 @@ defmodule FastestMCP.Session do
         progress_tokens =
           if MapSet.size(task_ids) == 0 and
                not Map.has_key?(state.active_requests, task.request_id) do
-            maybe_delete_progress_token(
+            Progress.delete_owner(
               state.progress_tokens,
               task.progress_token,
               task.request_id
@@ -2434,12 +1408,40 @@ defmodule FastestMCP.Session do
     end
   end
 
-  defp allow_rate(rate) do
-    case RateWindow.allow(rate) do
-      {:ok, next} -> {:ok, next}
-      {:error, :rate_limited, _next} -> {:error, :rate_limited}
+  defp per_second(limit), do: SlidingWindow.new(limit, 1_000)
+
+  # Where the progress behind a peer's progress token is tracked.
+  defp peer_progress_path(state, token) do
+    case Map.get(state.peer_progress_tokens, token) do
+      {:request, request_id} -> [Access.key!(:pending_requests), request_id]
+      {:task, task_id} -> [Access.key!(:peer_tasks), task_id, :context]
+      nil -> nil
     end
   end
+
+  # An inbound request reports its own progress; its receiver task continues
+  # reporting it once the request returned.
+  defp report_progress_path(state, request_id) do
+    cond do
+      Map.has_key?(state.active_requests, request_id) ->
+        [Access.key!(:active_requests), request_id]
+
+      task_id = receiver_task_id(state, request_id) ->
+        [Access.key!(:receiver_tasks), task_id]
+
+      true ->
+        nil
+    end
+  end
+
+  defp receiver_task_id(state, request_id) do
+    state.receiver_task_requests
+    |> Map.get(request_id, MapSet.new())
+    |> Enum.find(&Map.has_key?(state.receiver_tasks, &1))
+  end
+
+  defp notification(method, params),
+    do: %{"jsonrpc" => "2.0", "method" => method, "params" => params}
 
   defp run_callback(_state, nil, _params), do: :ok
 
@@ -2450,8 +1452,6 @@ defmodule FastestMCP.Session do
   end
 
   defp run_callback(_state, _callback, _params), do: :ok
-
-  defp logging_level_index(level), do: Enum.find_index(@logging_levels, &(&1 == level)) || 0
 
   defp normalize_roots(roots) do
     Enum.reduce_while(roots, {:ok, []}, fn root, {:ok, acc} ->
@@ -2495,19 +1495,10 @@ defmodule FastestMCP.Session do
   end
 
   defp drop_url_elicitation(state, elicitation_id) do
-    :ok =
-      Registry.unregister_url_elicitation(
-        state.server_name,
-        elicitation_id,
-        state.session_id,
-        self()
-      )
+    :ok = Registry.unregister_url_elicitation(state.server_name, elicitation_id)
 
     %{state | url_elicitations: Map.delete(state.url_elicitations, elicitation_id)}
   end
-
-  defp normalize_url_completion_error(:already_completed), do: :already_completed
-  defp normalize_url_completion_error(reason), do: reason
 
   defp maybe_track_peer_task_result(
          state,
@@ -2603,7 +1594,7 @@ defmodule FastestMCP.Session do
   end
 
   defp track_peer_task(state, task, source_method, context \\ %{}) do
-    task_id = fetch(task, "taskId")
+    task_id = task["taskId"]
 
     state
     |> put_peer_task(task, source_method, context)
@@ -2612,7 +1603,7 @@ defmodule FastestMCP.Session do
   end
 
   defp put_peer_task(state, task, source_method, context) do
-    case fetch(task, "taskId") do
+    case task["taskId"] do
       task_id when is_binary(task_id) and task_id != "" ->
         existing = Map.get(state.peer_tasks, task_id)
 
@@ -2630,8 +1621,7 @@ defmodule FastestMCP.Session do
             peer_task = %{
               task: task,
               source_method: if(existing, do: existing.source_method, else: source_method),
-              context: context,
-              updated_at: System.monotonic_time(:millisecond)
+              context: context
             }
 
             state = %{state | peer_tasks: Map.put(state.peer_tasks, task_id, peer_task)}
@@ -2669,16 +1659,12 @@ defmodule FastestMCP.Session do
   end
 
   defp release_peer_task_progress(state, task_id) do
-    token =
-      state.peer_tasks
-      |> Map.get(task_id, %{})
-      |> Map.get(:context, %{})
-      |> Map.get(:progress_token)
+    token = get_in(state.peer_tasks, [task_id, :context, :progress_token])
 
     %{
       state
       | peer_progress_tokens:
-          maybe_delete_progress_token(state.peer_progress_tokens, token, {:task, task_id})
+          Progress.delete_owner(state.peer_progress_tokens, token, {:task, task_id})
     }
   end
 
@@ -2730,7 +1716,7 @@ defmodule FastestMCP.Session do
   defp resolve_peer_url_task(state, _task_id, _result), do: state
 
   defp maybe_release_terminal_peer_url(state, task_id, task) do
-    if fetch(task, "status") in ["failed", "cancelled", :failed, :cancelled] do
+    if task["status"] in ["failed", "cancelled"] do
       release_peer_url_task(state, task_id)
     else
       state
@@ -2744,19 +1730,8 @@ defmodule FastestMCP.Session do
     end
   end
 
-  defp peer_url_elicitation_id(state, task_id) do
-    state.peer_tasks
-    |> Map.get(task_id, %{})
-    |> Map.get(:context, %{})
-    |> Map.get(:url_elicitation_id)
-  end
-
-  defp active_peer_tasks?(peer_tasks) do
-    Enum.any?(peer_tasks, fn {_task_id, peer_task} ->
-      status = fetch(peer_task.task, "status")
-      status not in ["completed", "failed", "cancelled", :completed, :failed, :cancelled]
-    end)
-  end
+  defp peer_url_elicitation_id(state, task_id),
+    do: get_in(state.peer_tasks, [task_id, :context, :url_elicitation_id])
 
   defp terminal_peer_task?(nil), do: false
 
@@ -2769,8 +1744,6 @@ defmodule FastestMCP.Session do
     map_size(state.peer_tasks) + reservations >= state.max_peer_tasks
   end
 
-  defp peer_task_callback_count(state), do: map_size(state.peer_task_callback_monitors)
-
   defp maybe_finalize_terminal_peer_task(state, task_id, task) do
     if terminal_task_status?(task) do
       state
@@ -2781,69 +1754,37 @@ defmodule FastestMCP.Session do
     end
   end
 
-  defp terminal_task_status?(task) do
-    fetch(task, "status") in [
-      "completed",
-      "failed",
-      "cancelled",
-      :completed,
-      :failed,
-      :cancelled
-    ]
-  end
+  defp terminal_task_status?(task), do: task["status"] in ["completed", "failed", "cancelled"]
 
   defp drop_peer_task_callbacks(state, task_id) do
-    case Map.pop(state.peer_task_callbacks, task_id) do
-      {nil, _callbacks} ->
-        state
+    {callbacks, remaining} = Map.pop(state.peer_task_callbacks, task_id, %{})
 
-      {callbacks, remaining_callbacks} ->
-        callback_monitors =
-          Enum.reduce(callbacks, state.peer_task_callback_monitors, fn {
-                                                                         _callback_ref,
-                                                                         callback_entry
-                                                                       },
-                                                                       monitors ->
-            Process.demonitor(callback_entry.monitor, [:flush])
-            Map.delete(monitors, callback_entry.monitor)
-          end)
+    monitors =
+      for {_callback_ref, %{monitor: monitor}} <- callbacks do
+        Process.demonitor(monitor, [:flush])
+        monitor
+      end
 
-        %{
-          state
-          | peer_task_callbacks: remaining_callbacks,
-            peer_task_callback_monitors: callback_monitors
-        }
-    end
+    %{
+      state
+      | peer_task_callbacks: remaining,
+        peer_task_callback_monitors: Map.drop(state.peer_task_callback_monitors, monitors)
+    }
   end
 
-  defp drop_peer_task_callback(state, task_id, callback_ref, demonitor?) do
-    case Map.get(state.peer_task_callbacks, task_id) do
-      nil ->
-        state
+  # The owner of a status callback exited.
+  defp drop_peer_task_callback(state, monitor, {task_id, callback_ref}) do
+    callbacks = Map.delete(state.peer_task_callbacks[task_id], callback_ref)
 
-      callbacks ->
-        case Map.pop(callbacks, callback_ref) do
-          {nil, _callbacks} ->
-            state
-
-          {callback_entry, remaining_callbacks} ->
-            if demonitor?, do: Process.demonitor(callback_entry.monitor, [:flush])
-
-            peer_task_callbacks =
-              if map_size(remaining_callbacks) == 0 do
-                Map.delete(state.peer_task_callbacks, task_id)
-              else
-                Map.put(state.peer_task_callbacks, task_id, remaining_callbacks)
-              end
-
-            %{
-              state
-              | peer_task_callbacks: peer_task_callbacks,
-                peer_task_callback_monitors:
-                  Map.delete(state.peer_task_callback_monitors, callback_entry.monitor)
-            }
-        end
-    end
+    %{
+      state
+      | peer_task_callbacks:
+          if(callbacks == %{},
+            do: Map.delete(state.peer_task_callbacks, task_id),
+            else: Map.put(state.peer_task_callbacks, task_id, callbacks)
+          ),
+        peer_task_callback_monitors: Map.delete(state.peer_task_callback_monitors, monitor)
+    }
   end
 
   defp do_peer_task_wait(server_name, session_id, task_id, opts, poll_interval, deadline) do
@@ -2877,30 +1818,6 @@ defmodule FastestMCP.Session do
       end
     end
   end
-
-  defp positive_option(opts, key, default) do
-    case Map.get(opts, key, default) do
-      value when is_integer(value) and value > 0 -> value
-      other -> raise ArgumentError, "#{key} must be a positive integer, got: #{inspect(other)}"
-    end
-  end
-
-  defp positive_timeout(value) when is_integer(value) and value > 0, do: value
-
-  defp positive_timeout(other),
-    do: raise(ArgumentError, "timeout must be positive, got: #{inspect(other)}")
-
-  defp fetch(map, key) when is_map(map) do
-    Map.get(map, key, Map.get(map, String.to_existing_atom(key)))
-  rescue
-    ArgumentError -> Map.get(map, key)
-  end
-
-  defp maybe_put(map, _key, nil), do: map
-  defp maybe_put(map, key, value), do: Map.put(map, key, value)
-
-  defp request_id_set_key(:client), do: :client_request_ids
-  defp request_id_set_key(:server), do: :server_request_ids
 
   # MCP 2025-11-25 retains the pre-mode elicitation capability spelling:
   # `elicitation: {}` is semantically equivalent to `elicitation.form: {}`.

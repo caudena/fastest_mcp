@@ -1,32 +1,21 @@
 defmodule FastestMCP.Transport.HTTPCommon do
-  @moduledoc """
-  Shared helpers used by the HTTP transports.
-
-  The transport layer is responsible for translating external payloads into
-  the normalized request shape consumed by `FastestMCP.Transport.Engine`,
-  then turning results back into protocol-specific output.
-
-  Most applications only choose which transport to mount. The parsing,
-  response encoding, and Plug or stdio loop details live here so the shared
-  operation pipeline can stay transport-agnostic.
-  """
+  @moduledoc false
 
   import Plug.Conn
 
   require Logger
+  import FastestMCP.Util, only: [maybe_put: 3]
 
   alias FastestMCP.Auth
   alias FastestMCP.Auth.ProtectedResource
   alias FastestMCP.Context
   alias FastestMCP.Error
-  alias FastestMCP.ServerRuntime
+  alias FastestMCP.URIPolicy
 
   @localhost_hosts MapSet.new(["localhost", "127.0.0.1", "::1", "[::1]"])
-  @invalid_percent_encoding ~r/%(?![0-9A-Fa-f]{2})/
   @normalized_allowed_hosts_key :__fastest_mcp_normalized_allowed_hosts__
   @invalid_host_character ~r/[\x00-\x20\x7F\\\/@?#,*%]/
 
-  @doc "Builds the HTTP context map passed to authenticators and HTTP helpers."
   def http_context(conn, runtime, opts) do
     protected_resource = protected_resource(runtime)
 
@@ -41,20 +30,17 @@ defmodule FastestMCP.Transport.HTTPCommon do
     }
   end
 
-  @doc false
   def authenticate(conn, runtime, opts) do
-    context_opts =
-      ServerRuntime.context_opts(runtime,
-        state_scope: :request,
-        session_id: request_session_id(conn),
-        transport: :streamable_http,
-        request_metadata: auth_request_metadata(conn, runtime)
-      )
-
     with :ok <- reject_query_access_token(conn),
          :ok <- validate_protected_resource_request(conn, runtime, opts),
          :ok <- ensure_protected_resource_auth(runtime.server),
-         {:ok, context} <- Context.build(runtime.server.name, context_opts),
+         context =
+           Context.new(runtime,
+             state_scope: :request,
+             session_id: request_session_id(conn),
+             transport: :streamable_http,
+             request_metadata: auth_request_metadata(conn, runtime)
+           ),
          {:ok, authenticated_context} <-
            Auth.resolve(runtime.server.auth, context, auth_input(conn, runtime, opts)) do
       {:ok, Auth.result_from_context(authenticated_context)}
@@ -69,12 +55,10 @@ defmodule FastestMCP.Transport.HTTPCommon do
        }}
   end
 
-  @doc false
   def auth_input(conn, opts) do
     auth_input(conn, %{}, opts)
   end
 
-  @doc false
   def auth_input(conn, runtime, opts) do
     headers = Map.new(conn.req_headers)
     protected_resource = protected_resource(runtime)
@@ -85,7 +69,6 @@ defmodule FastestMCP.Transport.HTTPCommon do
     |> maybe_put("expected_scopes", expected_scopes(protected_resource))
   end
 
-  @doc false
   def reject_query_access_token(%Plug.Conn{query_string: query_string}) do
     case decoded_query_parameter_names(query_string) do
       {:ok, names} ->
@@ -104,7 +87,6 @@ defmodule FastestMCP.Transport.HTTPCommon do
     end
   end
 
-  @doc false
   def mcp_resource_uri(conn, opts) do
     uri = URI.parse(base_url(conn, opts))
 
@@ -124,14 +106,13 @@ defmodule FastestMCP.Transport.HTTPCommon do
           |> Map.put(:path, normalize_base_path(Keyword.get(opts, :path, "/mcp")))
           |> Map.put(:query, nil)
           |> Map.put(:fragment, nil)
-          |> normalize_default_port()
+          |> URIPolicy.drop_default_port()
           |> URI.to_string()
 
         {:ok, resource_uri}
     end
   end
 
-  @doc "Sends a JSON HTTP response."
   def json(conn, status, payload) do
     body = JSON.encode!(payload)
 
@@ -140,19 +121,14 @@ defmodule FastestMCP.Transport.HTTPCommon do
     |> send_resp(status, body)
   end
 
-  @doc "Renders an error as an HTTP response."
   def render_error(conn, %Error{} = error, auth, http_context) do
     {status, headers, body} = error_response(error, auth, http_context)
 
-    conn =
-      Enum.reduce(headers, conn, fn {key, value}, current ->
-        put_resp_header(current, key, value)
-      end)
-
-    json(conn, status, body)
+    conn
+    |> merge_resp_headers(headers)
+    |> json(status, body)
   end
 
-  @doc "Builds the HTTP error response payload."
   def error_response(%Error{} = error, auth, http_context, payload_override \\ nil) do
     {status, headers} = error_status_and_headers(error, auth, http_context)
 
@@ -163,14 +139,12 @@ defmodule FastestMCP.Transport.HTTPCommon do
     {status, headers, body}
   end
 
-  @doc "Sends an HTTP redirect response."
   def redirect(conn, status, location) do
     conn
     |> put_resp_header("location", location)
     |> send_resp(status, "")
   end
 
-  @doc "Applies DNS-rebinding protection to the request."
   def validate_dns_rebinding(conn, opts) do
     allowed_hosts = allowed_hosts(opts)
 
@@ -190,7 +164,6 @@ defmodule FastestMCP.Transport.HTTPCommon do
     end
   end
 
-  @doc false
   def normalize_dns_rebinding_options!(opts) when is_list(opts) do
     reject_unsafe_host_bypass!(opts)
 
@@ -207,7 +180,6 @@ defmodule FastestMCP.Transport.HTTPCommon do
     end
   end
 
-  @doc false
   def validate_listener_security!(bandit_options, opts) do
     opts = normalize_dns_rebinding_options!(opts)
     ip = Keyword.fetch!(bandit_options, :ip)
@@ -239,7 +211,7 @@ defmodule FastestMCP.Transport.HTTPCommon do
 
   defp error_status_and_headers(%Error{code: :rate_limited} = error, _auth, _http_context) do
     headers =
-      case retry_after_header(error.details) do
+      case retry_after_header(error) do
         nil -> []
         value -> [{"retry-after", value}]
       end
@@ -248,7 +220,7 @@ defmodule FastestMCP.Transport.HTTPCommon do
   end
 
   defp error_status_and_headers(%Error{code: :overloaded} = error, _auth, _http_context) do
-    headers = [{"retry-after", retry_after_header(error.details) || "1"}]
+    headers = [{"retry-after", retry_after_header(error) || "1"}]
 
     {503, headers}
   end
@@ -269,23 +241,15 @@ defmodule FastestMCP.Transport.HTTPCommon do
 
   defp error_status_and_headers(_error, _auth, _http_context), do: {400, []}
 
-  defp retry_after_header(details) when is_map(details) do
-    case Map.get(details, :retry_after_seconds, Map.get(details, "retry_after_seconds")) do
+  defp retry_after_header(error) do
+    case Error.detail(error, :retry_after_seconds) do
       value when is_integer(value) and value > 0 -> Integer.to_string(value)
       _other -> nil
     end
   end
 
-  defp retry_after_header(_details), do: nil
-
-  defp opaque_authorization_denial?(%Error{details: details}) when is_map(details) do
-    Map.get(details, :authorization_denial, Map.get(details, "authorization_denial")) in [
-      :opaque,
-      "opaque"
-    ]
-  end
-
-  defp opaque_authorization_denial?(_error), do: false
+  defp opaque_authorization_denial?(error),
+    do: Error.detail(error, :authorization_denial) in [:opaque, "opaque"]
 
   defp base_url(conn, opts) do
     case Keyword.get(opts, :base_url) do
@@ -295,7 +259,7 @@ defmodule FastestMCP.Transport.HTTPCommon do
           host: conn.host,
           port: port_for(conn)
         }
-        |> normalize_default_port()
+        |> URIPolicy.drop_default_port()
         |> URI.to_string()
 
       base_url ->
@@ -303,9 +267,6 @@ defmodule FastestMCP.Transport.HTTPCommon do
     end
   end
 
-  defp normalize_default_port(%URI{scheme: "http", port: 80} = uri), do: %{uri | port: nil}
-  defp normalize_default_port(%URI{scheme: "https", port: 443} = uri), do: %{uri | port: nil}
-  defp normalize_default_port(uri), do: uri
   defp port_for(%Plug.Conn{port: nil}), do: nil
   defp port_for(%Plug.Conn{port: port}), do: port
 
@@ -418,9 +379,7 @@ defmodule FastestMCP.Transport.HTTPCommon do
   defp decoded_query_parameter_names(query_string) when query_string in [nil, ""], do: {:ok, []}
 
   defp decoded_query_parameter_names(query_string) when is_binary(query_string) do
-    if Regex.match?(@invalid_percent_encoding, query_string) do
-      {:error, :malformed_query}
-    else
+    if URIPolicy.valid_percent_encoding?(query_string) do
       names =
         query_string
         |> String.split("&")
@@ -432,13 +391,10 @@ defmodule FastestMCP.Transport.HTTPCommon do
         end)
 
       {:ok, names}
+    else
+      {:error, :malformed_query}
     end
-  rescue
-    ArgumentError -> {:error, :malformed_query}
   end
-
-  defp maybe_put(map, _key, nil), do: map
-  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
   defp loopback_listener?(:loopback), do: true
   defp loopback_listener?({127, _b, _c, _d}), do: true
@@ -529,9 +485,6 @@ defmodule FastestMCP.Transport.HTTPCommon do
     else
       _other -> {:error, :invalid_origin}
     end
-  rescue
-    ArgumentError -> {:error, :invalid_origin}
-    FunctionClauseError -> {:error, :invalid_origin}
   end
 
   defp validate_origin_port(nil), do: :ok

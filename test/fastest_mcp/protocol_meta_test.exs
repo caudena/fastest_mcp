@@ -1,5 +1,5 @@
 defmodule FastestMCP.Protocol.MetaTest do
-  use ExUnit.Case, async: true
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Protocol.Meta
 
@@ -73,6 +73,48 @@ defmodule FastestMCP.Protocol.MetaTest do
     assert :ok =
              Meta.validate_tree(%{"_meta" => %{"io.modelcontextprotocol/future" => %{}}},
                source: :peer
+             )
+  end
+
+  test "modern reserved metadata has exact key ownership and basic value shapes" do
+    meta = %{
+      "io.modelcontextprotocol/protocolVersion" => "2026-07-28",
+      "io.modelcontextprotocol/clientCapabilities" => %{},
+      "io.modelcontextprotocol/clientInfo" => %{"name" => "schema-client", "version" => "1.0.0"}
+    }
+
+    assert {:ok, ^meta} = Meta.validate(meta, source: :protocol)
+    assert {:ok, ^meta} = Meta.validate(meta, source: :peer)
+    assert {:error, _reason} = Meta.validate(meta, source: :application)
+
+    assert {:ok, _value} =
+             Meta.validate(
+               %{
+                 "io.modelcontextprotocol/serverInfo" => %{
+                   "name" => "schema-server",
+                   "version" => "1.0.0"
+                 },
+                 "io.modelcontextprotocol/subscriptionId" => 7
+               },
+               source: :protocol
+             )
+
+    assert {:error, _reason} =
+             Meta.validate(
+               %{"io.modelcontextprotocol/protocolVersion" => 20_260_728},
+               source: :protocol
+             )
+
+    assert {:error, _reason} =
+             Meta.validate(
+               %{"io.modelcontextprotocol/clientInfo" => %{"name" => "missing-version"}},
+               source: :peer
+             )
+
+    assert {:error, _reason} =
+             Meta.validate(
+               %{"io.modelcontextprotocol/logLevel" => "verbose"},
+               source: :protocol
              )
   end
 end

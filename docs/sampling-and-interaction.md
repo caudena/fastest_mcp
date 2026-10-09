@@ -322,7 +322,9 @@ end
 
 Interactive workflows usually belong on background tasks. The explicit input
 API below is for local, in-process Elixir workflows; remote MCP clients use the
-standard `tasks/result` relay instead of the removed `tasks/sendInput` method.
+protocol instead of the removed `tasks/sendInput` method: the `tasks/result`
+relay on `2025-11-25`, and `tasks/update` with `inputResponses` on
+`2026-07-28`.
 
 That is what allows:
 

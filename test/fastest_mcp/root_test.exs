@@ -1,5 +1,5 @@
 defmodule FastestMCP.RootTest do
-  use ExUnit.Case, async: true
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Root
 

@@ -1,5 +1,5 @@
 defmodule FastestMCP.SkillProviderTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.PathSafety
   alias FastestMCP.Providers.Skill
@@ -73,14 +73,11 @@ defmodule FastestMCP.SkillProviderTest do
     File.write!(Path.join(skill_dir, "scripts/helper.py"), "print('helper')")
 
     provider = Skill.new(skill_dir)
-    server_name = unique_server_name("skill-provider")
+    server_name = unique_name("skill-provider")
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_provider(provider)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_provider(provider)
+    |> start_server!()
 
     resources = FastestMCP.list_resources!(server_name)
     templates = FastestMCP.list_resource_templates!(server_name)
@@ -159,14 +156,11 @@ defmodule FastestMCP.SkillProviderTest do
     File.ln_s!(secret_file, Path.join(skill_dir, "leak.txt"))
 
     provider = Skill.new(skill_dir, supporting_files: :resources)
-    server_name = unique_server_name("skill-provider-resources")
+    server_name = unique_name("skill-provider-resources")
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_provider(provider)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_provider(provider)
+    |> start_server!()
 
     resources = FastestMCP.list_resources!(server_name)
 
@@ -230,14 +224,11 @@ defmodule FastestMCP.SkillProviderTest do
       FastestMCP.server("child-skill-server")
       |> FastestMCP.add_provider(Skill.new(skill_dir))
 
-    parent_name = unique_server_name("mounted-skill-parent")
+    parent_name = unique_name("mounted-skill-parent")
 
-    parent =
-      FastestMCP.server(parent_name)
-      |> FastestMCP.mount(child, namespace: "skills")
-
-    assert {:ok, _pid} = FastestMCP.start_server(parent)
-    on_exit(fn -> FastestMCP.stop_server(parent_name) end)
+    FastestMCP.server(parent_name)
+    |> FastestMCP.mount(child, namespace: "skills")
+    |> start_server!()
 
     resources = FastestMCP.list_resources!(parent_name)
     main = Enum.find(resources, &(&1.uri == "skill://skills/mounted-skill/SKILL.md"))
@@ -261,9 +252,5 @@ defmodule FastestMCP.SkillProviderTest do
     File.mkdir_p!(skill_dir)
     on_exit(fn -> File.rm_rf(root) end)
     skill_dir
-  end
-
-  defp unique_server_name(prefix) do
-    prefix <> "-" <> Integer.to_string(System.unique_integer([:positive]))
   end
 end

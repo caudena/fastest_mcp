@@ -1,5 +1,5 @@
 defmodule FastestMCP.SubscriptionSubscriberTest do
-  use ExUnit.Case, async: true
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.EventBus
   alias FastestMCP.Protocol.Subscriptions
@@ -53,12 +53,13 @@ defmodule FastestMCP.SubscriptionSubscriberTest do
   end
 
   test "acknowledges first and emits only opted-in notifications with the subscription id" do
-    bus = start_supervised!({EventBus, []})
+    bus = %EventBus{}
+    server_name = "subscriptions-#{System.unique_integer([:positive])}"
 
     subscriber =
       start_supervised!(
         {SubscriptionSubscriber,
-         server_name: "subscriptions",
+         server_name: server_name,
          event_bus: bus,
          owner: self(),
          subscription_id: "listen-1",
@@ -82,7 +83,7 @@ defmodule FastestMCP.SubscriptionSubscriberTest do
                       }
                     }}
 
-    EventBus.emit(bus, "subscriptions", [:components, :changed], %{}, %{
+    EventBus.emit(bus, server_name, [:components, :changed], %{}, %{
       families: [:tools, :resources]
     })
 
@@ -99,13 +100,13 @@ defmodule FastestMCP.SubscriptionSubscriberTest do
     refute_receive {:fastest_mcp_subscription_notification,
                     %{"method" => "notifications/resources/list_changed"}}
 
-    EventBus.emit(bus, "subscriptions", [:resources, :updated], %{}, %{
+    EventBus.emit(bus, server_name, [:resources, :updated], %{}, %{
       uri: "file:///ignored"
     })
 
     refute_receive {:fastest_mcp_subscription_notification, _notification}, 20
 
-    EventBus.emit(bus, "subscriptions", [:resources, :updated], %{}, %{
+    EventBus.emit(bus, server_name, [:resources, :updated], %{}, %{
       uri: "file:///wanted"
     })
 
@@ -124,7 +125,7 @@ defmodule FastestMCP.SubscriptionSubscriberTest do
   end
 
   test "dies with its request owner" do
-    bus = start_supervised!({EventBus, []})
+    bus = %EventBus{}
     parent = self()
 
     owner =

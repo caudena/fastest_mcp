@@ -23,69 +23,45 @@ defmodule FastestMCP.ClientGroup do
   never stopped. Prompts and resources remain accessible through `client/2`.
   """
   use Supervisor
-  alias FastestMCP.{Client, Error}
+  alias FastestMCP.{Client, Deadline, Error, Options}
+  alias FastestMCP.Client.{Catalog, Connection}
   alias FastestMCP.ClientGroup.Coordinator
+
+  @default_timeout_ms 10_000
 
   defstruct [:coordinator, :supervisor]
   @opaque t :: %__MODULE__{coordinator: pid(), supervisor: pid()}
 
   @doc "Connects a group and returns an opaque operation and lifecycle handle."
   def connect(opts) do
-    case start_link(opts) do
-      {:ok, supervisor} ->
-        Process.unlink(supervisor)
-        {:ok, execute_handle(supervisor)}
-
-      error ->
-        error
+    with {:ok, supervisor} <- start_link(opts) do
+      Process.unlink(supervisor)
+      handle(supervisor)
     end
   end
 
   @doc "Connects a group, raising on failure."
-  def connect!(opts), do: FastestMCP.OperationResult.unwrap!(connect(opts))
-
-  defp execute_handle(supervisor) do
-    coordinator =
-      Supervisor.which_children(supervisor)
-      |> Enum.find_value(fn
-        {Coordinator, pid, _, _} when is_pid(pid) -> pid
-        _ -> nil
-      end)
-
-    if coordinator do
-      %__MODULE__{coordinator: coordinator, supervisor: supervisor}
-    else
-      raise Error, code: :not_found, message: "client group is not running"
-    end
-  end
-
-  defp execute_disconnect(%__MODULE__{supervisor: supervisor}), do: Supervisor.stop(supervisor)
+  def connect!(opts), do: Error.unwrap!(connect(opts))
 
   @doc "Starts a group and waits for every member to become ready."
   def start_link(opts) do
     configs = normalize_clients!(Keyword.fetch!(opts, :clients))
-    opts = deadline_options(opts)
-    timeout = FastestMCP.Deadline.remaining!(opts[:deadline], "client group")
-    concurrency = positive!(Keyword.get(opts, :max_concurrency, 8), :max_concurrency)
-    opts = opts |> Keyword.put(:clients, configs) |> Keyword.put(:max_concurrency, concurrency)
+    concurrency = Keyword.get(opts, :max_concurrency, 8)
+    Options.check!(concurrency, :pos_integer, :max_concurrency)
+    opts = Keyword.merge(opts, clients: configs, max_concurrency: concurrency)
+    deadline = Deadline.from_options(opts, @default_timeout_ms)
 
-    case Supervisor.start_link(__MODULE__, opts) do
-      {:ok, pid} ->
-        try do
-          :ok = execute_await_ready(execute_handle(pid), timeout)
-          {:ok, pid}
-        rescue
-          error ->
-            stop_failed_start(pid)
-            {:error, error}
-        catch
-          kind, reason ->
-            stop_failed_start(pid)
-            {:error, {kind, reason}}
-        end
-
-      error ->
-        error
+    with {:ok, timeout} <- Deadline.check(deadline, "client group"),
+         {:ok, pid} <- Supervisor.start_link(__MODULE__, opts) do
+      with {:ok, group} <- handle(pid),
+           :ok <- await_ready(group, timeout) do
+        {:ok, pid}
+      else
+        error ->
+          Process.unlink(pid)
+          if Process.alive?(pid), do: Supervisor.stop(pid)
+          error
+      end
     end
   end
 
@@ -111,92 +87,174 @@ defmodule FastestMCP.ClientGroup do
     Supervisor.init(children, strategy: :rest_for_one)
   end
 
+  @doc "Returns the operation handle of a group started under `supervisor`."
+  def handle(supervisor) do
+    children = Supervisor.which_children(supervisor)
+
+    case for({Coordinator, pid, _, _} when is_pid(pid) <- children, do: pid) do
+      [pid] -> {:ok, %__MODULE__{coordinator: pid, supervisor: supervisor}}
+      [] -> {:error, %Error{code: :not_found, message: "client group is not running"}}
+    end
+  catch
+    :exit, reason -> {:error, Error.from_exit(reason)}
+  end
+
+  @doc "Raising variant of `handle/1`."
+  def handle!(supervisor), do: Error.unwrap!(handle(supervisor))
+
+  @doc "Stops a group and its owned clients; borrowed clients keep running."
+  def disconnect(%__MODULE__{supervisor: supervisor}) do
+    Supervisor.stop(supervisor)
+  catch
+    # Idempotent: a group that already stopped has stopped its clients.
+    :exit, {reason, {GenServer, :stop, _args}} when reason in [:noproc, :normal, :shutdown] -> :ok
+    :exit, reason -> {:error, Error.from_exit(reason)}
+  end
+
+  @doc "Raising variant of `disconnect/1`."
+  def disconnect!(group), do: Error.unwrap!(disconnect(group))
+
   @doc "Returns whether all pinned member clients are ready."
   def ready?(group) do
-    group |> members() |> Enum.all?(fn {_, client} -> Client.ready?(client) end)
-  rescue
-    _ -> false
-  catch
-    :exit, _ -> false
-  end
-
-  defp execute_await_ready(group, timeout) do
-    deadline = FastestMCP.Deadline.new(positive!(timeout, :timeout_ms))
-
-    Enum.each(members(group), fn {_, client} ->
-      remaining = FastestMCP.Deadline.remaining!(deadline, "client group readiness")
-
-      :ok = Client.await_ready!(client, remaining)
-    end)
-
-    :ok
-  end
-
-  defp execute_client(group, name) do
-    case Map.fetch(members(group), to_string(name)) do
-      {:ok, client} ->
-        Client.pin!(client)
-
-      :error ->
-        raise Error, code: :not_found, message: "unknown client group member #{inspect(name)}"
+    case members(group) do
+      {:ok, members} -> Enum.all?(members, fn {_name, client} -> Client.ready?(client) end)
+      {:error, _error} -> false
     end
   end
 
-  defp execute_protocol_versions(group),
-    do: Map.new(members(group), fn {name, client} -> {name, Client.protocol_version!(client)} end)
+  @doc "Waits until every member client is ready, as `FastestMCP.Client.await_ready/2`."
+  def await_ready(group, timeout \\ @default_timeout_ms) do
+    deadline = Deadline.new(timeout)
 
-  defp execute_list_tools(group, opts) do
-    opts = deadline_options(opts)
-    timeout = FastestMCP.Deadline.remaining!(opts[:deadline], "client group")
-    call(group, {:refresh, Keyword.put_new(opts, :cache, :refresh)}, timeout + 1_000)
+    with {:ok, members} <- members(group) do
+      Enum.find_value(members, :ok, fn {_name, client} ->
+        with :ok <- Client.await_ready(client, Deadline.remaining(deadline)), do: nil
+      end)
+    end
   end
 
-  defp execute_resolve_tool(group, name, opts) do
-    opts = deadline_options(opts)
-    timeout = FastestMCP.Deadline.remaining!(opts[:deadline], "client group")
-    route = call(group, {:route, to_string(name), opts}, timeout + 1_000)
-    revision = Client.catalog_revision!(route.client)
+  @doc "Raising variant of `await_ready/2`."
+  def await_ready!(group, timeout \\ @default_timeout_ms),
+    do: Error.unwrap!(await_ready(group, timeout))
 
-    unless revision.ready?,
-      do:
-        raise(Error,
-          code: :not_found,
-          message: "client group member #{inspect(route.server_name)} is unavailable"
-        )
+  @doc "Returns the pinned client of member `name`."
+  def client(group, name) do
+    with {:ok, members} <- members(group) do
+      case Map.fetch(members, to_string(name)) do
+        {:ok, client} ->
+          Connection.pin(client)
 
-    if revision.generation != route.generation or not revision.fresh? do
-      snapshot = Client.catalog_snapshot!(route.client, Keyword.put(opts, :cache, :use))
-
-      unless Enum.any?(snapshot.tools, &(&1["name"] == route.upstream_name)) do
-        raise Error,
-          code: :method_not_found,
-          message: "member no longer advertises tool #{inspect(name)}"
+        :error ->
+          {:error,
+           %Error{code: :not_found, message: "unknown client group member #{inspect(name)}"}}
       end
-
-      updated = %{route | generation: snapshot.generation}
-      call(group, {:validated_route, to_string(name), route, updated})
-    else
-      route
     end
   end
 
-  defp execute_call_tool(group, name, arguments, opts) do
-    opts = deadline_options(opts)
-    route = execute_resolve_tool(group, name, opts)
-    Client.call_tool!(route.client, route.upstream_name, arguments, opts)
+  @doc "Raising variant of `client/2`."
+  def client!(group, name), do: Error.unwrap!(client(group, name))
+
+  @doc "Returns the negotiated protocol version of every member."
+  def protocol_versions(group) do
+    with {:ok, members} <- members(group) do
+      Enum.reduce_while(members, {:ok, %{}}, fn {name, client}, {:ok, versions} ->
+        case Client.info(client) do
+          {:ok, info} -> {:cont, {:ok, Map.put(versions, name, info.protocol_version)}}
+          error -> {:halt, error}
+        end
+      end)
+    end
   end
 
-  defp execute_start_tool_result(group, name, arguments, opts) do
+  @doc "Raising variant of `protocol_versions/1`."
+  def protocol_versions!(group), do: Error.unwrap!(protocol_versions(group))
+
+  @doc "Refreshes every member and returns the complete list of group tools."
+  def list_tools(group, opts \\ []) do
     opts = deadline_options(opts)
-    route = execute_resolve_tool(group, name, opts)
-    Client.start_tool_result!(route.client, route.upstream_name, arguments, opts)
+    catalog_call(group, {:refresh, Keyword.put_new(opts, :cache, :refresh)}, opts[:deadline])
   end
 
-  defp deadline_options(opts) do
-    Keyword.put(opts, :deadline, FastestMCP.Deadline.from_options(opts, 10_000))
+  @doc "Raising variant of `list_tools/2`."
+  def list_tools!(group, opts \\ []), do: Error.unwrap!(list_tools(group, opts))
+
+  @doc """
+  Returns the route of a group tool. A route whose member catalog changed is
+  revalidated against that member's fresh catalog.
+  """
+  def resolve_tool(group, name, opts \\ []) do
+    opts = deadline_options(opts)
+    name = to_string(name)
+
+    with {:ok, route} <- catalog_call(group, {:route, name, opts}, opts[:deadline]),
+         {:ok, revision} <- Catalog.revision(route.client) do
+      cond do
+        not revision.ready? ->
+          {:error,
+           %Error{
+             code: :not_found,
+             message: "client group member #{inspect(route.server_name)} is unavailable"
+           }}
+
+        revision.generation == route.generation and revision.fresh? ->
+          {:ok, route}
+
+        true ->
+          revalidate(group, name, route, opts)
+      end
+    end
   end
+
+  @doc "Raising variant of `resolve_tool/3`."
+  def resolve_tool!(group, name, opts \\ []), do: Error.unwrap!(resolve_tool(group, name, opts))
+
+  defp revalidate(group, name, route, opts) do
+    with {:ok, snapshot} <- Catalog.snapshot(route.client, Keyword.put(opts, :cache, :use)) do
+      if Enum.any?(snapshot.tools, &(&1["name"] == route.upstream_name)) do
+        call(group, {:validated_route, name, route, %{route | generation: snapshot.generation}})
+      else
+        {:error,
+         %Error{
+           code: :method_not_found,
+           message: "member no longer advertises tool #{inspect(name)}"
+         }}
+      end
+    end
+  end
+
+  @doc "Calls a group tool on the member that advertises it."
+  def call_tool(group, name, arguments \\ %{}, opts \\ []),
+    do: routed(group, name, opts, &Client.call_tool(&1, &2, arguments, &3))
+
+  @doc "Raising variant of `call_tool/4`."
+  def call_tool!(group, name, arguments \\ %{}, opts \\ []),
+    do: Error.unwrap!(call_tool(group, name, arguments, opts))
+
+  @doc "Starts a cancellable call of a group tool, owned by the calling process."
+  def start_tool_result(group, name, arguments \\ %{}, opts \\ []),
+    do: routed(group, name, opts, &Client.start_tool_result(&1, &2, arguments, &3))
+
+  @doc "Raising variant of `start_tool_result/4`."
+  def start_tool_result!(group, name, arguments \\ %{}, opts \\ []),
+    do: Error.unwrap!(start_tool_result(group, name, arguments, opts))
+
+  # The group's deadline also bounds the member call.
+  defp routed(group, name, opts, fun) do
+    opts = deadline_options(opts)
+
+    with {:ok, route} <- resolve_tool(group, name, opts),
+         do: fun.(route.client, route.upstream_name, opts)
+  end
+
+  defp deadline_options(opts),
+    do: Keyword.put(opts, :deadline, Deadline.from_options(opts, @default_timeout_ms))
 
   defp members(group), do: call(group, :members)
+
+  defp catalog_call(group, request, deadline) do
+    with {:ok, timeout} <- Deadline.check(deadline, "client group"),
+         do: call(group, request, Connection.call_timeout(timeout))
+  end
 
   defp call(group, request, timeout \\ 5_000) do
     coordinator =
@@ -205,17 +263,9 @@ defmodule FastestMCP.ClientGroup do
         reference -> reference
       end
 
-    case GenServer.call(coordinator, request, timeout) do
-      {:ok, value} -> value
-      {:error, error} -> raise error
-    end
+    GenServer.call(coordinator, request, timeout)
   catch
-    :exit, reason -> raise FastestMCP.OperationResult.exit_error(reason)
-  end
-
-  defp stop_failed_start(pid) do
-    Process.unlink(pid)
-    if Process.alive?(pid), do: Supervisor.stop(pid)
+    :exit, reason -> {:error, Error.from_exit(reason)}
   end
 
   defp normalize_clients!(clients) when is_map(clients) and map_size(clients) > 0 do
@@ -232,6 +282,9 @@ defmodule FastestMCP.ClientGroup do
             unless Keyword.keyword?(opts) and Keyword.has_key?(opts, :target),
               do: raise(ArgumentError, "owned clients require keyword options with :target")
 
+            # Members start inside the group's supervisor; reject bad options here.
+            Client.child_spec(opts)
+
           _ ->
             raise ArgumentError, "clients must be configurations or {:existing, client_ref}"
         end
@@ -246,93 +299,6 @@ defmodule FastestMCP.ClientGroup do
   end
 
   defp normalize_clients!(_), do: raise(ArgumentError, "clients must be a non-empty map")
-  defp positive!(value, _) when is_integer(value) and value > 0, do: value
-  defp positive!(_, key), do: raise(ArgumentError, "#{key} must be a positive integer")
-  @doc "Runs `await_ready` and returns a tagged result."
-  def await_ready(group, timeout \\ 10_000),
-    do:
-      FastestMCP.OperationResult.capture(fn -> execute_await_ready(group, timeout) end, :command)
-
-  @doc "Raising variant of `await_ready/2`."
-  def await_ready!(group, timeout \\ 10_000),
-    do: FastestMCP.OperationResult.unwrap!(await_ready(group, timeout))
-
-  @doc "Runs `call_tool` and returns a tagged result."
-  def call_tool(group, name, arguments \\ %{}, opts \\ []),
-    do:
-      FastestMCP.OperationResult.capture(
-        fn -> execute_call_tool(group, name, arguments, opts) end,
-        :value
-      )
-
-  @doc "Raising variant of `call_tool/4`."
-  def call_tool!(group, name, arguments \\ %{}, opts \\ []),
-    do: FastestMCP.OperationResult.unwrap!(call_tool(group, name, arguments, opts))
-
-  @doc "Runs `client` and returns a tagged result."
-  def client(group, name),
-    do: FastestMCP.OperationResult.capture(fn -> execute_client(group, name) end, :value)
-
-  @doc "Raising variant of `client/2`."
-  def client!(group, name), do: FastestMCP.OperationResult.unwrap!(client(group, name))
-
-  @doc "Runs `disconnect` and returns a tagged result."
-  def disconnect(group),
-    do: FastestMCP.OperationResult.capture(fn -> execute_disconnect(group) end, :command)
-
-  @doc "Raising variant of `disconnect/1`."
-  def disconnect!(group),
-    do: FastestMCP.OperationResult.unwrap!(disconnect(group))
-
-  @doc "Runs `handle` and returns a tagged result."
-  def handle(supervisor),
-    do: FastestMCP.OperationResult.capture(fn -> execute_handle(supervisor) end, :value)
-
-  @doc "Raising variant of `handle/1`."
-  def handle!(supervisor), do: FastestMCP.OperationResult.unwrap!(handle(supervisor))
-
-  @doc "Runs `list_tools` and returns a tagged result."
-  def list_tools(group, opts \\ []),
-    do: FastestMCP.OperationResult.capture(fn -> execute_list_tools(group, opts) end, :value)
-
-  @doc "Raising variant of `list_tools/2`."
-  def list_tools!(group, opts \\ []),
-    do: FastestMCP.OperationResult.unwrap!(list_tools(group, opts))
-
-  @doc "Runs `protocol_versions` and returns a tagged result."
-  def protocol_versions(group),
-    do: FastestMCP.OperationResult.capture(fn -> execute_protocol_versions(group) end, :value)
-
-  @doc "Raising variant of `protocol_versions/1`."
-  def protocol_versions!(group), do: FastestMCP.OperationResult.unwrap!(protocol_versions(group))
-
-  @doc "Runs `resolve_tool` and returns a tagged result."
-  def resolve_tool(group, name, opts \\ []),
-    do:
-      FastestMCP.OperationResult.capture(
-        fn -> execute_resolve_tool(group, name, opts) end,
-        :value
-      )
-
-  @doc "Raising variant of `resolve_tool/3`."
-  def resolve_tool!(group, name, opts \\ []),
-    do: FastestMCP.OperationResult.unwrap!(resolve_tool(group, name, opts))
-
-  @doc "Runs `start_tool_result` and returns a tagged result."
-  def start_tool_result(group, name, arguments \\ %{}, opts \\ []),
-    do:
-      FastestMCP.OperationResult.capture(
-        fn -> execute_start_tool_result(group, name, arguments, opts) end,
-        :value
-      )
-
-  @doc "Raising variant of `start_tool_result/4`."
-  def start_tool_result!(group, name, arguments \\ %{}, opts \\ []),
-    do: FastestMCP.OperationResult.unwrap!(start_tool_result(group, name, arguments, opts))
-
-  @deprecated "Use call_tool/4."
-  def call_tool_result(group, name, arguments \\ %{}, opts \\ []),
-    do: call_tool(group, name, arguments, opts)
 end
 
 defmodule FastestMCP.ClientGroup.Members do

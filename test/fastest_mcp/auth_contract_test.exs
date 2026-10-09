@@ -1,5 +1,5 @@
 defmodule FastestMCP.AuthContractTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   import Plug.Conn
   import Plug.Test
@@ -86,18 +86,16 @@ defmodule FastestMCP.AuthContractTest do
   test "module authenticator enriches context for direct calls and rejects invalid credentials" do
     server_name = "auth-direct-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_auth(StaticProvider, token: "secret-token")
-      |> FastestMCP.add_tool("whoami", fn _args, ctx ->
-        %{
-          principal: ctx.principal,
-          auth: ctx.auth,
-          capabilities: ctx.capabilities
-        }
-      end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_auth(StaticProvider, token: "secret-token")
+    |> FastestMCP.add_tool("whoami", fn _args, ctx ->
+      %{
+        principal: ctx.principal,
+        auth: ctx.auth,
+        capabilities: ctx.capabilities
+      }
+    end)
+    |> start_server!()
 
     assert %{
              principal: %{"sub" => "user-123"},
@@ -119,29 +117,27 @@ defmodule FastestMCP.AuthContractTest do
   test "function authenticator works for direct calls" do
     server_name = "auth-function-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_auth(fn input, _ctx ->
-        if input["token"] == "function-token" do
-          {:ok,
-           %{
-             principal: %{"sub" => "function-user"},
-             auth: %{provider: :function},
-             capabilities: ["tools:call"]
-           }}
-        else
-          {:error, :unauthorized}
-        end
-      end)
-      |> FastestMCP.add_tool("whoami", fn _args, ctx ->
-        %{
-          principal: ctx.principal,
-          auth: ctx.auth,
-          capabilities: ctx.capabilities
-        }
-      end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_auth(fn input, _ctx ->
+      if input["token"] == "function-token" do
+        {:ok,
+         %{
+           principal: %{"sub" => "function-user"},
+           auth: %{provider: :function},
+           capabilities: ["tools:call"]
+         }}
+      else
+        {:error, :unauthorized}
+      end
+    end)
+    |> FastestMCP.add_tool("whoami", fn _args, ctx ->
+      %{
+        principal: ctx.principal,
+        auth: ctx.auth,
+        capabilities: ctx.capabilities
+      }
+    end)
+    |> start_server!()
 
     assert %{
              principal: %{"sub" => "function-user"},
@@ -156,23 +152,21 @@ defmodule FastestMCP.AuthContractTest do
   test "static token auth works for direct, stdio, and HTTP calls" do
     server_name = "auth-static-token-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_auth(FastestMCP.Auth.StaticToken,
-        tokens: %{
-          "valid-token" => %{
-            client_id: "service-a",
-            scopes: ["tools:call", "resources:read"],
-            principal: %{"sub" => "service-a"}
-          }
-        },
-        required_scopes: ["tools:call"]
-      )
-      |> FastestMCP.add_tool("whoami", fn _args, ctx ->
-        %{principal: ctx.principal, auth: ctx.auth, capabilities: ctx.capabilities}
-      end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_auth(FastestMCP.Auth.StaticToken,
+      tokens: %{
+        "valid-token" => %{
+          client_id: "service-a",
+          scopes: ["tools:call", "resources:read"],
+          principal: %{"sub" => "service-a"}
+        }
+      },
+      required_scopes: ["tools:call"]
+    )
+    |> FastestMCP.add_tool("whoami", fn _args, ctx ->
+      %{principal: ctx.principal, auth: ctx.auth, capabilities: ctx.capabilities}
+    end)
+    |> start_server!()
 
     assert %{
              principal: %{"sub" => "service-a"},
@@ -230,15 +224,14 @@ defmodule FastestMCP.AuthContractTest do
   test "HTTP auth errors use bearer challenges without protected-resource metadata" do
     server_name = "auth-http-errors-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_auth(FastestMCP.Auth.StaticToken,
-        tokens: %{"valid-token" => %{client_id: "service-a", scopes: ["resources:read"]}},
-        required_scopes: ["tools:call"]
-      )
-      |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_auth(FastestMCP.Auth.StaticToken,
+      tokens: %{"valid-token" => %{client_id: "service-a", scopes: ["resources:read"]}},
+      required_scopes: ["tools:call"]
+    )
+    |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
     ProtocolTest.initialize_session(server_name, "auth-error-session")
 
     unauthorized_conn =
@@ -300,6 +293,11 @@ defmodule FastestMCP.AuthContractTest do
     invalid = %{error | details: %{missing_scopes: ["files:admin\n"]}}
     assert FastestMCP.Auth.validated_missing_scopes(invalid) == []
     refute FastestMCP.Auth.default_www_authenticate(invalid) =~ "scope="
+
+    multiline = %Error{code: :unauthorized, message: ~s(bad "token"\r\nInjected: header)}
+
+    assert FastestMCP.Auth.default_www_authenticate(multiline) ==
+             ~s(Bearer error="invalid_token", error_description="bad \\"token\\"  Injected: header")
   end
 
   test "component scope denial includes exact missing scopes without protected-resource metadata" do
@@ -315,13 +313,11 @@ defmodule FastestMCP.AuthContractTest do
        }}
     end
 
-    server =
-      FastestMCP.server(server_name, auth: authenticator)
-      |> FastestMCP.add_tool("admin", fn -> "secret" end,
-        auth: FastestMCP.Authorization.require_scopes(["files:write", "files:admin"])
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    FastestMCP.server(server_name, auth: authenticator)
+    |> FastestMCP.add_tool("admin", fn -> "secret" end,
+      auth: FastestMCP.Authorization.require_scopes(["files:write", "files:admin"])
+    )
+    |> start_server!()
 
     response =
       ProtocolTest.modern_http_request(
@@ -348,28 +344,26 @@ defmodule FastestMCP.AuthContractTest do
   test "from_assign supports direct auth input" do
     server_name = "auth-assign-direct-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_auth(
-        FastestMCP.Auth.from_assign(:current_user,
-          principal: fn user -> %{"sub" => to_string(user.id)} end,
-          capabilities: fn user -> user.scopes end,
-          scopes: fn user -> user.scopes end,
-          audiences: fn user -> user.audiences end,
-          auth: fn user -> %{source: :phoenix, user_id: user.id} end
-        )
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_auth(
+      FastestMCP.Auth.from_assign(:current_user,
+        principal: fn user -> %{"sub" => to_string(user.id)} end,
+        capabilities: fn user -> user.scopes end,
+        scopes: fn user -> user.scopes end,
+        audiences: fn user -> user.audiences end,
+        auth: fn user -> %{source: :phoenix, user_id: user.id} end
       )
-      |> FastestMCP.add_tool("whoami", fn _args, ctx ->
-        %{
-          principal: ctx.principal,
-          auth: ctx.auth,
-          capabilities: ctx.capabilities,
-          verified_scopes: ctx.verified_scopes,
-          verified_audiences: ctx.verified_audiences
-        }
-      end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    )
+    |> FastestMCP.add_tool("whoami", fn _args, ctx ->
+      %{
+        principal: ctx.principal,
+        auth: ctx.auth,
+        capabilities: ctx.capabilities,
+        verified_scopes: ctx.verified_scopes,
+        verified_audiences: ctx.verified_audiences
+      }
+    end)
+    |> start_server!()
 
     assert %{
              principal: %{"sub" => "123"},
@@ -423,7 +417,7 @@ defmodule FastestMCP.AuthContractTest do
         }
       end)
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    start_server!(server)
     ProtocolTest.initialize_session(server_name, "auth-assign-session")
 
     conn =
@@ -483,12 +477,10 @@ defmodule FastestMCP.AuthContractTest do
   test "stdio and HTTP transports pass auth input into the shared authenticator" do
     server_name = "auth-transport-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_auth(StaticProvider, token: "secret-token")
-      |> FastestMCP.add_tool("whoami", fn _args, ctx -> ctx.principal end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_auth(StaticProvider, token: "secret-token")
+    |> FastestMCP.add_tool("whoami", fn _args, ctx -> ctx.principal end)
+    |> start_server!()
 
     auth_input = %{"token" => "secret-token"}
 

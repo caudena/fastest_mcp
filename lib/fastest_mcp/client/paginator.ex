@@ -22,7 +22,6 @@ defmodule FastestMCP.Client.Paginator do
     end
   end
 
-  @doc false
   @spec fetch_all_with_meta(
           (String.t() | nil -> {:ok, page()} | {:error, term()}),
           keyword()

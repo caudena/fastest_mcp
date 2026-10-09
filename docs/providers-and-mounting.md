@@ -256,6 +256,26 @@ server =
 This is useful when you want local skills to become discoverable through MCP
 resource reads without hand-registering each file.
 
+For an agent's conventional skill folders, use the vendor shorthand:
+
+| Vendor | Roots |
+| --- | --- |
+| `:claude` | `~/.claude/skills` |
+| `:codex` | `/etc/codex/skills`, then `~/.codex/skills` |
+| `:copilot`, `:vscode` | `~/.copilot/skills` |
+| `:cursor` | `~/.cursor/skills` |
+| `:gemini` | `~/.gemini/skills` |
+| `:goose` | `~/.config/agents/skills` |
+| `:opencode` | `~/.config/opencode/skills` |
+
+```elixir
+provider = FastestMCP.Providers.Skills.vendor(:codex, reload: true)
+```
+
+Earlier roots win when skill names collide. `:home` replaces the home directory
+and `:system_root` the Codex system root; other options, such as `reload:`,
+configure the directory provider as above.
+
 Skill roots are canonicalized before discovery. A main or supporting file is
 rejected if its resolved path leaves the owning root. With `reload: true`, the
 runtime activates a metadata-keyed cache and re-reads/re-hashes only files whose
@@ -270,47 +290,64 @@ fallback. Discovery, reload caching, and safe path resolution are unchanged.
 
 When components come from somewhere else entirely, write a custom provider.
 
-A provider must implement at least one component listing or lookup callback:
+A provider is a struct whose module calls `use FastestMCP.Provider` and
+implements `list_components/3`. The other callbacks have overridable defaults:
 
-- `list_components/3`
-- `get_component_candidates/4`
-- `get_component/4`
-- `get_resource_target_candidates/3`
-- `get_resource_target/3`
+- `get_component_candidates/4` resolves an exact lookup and
+  `get_resource_target_candidates/3` resolves a resource read; both default to
+  searching `list_components/3`
+- `provider_type/1` returns a label, by default the last segment of the module
+  name (currently used in the delegate spans of mounted servers)
+- `activate_runtime/1` and `deactivate_runtime/1` run when the owning server
+  starts and stops; `activate_runtime/1` returns `{:ok, provider}` or
+  `{:error, reason}`, and the defaults leave the provider unchanged
+- `http_routes/1` and `required_extensions/1` contribute HTTP routes and
+  extension declarations; both default to none. Extension requirements pass
+  through provider transforms and mounts. See
+  [Provider-bundled extensions](extensions.md#provider-bundled-extensions) for
+  opt-in registration and explicit root conflict resolution.
 
-Optional `http_routes/1` and `required_extensions/1` callbacks contribute HTTP
-routes and extension declarations. Extension requirements pass through provider
-transforms and mounts. See [Provider-bundled extensions](extensions.md#provider-bundled-extensions)
-for opt-in registration and explicit root conflict resolution.
+Override the candidate callbacks when the source can resolve one identifier
+without enumerating everything, so an exact lookup does not list the provider.
+Return every matching version; FastestMCP applies provider transforms once,
+then chooses the highest candidate that remains visible and authorized.
 
-Candidate callbacks are the preferred exact-lookup interface for versioned
-providers. Return every matching version; FastestMCP applies provider transforms
-once, then chooses the highest candidate that remains visible and authorized.
-Legacy single-result callbacks remain supported and are authoritative, so an
-exact lookup does not also enumerate the provider. A provider that implements
-only `list_components/3` uses the generic all-version fallback. Implement a
-candidate callback whenever an exact lookup must expose multiple versions.
+`list_component_page/5` defaults to `nil`, which lists the provider with
+`list_components/3`. Override it to serve bounded, key-ordered pages to wire
+list operations (see [Pagination](pagination.md)); a provider with transforms
+is always listed with `list_components/3`.
 
 Example:
 
 ```elixir
 defmodule MyApp.CountingProvider do
+  use FastestMCP.Provider
+
   defstruct [:tool]
 
+  @impl FastestMCP.Provider
   def list_components(%__MODULE__{tool: tool}, :tool, _operation), do: [tool]
   def list_components(%__MODULE__{}, _component_type, _operation), do: []
 
-  def get_component(%__MODULE__{tool: tool}, :tool, "dynamic_echo", _operation), do: tool
-  def get_component(%__MODULE__{}, _component_type, _identifier, _operation), do: nil
+  @impl FastestMCP.Provider
+  def get_component_candidates(%__MODULE__{tool: tool}, :tool, "dynamic_echo", _operation),
+    do: [tool]
+
+  def get_component_candidates(%__MODULE__{}, _component_type, _identifier, _operation),
+    do: []
 end
 ```
 
-Then:
+Build the components a provider returns with `FastestMCP.Components.Tool.new/3`
+(or `Resource.new/3`, `ResourceTemplate.new/3`, `Prompt.new/3`), which take
+the same handler and options as `FastestMCP.add_tool/4` and its siblings:
 
 ```elixir
+tool = FastestMCP.Components.Tool.new("dynamic_echo", fn arguments, _ctx -> arguments end)
+
 server =
   FastestMCP.server("providers")
-  |> FastestMCP.add_provider(%MyApp.CountingProvider{tool: my_tool})
+  |> FastestMCP.add_provider(%MyApp.CountingProvider{tool: tool})
 ```
 
 Use a custom provider when your components come from a database, config store,

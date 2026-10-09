@@ -3,7 +3,6 @@ defmodule FastestMCP.Protocol.Progress do
 
   @type supplied_total :: :absent | {:provided, number() | term()}
 
-  @doc false
   @spec total(map()) :: supplied_total()
   def total(params) when is_map(params) do
     cond do
@@ -19,7 +18,6 @@ defmodule FastestMCP.Protocol.Progress do
       else: :absent
   end
 
-  @doc false
   @spec validate_update(term(), term(), supplied_total(), term()) ::
           {:ok, number() | nil} | {:error, atom()}
   def validate_update(progress, previous, total, previous_total) do

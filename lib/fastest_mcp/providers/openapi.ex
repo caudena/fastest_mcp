@@ -1,14 +1,9 @@
 defmodule FastestMCP.Providers.OpenAPI do
-  @behaviour FastestMCP.Provider
-  @moduledoc """
-  OpenAPI-backed dynamic tool provider.
+  @moduledoc false
 
-  The public API stays Plug/BEAM-friendly:
+  use FastestMCP.Provider
 
-  - pass an OpenAPI spec map
-  - optionally pass a `:requester` callback for tests or custom HTTP transport
-  - otherwise the provider uses `FastestMCP.HTTP.request/3`
-  """
+  import FastestMCP.Util, only: [maybe_put: 3, stringify_keys: 1]
 
   alias FastestMCP.ComponentCompiler
   alias FastestMCP.Error
@@ -41,7 +36,6 @@ defmodule FastestMCP.Providers.OpenAPI do
     tools: []
   ]
 
-  @doc "Builds a new value for this module from the supplied options."
   def new(opts) when is_list(opts) do
     schema_options = normalize_schema_options!(Keyword.get(opts, :schema_options, []))
 
@@ -75,11 +69,9 @@ defmodule FastestMCP.Providers.OpenAPI do
     %{provider | tools: build_tools(provider)}
   end
 
-  @doc "Returns the provider type label."
   @impl FastestMCP.Provider
   def provider_type(%__MODULE__{}), do: "OpenAPIProvider"
 
-  @doc "Lists the components exposed by this module."
   @impl FastestMCP.Provider
   def list_components(%__MODULE__{} = provider, :tool, _operation), do: provider.tools
   def list_components(%__MODULE__{}, _component_type, _operation), do: []
@@ -152,7 +144,6 @@ defmodule FastestMCP.Providers.OpenAPI do
 
     ComponentCompiler.compile(
       :tool,
-      provider.name,
       operation_name(method, path, operation),
       fn arguments, _context -> execute_operation(plan, arguments || %{}) end,
       description: operation_description(operation),
@@ -818,9 +809,6 @@ defmodule FastestMCP.Providers.OpenAPI do
   defp maybe_put_map(value, _key, _value) when not is_map(value), do: value
   defp maybe_put_map(map, key, value), do: Map.put(map, key, value)
 
-  defp maybe_put(keyword, _key, nil), do: keyword
-  defp maybe_put(keyword, key, value), do: Keyword.put(keyword, key, value)
-
   defp first_server_url(spec) do
     spec
     |> get_in(["servers"])
@@ -885,18 +873,6 @@ defmodule FastestMCP.Providers.OpenAPI do
   end
 
   defp multipart_fields(body, _encoding), do: body
-
-  defp stringify_keys(%_{} = struct), do: stringify_keys(Map.from_struct(struct))
-
-  defp stringify_keys(value) when is_map(value) do
-    Enum.into(value, %{}, fn {key, child} -> {to_string(key), stringify_keys(child)} end)
-  end
-
-  defp stringify_keys(value) when is_list(value) do
-    Enum.map(value, &stringify_keys/1)
-  end
-
-  defp stringify_keys(value), do: value
 
   defp normalize_schema_options!(options) when is_list(options) do
     if Keyword.keyword?(options) do

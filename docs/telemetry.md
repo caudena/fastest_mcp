@@ -41,12 +41,15 @@ handler_id = "fastest-mcp-docs"
 ```
 
 The metadata includes fields such as the MCP method and server name, which is
-usually enough to build metrics and dashboards.
+usually enough to build metrics and dashboards. An operation that ends in an
+error, whether raised by a handler or returned by middleware, emits
+`[:fastest_mcp, :operation, :exception]` with the error `:code` and message
+`:error` added to the metadata.
 
 ## OpenTelemetry Spans
 
 FastestMCP creates SERVER spans around operations, INTERNAL spans around
-provider delegation, and CLIENT spans around connected-client operations.
+mounted-server delegation, and CLIENT spans around connected-client operations.
 
 That is useful when you want traces that connect:
 
@@ -76,16 +79,18 @@ so the immediate MCP client span remains the remote server span's parent.
 
 FastestMCP already handles:
 
-- span naming from MCP method and component type
+- span names of the MCP method and its target, such as `tools/call echo`
 - attributes for server name, MCP method, component key, transport, session,
   request id, and GenAI/MCP semantic fields
 - exception recording on failed spans
 - trace context extraction and injection
 - client cache-hit, pagination, task-poll, and task-status annotations
-- generic error status for tool results carrying `isError: true`
+- generic error status on client spans for tool results carrying `isError: true`
 
-Resource URIs are recorded as attributes rather than embedded in span names, so
-high-cardinality resource values do not fragment trace dashboards. Failed spans
+Server spans record resource URIs as attributes rather than in the span name
+(`resources/read`), so high-cardinality resource values do not fragment trace
+dashboards; client spans are named after the method and its target, URI
+included. Failed spans
 also include `error.type`, and nil attributes are dropped before they reach the
 OpenTelemetry exporter.
 

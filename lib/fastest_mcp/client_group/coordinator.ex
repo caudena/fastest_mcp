@@ -1,7 +1,11 @@
 defmodule FastestMCP.ClientGroup.Coordinator do
   @moduledoc false
+  # Pins a group's members and owns its routing catalog. A catalog load runs
+  # in a task; refresh callers join the running load, and a caller asking for
+  # a stronger refresh than the running load gets one follow-up load.
   use GenServer
-  alias FastestMCP.{Client, Error}
+  alias FastestMCP.{Deadline, Error}
+  alias FastestMCP.Client.{Catalog, Connection}
   alias FastestMCP.ClientGroup.Members
 
   def start_link({_supervisor, opts} = args),
@@ -33,7 +37,7 @@ defmodule FastestMCP.ClientGroup.Coordinator do
         member_supervisor: child_pid(children, Members)
       })
 
-    case capture(fn -> resolve_members(state, true) end) do
+    case resolve_members(state, true) do
       {:ok, members} -> {:noreply, install_members(state, members)}
       {:error, error} -> {:noreply, %{state | startup_error: error}}
     end
@@ -90,15 +94,13 @@ defmodule FastestMCP.ClientGroup.Coordinator do
   end
 
   defp launch_refresh(state, waiters, opts, explicit?) do
-    case capture(fn -> resolve_members(state, explicit?) end) do
+    case resolve_members(state, explicit?) do
       {:ok, members} ->
-        deadline = FastestMCP.Deadline.from_options(opts, 10_000)
+        deadline = Deadline.from_options(opts, 10_000)
 
         task =
           Task.Supervisor.async_nolink(state.tasks, fn ->
-            capture(fn ->
-              load_catalog(members, state.tasks, state.concurrency, opts, deadline)
-            end)
+            load_catalog(members, state.tasks, state.concurrency, opts, deadline)
           end)
 
         {:noreply,
@@ -137,20 +139,7 @@ defmodule FastestMCP.ClientGroup.Coordinator do
         {:ok, %{routes: routes, tools: tools}} ->
           Enum.each(load.waiters, fn {from, request, monitor} ->
             Process.demonitor(monitor, [:flush])
-
-            reply =
-              case request do
-                :list ->
-                  {:ok, tools}
-
-                {:route, name} ->
-                  case Map.fetch(routes, name) do
-                    {:ok, route} -> {:ok, route}
-                    :error -> {:error, unknown_tool(name)}
-                  end
-              end
-
-            GenServer.reply(from, reply)
+            GenServer.reply(from, reply(request, routes, tools))
           end)
 
           state
@@ -166,11 +155,10 @@ defmodule FastestMCP.ClientGroup.Coordinator do
   end
 
   def handle_info({:DOWN, ref, :process, _, reason}, %{load: %{task: %{ref: ref}} = load} = state) do
-    reply_error(load.waiters, %Error{
-      code: :internal_error,
-      message: "client group catalog worker failed",
-      details: %{reason: inspect(reason)}
-    })
+    reply_error(
+      load.waiters,
+      Error.internal("client group catalog worker failed", %{reason: inspect(reason)})
+    )
 
     {:noreply, %{state | load: nil}}
   end
@@ -201,106 +189,141 @@ defmodule FastestMCP.ClientGroup.Coordinator do
   def terminate(_, %{load: nil}), do: :ok
   def terminate(_, state), do: Task.shutdown(state.load.task, :brutal_kill)
 
+  defp reply(:list, _routes, tools), do: {:ok, tools}
+
+  defp reply({:route, name}, routes, _tools),
+    do: with(:error <- Map.fetch(routes, name), do: {:error, unknown_tool(name)})
+
+  ## Catalog loads
+
   defp load_catalog(members, supervisor, concurrency, opts, deadline) do
-    snapshots =
-      Task.Supervisor.async_stream_nolink(
-        supervisor,
-        Enum.sort(members),
-        fn {name, client} ->
-          capture(fn ->
-            remaining = deadline - System.monotonic_time(:millisecond)
-
-            if remaining <= 0,
-              do: raise(Error, code: :timeout, message: "client group catalog timed out")
-
-            {name, Client.catalog_snapshot!(client, Keyword.put(opts, :timeout_ms, remaining))}
-          end)
-        end,
-        max_concurrency: concurrency,
-        timeout: max(deadline - System.monotonic_time(:millisecond), 1),
-        on_timeout: :kill_task
-      )
-      |> Enum.map(fn
-        {:ok, {:ok, snapshot}} ->
-          snapshot
-
-        {:ok, {:error, error}} ->
-          raise error
-
-        {:exit, :timeout} ->
-          raise Error, code: :timeout, message: "client group catalog timed out"
-
-        {:exit, reason} ->
-          raise Error,
-            code: :internal_error,
-            message: "client group member catalog failed",
-            details: %{reason: inspect(reason)}
-      end)
-
-    {routes, tools} =
-      Enum.reduce(snapshots, {%{}, []}, fn {alias_name, snapshot}, acc ->
-        revision = Client.catalog_revision!(snapshot.client)
-
-        unless revision.ready? and revision.generation == snapshot.generation do
-          raise Error,
-            code: :invalid_request,
-            message: "client catalog changed during group discovery; refresh again"
-        end
-
-        Enum.reduce(snapshot.tools, acc, fn tool, {routes, tools} ->
-          name = alias_name <> "_" <> tool["name"]
-
-          route = %{
-            server_name: alias_name,
-            upstream_name: tool["name"],
-            client: snapshot.client,
-            generation: snapshot.generation
-          }
-
-          case Map.get(routes, name) do
-            nil ->
-              :ok
-
-            ^route ->
-              :ok
-
-            _different_member ->
-              raise Error,
-                code: :invalid_request,
-                message: "client group tool name collision: #{inspect(name)}"
-          end
-
-          {Map.put(routes, name, route), [Map.put(tool, "name", name) | tools]}
-        end)
-      end)
-
-    %{routes: routes, tools: Enum.reverse(tools)}
+    with {:ok, timeout} <- Deadline.check(deadline, "client group catalog"),
+         {:ok, snapshots} <- snapshots(members, supervisor, concurrency, opts, deadline, timeout),
+         :ok <- check_generations(snapshots),
+         do: routes(snapshots)
   end
+
+  # Member snapshots in alias order, or the first failure.
+  defp snapshots(members, supervisor, concurrency, opts, deadline, timeout) do
+    supervisor
+    |> Task.Supervisor.async_stream_nolink(
+      Enum.sort(members),
+      &snapshot(&1, opts, deadline),
+      max_concurrency: concurrency,
+      timeout: timeout,
+      on_timeout: :kill_task
+    )
+    |> Enum.reduce_while({:ok, []}, fn
+      {:ok, {:ok, snapshot}}, {:ok, snapshots} ->
+        {:cont, {:ok, [snapshot | snapshots]}}
+
+      {:ok, error}, _snapshots ->
+        {:halt, error}
+
+      {:exit, :timeout}, _snapshots ->
+        {:halt, {:error, Error.timeout("client group catalog")}}
+
+      {:exit, reason}, _snapshots ->
+        {:halt,
+         {:error,
+          Error.internal("client group member catalog failed", %{reason: inspect(reason)})}}
+    end)
+    |> case do
+      {:ok, snapshots} -> {:ok, Enum.reverse(snapshots)}
+      error -> error
+    end
+  end
+
+  defp snapshot({name, client}, opts, deadline) do
+    with {:ok, remaining} <- Deadline.check(deadline, "client group catalog"),
+         {:ok, snapshot} <-
+           Catalog.snapshot(client, Keyword.put(opts, :timeout_ms, remaining)),
+         do: {:ok, {name, snapshot}}
+  end
+
+  # A member whose catalog changed while the group loaded fails the load.
+  defp check_generations(snapshots) do
+    Enum.find_value(snapshots, :ok, fn {_name, snapshot} ->
+      case Catalog.revision(snapshot.client) do
+        {:ok, %{ready?: true, generation: generation}} when generation == snapshot.generation ->
+          nil
+
+        {:ok, _changed} ->
+          {:error,
+           %Error{
+             code: :invalid_request,
+             message: "client catalog changed during group discovery; refresh again"
+           }}
+
+        error ->
+          error
+      end
+    end)
+  end
+
+  # Versions of one member tool share a route; two routes under one public
+  # name are a collision.
+  defp routes(snapshots) do
+    entries =
+      for {alias_name, snapshot} <- snapshots, tool <- snapshot.tools do
+        name = alias_name <> "_" <> tool["name"]
+
+        route = %{
+          server_name: alias_name,
+          upstream_name: tool["name"],
+          client: snapshot.client,
+          generation: snapshot.generation
+        }
+
+        {{name, route}, Map.put(tool, "name", name)}
+      end
+
+    routes = entries |> Enum.map(&elem(&1, 0)) |> Enum.uniq()
+
+    case routes -- Enum.uniq_by(routes, &elem(&1, 0)) do
+      [] ->
+        {:ok, %{routes: Map.new(routes), tools: Enum.map(entries, &elem(&1, 1))}}
+
+      [{name, _route} | _collisions] ->
+        {:error,
+         %Error{
+           code: :invalid_request,
+           message: "client group tool name collision: #{inspect(name)}"
+         }}
+    end
+  end
+
+  ## Members
 
   defp resolve_members(state, explicit?) do
     children = Supervisor.which_children(state.member_supervisor)
 
-    Map.new(state.configs, fn
-      {name, {:existing, ref}} ->
-        client =
-          if explicit? or not Map.has_key?(state.members, name),
-            do: Client.pin!(ref),
-            else: Client.pin!(state.members[name])
-
-        {name, client}
-
-      {name, _opts} ->
-        pid = child_pid(children, {:client, name})
-
-        unless is_pid(pid),
-          do:
-            raise(Error,
-              code: :not_found,
-              message: "client group member #{inspect(name)} is unavailable"
-            )
-
-        {name, Client.pin!(pid)}
+    Enum.reduce_while(state.configs, {:ok, %{}}, fn {name, config}, {:ok, members} ->
+      case pin(state, children, name, config, explicit?) do
+        {:ok, client} -> {:cont, {:ok, Map.put(members, name, client)}}
+        error -> {:halt, error}
+      end
     end)
+  end
+
+  # A borrowed client is resolved by its reference again only on an explicit
+  # refresh.
+  defp pin(state, _children, name, {:existing, ref}, explicit?) do
+    case state.members do
+      %{^name => client} when not explicit? -> Connection.pin(client)
+      _members -> Connection.pin(ref)
+    end
+  end
+
+  defp pin(_state, children, name, _opts, _explicit?) do
+    case child_pid(children, {:client, name}) do
+      nil ->
+        {:error,
+         %Error{code: :not_found, message: "client group member #{inspect(name)} is unavailable"}}
+
+      pid ->
+        Connection.pin(pid)
+    end
   end
 
   defp install_members(state, members) do
@@ -329,15 +352,6 @@ defmodule FastestMCP.ClientGroup.Coordinator do
       :bypass -> 2
       _ -> 0
     end
-  end
-
-  defp capture(fun) do
-    {:ok, fun.()}
-  rescue
-    error -> {:error, error}
-  catch
-    :exit, _ ->
-      {:error, %Error{code: :internal_error, message: "client group member is unavailable"}}
   end
 
   defp reply_error(waiters, error) do

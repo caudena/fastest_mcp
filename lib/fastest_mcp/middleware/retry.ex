@@ -1,15 +1,5 @@
 defmodule FastestMCP.Middleware.Retry do
-  @moduledoc """
-  Middleware that retries transient failures with exponential backoff.
-
-  Middleware modules in FastestMCP are configured as explicit structs that
-  carry immutable configuration. Dispatch calls the module with that configuration;
-  runtime state is owned separately by the server.
-
-  Most applications reach this module through `FastestMCP.Middleware` helper
-  functions or by adding the configured struct directly with
-  `FastestMCP.Server.add_middleware/2`.
-  """
+  @moduledoc false
 
   require Logger
 
@@ -38,7 +28,6 @@ defmodule FastestMCP.Middleware.Retry do
           retry_exceptions: [module()]
         }
 
-  @doc "Builds a new value for this module from the supplied options."
   def new(opts \\ []) do
     middleware = %__MODULE__{
       logger: Keyword.get(opts, :logger, &Logger.warning/1),
@@ -53,70 +42,46 @@ defmodule FastestMCP.Middleware.Retry do
     middleware
   end
 
-  @doc "Runs the middleware around the next operation."
   @impl FastestMCP.Middleware
   def call(%__MODULE__{} = middleware, %Operation{} = operation, next)
       when is_function(next, 1) do
-    do_call(middleware, operation, next, 0)
+    retry(middleware, operation, next, 0)
   end
 
-  @doc "Returns whether the given error should be retried."
-  def should_retry?(%__MODULE__{} = middleware, %Error{code: code, details: details}) do
+  # An error is retried when its code is in `:retry_codes`, or when it wraps an
+  # exception (a component crash or an unexpected middleware exception) whose
+  # module is in `:retry_exceptions`.
+  def should_retry?(%__MODULE__{} = middleware, %Error{code: code} = error) do
+    kind = Error.detail(error, :kind)
+
     code in middleware.retry_codes or
-      retryable_component_crash?(details, middleware.retry_exceptions)
+      Enum.any?(middleware.retry_exceptions, &(inspect(&1) == kind))
   end
 
-  def should_retry?(%__MODULE__{} = middleware, error) do
-    Enum.any?(middleware.retry_exceptions, &match_exception_kind?(error, &1))
-  end
-
-  @doc "Calculates the retry delay for the given attempt."
   def calculate_delay(%__MODULE__{} = middleware, attempt) when attempt >= 0 do
     delay = middleware.base_delay * :math.pow(middleware.backoff_multiplier, attempt)
     min(delay, middleware.max_delay)
   end
 
-  defp do_call(middleware, operation, next, attempt) do
-    next.(operation)
-  rescue
-    error ->
-      stacktrace = __STACKTRACE__
-
+  defp retry(middleware, operation, next, attempt) do
+    with {:error, error} <- next.(operation) do
       if attempt < middleware.max_retries and should_retry?(middleware, error) do
         delay = calculate_delay(middleware, attempt)
 
         middleware.logger.(
           "Request #{operation.method || "unknown"} failed (attempt #{attempt + 1}/#{middleware.max_retries + 1}): " <>
-            "#{error_summary(error)}. Retrying in #{format_delay(delay)}s..."
+            "#{error.code}: #{error.message}. Retrying in #{format_delay(delay)}s..."
         )
 
         Process.sleep(max(1, round(delay * 1_000)))
-        do_call(middleware, operation, next, attempt + 1)
+        retry(middleware, operation, next, attempt + 1)
       else
-        reraise error, stacktrace
+        {:error, error}
       end
+    end
   end
-
-  defp retryable_component_crash?(details, retry_exceptions) when is_map(details) do
-    kind = Map.get(details, :kind) || Map.get(details, "kind")
-    Enum.any?(retry_exceptions, &(inspect(&1) == kind))
-  end
-
-  defp retryable_component_crash?(_details, _retry_exceptions), do: false
-
-  defp match_exception_kind?(%module{}, candidate), do: module == candidate
-  defp match_exception_kind?(_error, _candidate), do: false
-
-  defp error_summary(%Error{} = error), do: "#{error.code}: #{error.message}"
-  defp error_summary(error), do: "#{exception_name(error)}: #{Exception.message(error)}"
 
   defp format_delay(delay) do
     :erlang.float_to_binary(delay, decimals: 3)
-  end
-
-  defp exception_name(%module{}) do
-    module
-    |> inspect()
-    |> String.trim_leading("Elixir.")
   end
 end

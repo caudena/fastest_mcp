@@ -1,7 +1,8 @@
 defmodule FastestMCP.URLElicitationTest do
-  use ExUnit.Case, async: true
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Elicitation.URL
+  alias FastestMCP.Protocol.Schema, as: ProtocolSchema
   alias FastestMCP.Schema
   alias FastestMCP.Transport.JSONRPC
 
@@ -143,7 +144,9 @@ defmodule FastestMCP.URLElicitationTest do
              }
            }
 
-    compiled = Schema.compile_protocol_definition!("2025-11-25", "URLElicitationRequiredError")
+    assert {:ok, compiled} =
+             ProtocolSchema.compile_definition("2025-11-25", "URLElicitationRequiredError")
+
     assert {:ok, ^response} = Schema.validate(compiled, response)
   end
 end

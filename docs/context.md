@@ -15,7 +15,7 @@ The normal shape is explicit arity-2 handlers:
 server =
   FastestMCP.server("context")
   |> FastestMCP.add_tool("process_file", fn %{"file_uri" => file_uri}, ctx ->
-    :ok = FastestMCP.Context.info(ctx, "Processing #{file_uri}")
+    FastestMCP.Context.info(ctx, "Processing #{file_uri}")
 
     %{
       file_uri: file_uri,
@@ -27,7 +27,7 @@ server =
       "properties" => %{"file_uri" => %{"type" => "string"}},
       "required" => ["file_uri"]
     }
-  end)
+  )
 ```
 
 The same `%FastestMCP.Context{}` is passed to:
@@ -165,8 +165,9 @@ end)
 
 ## Client Metadata
 
-Clients can attach request-scoped metadata, and FastestMCP exposes it through
-`request_context.meta`.
+A connected client can attach request-scoped `_meta` to one call. A handler of
+that transport request finds it in the stored JSON-RPC envelope, under
+`request_context.meta`; direct in-process calls have no envelope.
 
 From the connected client:
 
@@ -181,11 +182,9 @@ Inside the handler:
 ```elixir
 FastestMCP.add_tool(server, "send_email", fn _arguments, ctx ->
   request = FastestMCP.Context.request_context(ctx)
+  meta = get_in(request.meta, ["jsonrpc_envelope", "params", "_meta"]) || %{}
 
-  %{
-    trace_id: request.meta["trace_id"],
-    user_id: request.meta["user_id"]
-  }
+  %{trace_id: meta["trace_id"], user_id: meta["user_id"]}
 end)
 ```
 
@@ -403,8 +402,8 @@ alias FastestMCP.Context
 server =
   FastestMCP.server("context")
   |> FastestMCP.add_tool("run", fn _arguments, ctx ->
-    :ok = Context.log(ctx, :info, "Starting work")
-    :ok = Context.debug(ctx, "Debug detail")
+    Context.log(ctx, :info, "Starting work")
+    Context.debug(ctx, "Debug detail")
     %{status: "ok"}
   end)
 ```
@@ -483,7 +482,11 @@ task capability.
 Protocol delivery helpers report failures explicitly. In particular,
 `Context.log/4`, `Context.report_progress/4`, and
 `Context.send_notification/3` can return delivery, lifecycle, rate, or state
-errors. Custom notifications cannot use reserved standard MCP method names.
+errors. `Context.log/4` and its level wrappers return `:ok` once the message is
+sent or queued, and `:filtered` below the session's level (default `info`, set
+by `logging/setLevel`) or, on `2026-07-28`, below the level the request carries
+in `io.modelcontextprotocol/logLevel` (a request without one gets no logs).
+Custom notifications cannot use reserved standard MCP method names.
 
 See:
 

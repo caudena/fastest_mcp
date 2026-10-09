@@ -6,8 +6,7 @@ pipeline, but the modern and legacy lifecycle envelopes stay distinct.
 
 ## Streamable HTTP
 
-The configured MCP endpoint is `/mcp` by default. It is the only built-in HTTP
-route:
+The configured MCP endpoint is `/mcp` by default. It is the only MCP route:
 
 - `POST /mcp` carries exactly one JSON-RPC request, notification, or response
 - `GET /mcp` opens the legacy session event stream
@@ -25,8 +24,10 @@ batch arrays are rejected. Accepted notifications and client responses receive
 `enable_get_streaming: false` returns `405 Method Not Allowed` for GET.
 
 There are no built-in `/health`, `/mcp/tools`, `/mcp/resources/read`, or other
-method-specific routes. Add application health endpoints or custom routes in
-the surrounding Plug/Phoenix router, outside the MCP endpoint.
+method-specific routes. The same app also serves the RFC 9728 metadata when the
+server sets `protected_resource:`, and the routes added with
+`FastestMCP.add_http_route/4`. Add application health endpoints there or in the
+surrounding Plug/Phoenix router.
 
 ### Modern request lifecycle (`2026-07-28`)
 
@@ -38,8 +39,10 @@ termination request. Standard `Mcp-Method`, `Mcp-Name`, and declared
 JSON-RPC body.
 
 Modern HTTP is POST-only: GET, DELETE, session replay, `Last-Event-ID`, and
-detached request work are not part of this profile. A POST can remain open as
-SSE for callbacks, progress/log notifications, or `subscriptions/listen`.
+detached request work are not part of this profile. A POST remains open as SSE
+when the request carries a progress token or a log level, and for
+`subscriptions/listen`; sampling, elicitation, and roots requests come back as
+`input_required` results instead.
 Closing that response stream cancels its request worker; reconnecting a modern
 listener creates a fresh `subscriptions/listen` request rather than replaying
 an old stream.
@@ -101,9 +104,12 @@ between requests in the same MCP session.
 ### Legacy bidirectional streams and replay (`2025-11-25`)
 
 Server-originated roots, sampling, elicitation, ping, task, progress, logging,
-and cancellation messages all pass through the session coordinator. A POST may
-switch to SSE when its handler originates a callback; a correlated client
-response sent in a later POST receives `202 Accepted` and resolves the waiter.
+and cancellation messages all pass through the session coordinator. A legacy
+POST request other than `initialize` is answered as an SSE stream from the
+start, carrying its callbacks, progress, and logs before the result (the
+transport option `json_response: true` answers with JSON instead); a
+correlated client response sent in a later POST receives `202 Accepted` and
+resolves the waiter.
 Each message is assigned to exactly one origin-affine POST or live GET sink.
 
 GET and POST SSE events are persisted before transmission. Each event uses an
@@ -115,9 +121,10 @@ from the current session whose retained event or stream was evicted receives
 `410 Gone`.
 
 Defaults retain 256 events and 4 MiB per stream for five minutes, with a 64 MiB
-runtime-wide replay limit. Configure those oldest-first bounds with
-`sse_replay_max_events:`, `sse_replay_max_stream_bytes:`,
-`sse_replay_max_total_bytes:`, and `sse_replay_ttl_ms:`. The built-in replay
+runtime-wide replay limit. Configure those oldest-first bounds with the server
+runtime options (`FastestMCP.start_server/2`) `sse_replay_max_events:`,
+`sse_replay_max_stream_bytes:`, `sse_replay_max_total_bytes:`, and
+`sse_replay_ttl_ms:`. The built-in replay
 store is process-local. A host that requires replay across process or node
 failure owns durable persistence and routing of a resumed session to that
 store.
@@ -137,15 +144,21 @@ session cannot cause an initialization loop.
 
 ## Plug Embedding
 
-`FastestMCP.http_app/2` returns a Plug-compatible app:
+`FastestMCP.http_app/2` returns the endpoint as a module plug,
+`{FastestMCP.Transport.HTTPApp, opts}`, for any Plug server:
 
 ```elixir
 children = [
   {Bandit,
    plug: FastestMCP.http_app(MyApp.MCPServer, allowed_hosts: :localhost),
-   port: 4100}
+   port: 4100,
+   ip: :loopback}
 ]
 ```
+
+From your own Plug code, run it with `Plug.run(conn, [app])`; in a router,
+forward to `FastestMCP.Transport.HTTPApp` with the same options plus
+`server_name:`.
 
 You can also run the transport child spec directly:
 

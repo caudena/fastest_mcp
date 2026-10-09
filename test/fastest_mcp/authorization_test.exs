@@ -1,5 +1,5 @@
 defmodule FastestMCP.AuthorizationTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Authorization
   alias FastestMCP.Context
@@ -29,7 +29,7 @@ defmodule FastestMCP.AuthorizationTest do
 
   test "require_scopes and restrict_tag behave like simple authorization checks" do
     component =
-      FastestMCP.ComponentCompiler.compile(:tool, "authz", "tool", fn -> :ok end, tags: ["admin"])
+      FastestMCP.ComponentCompiler.compile(:tool, "tool", fn -> :ok end, tags: ["admin"])
 
     context = %Authorization.Context{
       component: component,
@@ -57,7 +57,7 @@ defmodule FastestMCP.AuthorizationTest do
 
   test "authorization errors propagate while generic check failures are masked" do
     context = %Authorization.Context{
-      component: FastestMCP.ComponentCompiler.compile(:tool, "authz", "tool", fn -> :ok end, []),
+      component: FastestMCP.ComponentCompiler.compile(:tool, "tool", fn -> :ok end, []),
       authenticated: true,
       verified_scopes: ["read"],
       principal: %{"sub" => "user-123"},
@@ -89,7 +89,6 @@ defmodule FastestMCP.AuthorizationTest do
     component =
       FastestMCP.ComponentCompiler.compile(
         :resource_template,
-        "authz",
         "files://{+path}",
         fn args -> args end,
         auth: [
@@ -145,7 +144,7 @@ defmodule FastestMCP.AuthorizationTest do
 
   test "an opaque denial suppresses otherwise discoverable missing scope details" do
     component =
-      FastestMCP.ComponentCompiler.compile(:tool, "authz", "private", fn -> :ok end,
+      FastestMCP.ComponentCompiler.compile(:tool, "private", fn -> :ok end,
         auth: [Authorization.require_scopes("admin"), fn _context -> false end]
       )
 
@@ -179,23 +178,20 @@ defmodule FastestMCP.AuthorizationTest do
   test "component authorization filters list results and rejects direct calls" do
     server_name = "authz-component-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_auth(ScopeAuth)
-      |> FastestMCP.add_tool("public_tool", fn -> "public" end)
-      |> FastestMCP.add_tool("admin_tool", fn -> "admin" end,
-        auth: Authorization.require_scopes("admin")
-      )
-      |> FastestMCP.add_tool("tagged_tool", fn -> "tagged" end,
-        tags: ["admin"],
-        auth: Authorization.restrict_tag("admin", scopes: ["admin"])
-      )
-      |> FastestMCP.add_tool("custom_denial", fn -> "hidden" end,
-        auth: fn _ctx -> raise Authorization.Error, message: "need admin approval" end
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_auth(ScopeAuth)
+    |> FastestMCP.add_tool("public_tool", fn -> "public" end)
+    |> FastestMCP.add_tool("admin_tool", fn -> "admin" end,
+      auth: Authorization.require_scopes("admin")
+    )
+    |> FastestMCP.add_tool("tagged_tool", fn -> "tagged" end,
+      tags: ["admin"],
+      auth: Authorization.restrict_tag("admin", scopes: ["admin"])
+    )
+    |> FastestMCP.add_tool("custom_denial", fn -> "hidden" end,
+      auth: fn _ctx -> raise Authorization.Error, message: "need admin approval" end
+    )
+    |> start_server!()
 
     assert ["public_tool"] ==
              server_name
@@ -239,13 +235,10 @@ defmodule FastestMCP.AuthorizationTest do
         auth: Authorization.require_scopes("admin")
       )
 
-    parent =
-      FastestMCP.server(parent_name)
-      |> FastestMCP.add_auth(ScopeAuth)
-      |> FastestMCP.mount(child, namespace: "child")
-
-    assert {:ok, _pid} = FastestMCP.start_server(parent)
-    on_exit(fn -> FastestMCP.stop_server(parent_name) end)
+    FastestMCP.server(parent_name)
+    |> FastestMCP.add_auth(ScopeAuth)
+    |> FastestMCP.mount(child, namespace: "child")
+    |> start_server!()
 
     assert [] == FastestMCP.list_tools!(parent_name)
 
@@ -268,18 +261,15 @@ defmodule FastestMCP.AuthorizationTest do
   test "nested same-server calls preserve verified authorization evidence" do
     server_name = "authz-nested-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_auth(ScopeAuth)
-      |> FastestMCP.add_tool("inner", fn -> "authorized" end,
-        auth: Authorization.require_scopes("admin")
-      )
-      |> FastestMCP.add_tool("outer", fn _arguments, _context ->
-        FastestMCP.call_tool!(server_name, "inner", %{})
-      end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_auth(ScopeAuth)
+    |> FastestMCP.add_tool("inner", fn -> "authorized" end,
+      auth: Authorization.require_scopes("admin")
+    )
+    |> FastestMCP.add_tool("outer", fn _arguments, _context ->
+      FastestMCP.call_tool!(server_name, "inner", %{})
+    end)
+    |> start_server!()
 
     assert "authorized" ==
              FastestMCP.call_tool!(server_name, "outer", %{},

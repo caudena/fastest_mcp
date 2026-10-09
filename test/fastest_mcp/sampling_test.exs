@@ -1,5 +1,5 @@
 defmodule FastestMCP.SamplingTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Client
   alias FastestMCP.Context
@@ -44,36 +44,20 @@ defmodule FastestMCP.SamplingTest do
         %{text: response.text, raw: response.raw}
       end)
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
-    bandit =
-      start_supervised!(
-        {Bandit,
-         plug:
-           {FastestMCP.Transport.HTTPApp,
-            server_name: server_name,
-            path: "/mcp",
-            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
-         scheme: :http,
-         port: 0}
-      )
-
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+    %{url: url} =
+      start_http!(server_name, allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"])
 
     client =
-      Client.connect!(
-        "http://127.0.0.1:#{port}/mcp",
+      connect!(
+        url,
         protocol_version: "2025-11-25",
         sampling_handler: fn messages, params ->
           send(test_pid, {:sampling_seen, messages, params})
           sampling_result([%{"type" => "text", "text" => "summary"}])
         end
       )
-
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect!(client)
-    end)
 
     assert %{
              structured_content: %{
@@ -115,36 +99,20 @@ defmodule FastestMCP.SamplingTest do
         %{text: response.text}
       end)
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
-    bandit =
-      start_supervised!(
-        {Bandit,
-         plug:
-           {FastestMCP.Transport.HTTPApp,
-            server_name: server_name,
-            path: "/mcp",
-            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
-         scheme: :http,
-         port: 0}
-      )
-
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+    %{url: url} =
+      start_http!(server_name, allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"])
 
     client =
-      Client.connect!(
-        "http://127.0.0.1:#{port}/mcp",
+      connect!(
+        url,
         protocol_version: "2025-11-25",
         sampling_handler: fn messages, params ->
           send(test_pid, {:sampling_messages_seen, messages, params})
           sampling_result([%{"type" => "text", "text" => "ok"}])
         end
       )
-
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect!(client)
-    end)
 
     assert %{structured_content: %{"text" => "ok"}} = Client.call_tool!(client, "chat", %{})
 
@@ -200,8 +168,7 @@ defmodule FastestMCP.SamplingTest do
         ).text
       end)
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
     client =
       connect_client!(server_name,
@@ -280,17 +247,14 @@ defmodule FastestMCP.SamplingTest do
         parameters: %{"type" => "object", "properties" => %{}}
       )
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("validate", fn _arguments, ctx ->
-        case Sampling.run(ctx, "use a tool", tools: [known]) do
-          {:ok, _response} -> %{"unexpected" => true}
-          {:error, error} -> %{"code" => to_string(error.code), "message" => error.message}
-        end
-      end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("validate", fn _arguments, ctx ->
+      case Sampling.run(ctx, "use a tool", tools: [known]) do
+        {:ok, _response} -> %{"unexpected" => true}
+        {:error, error} -> %{"code" => to_string(error.code), "message" => error.message}
+      end
+    end)
+    |> start_server!()
 
     client =
       connect_client!(server_name,
@@ -314,17 +278,14 @@ defmodule FastestMCP.SamplingTest do
     test_pid = self()
     server_name = "sampling-context-capability-" <> unique_id()
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("sample", fn _arguments, ctx ->
-        case Sampling.run(ctx, "use context", include_context: :this_server) do
-          {:ok, response} -> %{"text" => response.text}
-          {:error, error} -> %{"code" => to_string(error.code), "message" => error.message}
-        end
-      end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("sample", fn _arguments, ctx ->
+      case Sampling.run(ctx, "use context", include_context: :this_server) do
+        {:ok, response} -> %{"text" => response.text}
+        {:error, error} -> %{"code" => to_string(error.code), "message" => error.message}
+      end
+    end)
+    |> start_server!()
 
     unsupported =
       connect_client!(server_name,
@@ -375,8 +336,7 @@ defmodule FastestMCP.SamplingTest do
         end
       end)
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
     client =
       connect_client!(server_name,
@@ -475,17 +435,14 @@ defmodule FastestMCP.SamplingTest do
         parameters: %{"type" => "object", "properties" => %{}}
       )
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("validate", fn _arguments, ctx ->
-        case Sampling.run(ctx, "reuse an id", tools: [known]) do
-          {:ok, _response} -> %{"unexpected" => true}
-          {:error, error} -> %{"code" => to_string(error.code), "message" => error.message}
-        end
-      end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("validate", fn _arguments, ctx ->
+      case Sampling.run(ctx, "reuse an id", tools: [known]) do
+        {:ok, _response} -> %{"unexpected" => true}
+        {:error, error} -> %{"code" => to_string(error.code), "message" => error.message}
+      end
+    end)
+    |> start_server!()
 
     client =
       connect_client!(server_name,
@@ -519,17 +476,14 @@ defmodule FastestMCP.SamplingTest do
         parameters: %{"type" => "object", "properties" => %{}}
       )
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("loop", fn _arguments, ctx ->
-        case Sampling.run(ctx, "keep going", tools: [repeat]) do
-          {:ok, _response} -> %{"unexpected" => true}
-          {:error, error} -> %{"code" => to_string(error.code), "message" => error.message}
-        end
-      end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("loop", fn _arguments, ctx ->
+      case Sampling.run(ctx, "keep going", tools: [repeat]) do
+        {:ok, _response} -> %{"unexpected" => true}
+        {:error, error} -> %{"code" => to_string(error.code), "message" => error.message}
+      end
+    end)
+    |> start_server!()
 
     client =
       connect_client!(server_name,
@@ -605,8 +559,7 @@ defmodule FastestMCP.SamplingTest do
         end
       end)
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
     assert :error = FastestMCP.call_tool!(server_name, "probe", %{})
 
@@ -619,29 +572,14 @@ defmodule FastestMCP.SamplingTest do
   end
 
   defp connect_client!(server_name, opts) do
-    bandit =
-      start_supervised!(
-        {Bandit,
-         plug:
-           {FastestMCP.Transport.HTTPApp,
-            server_name: server_name,
-            path: "/mcp",
-            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
-         scheme: :http,
-         port: 0}
-      )
-
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+    %{url: url} =
+      start_http!(server_name, allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"])
 
     client =
-      Client.connect!(
-        "http://127.0.0.1:#{port}/mcp",
+      connect!(
+        url,
         Keyword.put_new(opts, :protocol_version, "2025-11-25")
       )
-
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect!(client)
-    end)
 
     client
   end

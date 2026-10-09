@@ -1,23 +1,13 @@
 defmodule FastestMCP.Middleware.ResponseLimiting do
-  @moduledoc """
-  Middleware that limits tool response sizes and truncates oversized payloads.
-
-  Middleware modules in FastestMCP are configured as explicit structs that
-  carry immutable configuration. Dispatch calls the module with that configuration;
-  runtime state is owned separately by the server.
-
-  Most applications reach this module through `FastestMCP.Middleware` helper
-  functions or by adding the configured struct directly with
-  `FastestMCP.Server.add_middleware/2`.
-  """
+  @moduledoc false
 
   require Logger
+  import FastestMCP.Util, only: [maybe_put: 3, string_keys: 1]
 
   alias FastestMCP.Error
   @behaviour FastestMCP.Middleware
 
   alias FastestMCP.Operation
-  alias FastestMCP.OperationPipeline
   alias FastestMCP.Transport.Serializer
 
   @default_suffix "\n\n[Response truncated due to size limit]"
@@ -36,7 +26,6 @@ defmodule FastestMCP.Middleware.ResponseLimiting do
           tools: MapSet.t(String.t()) | nil
         }
 
-  @doc "Builds a new value for this module from the supplied options."
   def new(opts \\ []) do
     max_size = Keyword.get(opts, :max_size, 1_000_000)
 
@@ -61,62 +50,59 @@ defmodule FastestMCP.Middleware.ResponseLimiting do
     middleware
   end
 
-  @doc "Runs the middleware around the next operation."
   @impl FastestMCP.Middleware
   def call(%__MODULE__{} = middleware, %Operation{} = operation, next)
       when is_function(next, 1) do
-    result = next.(operation)
-
-    if operation.task_request do
-      result
-    else
-      if limit_tool?(middleware, operation) do
-        maybe_limit_result(middleware, operation, result)
-      else
-        result
-      end
+    with {:ok, done} <- next.(operation) do
+      if not operation.task_request and limit_tool?(middleware, operation),
+        do: limit_result(middleware, operation, done),
+        else: {:ok, done}
     end
   end
 
-  @doc "Truncates text into the normalized limited-result shape."
   def truncate_to_result(%__MODULE__{} = middleware, text) when is_binary(text) do
     truncate_to_tool_result(text, middleware.max_size, middleware.truncation_suffix, %{})
   end
 
-  @doc "Truncates text into the normalized limited-result shape while preserving metadata if it fits."
   def truncate_to_result(%__MODULE__{} = middleware, text, metadata)
       when is_binary(text) and is_map(metadata) do
     truncate_to_tool_result(text, middleware.max_size, middleware.truncation_suffix, metadata)
   end
 
-  defp maybe_limit_result(%__MODULE__{} = middleware, %Operation{} = operation, result) do
-    component = operation.component || resolved_component(operation.context)
+  defp limit_result(%__MODULE__{} = middleware, %Operation{} = operation, done) do
+    %Operation{result: result, component: component} = done
     payload = Serializer.tool_result(result, component)
-    serialized = JSON.encode!(payload)
+    size = payload |> JSON.encode!() |> byte_size()
 
-    if byte_size(serialized) <= middleware.max_size do
-      result
+    if size <= middleware.max_size do
+      {:ok, done}
     else
       middleware.logger.(
-        "Tool #{inspect(operation.target)} response exceeds size limit: #{byte_size(serialized)} bytes > #{middleware.max_size} bytes, truncating"
+        "Tool #{inspect(operation.target)} response exceeds size limit: #{size} bytes > #{middleware.max_size} bytes, truncating"
       )
 
-      if structured_output_required?(component) do
-        truncate_structured_tool_result(
-          payload,
-          byte_size(serialized),
-          middleware.max_size,
-          middleware.truncation_suffix
-        )
-      else
-        result
-        |> extract_text()
-        |> truncate_to_tool_result(
-          middleware.max_size,
-          middleware.truncation_suffix,
-          extract_metadata(result)
-        )
-      end
+      with {:ok, limited} <- truncate_result(middleware, result, component, payload, size),
+           do: {:ok, %{done | result: limited}}
+    end
+  end
+
+  defp truncate_result(middleware, result, component, payload, size) do
+    if structured_output_required?(component) do
+      truncate_structured_tool_result(
+        payload,
+        size,
+        middleware.max_size,
+        middleware.truncation_suffix
+      )
+    else
+      result
+      |> extract_text()
+      |> truncate_to_tool_result(
+        middleware.max_size,
+        middleware.truncation_suffix,
+        extract_metadata(result)
+      )
+      |> then(&{:ok, &1})
     end
   end
 
@@ -125,11 +111,11 @@ defmodule FastestMCP.Middleware.ResponseLimiting do
       {:ok, structured_content} when not is_nil(structured_content) ->
         required_metadata =
           %{"structuredContent" => structured_content}
-          |> maybe_put_metadata("isError", Map.get(payload, "isError"))
+          |> maybe_put("isError", Map.get(payload, "isError"))
 
         optional_metadata =
           %{}
-          |> maybe_put_metadata("_meta", Map.get(payload, "_meta"))
+          |> maybe_put("_meta", Map.get(payload, "_meta"))
 
         text = extract_text(payload)
 
@@ -142,15 +128,17 @@ defmodule FastestMCP.Middleware.ResponseLimiting do
           ) ||
             truncate_preserving_metadata(text, max_size, suffix, required_metadata)
 
-        limited ||
-          raise_unrepresentable_result!(
-            actual_size,
-            max_size,
-            encoded_result_size("", required_metadata)
-          )
+        if limited,
+          do: {:ok, limited},
+          else:
+            unrepresentable_result(
+              actual_size,
+              max_size,
+              encoded_result_size("", required_metadata)
+            )
 
       _other ->
-        raise_unrepresentable_result!(actual_size, max_size, minimum_result_size())
+        unrepresentable_result(actual_size, max_size, minimum_result_size())
     end
   end
 
@@ -164,15 +152,13 @@ defmodule FastestMCP.Middleware.ResponseLimiting do
     end
   end
 
-  defp raise_unrepresentable_result!(actual_size, max_size, minimum_size) do
-    raise Error,
-      code: :internal_error,
-      message: "tool response exceeds the configured size limit",
-      details: %{
-        actual_bytes: actual_size,
-        maximum_bytes: max_size,
-        minimum_valid_result_bytes: minimum_size
-      }
+  defp unrepresentable_result(actual_size, max_size, minimum_size) do
+    {:error,
+     Error.internal("tool response exceeds the configured size limit", %{
+       actual_bytes: actual_size,
+       maximum_bytes: max_size,
+       minimum_valid_result_bytes: minimum_size
+     })}
   end
 
   defp truncate_to_tool_result(text, max_size, suffix, metadata) do
@@ -247,12 +233,6 @@ defmodule FastestMCP.Middleware.ResponseLimiting do
 
   defp minimum_result_size, do: encoded_result_size("", %{})
 
-  defp resolved_component(%FastestMCP.Context{} = context) do
-    OperationPipeline.resolved_component(context)
-  end
-
-  defp resolved_component(_context), do: nil
-
   defp structured_output_required?(%{output_schema: schema}) when not is_nil(schema), do: true
   defp structured_output_required?(_component), do: false
 
@@ -266,8 +246,9 @@ defmodule FastestMCP.Middleware.ResponseLimiting do
   defp extract_text(%FastestMCP.Tools.Result{} = result),
     do: result |> FastestMCP.Tools.Result.to_map() |> extract_text()
 
+  # A plain result is application data, with atom or string keys.
   defp extract_text(result) when is_map(result) do
-    case fetch_content(result) do
+    case string_keys(result)["content"] do
       nil ->
         JSON.encode!(result)
 
@@ -294,26 +275,18 @@ defmodule FastestMCP.Middleware.ResponseLimiting do
   defp extract_text_block(value) when is_binary(value), do: value
 
   defp extract_text_block(%{} = block) do
-    type = Map.get(block, :type, Map.get(block, "type"))
-    text = Map.get(block, :text, Map.get(block, "text"))
-
-    if type == "text" and is_binary(text), do: text, else: nil
+    case string_keys(block) do
+      %{"type" => "text", "text" => text} when is_binary(text) -> text
+      _other -> nil
+    end
   end
 
   defp extract_text_block(_value), do: nil
 
-  defp fetch_content(result) do
-    Map.get(result, :content, Map.get(result, "content"))
-  end
-
   defp extract_metadata(%FastestMCP.Tools.Result{meta: meta}),
-    do: maybe_put_metadata(%{}, "_meta", meta)
+    do: maybe_put(%{}, "_meta", meta)
 
-  defp extract_metadata(%{} = result) do
-    %{}
-    |> maybe_put_metadata("meta", Map.get(result, "meta", Map.get(result, :meta)))
-    |> maybe_put_metadata("_meta", Map.get(result, "_meta", Map.get(result, :_meta)))
-  end
+  defp extract_metadata(%{} = result), do: Map.take(string_keys(result), ["meta", "_meta"])
 
   defp extract_metadata(_result), do: %{}
 
@@ -322,9 +295,6 @@ defmodule FastestMCP.Middleware.ResponseLimiting do
     |> Enum.reject(fn {_key, value} -> is_nil(value) end)
     |> Map.new(fn {key, value} -> {to_string(key), value} end)
   end
-
-  defp maybe_put_metadata(metadata, _key, nil), do: metadata
-  defp maybe_put_metadata(metadata, key, value), do: Map.put(metadata, key, value)
 
   defp limit_tool?(%__MODULE__{tools: nil}, %Operation{method: "tools/call"}), do: true
 

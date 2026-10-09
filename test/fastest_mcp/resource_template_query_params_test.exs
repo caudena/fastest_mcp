@@ -1,16 +1,14 @@
 defmodule FastestMCP.ResourceTemplateQueryParamsTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   test "resource templates can extract optional query params" do
     server_name = "resource-template-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_resource_template("data://{id}{?format,limit}", fn arguments, _ctx ->
-        arguments
-      end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_resource_template("data://{id}{?format,limit}", fn arguments, _ctx ->
+      arguments
+    end)
+    |> start_server!()
 
     assert %{"id" => "123"} == FastestMCP.read_resource!(server_name, "data://123")
 
@@ -25,11 +23,9 @@ defmodule FastestMCP.ResourceTemplateQueryParamsTest do
     server_name =
       "resource-template-wildcard-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_resource_template("files://{+path}", fn arguments, _ctx -> arguments end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_resource_template("files://{+path}", fn arguments, _ctx -> arguments end)
+    |> start_server!()
 
     assert %{"path" => "users/42/profile.json"} ==
              FastestMCP.read_resource!(server_name, "files://users/42/profile.json")
@@ -42,26 +38,23 @@ defmodule FastestMCP.ResourceTemplateQueryParamsTest do
     server_name =
       "resource-template-operators-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_resource_template("docs://{+path}", fn arguments, _ctx -> arguments end)
-      |> FastestMCP.add_resource_template(
-        "repo://tree{/path*}",
-        fn arguments, _ctx -> arguments end
-      )
-      |> FastestMCP.add_resource_template("asset://bundle{.format}", fn arguments, _ctx ->
-        arguments
-      end)
-      |> FastestMCP.add_resource_template("pkg://release{;version}", fn arguments, _ctx ->
-        arguments
-      end)
-      |> FastestMCP.add_resource_template(
-        "search://items{?q,limit}{&page}",
-        fn arguments, _ctx -> arguments end
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_resource_template("docs://{+path}", fn arguments, _ctx -> arguments end)
+    |> FastestMCP.add_resource_template(
+      "repo://tree{/path*}",
+      fn arguments, _ctx -> arguments end
+    )
+    |> FastestMCP.add_resource_template("asset://bundle{.format}", fn arguments, _ctx ->
+      arguments
+    end)
+    |> FastestMCP.add_resource_template("pkg://release{;version}", fn arguments, _ctx ->
+      arguments
+    end)
+    |> FastestMCP.add_resource_template(
+      "search://items{?q,limit}{&page}",
+      fn arguments, _ctx -> arguments end
+    )
+    |> start_server!()
 
     assert %{"path" => "guides/http/intro.md"} ==
              FastestMCP.read_resource!(server_name, "docs://guides/http/intro.md")
@@ -83,15 +76,12 @@ defmodule FastestMCP.ResourceTemplateQueryParamsTest do
     server_name =
       "resource-template-hyphen-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_resource_template(
-        "data://{user.id}{?include_details}",
-        fn arguments, _ctx -> arguments end
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_resource_template(
+      "data://{user.id}{?include_details}",
+      fn arguments, _ctx -> arguments end
+    )
+    |> start_server!()
 
     assert %{"user.id" => "42", "include_details" => ""} ==
              FastestMCP.read_resource!(server_name, "data://42?include_details=")
@@ -101,14 +91,11 @@ defmodule FastestMCP.ResourceTemplateQueryParamsTest do
     server_name =
       "resource-template-precedence-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_resource_template("data://{id}{?id}", fn arguments, _ctx ->
-        arguments
-      end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_resource_template("data://{id}{?id}", fn arguments, _ctx ->
+      arguments
+    end)
+    |> start_server!()
 
     assert %{"id" => "path"} == FastestMCP.read_resource!(server_name, "data://path?id=query")
 
@@ -122,15 +109,12 @@ defmodule FastestMCP.ResourceTemplateQueryParamsTest do
     server_name =
       "resource-template-fragment-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_resource_template("data://items/{id}#details", fn args, _ctx -> args end)
-      |> FastestMCP.add_resource_template("data://chapters/{id}{#fragment}", fn args, _ctx ->
-        args
-      end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_resource_template("data://items/{id}#details", fn args, _ctx -> args end)
+    |> FastestMCP.add_resource_template("data://chapters/{id}{#fragment}", fn args, _ctx ->
+      args
+    end)
+    |> start_server!()
 
     assert %{"id" => "42"} ==
              FastestMCP.read_resource!(server_name, "data://items/42#details")

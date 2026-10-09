@@ -1,5 +1,5 @@
 defmodule FastestMCP.StreamableHTTPEventStreamTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Context
   alias FastestMCP.Elicitation.Accepted
@@ -26,8 +26,7 @@ defmodule FastestMCP.StreamableHTTPEventStreamTest do
         end
       end)
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
     port = start_http(server_name)
 
@@ -62,12 +61,9 @@ defmodule FastestMCP.StreamableHTTPEventStreamTest do
   test "streamable HTTP uses event-stream framing for tool calls" do
     server_name = "http-event-stream-#{System.unique_integer([:positive])}"
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+    |> start_server!()
 
     port = start_http(server_name)
     session_id = initialize_session(port)
@@ -92,6 +88,76 @@ defmodule FastestMCP.StreamableHTTPEventStreamTest do
     assert response.body =~ "event: message\n"
     assert response.body =~ "\"jsonrpc\":\"2.0\""
     assert response.body =~ "\"structuredContent\":{\"message\":\"hi\"}"
+  end
+
+  test "live JSON-RPC initialization, listing, and calls work through Bandit" do
+    server_name = "http-json-response-#{System.unique_integer([:positive])}"
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+    |> start_server!()
+
+    port = start_http(server_name, json_response: true)
+    session_id = initialize_session(port)
+
+    tools = post_json(port, ProtocolTest.jsonrpc_request(2, "tools/list"), session_id)
+    assert tools.status == 200
+
+    assert %{"jsonrpc" => "2.0", "id" => 2, "result" => %{"tools" => [%{"name" => "echo"}]}} =
+             JSON.decode!(tools.body)
+
+    call =
+      post_json(
+        port,
+        ProtocolTest.jsonrpc_request(3, "tools/call", %{
+          "name" => "echo",
+          "arguments" => %{"message" => "hi"}
+        }),
+        session_id
+      )
+
+    assert call.status == 200
+
+    assert %{
+             "jsonrpc" => "2.0",
+             "id" => 3,
+             "result" => %{"structuredContent" => %{"message" => "hi"}}
+           } = JSON.decode!(call.body)
+  end
+
+  test "live HTTP requests classify malformed JSON as a bad request" do
+    server_name = unique_name("http-bad-json")
+    start_server!(FastestMCP.server(server_name))
+    listener = start_supervised!(FastestMCP.streamable_http_child_spec(server_name, port: 0))
+    {:ok, {_address, port}} = ThousandIsland.listener_info(listener)
+
+    response =
+      request(
+        port,
+        IO.iodata_to_binary([
+          "POST /mcp HTTP/1.1\r\n",
+          "Host: 127.0.0.1\r\n",
+          "Content-Type: application/json\r\n",
+          "Accept: application/json, text/event-stream\r\n",
+          "Content-Length: 8\r\n",
+          "Connection: close\r\n\r\n",
+          "not-json"
+        ])
+      )
+
+    assert response.status == 400
+
+    payload = JSON.decode!(response.body)
+
+    assert %{
+             "jsonrpc" => "2.0",
+             "error" => %{
+               "code" => -32_700,
+               "data" => %{"fastestmcp" => %{"code" => "parse_error"}}
+             }
+           } = payload
+
+    refute Map.has_key?(payload, "id")
   end
 
   test "a resumed GET exclusively receives an overlapping POST's live events" do
@@ -120,10 +186,7 @@ defmodule FastestMCP.StreamableHTTPEventStreamTest do
         end
       end)
 
-    assert {:ok, _pid} =
-             FastestMCP.start_server(server, session_idle_ttl: :infinity)
-
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server, session_idle_ttl: :infinity)
 
     port = start_http(server_name)
     session_id = initialize_session(port)
@@ -234,8 +297,7 @@ defmodule FastestMCP.StreamableHTTPEventStreamTest do
         task: true
       )
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
     port = start_http(server_name, json_response: true)
     session_id = initialize_session(port)
@@ -289,10 +351,7 @@ defmodule FastestMCP.StreamableHTTPEventStreamTest do
   test "GET resumes missed events by id without crossing sessions" do
     server_name = "http-session-resume-#{System.unique_integer([:positive])}"
 
-    assert {:ok, _pid} =
-             FastestMCP.start_server(FastestMCP.server(server_name), session_idle_ttl: :infinity)
-
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(FastestMCP.server(server_name), session_idle_ttl: :infinity)
 
     port = start_http(server_name, json_response: true)
     session_id = initialize_session(port)
@@ -313,12 +372,7 @@ defmodule FastestMCP.StreamableHTTPEventStreamTest do
 
     second = replay_notification(2)
     assert {:ok, %{event_id: second_id}} = Session.send_envelope(server_name, session_id, second)
-
-    assert_eventually(fn ->
-      :sys.get_state(session_pid).sinks
-      |> Map.values()
-      |> Enum.all?(&(&1.kind != :get))
-    end)
+    await_get_stream_closed(session_pid)
 
     third = replay_notification(3)
 
@@ -405,13 +459,10 @@ defmodule FastestMCP.StreamableHTTPEventStreamTest do
   test "GET returns gone when a valid event id has fallen out of replay retention" do
     server_name = "http-session-evicted-#{System.unique_integer([:positive])}"
 
-    assert {:ok, _pid} =
-             FastestMCP.start_server(FastestMCP.server(server_name),
-               session_idle_ttl: :infinity,
-               sse_replay_max_events: 1
-             )
-
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(FastestMCP.server(server_name),
+      session_idle_ttl: :infinity,
+      sse_replay_max_events: 1
+    )
 
     port = start_http(server_name, json_response: true)
     session_id = initialize_session(port)
@@ -432,11 +483,7 @@ defmodule FastestMCP.StreamableHTTPEventStreamTest do
     assert {:ok, %{event_id: _second_id}} =
              Session.send_envelope(server_name, session_id, replay_notification(2))
 
-    assert_eventually(fn ->
-      :sys.get_state(session_pid).sinks
-      |> Map.values()
-      |> Enum.all?(&(&1.kind != :get))
-    end)
+    await_get_stream_closed(session_pid)
 
     {:ok, gone_socket, %{status: 410}, _gone_state} =
       open_session_stream(port, session_id, first_id)
@@ -447,13 +494,10 @@ defmodule FastestMCP.StreamableHTTPEventStreamTest do
   test "GET still returns gone after an earlier operation pruned the event's stream" do
     server_name = "http-session-pruned-#{System.unique_integer([:positive])}"
 
-    assert {:ok, _pid} =
-             FastestMCP.start_server(FastestMCP.server(server_name),
-               session_idle_ttl: :infinity,
-               sse_replay_ttl_ms: 10
-             )
-
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(FastestMCP.server(server_name),
+      session_idle_ttl: :infinity,
+      sse_replay_ttl_ms: 10
+    )
 
     port = start_http(server_name, json_response: true)
     session_id = initialize_session(port)
@@ -484,13 +528,10 @@ defmodule FastestMCP.StreamableHTTPEventStreamTest do
   test "GET does not receive an event that cannot be persisted for replay" do
     server_name = "http-session-unretained-#{System.unique_integer([:positive])}"
 
-    assert {:ok, _pid} =
-             FastestMCP.start_server(FastestMCP.server(server_name),
-               session_idle_ttl: :infinity,
-               sse_replay_max_total_bytes: 1
-             )
-
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(FastestMCP.server(server_name),
+      session_idle_ttl: :infinity,
+      sse_replay_max_total_bytes: 1
+    )
 
     port = start_http(server_name, json_response: true)
     session_id = initialize_session(port)
@@ -526,8 +567,7 @@ defmodule FastestMCP.StreamableHTTPEventStreamTest do
         task: true
       )
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
     port = start_http(server_name)
     session_id = initialize_session(port, %{"elicitation" => %{"form" => %{}}})
@@ -549,7 +589,7 @@ defmodule FastestMCP.StreamableHTTPEventStreamTest do
              "jsonrpc" => "2.0",
              "id" => 10,
              "result" => %{"task" => %{"taskId" => task_id}}
-           } = sse_json(create_response.body)
+           } = ProtocolTest.sse_message(create_response.body)
 
     assert_receive {:task_result_started, ^session_id}, 1_000
 
@@ -613,12 +653,7 @@ defmodule FastestMCP.StreamableHTTPEventStreamTest do
       ]
       |> Keyword.merge(opts)
 
-    bandit =
-      start_supervised!(
-        {Bandit, plug: {FastestMCP.Transport.HTTPApp, plug_opts}, scheme: :http, port: 0}
-      )
-
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+    %{port: port} = serve!({FastestMCP.Transport.HTTPApp, plug_opts})
     port
   end
 
@@ -738,11 +773,6 @@ defmodule FastestMCP.StreamableHTTPEventStreamTest do
       ProtocolTest.protocol_version(),
       "\r\n"
     ]
-  end
-
-  defp sse_json(body) do
-    [json | _rest] = Regex.run(~r/data: ([^\n]+)/, body, capture: :all_but_first)
-    JSON.decode!(json)
   end
 
   defp request(port, payload) do
@@ -894,28 +924,25 @@ defmodule FastestMCP.StreamableHTTPEventStreamTest do
     }
   end
 
-  defp assert_eventually(fun, attempts \\ 100)
-
-  defp assert_eventually(fun, attempts) when attempts > 0 do
-    if fun.() do
-      :ok
-    else
-      Process.sleep(10)
-      assert_eventually(fun, attempts - 1)
-    end
-  end
-
-  defp assert_eventually(_fun, 0), do: flunk("condition did not become true")
-
   defp close_session_stream(socket, server_name, session_id, session_pid, sequence) do
     _ = :inet.setopts(socket, linger: {true, 0})
     :ok = :gen_tcp.close(socket)
     _ = Session.send_envelope(server_name, session_id, replay_notification(sequence))
+    await_get_stream_closed(session_pid)
+  end
 
+  # A GET stream notices a reset client on its next write, which can still
+  # succeed while the reset is in flight; unrecorded cursor writes probe it.
+  defp await_get_stream_closed(session_pid) do
     assert_eventually(fn ->
-      :sys.get_state(session_pid).sinks
-      |> Map.values()
-      |> Enum.all?(&(&1.kind != :get))
+      streams =
+        for {ref, %{kind: :get, pid: pid}} <- :sys.get_state(session_pid).sinks, do: {ref, pid}
+
+      Enum.each(streams, fn {ref, pid} ->
+        send(pid, {:fastest_mcp_session_cursor, ref, "probe"})
+      end)
+
+      streams == []
     end)
   end
 end

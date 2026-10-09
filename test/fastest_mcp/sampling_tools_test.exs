@@ -1,5 +1,5 @@
 defmodule FastestMCP.SamplingToolsTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Authorization
   alias FastestMCP.Context
@@ -88,8 +88,7 @@ defmodule FastestMCP.SamplingToolsTest do
         }
       )
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
     [tool] = FastestMCP.prepare_sampling_tools(server_name)
 
@@ -125,8 +124,7 @@ defmodule FastestMCP.SamplingToolsTest do
         }
       )
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
     [compiled_tool] = server.tools
     tool = SamplingTool.from_tool(compiled_tool)
@@ -147,8 +145,7 @@ defmodule FastestMCP.SamplingToolsTest do
         auth: Authorization.require_scopes("sampling:run")
       )
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
     context = %Context{
       server_name: server_name,

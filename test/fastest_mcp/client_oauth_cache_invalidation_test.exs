@@ -1,5 +1,7 @@
 defmodule FastestMCP.ClientOAuthCacheInvalidationTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
+
+  alias FastestMCP.Test.ClientProbe
 
   import Plug.Conn
 
@@ -102,12 +104,7 @@ defmodule FastestMCP.ClientOAuthCacheInvalidationTest do
   test "proactive OAuth reacquisition invalidates response and descriptor caches" do
     state = start_supervised!({Agent, fn -> %{token_requests: 0} end})
 
-    bandit =
-      start_supervised!(
-        {Bandit, plug: {AuthenticatedCatalogPlug, state: state}, scheme: :http, port: 0}
-      )
-
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+    %{port: port} = serve!({AuthenticatedCatalogPlug, state: state})
     resource = "http://127.0.0.1:#{port}/mcp"
     issuer = "https://auth.example.com"
     token_endpoint = issuer <> "/token"
@@ -136,7 +133,7 @@ defmodule FastestMCP.ClientOAuthCacheInvalidationTest do
           end)
 
         {credential, expires_in} =
-          if request_number == 1, do: {"token-one", 31}, else: {"token-two", 3_600}
+          if request_number == 1, do: {"token-one", 33}, else: {"token-two", 3_600}
 
         json_response(%{
           "access_token" => credential,
@@ -147,7 +144,7 @@ defmodule FastestMCP.ClientOAuthCacheInvalidationTest do
     end
 
     client =
-      Client.connect!(resource,
+      connect!(resource,
         protocol_version: "2026-07-28",
         response_cache: true,
         oauth: [
@@ -161,10 +158,7 @@ defmodule FastestMCP.ClientOAuthCacheInvalidationTest do
         ]
       )
 
-    on_exit(fn -> if Client.connected?(client), do: Client.disconnect!(client) end)
-
-    client_state = :sys.get_state(client.pid)
-    assert {:ok, "Bearer token-one"} = OAuth.authorize(client_state.oauth.pid, resource)
+    assert {:ok, "Bearer token-one"} = OAuth.authorize(ClientProbe.oauth_pid(client), resource)
     wait_for_auth_generation(client, 1)
 
     assert %{structured_content: %{"tool" => "first_tool"}} =
@@ -176,7 +170,8 @@ defmodule FastestMCP.ClientOAuthCacheInvalidationTest do
     assert Agent.get(state, & &1.tool_lists) == 1
     assert Agent.get(state, & &1.resource_reads) == 1
 
-    Process.sleep(1_100)
+    # token-one enters the proactive refresh window after three seconds.
+    Process.sleep(3_100)
 
     assert %{structured_content: %{"tool" => "first_tool"}} =
              Client.call_tool!(client, "first_tool", %{})
@@ -195,19 +190,8 @@ defmodule FastestMCP.ClientOAuthCacheInvalidationTest do
     assert snapshot.resource_reads == 2
   end
 
-  defp wait_for_auth_generation(client, expected, attempts \\ 100)
-
-  defp wait_for_auth_generation(_client, _expected, 0),
-    do: flunk("OAuth credential change was not applied to the client")
-
-  defp wait_for_auth_generation(client, expected, attempts) do
-    if :sys.get_state(client.pid).lifecycle.auth_generation >= expected do
-      :ok
-    else
-      Process.sleep(10)
-      wait_for_auth_generation(client, expected, attempts - 1)
-    end
-  end
+  defp wait_for_auth_generation(client, expected),
+    do: assert_eventually(fn -> ClientProbe.auth_generation(client) >= expected end)
 
   defp json_response(document) do
     {:ok, 200, [{"content-type", "application/json"}], JSON.encode!(document)}

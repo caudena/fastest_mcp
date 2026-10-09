@@ -1,5 +1,5 @@
 defmodule FastestMCP.MiddlewarePingTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.EventBus
   alias FastestMCP.Middleware
@@ -10,17 +10,13 @@ defmodule FastestMCP.MiddlewarePingTest do
 
   test "ping middleware starts one loop per stdio session and cleans up when the session expires" do
     middleware = Middleware.ping(interval_ms: 10)
-    on_exit(fn -> Ping.close(middleware) end)
-
     server_name = "ping-stdio-" <> Integer.to_string(System.unique_integer([:positive]))
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_middleware(middleware)
-      |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_middleware(middleware)
+    |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+    |> start_server!(session_idle_ttl: 1_000)
 
-    assert {:ok, _pid} = FastestMCP.start_server(server, session_idle_ttl: 35)
     assert {:ok, runtime} = ServerRuntime.fetch(server_name)
     assert :ok = EventBus.subscribe(runtime.event_bus, server_name)
 
@@ -43,10 +39,9 @@ defmodule FastestMCP.MiddlewarePingTest do
     assert response["jsonrpc"] == "2.0"
 
     assert_receive {:fastest_mcp_event, ^server_name, [:session, :ping], %{system_time: _},
-                    %{session_id: ^session_id, transport: :stdio}},
-                   200
+                    %{session_id: ^session_id, transport: :stdio}}
 
-    assert MapSet.member?(Ping.active_sessions(middleware), {server_name, session_id})
+    assert MapSet.member?(Middleware.ping_sessions(middleware), {server_name, session_id})
 
     _response =
       ProtocolTest.stdio_request(
@@ -57,25 +52,21 @@ defmodule FastestMCP.MiddlewarePingTest do
         %{"name" => "echo", "arguments" => %{"message" => "again"}}
       )
 
-    assert MapSet.size(Ping.active_sessions(middleware)) == 1
+    assert MapSet.size(Middleware.ping_sessions(middleware)) == 1
 
-    Process.sleep(80)
-    assert MapSet.size(Ping.active_sessions(middleware)) == 0
+    # The session expires after its idle ttl and takes its ping loop along.
+    assert_eventually(fn -> MapSet.size(Middleware.ping_sessions(middleware)) == 0 end, 5_000)
   end
 
   test "ping middleware starts for explicit HTTP sessions and skips in-process calls" do
     middleware = Middleware.ping(interval_ms: 10)
-    on_exit(fn -> Ping.close(middleware) end)
-
     server_name = "ping-http-" <> Integer.to_string(System.unique_integer([:positive]))
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_middleware(middleware)
-      |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_middleware(middleware)
+    |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+    |> start_server!(session_idle_ttl: 1_000)
 
-    assert {:ok, _pid} = FastestMCP.start_server(server, session_idle_ttl: 50)
     assert {:ok, runtime} = ServerRuntime.fetch(server_name)
     assert :ok = EventBus.subscribe(runtime.event_bus, server_name)
 
@@ -84,7 +75,7 @@ defmodule FastestMCP.MiddlewarePingTest do
                session_id: "ignored"
              )
 
-    assert MapSet.size(Ping.active_sessions(middleware)) == 0
+    assert MapSet.size(Middleware.ping_sessions(middleware)) == 0
 
     {session_id, _initialize_response, initialized_response} =
       ProtocolTest.initialize_http(server_name)
@@ -103,21 +94,16 @@ defmodule FastestMCP.MiddlewarePingTest do
     assert conn.status == 200
 
     assert_receive {:fastest_mcp_event, ^server_name, [:session, :ping], %{system_time: _},
-                    %{session_id: ^session_id, transport: :streamable_http}},
-                   200
+                    %{session_id: ^session_id, transport: :streamable_http}}
 
-    assert MapSet.member?(Ping.active_sessions(middleware), {server_name, session_id})
+    assert MapSet.member?(Middleware.ping_sessions(middleware), {server_name, session_id})
   end
 
-  test "ping close is safe after the state process already exits" do
-    middleware = Middleware.ping(interval_ms: 10)
-    middleware = Ping.activate_runtime(middleware)
-    state = Ping.state_pid(middleware)
-    ref = Process.monitor(state)
-    GenServer.stop(state, :normal)
-    assert_receive {:DOWN, ^ref, :process, _pid, _reason}
+  test "ping middleware no server started returns an internal error naming the cause" do
+    assert {:error, %FastestMCP.Error{code: :internal_error, message: message}} =
+             Ping.call(Middleware.ping(), %FastestMCP.Operation{}, &{:ok, &1})
 
-    assert :ok == Ping.close(middleware)
+    assert message =~ "FastestMCP.Middleware.Ping has no running state"
   end
 
   test "ping middleware rejects non-positive intervals" do

@@ -1,8 +1,20 @@
 defmodule FastestMCP.Client.Catalog do
   @moduledoc false
-  alias FastestMCP.Client.Paginator
+  # The connected client's tool catalog from the caller: complete tools/list
+  # snapshots, loaded by one caller while concurrent callers wait (see
+  # `FastestMCP.Client.Connection.Catalog`), the descriptor a tools/call is
+  # validated against, and tool argument and result validation. A per-call
+  # identity loads a private catalog.
+
+  import FastestMCP.Protocol.Version
+
+  alias FastestMCP.Client
+  alias FastestMCP.Client.Auth
+  alias FastestMCP.Client.Connection
   alias FastestMCP.Client.ProtocolError
+  alias FastestMCP.Client.Requests
   alias FastestMCP.Client.ToolCatalog
+  alias FastestMCP.Deadline
   alias FastestMCP.Error
   alias FastestMCP.Protocol
   alias FastestMCP.Protocol.HTTPHeaders
@@ -10,330 +22,230 @@ defmodule FastestMCP.Client.Catalog do
 
   @default_timeout_ms 5_000
 
-  @doc false
-  def catalog_snapshot(client_ref, opts \\ []) do
-    client = FastestMCP.Client.Connection.pin_client!(client_ref)
+  def snapshot(client_ref, opts) do
+    with {:ok, client, opts} <- Requests.operation(client_ref, opts),
+         do: snapshot(client, opts, nil)
+  end
+
+  def snapshot(%Client{} = client, opts, trace) do
     mode = Keyword.get(opts, :cache, :use)
 
     unless mode in [:use, :refresh, :bypass],
       do: raise(ArgumentError, "cache must be :use, :refresh, or :bypass")
 
-    deadline = FastestMCP.Deadline.from_options(opts, @default_timeout_ms)
-    catalog = ensure_tool_catalog!(client, deadline, opts, mode)
-    validate_limits!(catalog, opts)
+    deadline = Deadline.from_options(opts, @default_timeout_ms)
 
-    %{
-      client: client,
-      generation: catalog.generation,
-      tools: catalog.raw,
-      expires_at_ms: catalog.expires_at_ms
-    }
-  end
-
-  @doc false
-  def catalog_revision(client_ref) do
-    GenServer.call(FastestMCP.Client.Connection.pin_client!(client_ref).pid, :catalog_revision)
-  end
-
-  def tool_descriptor!(client, name, version, deadline, trace_opts) do
-    catalog = ensure_tool_catalog!(client, deadline, trace_opts)
-
-    case ToolCatalog.lookup(catalog, name, version) do
-      {:ok, descriptor} ->
-        descriptor
-
-      {:error, %FastestMCP.Schema.Error{} = error} ->
-        raise ProtocolError.new(
-                "tools/list",
-                :server_to_client,
-                :response,
-                error.violations,
-                nil
-              )
-
-      {:error, reason} ->
-        raise Error,
-          code: :invalid_request,
-          message: "server advertised an unusable descriptor for tool #{inspect(name)}",
-          details: %{tool: name, version: version, reason: inspect(reason)}
-
-      :error ->
-        raise Error,
-          code: :method_not_found,
-          message: "server did not advertise tool #{inspect(name)}",
-          details: %{tool: name, version: version}
+    with {:ok, catalog} <- fetch(client, :all, mode, deadline, opts, trace),
+         :ok <- check_limits(catalog, opts) do
+      {:ok,
+       %{
+         client: client,
+         generation: catalog.generation,
+         tools: catalog.raw,
+         expires_at_ms: catalog.expires_at_ms
+       }}
     end
   end
 
-  defp ensure_tool_catalog!(client, deadline, trace_opts, mode \\ :use) do
-    if FastestMCP.Client.Codec.authentication_options(trace_opts) != [] do
-      {generation, schema_options} = GenServer.call(client.pid, :catalog_configuration)
+  def revision(client_ref) do
+    with {:ok, client} <- Connection.pin(client_ref),
+         do: Connection.call(client, :catalog_revision)
+  end
 
-      case load_tool_catalog(
-             client,
-             generation,
-             schema_options,
-             deadline,
-             Keyword.put(trace_opts, :cache, :bypass)
-           ) do
-        {:ok, catalog} -> catalog
-        {:error, error} -> raise error
+  # The advertised descriptor of one tool, with the connection snapshot.
+  def descriptor(client, name, version, deadline, opts, trace) do
+    with {:ok, {lookup, snapshot}} <- fetch(client, {name, version}, :use, deadline, opts, trace) do
+      case lookup do
+        {:ok, descriptor} ->
+          {:ok, descriptor, snapshot}
+
+        {:error, %Schema.Error{} = error} ->
+          {:error,
+           ProtocolError.new("tools/list", :server_to_client, :response, error.violations)}
+
+        {:error, reason} ->
+          {:error,
+           %Error{
+             code: :invalid_request,
+             message: "server advertised an unusable descriptor for tool #{inspect(name)}",
+             details: %{tool: name, version: version, reason: inspect(reason)}
+           }}
+
+        :error ->
+          {:error,
+           %Error{
+             code: :method_not_found,
+             message: "server did not advertise tool #{inspect(name)}",
+             details: %{tool: name, version: version}
+           }}
       end
-    else
-      shared_tool_catalog!(client, deadline, trace_opts, mode)
     end
   end
 
-  defp shared_tool_catalog!(client, deadline, trace_opts, mode) do
-    timeout = remaining_timeout!(deadline, "tools/list")
+  # `select` (:all or `{name, version}`) of the connection's catalog; this
+  # caller loads it when the connection makes it the loader.
+  defp fetch(client, select, mode, deadline, opts, trace) do
+    mode = if Auth.options(opts) == [], do: mode, else: :private
 
-    response =
-      try do
-        GenServer.call(
-          client.pid,
-          {:ensure_tool_catalog, mode},
-          FastestMCP.Client.Connection.call_timeout(timeout)
-        )
-      catch
-        :exit, {:timeout, _call} ->
-          raise Error, code: :timeout, message: "tools/list catalog discovery timed out"
+    with {:ok, timeout} <- Deadline.check(deadline, "tools/list") do
+      call_timeout = Connection.call_timeout(timeout)
+
+      case Connection.call(client, {:tool_catalog, mode, select}, call_timeout) do
+        {:load, generation, schema_options, snapshot} when mode == :private ->
+          opts = Keyword.put(opts, :cache, :bypass)
+
+          with {:ok, tools} <- load(client, generation, schema_options, deadline, opts, trace),
+               do: {:ok, selection(tools, select, snapshot)}
+
+        {:load, generation, schema_options, _snapshot} ->
+          opts = Keyword.put(opts, :cache, mode)
+          result = load(client, generation, schema_options, deadline, opts, trace)
+
+          case Connection.call(client, {:install_tool_catalog, generation, result, select}) do
+            :stale -> fetch(client, select, mode, deadline, opts, trace)
+            reply -> reply
+          end
+
+        reply ->
+          reply
       end
-
-    case response do
-      {:ready, %ToolCatalog{} = catalog} ->
-        catalog
-
-      {:load, generation, schema_options} ->
-        result =
-          load_tool_catalog(
-            client,
-            generation,
-            schema_options,
-            deadline,
-            Keyword.put(trace_opts, :cache, mode)
-          )
-
-        case GenServer.call(client.pid, {:install_tool_catalog, generation, result}) do
-          {:ready, %ToolCatalog{} = catalog} -> catalog
-          {:error, exception} when is_exception(exception) -> raise exception
-          :stale -> ensure_tool_catalog!(client, deadline, trace_opts, mode)
-        end
-
-      {:error, exception} when is_exception(exception) ->
-        raise exception
     end
   end
 
-  defp load_tool_catalog(client, generation, schema_options, deadline, trace_opts) do
-    fetch_page = fn cursor ->
-      opts =
-        trace_opts
-        |> FastestMCP.Client.Codec.authentication_options()
-        |> Keyword.merge(
-          Keyword.take(trace_opts, [:__fastestmcp_trace_context, :__fastestmcp_client_trace])
-        )
-        |> Keyword.put(:__fastestmcp_trace_mode, :propagate_only)
-        |> Keyword.put(:cache, Keyword.get(trace_opts, :cache, :use))
-        |> Keyword.put(:timeout_ms, remaining_timeout!(deadline, "tools/list"))
+  defp selection(tools, :all, _snapshot), do: tools
 
-      opts =
-        if is_nil(cursor) do
-          opts
-        else
-          opts
-          |> Keyword.put(:cursor, cursor)
-          |> Keyword.put(:cache, :bypass)
-        end
+  defp selection(tools, {name, version}, snapshot),
+    do: {ToolCatalog.lookup(tools, name, version), snapshot}
 
-      FastestMCP.Client.Interaction.capture_page(fn ->
-        FastestMCP.Client.Requests.list_tools(client, opts)
-      end)
-    end
+  defp load(client, generation, schema_options, deadline, opts, trace) do
+    opts = Keyword.merge(Auth.options(opts), Keyword.take(opts, [:cache, :max_pages, :max_items]))
 
-    case Paginator.fetch_all_with_meta(
-           fetch_page,
-           Keyword.take(trace_opts, [:max_pages, :max_items])
-         ) do
+    case Requests.pages(client, "tools/list", :tools, opts, deadline, trace) do
       {:ok, %{items: tools, ttl_ms: ttl_ms, page_count: page_count}} ->
-        FastestMCP.Client.Trace.annotate_pagination_trace(trace_opts, page_count, length(tools))
-
         {:ok,
          %{ToolCatalog.build(tools, generation, schema_options, ttl_ms) | page_count: page_count}}
 
-      {:error, %Error{} = error} ->
-        {:error, tool_catalog_pagination_error(error)}
-
-      {:error, exception} when is_exception(exception) ->
-        {:error, exception}
-
-      {:error, reason} ->
-        {:error,
-         %Error{
-           code: :internal_error,
-           message: "tools/list catalog pagination failed",
-           details: %{reason: inspect(reason)}
-         }}
+      {:error, error} ->
+        {:error, pagination_error(error)}
     end
-  rescue
-    exception -> {:error, exception}
   end
 
-  defp tool_catalog_pagination_error(%Error{details: %{cursor: _cursor}} = error),
+  defp pagination_error(%Error{details: %{cursor: _cursor}} = error),
     do: %{error | message: "tools/list returned a repeated cursor"}
 
-  defp tool_catalog_pagination_error(%Error{details: %{max_pages: _max_pages}} = error),
+  defp pagination_error(%Error{details: %{max_pages: _max_pages}} = error),
     do: %{error | message: "tools/list exceeded the client catalog page limit"}
 
-  defp tool_catalog_pagination_error(%Error{details: %{max_items: _max_items}} = error),
+  defp pagination_error(%Error{details: %{max_items: _max_items}} = error),
     do: %{error | message: "tools/list exceeded the client catalog item limit"}
 
-  defp tool_catalog_pagination_error(error), do: error
+  defp pagination_error(error), do: error
 
-  def validate_tool_arguments!(descriptor, arguments) do
+  # A cached catalog may have been loaded under larger limits.
+  defp check_limits(catalog, opts) do
+    [max_pages: {catalog.page_count, 256}, max_items: {length(catalog.raw), 100_000}]
+    |> Enum.find_value(:ok, fn {key, {count, default}} ->
+      limit = Keyword.get(opts, key, default)
+
+      unless is_integer(limit) and limit > 0,
+        do: raise(ArgumentError, "#{key} must be a positive integer")
+
+      if count > limit do
+        message = "tools/list exceeded #{key}"
+        {:error, %Error{code: :overloaded, message: message, details: %{key => limit}}}
+      end
+    end)
+  end
+
+  ## Validation
+
+  def validate_arguments(descriptor, arguments) do
     case Schema.validate(descriptor.input_validator, arguments) do
       {:ok, ^arguments} ->
         :ok
 
-      {:error, %FastestMCP.Schema.Error{} = error} ->
-        raise Error,
-          code: :invalid_params,
-          message: "tool arguments do not match the advertised inputSchema",
-          details: %{tool: descriptor.name, violations: error.violations}
+      {:error, %Schema.Error{} = error} ->
+        {:error,
+         %Error{
+           code: :invalid_params,
+           message: "tool arguments do not match the advertised inputSchema",
+           details: %{tool: descriptor.name, violations: error.violations}
+         }}
     end
   end
 
-  def http_parameter_headers!(client, descriptor, arguments) do
-    if FastestMCP.Client.Connection.client_transport_type(client) == :streamable_http do
-      encode_http_parameter_headers!(descriptor, arguments)
-    else
-      %{}
-    end
-  end
-
-  defp encode_http_parameter_headers!(descriptor, arguments) do
+  # Streamable HTTP mirrors annotated arguments in Mcp-Param headers.
+  def http_parameter_headers(%{transport: :streamable_http}, descriptor, arguments) do
     case HTTPHeaders.encode(descriptor.http_headers, arguments) do
       {:ok, headers} ->
-        headers
+        {:ok, headers}
 
       {:error, reason} ->
-        raise Error,
-          code: :invalid_params,
-          message: "tool arguments cannot be represented in the declared HTTP headers",
-          details: %{tool: descriptor.name, reason: reason}
+        {:error,
+         %Error{
+           code: :invalid_params,
+           message: "tool arguments cannot be represented in the declared HTTP headers",
+           details: %{tool: descriptor.name, reason: reason}
+         }}
     end
   end
 
-  def validate_tool_task_mode!(client, descriptor, task_augmented?, modern_protocol?) do
-    capabilities = FastestMCP.Client.Connection.capabilities(client)
+  def http_parameter_headers(_snapshot, _descriptor, _arguments), do: {:ok, %{}}
 
-    task_capability? =
-      Protocol.capability?(capabilities, ["tasks", "requests", "tools", "call"])
+  # Legacy task augmentation must match the server's and the tool's support;
+  # modern tasks are server-directed.
+  def validate_task_mode(%{protocol_version: modern()}, _descriptor, _task_requested?),
+    do: :ok
+
+  def validate_task_mode(snapshot, descriptor, task_requested?) do
+    capable? = Protocol.capability?(snapshot.capabilities, ["tasks", "requests", "tools", "call"])
 
     cond do
-      modern_protocol? ->
-        :ok
+      task_requested? and not capable? ->
+        {:error,
+         %Error{code: :bad_request, message: "server did not advertise task-augmented tool calls"}}
 
-      task_augmented? and not task_capability? ->
-        raise Error,
-          code: :bad_request,
-          message: "server did not advertise task-augmented tool calls"
+      task_requested? and descriptor.task_support == :forbidden ->
+        {:error,
+         %Error{
+           code: :method_not_found,
+           message: "tool #{inspect(descriptor.name)} does not support task execution"
+         }}
 
-      task_augmented? and descriptor.task_support == :forbidden ->
-        raise Error,
-          code: :method_not_found,
-          message: "tool #{inspect(descriptor.name)} does not support task execution"
-
-      not task_augmented? and descriptor.task_support == :required ->
-        raise Error,
-          code: :method_not_found,
-          message: "tool #{inspect(descriptor.name)} requires task execution"
+      not task_requested? and descriptor.task_support == :required ->
+        {:error,
+         %Error{
+           code: :method_not_found,
+           message: "tool #{inspect(descriptor.name)} requires task execution"
+         }}
 
       true ->
         :ok
     end
   end
 
-  def validate_tool_output!(descriptor, result),
-    do: validate_tool_output_validator!(descriptor.output_validator, descriptor.name, result)
+  # A result is checked against the advertised outputSchema; an error result
+  # need not carry structured content.
+  def validate_output(nil, _name, _result), do: :ok
 
-  def validate_tool_output_validator!(nil, _name, _result), do: :ok
+  def validate_output(validator, name, result) do
+    case result do
+      %{"structuredContent" => structured} ->
+        case Schema.validate(validator, structured) do
+          {:ok, ^structured} ->
+            :ok
 
-  def validate_tool_output_validator!(validator, name, %{"isError" => true} = result) do
-    if Map.has_key?(result, "structuredContent") do
-      validate_structured_tool_output!(validator, name, result["structuredContent"])
-    else
-      :ok
-    end
-  end
+          {:error, %Schema.Error{} = error} ->
+            violations = Enum.map(error.violations, &Map.put_new(&1, :tool, name))
+            {:error, ProtocolError.new("tools/call", :server_to_client, :response, violations)}
+        end
 
-  def validate_tool_output_validator!(validator, name, result) do
-    if Map.has_key?(result, "structuredContent") do
-      validate_structured_tool_output!(validator, name, result["structuredContent"])
-    else
-      raise ProtocolError.new(
-              "tools/call",
-              :server_to_client,
-              :response,
-              [%{path: "/structuredContent", message: "required by advertised outputSchema"}],
-              nil
-            )
-    end
-  end
-
-  defp validate_structured_tool_output!(validator, name, structured_content) do
-    case Schema.validate(validator, structured_content) do
-      {:ok, ^structured_content} ->
+      %{"isError" => true} ->
         :ok
 
-      {:error, %FastestMCP.Schema.Error{} = error} ->
-        raise ProtocolError.new(
-                "tools/call",
-                :server_to_client,
-                :response,
-                Enum.map(error.violations, &Map.put_new(&1, :tool, name)),
-                nil
-              )
+      _result ->
+        violation = %{path: "/structuredContent", message: "required by advertised outputSchema"}
+        {:error, ProtocolError.new("tools/call", :server_to_client, :response, [violation])}
     end
   end
-
-  defdelegate remaining_timeout!(deadline, operation), to: FastestMCP.Deadline, as: :remaining!
-
-  defp validate_limits!(catalog, opts) do
-    for {key, count, default} <- [
-          {:max_pages, catalog.page_count, 256},
-          {:max_items, length(catalog.raw), 100_000}
-        ] do
-      limit = Keyword.get(opts, key, default)
-
-      unless is_integer(limit) and limit > 0,
-        do: raise(ArgumentError, "#{key} must be a positive integer")
-
-      if count > limit,
-        do:
-          raise(Error,
-            code: :overloaded,
-            message: "tools/list exceeded #{key}",
-            details: %{key => limit}
-          )
-    end
-
-    :ok
-  end
-
-  def normalize_schema_options!(options) when is_list(options) do
-    if Keyword.keyword?(options) do
-      options
-    else
-      raise ArgumentError, "schema_options must be a keyword list"
-    end
-  end
-
-  def normalize_schema_options!(other) do
-    raise ArgumentError, "schema_options must be a keyword list, got: #{inspect(other)}"
-  end
-
-  def maybe_put_task_output_validator(entry, nil), do: entry
-
-  def maybe_put_task_output_validator(entry, validator),
-    do: Map.put(entry, :output_validator, validator)
 end

@@ -89,6 +89,7 @@ scope "/" do
   forward "/mcp", FastestMCP.Transport.HTTPApp,
     server_name: MyApp.MCPServer,
     path: "/mcp",
+    allowed_hosts: ["mcp.example.com"],
     auth_assigns: [:current_user]
 end
 ```
@@ -239,7 +240,7 @@ https://mcp.example.com/.well-known/oauth-protected-resource/mcp
 Authentication failures include both discovery and authoritative scope:
 
 ```text
-WWW-Authenticate: Bearer resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource/mcp", scope="documents:read", error="invalid_token"
+WWW-Authenticate: Bearer resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource/mcp", scope="documents:read", error="invalid_token", error_description="missing credentials"
 ```
 
 The configured `resource` must be the exact absolute MCP resource URI.

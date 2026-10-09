@@ -1,5 +1,5 @@
 defmodule FastestMCP.ApplicationSessionTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.ApplicationSession
   alias FastestMCP.Auth.StaticToken
@@ -218,8 +218,7 @@ defmodule FastestMCP.ApplicationSessionTest do
   test "anonymous explicit sessions require an opt-in and remain bearer capabilities" do
     disabled_name = unique_name("application-session-anonymous-disabled")
     disabled_server = FastestMCP.server(disabled_name) |> add_session_tools()
-    assert {:ok, _pid} = FastestMCP.start_server(disabled_server)
-    on_exit(fn -> FastestMCP.stop_server(disabled_name) end)
+    start_server!(disabled_server)
 
     error =
       assert_raise Error, fn ->
@@ -230,12 +229,9 @@ defmodule FastestMCP.ApplicationSessionTest do
 
     enabled_name = unique_name("application-session-anonymous-enabled")
 
-    enabled_server =
-      FastestMCP.server(enabled_name, application_sessions: [allow_anonymous: true])
-      |> add_session_tools()
-
-    assert {:ok, _pid} = FastestMCP.start_server(enabled_server)
-    on_exit(fn -> FastestMCP.stop_server(enabled_name) end)
+    FastestMCP.server(enabled_name, application_sessions: [allow_anonymous: true])
+    |> add_session_tools()
+    |> start_server!()
 
     assert %{"sessionId" => session_id} =
              FastestMCP.call_tool!(enabled_name, "explicit_create", %{})
@@ -248,14 +244,11 @@ defmodule FastestMCP.ApplicationSessionTest do
 
     {:ok, runtime} = ServerRuntime.fetch(enabled_name)
 
-    {:ok, authenticated_context} =
-      Context.build(
-        enabled_name,
-        ServerRuntime.context_opts(runtime,
-          state_scope: :request,
-          authenticated: true,
-          principal: {"https://issuer.example", "alice"}
-        )
+    authenticated_context =
+      Context.new(runtime,
+        state_scope: :request,
+        authenticated: true,
+        principal: {"https://issuer.example", "alice"}
       )
 
     authenticated_session = ApplicationSession.fetch!(authenticated_context, session_id)
@@ -273,21 +266,15 @@ defmodule FastestMCP.ApplicationSessionTest do
     server_name = unique_name("application-session-race")
     server = session_server(server_name)
 
-    assert {:ok, _pid} =
-             FastestMCP.start_server(server, session_state_store: {RaceStore, owner: self()})
-
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server, session_state_store: {RaceStore, owner: self()})
 
     {:ok, runtime} = ServerRuntime.fetch(server_name)
 
-    {:ok, context} =
-      Context.build(
-        server_name,
-        ServerRuntime.context_opts(runtime,
-          state_scope: :request,
-          authenticated: true,
-          principal: {"https://issuer.example", "alice"}
-        )
+    context =
+      Context.new(runtime,
+        state_scope: :request,
+        authenticated: true,
+        principal: {"https://issuer.example", "alice"}
       )
 
     session = ApplicationSession.create!(context)
@@ -306,12 +293,9 @@ defmodule FastestMCP.ApplicationSessionTest do
   test "optional provider exposes create and terminate tools through Providers.Local" do
     server_name = unique_name("application-session-provider")
 
-    server =
-      authenticated_server(server_name)
-      |> FastestMCP.add_provider(ApplicationSessions.new())
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    authenticated_server(server_name)
+    |> FastestMCP.add_provider(ApplicationSessions.new())
+    |> start_server!()
 
     names =
       server_name
@@ -348,8 +332,7 @@ defmodule FastestMCP.ApplicationSessionTest do
 
   defp start_session_server!(server_name, opts \\ []) do
     server = session_server(server_name, opts)
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
     server
   end
 
@@ -430,9 +413,6 @@ defmodule FastestMCP.ApplicationSessionTest do
   end
 
   defp auth_input(token), do: %{"authorization" => "Bearer " <> token}
-
-  defp unique_name(prefix),
-    do: prefix <> "-" <> Integer.to_string(System.unique_integer([:positive]))
 
   defp random_id, do: :crypto.strong_rand_bytes(32) |> Base.url_encode64(padding: false)
 end

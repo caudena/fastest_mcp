@@ -1,30 +1,27 @@
 defmodule FastestMCP.InjectedArgumentsTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   test "injected tool arguments stay out of metadata and override caller input" do
     server_name = "inject-tool-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool(
-        "whoami",
-        fn arguments, _ctx ->
-          arguments
-        end,
-        input_schema: %{
-          type: "object",
-          properties: %{
-            value: %{type: "integer"}
-          },
-          required: ["value"]
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool(
+      "whoami",
+      fn arguments, _ctx ->
+        arguments
+      end,
+      input_schema: %{
+        type: "object",
+        properties: %{
+          value: %{type: "integer"}
         },
-        inject: [
-          session_id: fn ctx -> ctx.session_id end
-        ]
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+        required: ["value"]
+      },
+      inject: [
+        session_id: fn ctx -> ctx.session_id end
+      ]
+    )
+    |> start_server!()
 
     [tool] = FastestMCP.list_tools!(server_name)
     refute Map.has_key?(tool.input_schema["properties"], "session_id")
@@ -41,25 +38,22 @@ defmodule FastestMCP.InjectedArgumentsTest do
   test "resource and prompt injection receive context-resolved values" do
     server_name = "inject-surface-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_resource(
-        "memo://session",
-        fn arguments, _ctx -> arguments end,
-        inject: [session_id: fn ctx -> ctx.session_id end]
-      )
-      |> FastestMCP.add_prompt(
-        "session_prompt",
-        fn arguments, _ctx ->
-          FastestMCP.Prompts.Result.from(%{
-            messages: [%{role: "user", content: arguments["session_id"]}]
-          })
-        end,
-        inject: [session_id: fn ctx -> ctx.session_id end]
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_resource(
+      "memo://session",
+      fn arguments, _ctx -> arguments end,
+      inject: [session_id: fn ctx -> ctx.session_id end]
+    )
+    |> FastestMCP.add_prompt(
+      "session_prompt",
+      fn arguments, _ctx ->
+        FastestMCP.Prompts.Result.from(%{
+          messages: [%{role: "user", content: arguments["session_id"]}]
+        })
+      end,
+      inject: [session_id: fn ctx -> ctx.session_id end]
+    )
+    |> start_server!()
 
     assert %{"session_id" => "inject-session"} ==
              FastestMCP.read_resource!(server_name, "memo://session",

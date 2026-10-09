@@ -1,5 +1,5 @@
 defmodule FastestMCP.ContextStateTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Context
 
@@ -122,8 +122,7 @@ defmodule FastestMCP.ContextStateTest do
         %{shared: Context.get_state(ctx, :shared, :missing)}
       end)
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
     assert %{stored: "hello"} ==
              FastestMCP.call_tool!(server_name, "write_session", %{"value" => "hello"},
@@ -147,19 +146,12 @@ defmodule FastestMCP.ContextStateTest do
     server_name =
       "context-custom-store-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("remember", fn %{"value" => value}, ctx ->
-        :ok = Context.set_state(ctx, :value, value)
-        %{value: Context.get_state(ctx, :value)}
-      end)
-
-    assert {:ok, _pid} =
-             FastestMCP.start_server(server,
-               session_state_store: {RecordingStore, owner: self()}
-             )
-
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("remember", fn %{"value" => value}, ctx ->
+      :ok = Context.set_state(ctx, :value, value)
+      %{value: Context.get_state(ctx, :value)}
+    end)
+    |> start_server!(session_state_store: {RecordingStore, owner: self()})
 
     assert %{value: "stored"} ==
              FastestMCP.call_tool!(server_name, "remember", %{"value" => "stored"},
@@ -168,15 +160,51 @@ defmodule FastestMCP.ContextStateTest do
 
     assert_receive {:recording_store_put, "recorded-session", :value, "stored"}, 1_000
 
-    {:ok, runtime} = FastestMCP.ServerRuntime.fetch(server_name)
-
-    assert :ok =
-             FastestMCP.SessionSupervisor.terminate_session(
-               runtime.session_supervisor,
-               server_name,
-               "recorded-session"
-             )
+    assert :ok = FastestMCP.SessionSupervisor.terminate_session(server_name, "recorded-session")
 
     assert_receive {:recording_store_delete_session, "recorded-session"}, 1_000
+  end
+
+  test "request-local state keeps the negotiated HTTP session identity" do
+    server_name = unique_name("request-state")
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("state", fn _arguments, context ->
+      count = Context.get_state(context, :count, 0)
+      :ok = Context.set_state(context, :count, count + 1)
+      %{count: count + 1, session_id: context.session_id, state_scope: context.state_scope}
+    end)
+    |> start_server!()
+
+    call_opts = [state_scope: :request]
+
+    {session_id, _initialize, initialized} =
+      ProtocolTest.initialize_http(server_name, call_opts)
+
+    assert initialized.status == 202
+
+    for id <- [2, 3] do
+      response =
+        ProtocolTest.http_request(
+          server_name,
+          session_id,
+          id,
+          "tools/call",
+          %{"name" => "state"},
+          call_opts
+        )
+
+      assert response.status == 200
+
+      assert %{
+               "result" => %{
+                 "structuredContent" => %{
+                   "count" => 1,
+                   "session_id" => ^session_id,
+                   "state_scope" => "request"
+                 }
+               }
+             } = JSON.decode!(response.resp_body)
+    end
   end
 end

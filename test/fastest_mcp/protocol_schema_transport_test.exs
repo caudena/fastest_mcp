@@ -1,5 +1,5 @@
 defmodule FastestMCP.ProtocolSchemaTransportTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   import Plug.Conn
   import Plug.Test
@@ -166,7 +166,7 @@ defmodule FastestMCP.ProtocolSchemaTransportTest do
       |> put_req_header("accept", "application/json, text/event-stream")
 
     assert {:ok, %Request{request_metadata: %{jsonrpc_envelope: ^envelope}}} =
-             StreamableHTTPAdapter.decode(conn)
+             decode_http(conn)
 
     reconstructed_would_pass =
       jsonrpc_request("tools/list", %{},
@@ -226,7 +226,7 @@ defmodule FastestMCP.ProtocolSchemaTransportTest do
       |> put_req_header("mcp-session-id", "private-envelope-session")
       |> put_req_header("mcp-protocol-version", ProtocolTest.protocol_version())
 
-    assert {:ok, %Request{} = http_request} = StreamableHTTPAdapter.decode(conn)
+    assert {:ok, %Request{} = http_request} = decode_http(conn)
     assert http_request.auth_input["authorization"] == "Bearer " <> secret
     assert http_request.transport_authorization == "Bearer " <> secret
     assert get_in(http_request.payload, ["_meta", "fastestmcp", "auth"]) == nil
@@ -460,7 +460,7 @@ defmodule FastestMCP.ProtocolSchemaTransportTest do
   end
 
   test "Engine routes validated session control requests and notifications" do
-    server_name = unique_server_name("protocol-schema-session")
+    server_name = unique_name("protocol-schema-session")
     start_server!(FastestMCP.server(server_name))
     session_id = ProtocolTest.initialize_session(server_name, "schema-session")
 
@@ -537,7 +537,7 @@ defmodule FastestMCP.ProtocolSchemaTransportTest do
   end
 
   test "schema-invalid notifications stay silent at the stdio boundary" do
-    server_name = unique_server_name("protocol-schema-notification")
+    server_name = unique_name("protocol-schema-notification")
     start_server!(FastestMCP.server(server_name))
     {connection_id, _initialize_response} = ProtocolTest.initialize_stdio(server_name)
 
@@ -562,15 +562,13 @@ defmodule FastestMCP.ProtocolSchemaTransportTest do
   end
 
   test "authentication failures do not create responses for malformed HTTP notifications" do
-    server_name = unique_server_name("protocol-schema-auth-notification")
+    server_name = unique_name("protocol-schema-auth-notification")
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_auth(fn _input, _context ->
-        {:error, %Error{code: :unauthorized, message: "authentication required"}}
-      end)
-
-    start_server!(server)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_auth(fn _input, _context ->
+      {:error, %Error{code: :unauthorized, message: "authentication required"}}
+    end)
+    |> start_server!()
 
     response =
       ProtocolTest.http_post(
@@ -617,10 +615,6 @@ defmodule FastestMCP.ProtocolSchemaTransportTest do
     }
   end
 
-  defp start_server!(server) do
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server.name) end)
-  end
-
-  defp unique_server_name(prefix), do: "#{prefix}-#{System.unique_integer([:positive])}"
+  defp decode_http(conn),
+    do: conn |> StreamableHTTPAdapter.decode_with_conn([]) |> elem(0)
 end
