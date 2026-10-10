@@ -187,13 +187,10 @@ defmodule FastestMCP.StreamableHTTPTest do
 
     assert reuse_response.status == 404
 
-    assert %{
-             "jsonrpc" => "2.0",
-             "id" => 2,
-             "error" => %{"message" => message}
-           } = JSON.decode!(reuse_response.resp_body)
-
-    assert message =~ "unknown session"
+    # The error answers no request: the client starts a new session.
+    body = JSON.decode!(reuse_response.resp_body)
+    assert %{"jsonrpc" => "2.0", "error" => %{"message" => "Session not found"}} = body
+    refute Map.has_key?(body, "id")
   end
 
   test "GET /mcp requires event-stream negotiation and an existing session", %{
@@ -230,10 +227,8 @@ defmodule FastestMCP.StreamableHTTPTest do
     assert unknown_session.status == 404
 
     body = JSON.decode!(unknown_session.resp_body)
-    assert %{"jsonrpc" => "2.0", "error" => %{"message" => message}} = body
+    assert %{"jsonrpc" => "2.0", "error" => %{"message" => "Session not found"}} = body
     refute Map.has_key?(body, "id")
-
-    assert message =~ "unknown session"
   end
 
   test "GET /mcp returns 405 when session streaming is explicitly disabled", %{
@@ -344,6 +339,31 @@ defmodule FastestMCP.StreamableHTTPTest do
 
     # A version the server doesn't support is still refused.
     assert call.(3, "2099-01-01").status == 400
+  end
+
+  test "a request for an unknown session gets 404 with an error that answers no request" do
+    # As after a deploy: the client still holds a session the server no longer has.
+    server_name = unique_name("http-stale-session")
+    FastestMCP.server(server_name) |> start_server!()
+
+    body = ProtocolTest.jsonrpc_request(7, "tools/list", %{})
+
+    conn =
+      ProtocolTest.http_post_raw(server_name, JSON.encode!(body), session_id: "stale-session")
+
+    # 404 tells the client to start a new session. The JSON-RPC error names no
+    # request, as the reference SDKs answer, so that a client doesn't take it for
+    # the answer to its call.
+    assert conn.status == 404
+
+    assert JSON.decode!(conn.resp_body) == %{
+             "jsonrpc" => "2.0",
+             "error" => %{
+               "code" => -32_001,
+               "message" => "Session not found",
+               "data" => %{"fastestmcp" => %{"code" => "not_found"}}
+             }
+           }
   end
 
   test "a request for a server that isn't running gets 503 with Retry-After" do

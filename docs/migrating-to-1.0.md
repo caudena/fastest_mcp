@@ -737,6 +737,9 @@ list (was `:resource_required`).
 
 Over HTTP:
 
+- A request for an unknown or ended `2025-11-25` session gets `404` with a
+  JSON-RPC error `Session not found` (code `-32001`) that names no request id
+  (it had `unknown session "..."`, code `-32602`, and the request's id).
 - A `2025-11-25` session request without `MCP-Protocol-Version` uses the
   version its session negotiated (it got `400`
   `MCP-Protocol-Version is required`).

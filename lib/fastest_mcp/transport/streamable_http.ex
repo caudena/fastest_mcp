@@ -171,8 +171,16 @@ defmodule FastestMCP.Transport.StreamableHTTP do
           request = %{request | auth_result: auth_result}
 
           case validate_request(runtime, request) do
-            :ok -> dispatch(conn, runtime, request, opts)
-            {:error, %Error{} = error} -> {:error, :transport, request, error}
+            :ok ->
+              dispatch(conn, runtime, request, opts)
+
+            # The session is gone: the error answers no request, so that the
+            # client takes the 404 for what it is and starts a new session.
+            {:error, %Error{code: :not_found} = error} ->
+              {:error, :transport, %{request | request_id: nil}, error}
+
+            {:error, %Error{} = error} ->
+              {:error, :transport, request, error}
           end
 
         {{:respond, _status, _body, _headers} = response, {:ok, _auth_result}} ->
@@ -281,8 +289,13 @@ defmodule FastestMCP.Transport.StreamableHTTP do
 
   defp lookup_session(runtime, session_id) do
     with {:error, :not_found} <- Registry.lookup_session(runtime.server.name, session_id),
-         do: {:error, Error.not_found(:session, session_id)}
+         do: {:error, session_not_found()}
   end
+
+  # A session that ended or never existed gets 404, which tells MCP clients to
+  # start a new one, with the JSON-RPC code and message of the reference SDKs.
+  defp session_not_found,
+    do: %Error{code: :not_found, message: "Session not found", details: %{jsonrpc_code: -32_001}}
 
   # A server without an authenticator has no identities to tell apart.
   defp verify_identity(_runtime, %Request{auth_result: nil}), do: :ok
@@ -302,7 +315,7 @@ defmodule FastestMCP.Transport.StreamableHTTP do
          }}
 
       {:error, :not_found} ->
-        {:error, Error.not_found(:session, request.session_id)}
+        {:error, session_not_found()}
     end
   end
 
@@ -323,7 +336,7 @@ defmodule FastestMCP.Transport.StreamableHTTP do
          }}
 
       {:error, :not_found} ->
-        {:error, Error.not_found(:session, session_id)}
+        {:error, session_not_found()}
     end
   end
 
@@ -433,7 +446,7 @@ defmodule FastestMCP.Transport.StreamableHTTP do
         {:respond, 204, nil, []}
 
       {:error, :not_found} ->
-        {:error, :transport, nil, Error.not_found(:session, session_id)}
+        {:error, :transport, nil, session_not_found()}
 
       {:error, %Error{} = error} ->
         {:error, :transport, nil, error}

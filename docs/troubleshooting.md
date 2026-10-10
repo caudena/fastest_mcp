@@ -151,10 +151,11 @@ The body says which part didn't match:
 - **`Phoenix.Router.NoRouteError`**, with `no route found for POST /mcp`, means
   that the router has no matching `forward`: check the client's URL against
   your routes.
-- **`unknown session`**, followed by the session id, answers a `2025-11-25`
-  request whose session has ended: it was idle for 15 minutes, the server
-  restarted, or the request reached another node. The client must initialize
-  a new session; `FastestMCP.Client` does that by itself. With several nodes,
+- **`Session not found`**, JSON-RPC code `-32001` in an error that names no
+  request id, answers a `2025-11-25` request whose session has ended: it was
+  idle for 15 minutes, the server restarted, or the request reached another
+  node. The `404` tells the client to initialize a new session;
+  `FastestMCP.Client` does that by itself. With several nodes,
   see [Running several nodes](production.md#running-several-nodes).
 
 ## The client gets 405 Method Not Allowed

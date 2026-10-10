@@ -283,6 +283,11 @@ change and the code to update.
 
 ### Fixes
 
+- answer a request for an unknown or ended session with `404` and a JSON-RPC
+  error `Session not found` (code `-32001`) that names no request id, as the
+  reference SDKs answer, instead of `unknown session "..."` with the request's
+  id, which clients took for the answer to their call instead of starting a
+  new session
 - accept a `2025-11-25` session request without `MCP-Protocol-Version`, with
   the version its session negotiated, as MCP's backwards compatibility asks,
   instead of `400` `MCP-Protocol-Version is required`; a version the server

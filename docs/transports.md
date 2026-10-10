@@ -495,11 +495,15 @@ performs for you:
 3. Send every later request with both headers. `GET` opens the session's
    stream for server messages, and `DELETE` ends the session with `204`.
 
-A request without a session id gets `400`, and a request for an unknown or
-ended session gets `404`. A session request without `MCP-Protocol-Version`
-uses the version its session negotiated, as MCP's backwards compatibility asks,
-and one that names a version the server doesn't support gets `400`. Until `notifications/initialized` arrives, the
-server accepts only that notification and `ping`. Every `POST` except
+A request without a session id gets `400`. A request for an unknown or ended
+session gets `404`, the signal for the client to start a new session, with a
+JSON-RPC error `Session not found` (code `-32001`) that names no request id, as
+the reference SDKs answer, so that clients don't take it for the answer to
+their call. A session request without `MCP-Protocol-Version` uses the version
+its session negotiated, as MCP's backwards compatibility asks, and one that
+names a version the server doesn't support gets `400`. Until
+`notifications/initialized` arrives, the server accepts only that notification
+and `ping`. Every `POST` except
 `initialize` is answered with an event stream unless `json_response: true`.
 Server messages that belong to a request, such as its progress and the
 server's own requests to the client, travel on that request's stream; other

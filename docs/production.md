@@ -283,7 +283,7 @@ can answer it. Some state stays on the node where it was created:
 
 | State | Lives on | So |
 | --- | --- | --- |
-| A `2025-11-25` session, with the events kept for resuming its streams | The node that answered its `initialize` | Send every request with the session's `Mcp-Session-Id` header to that node. Other nodes answer `404` with `unknown session`. |
+| A `2025-11-25` session, with the events kept for resuming its streams | The node that answered its `initialize` | Send every request with the session's `Mcp-Session-Id` header to that node. Other nodes answer `404` with `Session not found`. |
 | A background task | The node that started it | Requests about the task, such as `tasks/get` and `tasks/cancel`, must reach that node. Other nodes answer with an `Invalid taskId` error. |
 | A `subscriptions/listen` stream (`2026-07-28`) | The node that holds the stream | It receives the notifications of that node only. |
 | Resource update notifications, component changes, and visibility rules | The node where your code makes them | Make them on every node, for example from a `Phoenix.PubSub` message. |
@@ -327,8 +327,8 @@ supervisor reports leave it out.
 ### Restarts and deploys
 
 When a node stops, the `2025-11-25` sessions it held end. A client's next
-request gets `404` with `unknown session`, and the client must initialize a new
-session; `FastestMCP.Client` does that by itself, after the request that
+request gets `404` with `Session not found`, and the client must initialize a
+new session; `FastestMCP.Client` does that by itself, after the request that
 received the `404` fails. Requests still running when the node stops end with
 it, and so do its background tasks; with a durable task backend, they fail with
 `:runtime_restarted` when the node starts again. `2026-07-28` clients send their
