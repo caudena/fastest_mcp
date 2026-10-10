@@ -119,10 +119,10 @@ defmodule FastestMCP.TestSupport.ConformanceFixture do
       fn _arguments, _ctx ->
         Process.sleep(100)
 
-        %{
+        FastestMCP.Tools.Result.from(%{
           isError: true,
           content: [%{type: "text", text: "This task intentionally failed."}]
-        }
+        })
       end,
       description: "Returns a tool execution error from a required task.",
       task: [mode: :required]
@@ -249,21 +249,21 @@ defmodule FastestMCP.TestSupport.ConformanceFixture do
     |> FastestMCP.add_tool(
       "test_image_content",
       fn _arguments, _ctx ->
-        %{type: "image", data: @red_png, mimeType: "image/png"}
+        FastestMCP.Tools.Result.new(%{type: "image", data: @red_png, mimeType: "image/png"})
       end,
       description: "Returns a PNG image."
     )
     |> FastestMCP.add_tool(
       "test_audio_content",
       fn _arguments, _ctx ->
-        %{type: "audio", data: @silent_wav, mimeType: "audio/wav"}
+        FastestMCP.Tools.Result.new(%{type: "audio", data: @silent_wav, mimeType: "audio/wav"})
       end,
       description: "Returns WAV audio."
     )
     |> FastestMCP.add_tool(
       "test_embedded_resource",
       fn _arguments, _ctx ->
-        [
+        FastestMCP.Tools.Result.new([
           %{
             type: "resource",
             resource: %{
@@ -272,14 +272,14 @@ defmodule FastestMCP.TestSupport.ConformanceFixture do
               text: "This is an embedded resource content."
             }
           }
-        ]
+        ])
       end,
       description: "Returns an embedded resource."
     )
     |> FastestMCP.add_tool(
       "test_multiple_content_types",
       fn _arguments, _ctx ->
-        [
+        FastestMCP.Tools.Result.new([
           %{type: "text", text: "This is a text part of the response."},
           %{type: "image", data: @red_png, mimeType: "image/png"},
           %{
@@ -290,19 +290,19 @@ defmodule FastestMCP.TestSupport.ConformanceFixture do
               text: ~s({"test":"data","value":123})
             }
           }
-        ]
+        ])
       end,
       description: "Returns mixed text, image, and resource content."
     )
     |> FastestMCP.add_tool(
       "test_error_handling",
       fn _arguments, _ctx ->
-        %{
+        FastestMCP.Tools.Result.from(%{
           isError: true,
           content: [
             %{type: "text", text: "This tool intentionally returns an error for testing"}
           ]
-        }
+        })
       end,
       description: "Always returns an error."
     )
@@ -575,7 +575,7 @@ defmodule FastestMCP.TestSupport.ConformanceFixture do
     |> FastestMCP.add_prompt(
       "test_prompt_with_embedded_resource",
       fn %{"resourceUri" => resource_uri}, _ctx ->
-        %{
+        FastestMCP.Prompts.Result.from(%{
           messages: [
             %{
               role: "user",
@@ -589,7 +589,7 @@ defmodule FastestMCP.TestSupport.ConformanceFixture do
               }
             }
           ]
-        }
+        })
       end,
       description: "A prompt that returns an embedded resource.",
       arguments: [%{name: "resourceUri", required: true, description: "Embedded resource URI"}]
@@ -597,12 +597,12 @@ defmodule FastestMCP.TestSupport.ConformanceFixture do
     |> FastestMCP.add_prompt(
       "test_prompt_with_image",
       fn _arguments, _ctx ->
-        %{
+        FastestMCP.Prompts.Result.from(%{
           messages: [
             %{role: "user", content: %{type: "image", data: @red_png, mimeType: "image/png"}},
             %{role: "user", content: "Please analyze the image above."}
           ]
-        }
+        })
       end,
       description: "A prompt that returns an image."
     )
@@ -627,7 +627,7 @@ defmodule FastestMCP.TestSupport.ConformanceFixture do
   end
 
   defp trigger_tool_change(_arguments, ctx) do
-    manager = FastestMCP.component_manager(ctx.server_name)
+    manager = FastestMCP.component_manager!(ctx.server_name)
 
     {:ok, _component} =
       ComponentManager.add_tool(
@@ -642,7 +642,7 @@ defmodule FastestMCP.TestSupport.ConformanceFixture do
   end
 
   defp trigger_prompt_change(_arguments, ctx) do
-    manager = FastestMCP.component_manager(ctx.server_name)
+    manager = FastestMCP.component_manager!(ctx.server_name)
 
     {:ok, _component} =
       ComponentManager.add_prompt(
@@ -845,11 +845,7 @@ defmodule FastestMCP.TestSupport.ConformanceFixture do
   defp input_required_prompt(_arguments, ctx) do
     case accepted_content(Context.input_responses(ctx), "user_context") do
       {:ok, %{"context" => context}} when is_binary(context) ->
-        %{
-          messages: [
-            %{role: "user", content: %{type: "text", text: "Use this context: #{context}"}}
-          ]
-        }
+        FastestMCP.Prompts.Result.new("Use this context: #{context}")
 
       _missing_or_invalid ->
         InputRequiredResult.new(%{
@@ -876,13 +872,16 @@ defmodule FastestMCP.TestSupport.ConformanceFixture do
         next.(operation)
 
       _missing_or_invalid ->
-        InputRequiredResult.new(
-          %{
-            "user_name" =>
-              elicitation_request("What is your name?", %{"name" => %{"type" => "string"}})
-          },
-          request_state: "task-conformance-user-name"
-        )
+        input_required =
+          InputRequiredResult.new(
+            %{
+              "user_name" =>
+                elicitation_request("What is your name?", %{"name" => %{"type" => "string"}})
+            },
+            request_state: "task-conformance-user-name"
+          )
+
+        {:ok, %{operation | result: input_required}}
     end
   end
 

@@ -1,11 +1,11 @@
 defmodule FastestMCP.CapabilityNegotiationTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
+  alias FastestMCP.EventBus
   alias FastestMCP.Protocol
   alias FastestMCP.Registry
   alias FastestMCP.ServerRuntime
   alias FastestMCP.Session
-  alias FastestMCP.SessionNotificationSubscriber
   alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
 
   test "false capability values are not treated as advertised support" do
@@ -27,12 +27,9 @@ defmodule FastestMCP.CapabilityNegotiationTest do
     server_name = "capability-list-change-#{System.unique_integer([:positive])}"
     session_id = "capability-session"
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+    |> start_server!()
 
     ProtocolTest.initialize_session(server_name, session_id)
     assert {:ok, session_pid} = Registry.lookup_session(server_name, session_id)
@@ -40,28 +37,69 @@ defmodule FastestMCP.CapabilityNegotiationTest do
 
     set_tools_list_changed(session_pid, false)
 
-    assert {:ok, subscriber} =
-             SessionNotificationSubscriber.start_link(
-               server_name: server_name,
-               session_id: session_id,
-               event_bus: runtime.event_bus,
-               task_store: runtime.task_store,
-               owner: self(),
-               target: self()
-             )
+    assert {:ok, %{sink_ref: sink_ref}} =
+             Session.attach_sink(server_name, session_id, self(), kind: :get)
 
-    send_component_change(subscriber, server_name)
-    refute_receive {:fastest_mcp_session_notification, ^server_name, _notification}, 100
+    emit_component_change(runtime, server_name)
+    refute_receive {:fastest_mcp_session_message, ^sink_ref, _event_id, _notification}, 100
 
     set_tools_list_changed(session_pid, true)
-    send_component_change(subscriber, server_name)
+    emit_component_change(runtime, server_name)
 
-    assert_receive {:fastest_mcp_session_notification, ^server_name,
-                    %{"method" => "notifications/tools/list_changed"}},
-                   500
+    assert_receive {:fastest_mcp_session_message, ^sink_ref, _event_id,
+                    %{"method" => "notifications/tools/list_changed"}}
 
     assert {:ok, %{server_capabilities: %{"tools" => %{"listChanged" => true}}}} =
              Session.lifecycle(server_name, session_id)
+  end
+
+  test "a server offers every kind of component, so clients learn about the first one added" do
+    server_name = unique_name("capability-every-kind")
+    test_pid = self()
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+    |> start_server!()
+
+    assert %{"tools" => %{}, "resources" => %{}, "prompts" => %{}} =
+             FastestMCP.initialize!(server_name)["capabilities"]
+
+    legacy =
+      connect!({:in_process, server_name},
+        protocol_version: "2025-11-25",
+        notification_handler: &send(test_pid, {:legacy, &1["method"]})
+      )
+
+    assert %{
+             "tools" => %{"listChanged" => true},
+             "resources" => %{"listChanged" => true, "subscribe" => true},
+             "prompts" => %{"listChanged" => true}
+           } = FastestMCP.Client.info!(legacy).capabilities
+
+    modern = connect!({:in_process, server_name}, protocol_version: "2026-07-28")
+    filter = %{"resourcesListChanged" => true, "promptsListChanged" => true}
+
+    listener =
+      FastestMCP.Client.listen!(modern, filter,
+        on_notification: &send(test_pid, {:modern, &1["method"], &1["params"]})
+      )
+
+    assert_receive {:modern, "notifications/subscriptions/acknowledged",
+                    %{"notifications" => ^filter}}
+
+    assert %{items: []} = FastestMCP.Client.list_prompts!(legacy)
+
+    {:ok, _prompt} =
+      FastestMCP.ComponentManager.add_prompt(server_name, "summarize", fn _args, _ctx ->
+        "Summarize my notes."
+      end)
+
+    assert_receive {:legacy, "notifications/prompts/list_changed"}
+    assert_receive {:modern, "notifications/prompts/list_changed", _params}
+    assert %{items: [%{"name" => "summarize"}]} = FastestMCP.Client.list_prompts!(legacy)
+    assert %{items: [%{"name" => "summarize"}]} = FastestMCP.Client.list_prompts!(modern)
+
+    assert :ok = FastestMCP.Client.Request.cancel!(listener, "test complete")
   end
 
   defp set_tools_list_changed(session_pid, value) do
@@ -73,11 +111,9 @@ defmodule FastestMCP.CapabilityNegotiationTest do
     end)
   end
 
-  defp send_component_change(subscriber, server_name) do
-    send(
-      subscriber,
-      {:fastest_mcp_event, server_name, [:components, :changed], %{count: 1},
-       %{families: [:tools]}}
-    )
+  defp emit_component_change(runtime, server_name) do
+    EventBus.emit(runtime.event_bus, server_name, [:components, :changed], %{count: 1}, %{
+      families: [:tools]
+    })
   end
 end

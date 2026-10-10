@@ -1,5 +1,5 @@
 defmodule FastestMCP.MiddlewareRetryTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   import ExUnit.CaptureLog
 
@@ -22,8 +22,8 @@ defmodule FastestMCP.MiddlewareRetryTest do
 
     log =
       capture_log(fn ->
-        assert %{status: "ok"} ==
-                 Retry.call(middleware, operation, fn _operation ->
+        assert {:ok, %Operation{result: %{status: "ok"}}} =
+                 Middleware.run([middleware], operation, fn operation ->
                    attempt =
                      Agent.get_and_update(counter, fn current -> {current, current + 1} end)
 
@@ -31,7 +31,7 @@ defmodule FastestMCP.MiddlewareRetryTest do
                      raise ConnectionError, "temporary failure"
                    end
 
-                   %{status: "ok"}
+                   {:ok, %{operation | result: %{status: "ok"}}}
                  end)
       end)
 
@@ -59,8 +59,8 @@ defmodule FastestMCP.MiddlewareRetryTest do
         %{status: "ok"}
       end)
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    assert %{status: "ok"} == FastestMCP.call_tool(server_name, "flaky", %{})
+    start_server!(server)
+    assert %{status: "ok"} == FastestMCP.call_tool!(server_name, "flaky", %{})
   end
 
   test "retries timeout-coded FastestMCP errors by default" do
@@ -69,15 +69,13 @@ defmodule FastestMCP.MiddlewareRetryTest do
     {:ok, counter} = Agent.start(fn -> 0 end)
     on_exit(fn -> if Process.alive?(counter), do: Agent.stop(counter) end)
 
-    assert %{status: "ok"} ==
-             Retry.call(middleware, operation, fn _operation ->
+    assert {:ok, %Operation{result: %{status: "ok"}}} =
+             Retry.call(middleware, operation, fn operation ->
                attempt = Agent.get_and_update(counter, fn current -> {current, current + 1} end)
 
-               if attempt == 0 do
-                 raise Error, code: :timeout, message: "slow"
-               end
-
-               %{status: "ok"}
+               if attempt == 0,
+                 do: {:error, %Error{code: :timeout, message: "slow"}},
+                 else: {:ok, %{operation | result: %{status: "ok"}}}
              end)
   end
 
@@ -89,12 +87,11 @@ defmodule FastestMCP.MiddlewareRetryTest do
     {:ok, counter} = Agent.start(fn -> 0 end)
     on_exit(fn -> if Process.alive?(counter), do: Agent.stop(counter) end)
 
-    assert_raise RuntimeError, fn ->
-      Retry.call(middleware, operation, fn _operation ->
-        Agent.update(counter, &(&1 + 1))
-        raise "boom"
-      end)
-    end
+    assert {:error, %Error{cause: {%RuntimeError{message: "boom"}, _stacktrace}}} =
+             Middleware.run([middleware], operation, fn _operation ->
+               Agent.update(counter, &(&1 + 1))
+               raise "boom"
+             end)
 
     assert Agent.get(counter, & &1) == 1
   end

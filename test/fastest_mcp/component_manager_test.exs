@@ -1,5 +1,5 @@
 defmodule FastestMCP.ComponentManagerTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.ComponentManager
   alias FastestMCP.Error
@@ -8,12 +8,11 @@ defmodule FastestMCP.ComponentManagerTest do
     server_name =
       "component-manager-tools-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    assert {:ok, _pid} = FastestMCP.start_server(FastestMCP.server(server_name))
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(FastestMCP.server(server_name))
 
-    manager = FastestMCP.component_manager(server_name)
+    manager = FastestMCP.component_manager!(server_name)
 
-    assert [] == FastestMCP.list_tools(server_name)
+    assert [] == FastestMCP.list_tools!(server_name)
 
     assert {:ok, _tool_v1} =
              ComponentManager.add_tool(
@@ -31,16 +30,16 @@ defmodule FastestMCP.ComponentManagerTest do
                version: "2.0.0"
              )
 
-    assert Enum.map(FastestMCP.list_tools(server_name), & &1.name) == [
+    assert Enum.map(FastestMCP.list_tools!(server_name), & &1.name) == [
              "dynamic.echo",
              "dynamic.echo"
            ]
 
     assert %{version: 2, value: "hi"} ==
-             FastestMCP.call_tool(server_name, "dynamic.echo", %{"value" => "hi"})
+             FastestMCP.call_tool!(server_name, "dynamic.echo", %{"value" => "hi"})
 
     assert %{version: 1, value: "hi"} ==
-             FastestMCP.call_tool(server_name, "dynamic.echo", %{"value" => "hi"},
+             FastestMCP.call_tool!(server_name, "dynamic.echo", %{"value" => "hi"},
                version: "1.0.0"
              )
 
@@ -48,7 +47,7 @@ defmodule FastestMCP.ComponentManagerTest do
              ComponentManager.disable_tool(manager, "dynamic.echo", version: "2.0.0")
 
     assert %{version: 1, value: "fallback"} ==
-             FastestMCP.call_tool(server_name, "dynamic.echo", %{"value" => "fallback"})
+             FastestMCP.call_tool!(server_name, "dynamic.echo", %{"value" => "fallback"})
 
     assert {:ok, disabled_tools} =
              ComponentManager.list(manager, :tool, include_disabled: true)
@@ -60,7 +59,7 @@ defmodule FastestMCP.ComponentManagerTest do
              ComponentManager.enable_tool(manager, "dynamic.echo", version: "2.0.0")
 
     assert %{version: 2, value: "again"} ==
-             FastestMCP.call_tool(server_name, "dynamic.echo", %{"value" => "again"})
+             FastestMCP.call_tool!(server_name, "dynamic.echo", %{"value" => "again"})
 
     assert {:ok, removed} =
              ComponentManager.remove_tool(manager, "dynamic.echo", version: "2.0.0")
@@ -68,14 +67,14 @@ defmodule FastestMCP.ComponentManagerTest do
     assert Enum.map(removed, & &1.version) == ["2.0.0"]
 
     assert %{version: 1, value: "left"} ==
-             FastestMCP.call_tool(server_name, "dynamic.echo", %{"value" => "left"})
+             FastestMCP.call_tool!(server_name, "dynamic.echo", %{"value" => "left"})
 
     assert {:ok, removed} = ComponentManager.remove_tool(manager, "dynamic.echo")
     assert Enum.map(removed, & &1.version) == ["1.0.0"]
 
     error =
       assert_raise Error, fn ->
-        FastestMCP.call_tool(server_name, "dynamic.echo", %{"value" => "missing"})
+        FastestMCP.call_tool!(server_name, "dynamic.echo", %{"value" => "missing"})
       end
 
     assert error.code == :not_found
@@ -85,10 +84,9 @@ defmodule FastestMCP.ComponentManagerTest do
     server_name =
       "component-manager-surface-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    assert {:ok, _pid} = FastestMCP.start_server(FastestMCP.server(server_name))
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(FastestMCP.server(server_name))
 
-    manager = FastestMCP.component_manager(server_name)
+    manager = FastestMCP.component_manager!(server_name)
 
     assert {:ok, _resource} =
              ComponentManager.add_resource(
@@ -109,27 +107,27 @@ defmodule FastestMCP.ComponentManagerTest do
                manager,
                "dynamic_greet",
                fn %{"name" => name}, _ctx ->
-                 %{
+                 FastestMCP.Prompts.Result.from(%{
                    messages: [
                      %{
                        role: "assistant",
                        content: %{type: "text", text: "Hello, #{name}!"}
                      }
                    ]
-                 }
+                 })
                end
              )
 
-    assert Enum.map(FastestMCP.list_resources(server_name), & &1.uri) == ["config://runtime"]
+    assert Enum.map(FastestMCP.list_resources!(server_name), & &1.uri) == ["config://runtime"]
 
-    assert Enum.map(FastestMCP.list_resource_templates(server_name), & &1.uri_template) == [
+    assert Enum.map(FastestMCP.list_resource_templates!(server_name), & &1.uri_template) == [
              "users://{id}"
            ]
 
-    assert Enum.map(FastestMCP.list_prompts(server_name), & &1.name) == ["dynamic_greet"]
+    assert Enum.map(FastestMCP.list_prompts!(server_name), & &1.name) == ["dynamic_greet"]
 
-    assert %{status: "ok"} == FastestMCP.read_resource(server_name, "config://runtime")
-    assert %{"id" => "42"} == FastestMCP.read_resource(server_name, "users://42")
+    assert %{status: "ok"} == FastestMCP.read_resource!(server_name, "config://runtime")
+    assert %{"id" => "42"} == FastestMCP.read_resource!(server_name, "users://42")
 
     assert %{
              messages: [
@@ -138,13 +136,13 @@ defmodule FastestMCP.ComponentManagerTest do
                  content: %{type: "text", text: "Hello, Nate!"}
                }
              ]
-           } = FastestMCP.render_prompt(server_name, "dynamic_greet", %{"name" => "Nate"})
+           } = FastestMCP.render_prompt!(server_name, "dynamic_greet", %{"name" => "Nate"})
 
     assert {:ok, [_]} = ComponentManager.disable_resource(manager, "config://runtime")
 
     resource_error =
       assert_raise Error, fn ->
-        FastestMCP.read_resource(server_name, "config://runtime")
+        FastestMCP.read_resource!(server_name, "config://runtime")
       end
 
     assert resource_error.code == :disabled
@@ -153,7 +151,7 @@ defmodule FastestMCP.ComponentManagerTest do
 
     template_error =
       assert_raise Error, fn ->
-        FastestMCP.read_resource(server_name, "users://42")
+        FastestMCP.read_resource!(server_name, "users://42")
       end
 
     assert template_error.code == :disabled
@@ -162,7 +160,7 @@ defmodule FastestMCP.ComponentManagerTest do
 
     prompt_error =
       assert_raise Error, fn ->
-        FastestMCP.render_prompt(server_name, "dynamic_greet", %{"name" => "Nate"})
+        FastestMCP.render_prompt!(server_name, "dynamic_greet", %{"name" => "Nate"})
       end
 
     assert prompt_error.code == :disabled
@@ -172,14 +170,11 @@ defmodule FastestMCP.ComponentManagerTest do
     server_name =
       "component-manager-tool-collision-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("echo", fn _arguments, _ctx -> %{source: :static} end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("echo", fn _arguments, _ctx -> %{source: :static} end)
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
-
-    manager = FastestMCP.component_manager(server_name)
+    manager = FastestMCP.component_manager!(server_name)
 
     assert {:ok, _tool} =
              ComponentManager.add_tool(
@@ -190,15 +185,15 @@ defmodule FastestMCP.ComponentManagerTest do
              )
 
     assert [{"echo", nil}, {"echo", "2.0.0"}] ==
-             FastestMCP.list_tools(server_name)
+             FastestMCP.list_tools!(server_name)
              |> Enum.map(&{&1.name, &1.version})
              |> Enum.sort()
 
-    assert %{source: :dynamic} == FastestMCP.call_tool(server_name, "echo", %{})
+    assert %{source: :dynamic} == FastestMCP.call_tool!(server_name, "echo", %{})
 
     assert {:ok, [_]} = ComponentManager.disable_tool(manager, "echo", version: "2.0.0")
 
-    assert %{source: :static} == FastestMCP.call_tool(server_name, "echo", %{})
+    assert %{source: :static} == FastestMCP.call_tool!(server_name, "echo", %{})
   end
 
   test "dynamic resources take precedence over static registry entries until disabled" do
@@ -206,14 +201,11 @@ defmodule FastestMCP.ComponentManagerTest do
       "component-manager-resource-collision-" <>
         Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_resource("config://runtime", fn _arguments, _ctx -> %{source: :static} end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_resource("config://runtime", fn _arguments, _ctx -> %{source: :static} end)
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
-
-    manager = FastestMCP.component_manager(server_name)
+    manager = FastestMCP.component_manager!(server_name)
 
     assert {:ok, _resource} =
              ComponentManager.add_resource(
@@ -224,16 +216,16 @@ defmodule FastestMCP.ComponentManagerTest do
              )
 
     assert [{"config://runtime", nil}, {"config://runtime", "2.0.0"}] ==
-             FastestMCP.list_resources(server_name)
+             FastestMCP.list_resources!(server_name)
              |> Enum.map(&{&1.uri, &1.version})
              |> Enum.sort()
 
-    assert %{source: :dynamic} == FastestMCP.read_resource(server_name, "config://runtime")
+    assert %{source: :dynamic} == FastestMCP.read_resource!(server_name, "config://runtime")
 
     assert {:ok, [_]} =
              ComponentManager.disable_resource(manager, "config://runtime", version: "2.0.0")
 
-    assert %{source: :static} == FastestMCP.read_resource(server_name, "config://runtime")
+    assert %{source: :static} == FastestMCP.read_resource!(server_name, "config://runtime")
   end
 
   test "dynamic resource templates take precedence over static registry entries until disabled" do
@@ -241,16 +233,13 @@ defmodule FastestMCP.ComponentManagerTest do
       "component-manager-template-collision-" <>
         Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_resource_template("users://{id}", fn %{"id" => id}, _ctx ->
-        %{id: id, source: :static}
-      end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_resource_template("users://{id}", fn %{"id" => id}, _ctx ->
+      %{id: id, source: :static}
+    end)
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
-
-    manager = FastestMCP.component_manager(server_name)
+    manager = FastestMCP.component_manager!(server_name)
 
     assert {:ok, _template} =
              ComponentManager.add_resource_template(
@@ -261,15 +250,47 @@ defmodule FastestMCP.ComponentManagerTest do
              )
 
     assert [{"users://{id}", nil}, {"users://{id}", "2.0.0"}] ==
-             FastestMCP.list_resource_templates(server_name)
+             FastestMCP.list_resource_templates!(server_name)
              |> Enum.map(&{&1.uri_template, &1.version})
              |> Enum.sort()
 
-    assert %{id: "42", source: :dynamic} == FastestMCP.read_resource(server_name, "users://42")
+    assert %{id: "42", source: :dynamic} == FastestMCP.read_resource!(server_name, "users://42")
 
     assert {:ok, [_]} =
              ComponentManager.disable_resource_template(manager, "users://{id}", version: "2.0.0")
 
-    assert %{id: "42", source: :static} == FastestMCP.read_resource(server_name, "users://42")
+    assert %{id: "42", source: :static} == FastestMCP.read_resource!(server_name, "users://42")
+  end
+
+  test "runtime components and server-wide rules survive an internal restart, not a stop" do
+    server_name = unique_name("component-manager-restart")
+
+    server =
+      FastestMCP.server(server_name)
+      |> FastestMCP.add_tool("static", fn _arguments, _ctx -> "static" end)
+
+    start_server!(server)
+
+    assert {:ok, _tool} =
+             ComponentManager.add_tool(server_name, "dynamic", fn _, _ -> "dynamic" end)
+
+    :ok = FastestMCP.disable_components!(server_name, names: ["static"])
+    {:ok, before} = FastestMCP.ServerRuntime.fetch(server_name)
+
+    Process.exit(before.call_supervisor, :kill)
+
+    assert_eventually(fn ->
+      case FastestMCP.ServerRuntime.fetch(server_name) do
+        {:ok, runtime} -> runtime.call_supervisor != before.call_supervisor
+        {:error, :not_found} -> false
+      end
+    end)
+
+    assert ["dynamic"] == Enum.map(FastestMCP.list_tools!(server_name), & &1.name)
+    assert "dynamic" == FastestMCP.call_tool!(server_name, "dynamic")
+
+    assert :ok = FastestMCP.stop_server(server_name)
+    start_server!(server)
+    assert ["static"] == Enum.map(FastestMCP.list_tools!(server_name), & &1.name)
   end
 end

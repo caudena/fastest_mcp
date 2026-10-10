@@ -1,11 +1,47 @@
 defmodule FastestMCP.ResourceHelpersTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
+  defmodule HTTPResourcePlug do
+    @behaviour Plug
+    import Plug.Conn
+
+    def init(test_pid), do: test_pid
+
+    def call(%{request_path: "/notes"} = conn, test_pid) do
+      send(test_pid, {:resource_request, conn.method, conn.req_headers})
+
+      conn
+      |> put_resp_content_type("text/markdown")
+      |> send_resp(200, "# Notes")
+    end
+
+    def call(%{request_path: "/image"} = conn, _test_pid) do
+      conn
+      |> put_resp_content_type("image/png", nil)
+      |> send_resp(200, <<137, 80, 78, 71, 0, 255>>)
+    end
+
+    def call(%{request_path: "/echo"} = conn, _test_pid) do
+      {:ok, body, conn} = read_body(conn)
+      send_resp(conn, 201, "posted " <> body)
+    end
+
+    def call(%{request_path: "/large"} = conn, _test_pid),
+      do: send_resp(conn, 200, String.duplicate("x", 2_000))
+
+    # Never answers, so a read with a timeout gives up.
+    def call(%{request_path: "/slow"}, _test_pid), do: Process.sleep(:infinity)
+
+    def call(conn, _test_pid), do: send_resp(conn, 404, "missing")
+  end
+
+  alias FastestMCP.Error
   alias FastestMCP.PathSafety
   alias FastestMCP.Resources.Binary
   alias FastestMCP.Resources.Content
   alias FastestMCP.Resources.Directory, as: ResourceDirectory
   alias FastestMCP.Resources.File, as: ResourceFile
+  alias FastestMCP.Resources.HTTP, as: ResourceHTTP
   alias FastestMCP.Resources.Result
   alias FastestMCP.Resources.Text
   alias FastestMCP.Transport.Engine
@@ -29,37 +65,34 @@ defmodule FastestMCP.ResourceHelpersTest do
   test "resource handlers can return resource helper types and annotations are serialized" do
     server_name = "resource-helpers-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_resource(
-        "memo://bundle",
-        fn _arguments, _ctx ->
-          Result.new(
-            [
-              Text.new("hello", meta: %{slot: "text"}),
-              Binary.new(<<0, 1, 2>>, meta: %{slot: "blob"})
-            ],
-            meta: %{source: "helper"}
-          )
-        end,
-        annotations: %{cacheable: true}
-      )
-      |> FastestMCP.add_resource("memo://json", fn _arguments, _ctx ->
-        %{ok: true, values: 1..3}
-      end)
-      |> FastestMCP.add_resource_template(
-        "memo://users/{id}",
-        fn arguments, _ctx -> arguments end,
-        annotations: %{httpMethod: "GET"}
-      )
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_resource(
+      "memo://bundle",
+      fn _arguments, _ctx ->
+        Result.new(
+          [
+            Text.new("hello", meta: %{slot: "text"}),
+            Binary.new(<<0, 1, 2>>, meta: %{slot: "blob"})
+          ],
+          meta: %{source: "helper"}
+        )
+      end,
+      annotations: %{cacheable: true}
+    )
+    |> FastestMCP.add_resource("memo://json", fn _arguments, _ctx ->
+      %{ok: true, values: 1..3}
+    end)
+    |> FastestMCP.add_resource_template(
+      "memo://users/{id}",
+      fn arguments, _ctx -> arguments end,
+      annotations: %{httpMethod: "GET"}
+    )
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
-
-    resource = Enum.find(FastestMCP.list_resources(server_name), &(&1.uri == "memo://bundle"))
+    resource = Enum.find(FastestMCP.list_resources!(server_name), &(&1.uri == "memo://bundle"))
     assert resource.annotations == %{cacheable: true}
 
-    [template] = FastestMCP.list_resource_templates(server_name)
+    [template] = FastestMCP.list_resource_templates!(server_name)
     assert template.annotations == %{httpMethod: "GET"}
 
     assert %{
@@ -72,7 +105,7 @@ defmodule FastestMCP.ResourceHelpersTest do
                }
              ],
              meta: %{source: "helper"}
-           } = FastestMCP.read_resource(server_name, "memo://bundle")
+           } = FastestMCP.read_resource!(server_name, "memo://bundle")
 
     assert %{
              "contents" => [
@@ -138,6 +171,82 @@ defmodule FastestMCP.ResourceHelpersTest do
            )
 
     assert Enum.any?(resources, &(&1["uri"] == "memo://json"))
+  end
+
+  test "a raw binary from a resource handler reaches clients base64-encoded once" do
+    server_name = unique_name("resource-raw-binary")
+    png = <<137, 80, 78, 71, 13, 10, 26, 10, 0, 255>>
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_resource("images://logo", fn _arguments, _ctx -> png end,
+      mime_type: "image/png"
+    )
+    |> start_server!()
+
+    assert FastestMCP.read_resource!(server_name, "images://logo") == png
+
+    assert %{"contents" => [%{"mimeType" => "image/png", "blob" => blob}]} =
+             Engine.dispatch!(server_name, %Request{
+               method: "resources/read",
+               transport: :stdio,
+               payload: %{"uri" => "images://logo"}
+             })
+
+    assert Base.decode64!(blob) == png
+
+    client = connect!({:in_process, server_name})
+    [content] = FastestMCP.Client.read_resource!(client, "images://logo")["contents"]
+    assert Base.decode64!(content["blob"]) == png
+  end
+
+  test "without mime_type a resource lists no type and a read names the type of its value" do
+    server_name = unique_name("resource-inferred-mime")
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_resource("data://json", fn _arguments, _ctx -> %{ok: true} end)
+    |> FastestMCP.add_resource("data://list", fn _arguments, _ctx -> [1, 2] end)
+    |> FastestMCP.add_resource("data://text", fn _arguments, _ctx -> "hello" end)
+    |> FastestMCP.add_resource("data://bytes", fn _arguments, _ctx -> <<0, 255, 1>> end)
+    |> FastestMCP.add_resource("data://notes", fn _arguments, _ctx -> "# Notes" end,
+      mime_type: "text/markdown"
+    )
+    |> FastestMCP.add_resource_template("data://items/{id}", fn %{"id" => id}, _ctx ->
+      "item #{id}"
+    end)
+    |> start_server!()
+
+    {connection_id, _initialize} = ProtocolTest.initialize_stdio(server_name)
+    id = fn -> System.unique_integer([:positive]) end
+
+    legacy = fn method, params ->
+      ProtocolTest.stdio_request(server_name, connection_id, id.(), method, params)["result"]
+    end
+
+    modern = fn method, params ->
+      ProtocolTest.modern_stdio_request(server_name, id.(), method, params)["result"]
+    end
+
+    for request <- [legacy, modern] do
+      assert %{
+               "data://json" => nil,
+               "data://list" => nil,
+               "data://text" => nil,
+               "data://bytes" => nil,
+               "data://notes" => "text/markdown"
+             } ==
+               Map.new(request.("resources/list", %{})["resources"], &{&1["uri"], &1["mimeType"]})
+
+      assert [template] = request.("resources/templates/list", %{})["resourceTemplates"]
+      refute Map.has_key?(template, "mimeType")
+
+      read = fn uri -> hd(request.("resources/read", %{"uri" => uri})["contents"]) end
+      assert %{"mimeType" => "application/json", "text" => ~s({"ok":true})} = read.("data://json")
+      assert %{"mimeType" => "application/json", "text" => "[1,2]"} = read.("data://list")
+      assert %{"mimeType" => "text/plain", "text" => "hello"} = read.("data://text")
+      assert %{"mimeType" => "application/octet-stream", "blob" => "AP8B"} = read.("data://bytes")
+      assert %{"mimeType" => "text/markdown", "text" => "# Notes"} = read.("data://notes")
+      assert %{"mimeType" => "text/plain", "text" => "item 7"} = read.("data://items/7")
+    end
   end
 
   test "file resources read text and binary content and normalize failures" do
@@ -209,26 +318,16 @@ defmodule FastestMCP.ResourceHelpersTest do
 
     assert %Result{
              contents: [%Content{mime_type: "application/json", content: payload}],
-             meta: %{count: 2, path: ^root, recursive: true}
+             meta: %{count: 2, recursive: true}
            } =
              root
              |> ResourceDirectory.new(recursive: true)
              |> ResourceDirectory.read()
 
     assert [
-             %{
-               "name" => "alpha.txt",
-               "path" => ^top_file,
-               "relative_path" => "alpha.txt",
-               "size_bytes" => 5
-             },
-             %{
-               "name" => "beta.txt",
-               "path" => ^nested_file,
-               "relative_path" => "nested/beta.txt",
-               "size_bytes" => 4
-             }
-           ] = JSON.decode!(payload)
+             %{"name" => "alpha.txt", "relative_path" => "alpha.txt", "size_bytes" => 5},
+             %{"name" => "beta.txt", "relative_path" => "nested/beta.txt", "size_bytes" => 4}
+           ] == JSON.decode!(payload)
 
     assert_raise ArgumentError, ~r/path must be absolute/, fn ->
       ResourceDirectory.new("relative-dir")
@@ -293,20 +392,134 @@ defmodule FastestMCP.ResourceHelpersTest do
     server_name = "directory-helper-" <> Integer.to_string(System.unique_integer([:positive]))
     directory = ResourceDirectory.new(root)
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_resource("dir://notes", fn _arguments, _ctx ->
-        ResourceDirectory.read(directory)
-      end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_resource("dir://notes", fn _arguments, _ctx ->
+      ResourceDirectory.read(directory)
+    end)
+    |> start_server!()
 
     assert %{
              contents: [%{mime_type: "application/json", content: payload}],
-             meta: %{count: 1, path: ^root, recursive: false}
-           } = FastestMCP.read_resource(server_name, "dir://notes")
+             meta: %{count: 1, recursive: false}
+           } = FastestMCP.read_resource!(server_name, "dir://notes")
 
     assert [%{"relative_path" => "notes.md"}] = JSON.decode!(payload)
   end
+
+  test "file and directory helpers keep server paths out of what clients receive" do
+    root = Path.join(System.tmp_dir!(), "fastest_mcp_paths_#{System.unique_integer([:positive])}")
+    File.mkdir_p!(Path.join(root, "nested"))
+    File.write!(Path.join(root, "nested/note.md"), "# Note")
+    on_exit(fn -> File.rm_rf(root) end)
+
+    server_name = unique_name("resource-paths")
+
+    FastestMCP.server(server_name, mask_error_details: true)
+    |> FastestMCP.add_resource("dir://notes", fn _arguments, _ctx ->
+      root |> ResourceDirectory.new(recursive: true) |> ResourceDirectory.read()
+    end)
+    |> FastestMCP.add_resource("notes://missing-file", fn _arguments, _ctx ->
+      root |> Path.join("missing.md") |> ResourceFile.new() |> ResourceFile.read()
+    end)
+    |> FastestMCP.add_resource("notes://missing-dir", fn _arguments, _ctx ->
+      root |> Path.join("gone") |> ResourceDirectory.new() |> ResourceDirectory.read()
+    end)
+    |> start_server!()
+
+    client = connect!({:in_process, server_name})
+    listing = FastestMCP.Client.read_resource!(client, "dir://notes")
+    refute inspect(listing) =~ root
+
+    assert [%{"name" => "note.md", "relative_path" => "nested/note.md", "size_bytes" => 6}] ==
+             listing["contents"] |> hd() |> Map.fetch!("text") |> JSON.decode!()
+
+    assert {:error, %Error{code: :internal_error} = file_error} =
+             FastestMCP.Client.read_resource(client, "notes://missing-file")
+
+    assert file_error.message == ~s(Error reading file "missing.md": no such file or directory)
+
+    assert {:error, %Error{code: :internal_error} = directory_error} =
+             FastestMCP.Client.read_resource(client, "notes://missing-dir")
+
+    assert directory_error.message ==
+             ~s(Error listing directory "gone": no such file or directory)
+  end
+
+  test "HTTP resources read text and binary bodies with their response media type" do
+    base_url = serve_http_resources!()
+    notes = ResourceHTTP.new(base_url <> "/notes", headers: %{"X-Trace" => "trace-1"})
+
+    assert %Result{
+             contents: [%Content{content: "# Notes", mime_type: "text/markdown; charset=utf-8"}],
+             meta: %{status: 200}
+           } = ResourceHTTP.read(notes)
+
+    assert_receive {:resource_request, "GET", request_headers}
+    assert {"accept", "*/*"} in request_headers
+    assert {"x-trace", "trace-1"} in request_headers
+
+    assert %Result{contents: [%Content{mime_type: "image/png"} = image]} =
+             ResourceHTTP.read(ResourceHTTP.new(base_url <> "/image"))
+
+    assert image.content == <<137, 80, 78, 71, 0, 255>>
+    refute Content.textual?(image)
+
+    assert %Result{contents: [%Content{mime_type: "text/x-notes"}]} =
+             ResourceHTTP.read(ResourceHTTP.new(base_url <> "/notes", mime_type: "text/x-notes"))
+
+    assert %Result{contents: [%Content{content: "posted payload"}], meta: %{status: 201}} =
+             ResourceHTTP.read(
+               ResourceHTTP.new(base_url <> "/echo", method: :post, body: "payload")
+             )
+  end
+
+  test "HTTP resource reads are bounded and fail with internal errors" do
+    base_url = serve_http_resources!()
+
+    assert_raise Error, "HTTP resource fetch failed with status 404", fn ->
+      ResourceHTTP.read(ResourceHTTP.new(base_url <> "/missing"))
+    end
+
+    assert_raise Error, ~r/body_too_large/, fn ->
+      ResourceHTTP.read(ResourceHTTP.new(base_url <> "/large", max_body_bytes: 1_000))
+    end
+
+    assert_raise Error, ~r/timeout/, fn ->
+      ResourceHTTP.read(ResourceHTTP.new(base_url <> "/slow", timeout_ms: 50))
+    end
+
+    assert_raise ArgumentError, ~r/unknown keys/, fn ->
+      ResourceHTTP.new(base_url <> "/notes", follow_redirects: true)
+    end
+  end
+
+  test "HTTP resources work through normal resource handlers" do
+    base_url = serve_http_resources!()
+    server_name = unique_name("http-resource-helper")
+    notes = ResourceHTTP.new(base_url <> "/notes")
+
+    start_server!(
+      FastestMCP.server(server_name)
+      |> FastestMCP.add_resource("memo://notes", fn _arguments, _ctx ->
+        ResourceHTTP.read(notes)
+      end)
+    )
+
+    assert %{
+             "contents" => [
+               %{
+                 "uri" => "memo://notes",
+                 "mimeType" => "text/markdown; charset=utf-8",
+                 "text" => "# Notes"
+               }
+             ]
+           } =
+             Engine.dispatch!(server_name, %Request{
+               method: "resources/read",
+               transport: :stdio,
+               payload: %{"uri" => "memo://notes"}
+             })
+  end
+
+  defp serve_http_resources!, do: serve!({HTTPResourcePlug, self()}, path: "").url
 end

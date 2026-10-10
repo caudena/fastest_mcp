@@ -1,23 +1,15 @@
 defmodule FastestMCP.Protocol do
   @moduledoc """
-  Central protocol version and capability helpers.
-  Keep the active MCP protocol baseline in one place so server responses, client
-  handshakes, and tests do not drift.
-
-  This module keeps one focused piece of FastestMCP behavior in a dedicated
-  place so builders, runtimes, transports, and providers can share the same
-  rules without duplicating logic.
-
-  Unless you are extending FastestMCP itself, you will usually meet this
-  module indirectly through higher-level APIs rather than calling it first.
+  MCP protocol versions and capability maps: the supported versions (newest
+  first), the implementation profile (`:modern` or `:legacy`) of each version,
+  and lookups in negotiated capability maps.
   """
 
-  @supported_versions ["2026-07-28", "2025-11-25"]
-  @current_version hd(@supported_versions)
-  @profiles %{
-    "2026-07-28" => :modern,
-    "2025-11-25" => :legacy
-  }
+  import FastestMCP.Protocol.Version
+
+  @supported_versions [modern(), legacy()]
+  @current_version modern()
+  @profiles %{modern() => :modern, legacy() => :legacy}
 
   @cache_hinted_methods MapSet.new(~w(
     server/discover
@@ -92,21 +84,6 @@ defmodule FastestMCP.Protocol do
 
   def cache_hinted_method?(_method), do: false
 
-  @doc "Returns the protocol version string for the given input."
-  def version(metadata_or_server, default \\ @current_version)
-
-  def version(%{metadata: metadata}, default) when is_map(metadata) do
-    version(metadata, default)
-  end
-
-  def version(metadata, default) when is_map(metadata) do
-    metadata_value(metadata, :protocol_version) ||
-      metadata_value(metadata, :protocolVersion) ||
-      default
-  end
-
-  def version(_other, default), do: default
-
   @doc "Normalizes capability input into a stable map."
   def normalize_capabilities(nil), do: %{}
 
@@ -173,8 +150,7 @@ defmodule FastestMCP.Protocol do
     end
   end
 
-  @doc false
-  def required_client_capability("elicitation/create", params) when is_map(params) do
+  defp required_client_capability("elicitation/create", params) when is_map(params) do
     case Map.get(params, "mode", "form") do
       "url" -> ["elicitation", "url"]
       # The 2026 elicitation specification explicitly defines an empty
@@ -183,7 +159,7 @@ defmodule FastestMCP.Protocol do
     end
   end
 
-  def required_client_capability(method, _params) when is_binary(method),
+  defp required_client_capability(method, _params) when is_binary(method),
     do: Map.get(@client_method_capabilities, method)
 
   @doc false
@@ -194,8 +170,7 @@ defmodule FastestMCP.Protocol do
     end
   end
 
-  @doc false
-  def required_input_capability_paths(input_requests) when is_map(input_requests) do
+  defp required_input_capability_paths(input_requests) when is_map(input_requests) do
     input_requests
     |> Map.values()
     |> Enum.flat_map(&input_request_capability_paths/1)
@@ -218,9 +193,9 @@ defmodule FastestMCP.Protocol do
     end)
   end
 
-  defp input_request_capability_paths(request) when is_map(request) do
-    method = metadata_value(request, :method)
-    params = metadata_value(request, :params, %{})
+  # `InputRequiredResult.new/2` gives the input requests string keys.
+  defp input_request_capability_paths(%{"method" => method} = request) do
+    params = Map.get(request, "params", %{})
 
     base =
       case required_client_capability(method, params) do
@@ -236,12 +211,11 @@ defmodule FastestMCP.Protocol do
   defp sampling_capability_paths("sampling/createMessage", params) when is_map(params) do
     []
     |> maybe_add_capability_path(
-      Map.has_key?(params, "tools") or Map.has_key?(params, :tools) or
-        Map.has_key?(params, "toolChoice") or Map.has_key?(params, :toolChoice),
+      Map.has_key?(params, "tools") or Map.has_key?(params, "toolChoice"),
       ["sampling", "tools"]
     )
     |> maybe_add_capability_path(
-      metadata_value(params, :includeContext) in ["thisServer", "allServers"],
+      params["includeContext"] in ["thisServer", "allServers"],
       ["sampling", "context"]
     )
   end
@@ -265,13 +239,5 @@ defmodule FastestMCP.Protocol do
         right_value
       end
     end)
-  end
-
-  defp metadata_value(metadata, key) do
-    Map.get(metadata, key, Map.get(metadata, Atom.to_string(key)))
-  end
-
-  defp metadata_value(metadata, key, default) do
-    Map.get(metadata, key, Map.get(metadata, Atom.to_string(key), default))
   end
 end

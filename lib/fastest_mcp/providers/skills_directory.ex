@@ -1,15 +1,19 @@
 defmodule FastestMCP.Providers.SkillsDirectory do
   @moduledoc """
-  Provider that scans one or more roots for skill folders.
+  A provider that exposes skill directories as MCP resources: each skill's main
+  file, a `_manifest`, and its supporting files.
 
-  Providers are the extension point FastestMCP uses when components come
-  from somewhere other than the server struct itself. This module implements
-  one concrete provider shape and is usually wrapped by `FastestMCP.Provider`
-  when mounted into a server.
+      FastestMCP.server("skills")
+      |> FastestMCP.add_provider(
+        FastestMCP.Providers.SkillsDirectory.new(roots: ["~/.claude/skills"])
+      )
 
-  That lets the runtime treat local, mounted, OpenAPI, and skills-backed
-  component sources the same way once they enter the provider layer.
+  `FastestMCP.Providers.Skills.vendor/2` builds one for an agent's
+  conventional skill folders. The [Providers and Mounting](providers-and-mounting.md)
+  guide describes discovery and path safety.
   """
+
+  use FastestMCP.Provider
 
   alias FastestMCP.PathSafety
   alias FastestMCP.Provider
@@ -23,7 +27,14 @@ defmodule FastestMCP.Providers.SkillsDirectory do
             providers: [],
             cache: nil
 
-  @doc "Builds a new value for this module from the supplied options."
+  @doc """
+  Discovers the skills under `:roots` (a path or a list; earlier roots win
+  when skill names collide). Other options: `:main_file_name` (default
+  `"SKILL.md"`), `:supporting_files` (`:template`, the default, serves them
+  through one resource template; `:resources` lists each file), and `:reload`
+  (default `false`; `true` re-reads changed files while the server runs
+  instead of discovering once here).
+  """
   def new(opts) when is_list(opts) do
     roots = normalize_roots(Keyword.get(opts, :roots, []))
     main_file_name = Keyword.get(opts, :main_file_name, "SKILL.md")
@@ -46,51 +57,28 @@ defmodule FastestMCP.Providers.SkillsDirectory do
     }
   end
 
-  @doc "Returns the provider type label."
+  @impl FastestMCP.Provider
   def provider_type(%__MODULE__{}), do: "SkillsDirectoryProvider"
 
-  @doc false
-  def activate_runtime(%__MODULE__{reload: false} = provider), do: provider
+  @impl FastestMCP.Provider
+  def activate_runtime(%__MODULE__{reload: false} = provider), do: {:ok, provider}
 
   def activate_runtime(%__MODULE__{reload: true} = provider) do
-    case __MODULE__.ReloadCache.start_link() do
-      {:ok, cache} -> {:ok, %{provider | cache: cache}}
-      {:error, reason} -> {:error, reason}
-    end
+    with {:ok, cache} <- __MODULE__.ReloadCache.start_link(),
+         do: {:ok, %{provider | cache: cache}}
   end
 
-  @doc false
-  def deactivate_runtime(%__MODULE__{cache: cache}) when is_pid(cache) do
-    if Process.alive?(cache) do
-      GenServer.stop(cache, :normal)
-    end
-
-    :ok
-  catch
-    :exit, _reason -> :ok
-  end
+  @impl FastestMCP.Provider
+  def deactivate_runtime(%__MODULE__{cache: cache}) when is_pid(cache),
+    do: FastestMCP.Util.stop_process(cache)
 
   def deactivate_runtime(%__MODULE__{}), do: :ok
 
-  @doc "Lists the components exposed by this module."
+  @impl FastestMCP.Provider
   def list_components(%__MODULE__{} = provider, component_type, operation) do
     provider
     |> current_providers()
-    |> Enum.flat_map(&Provider.list_components(&1, component_type, operation))
-  end
-
-  @doc "Resolves one component by type and identifier."
-  def get_component(%__MODULE__{} = provider, component_type, identifier, operation) do
-    provider
-    |> current_providers()
-    |> Enum.find_value(&Provider.get_component(&1, component_type, identifier, operation))
-  end
-
-  @doc "Resolves the backing resource target for a concrete URI."
-  def get_resource_target(%__MODULE__{} = provider, uri, operation) do
-    provider
-    |> current_providers()
-    |> Enum.find_value(&Provider.get_resource_target(&1, uri, operation))
+    |> Enum.flat_map(&Provider.Dispatch.list_components(&1, component_type, operation))
   end
 
   defp current_providers(%__MODULE__{reload: true, cache: cache} = provider) do

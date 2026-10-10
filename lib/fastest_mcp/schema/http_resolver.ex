@@ -19,20 +19,18 @@ defmodule FastestMCP.Schema.HTTPResolver do
 
   @impl true
   def resolve(url, opts) when is_binary(url) and is_list(opts) do
-    with :ok <- validate_options(opts),
-         :ok <- validate_url(url, opts),
-         {:ok, status, headers, body} <- request(url, opts),
-         :ok <- validate_status(status),
-         :ok <- validate_content_type(headers),
-         {:ok, body} <- normalize_body(body, opts),
-         {:ok, schema} <- JSON.decode(body),
-         {:ok, normalized} <- Resolver.normalize_remote_schema(url, schema, opts) do
-      {:normal, normalized}
-    end
-  rescue
-    error -> {:error, {:resolver_exception, error.__struct__}}
-  catch
-    kind, _reason -> {:error, {:resolver_failure, kind}}
+    Resolver.guard(fn ->
+      with :ok <- validate_options(opts),
+           :ok <- validate_url(url, opts),
+           {:ok, status, headers, body} <- request(url, opts),
+           :ok <- validate_status(status),
+           :ok <- validate_content_type(headers),
+           {:ok, body} <- normalize_body(body, opts),
+           {:ok, schema} <- JSON.decode(body),
+           {:ok, normalized} <- Resolver.normalize_remote_schema(url, schema, opts) do
+        {:normal, normalized}
+      end
+    end)
   end
 
   def resolve(url, _opts), do: {:error, {:invalid_remote_schema_uri, url}}
@@ -88,7 +86,6 @@ defmodule FastestMCP.Schema.HTTPResolver do
 
   defp request(url, opts) do
     timeout_ms = Keyword.get(opts, :timeout_ms, @default_timeout_ms)
-    max_body_bytes = Keyword.get(opts, :max_body_bytes, @default_max_body_bytes)
 
     request_opts = [
       timeout_ms: timeout_ms,
@@ -96,21 +93,13 @@ defmodule FastestMCP.Schema.HTTPResolver do
       http_options: [autoredirect: false]
     ]
 
-    request_opts =
-      case Keyword.get(opts, :requester) do
-        requester when is_function(requester, 3) ->
-          Keyword.put(request_opts, :requester, requester)
-
-        _other ->
-          request_opts
-      end
-
     case Keyword.get(opts, :requester) do
-      requester when is_function(requester, 3) ->
-        HTTP.request(:get, url, request_opts)
-
-      _other ->
+      nil ->
+        max_body_bytes = Keyword.get(opts, :max_body_bytes, @default_max_body_bytes)
         HTTP.bounded_request(:get, url, max_body_bytes, request_opts)
+
+      requester ->
+        HTTP.request(:get, url, Keyword.put(request_opts, :requester, requester))
     end
   end
 

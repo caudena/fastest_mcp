@@ -1,5 +1,5 @@
 defmodule FastestMCP.IconsTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Transport.Engine
   alias FastestMCP.Transport.Request
@@ -20,25 +20,22 @@ defmodule FastestMCP.IconsTest do
       }
     ]
 
-    server =
-      FastestMCP.server(server_name,
-        metadata: %{website_url: "https://example.com", icons: icons}
-      )
-      |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end, icons: icons)
-      |> FastestMCP.add_resource("data://config", fn _args, _ctx -> %{ok: true} end, icons: icons)
-      |> FastestMCP.add_resource_template("data://item/{id}", fn args, _ctx -> args end,
-        icons: icons
-      )
-      |> FastestMCP.add_prompt("greet", fn _args, _ctx -> "hi" end, icons: icons)
+    FastestMCP.server(server_name,
+      metadata: %{website_url: "https://example.com", icons: icons}
+    )
+    |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end, icons: icons)
+    |> FastestMCP.add_resource("data://config", fn _args, _ctx -> %{ok: true} end, icons: icons)
+    |> FastestMCP.add_resource_template("data://item/{id}", fn args, _ctx -> args end,
+      icons: icons
+    )
+    |> FastestMCP.add_prompt("greet", fn _args, _ctx -> "hi" end, icons: icons)
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
-
-    [tool] = FastestMCP.list_tools(server_name)
-    [resource] = FastestMCP.list_resources(server_name)
-    [template] = FastestMCP.list_resource_templates(server_name)
-    [prompt] = FastestMCP.list_prompts(server_name)
-    initialize = FastestMCP.initialize(server_name)
+    [tool] = FastestMCP.list_tools!(server_name)
+    [resource] = FastestMCP.list_resources!(server_name)
+    [template] = FastestMCP.list_resource_templates!(server_name)
+    [prompt] = FastestMCP.list_prompts!(server_name)
+    initialize = FastestMCP.initialize!(server_name)
 
     assert tool.icons == Enum.map(icons, &Map.new/1)
     assert resource.icons == Enum.map(icons, &Map.new/1)

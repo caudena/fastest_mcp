@@ -26,14 +26,19 @@ defmodule FastestMCP.TestSupport.SubscriptionValidationPlug do
           |> put_resp_content_type("text/event-stream")
           |> send_chunked(200)
 
-        mode
-        |> subscription_messages(id)
-        |> Enum.reduce_while(conn, fn message, conn ->
-          case chunk(conn, "event: message\ndata: #{JSON.encode!(message)}\n\n") do
-            {:ok, conn} -> {:cont, conn}
-            {:error, _reason} -> {:halt, conn}
-          end
-        end)
+        conn =
+          mode
+          |> subscription_messages(id)
+          |> Enum.reduce_while(conn, fn message, conn ->
+            case chunk(conn, "event: message\ndata: #{JSON.encode!(message)}\n\n") do
+              {:ok, conn} -> {:cont, conn}
+              {:error, _reason} -> {:halt, conn}
+            end
+          end)
+
+        # The stream stays open until the test stops the listener.
+        if mode == :pre_ack_open, do: Process.sleep(:infinity)
+        conn
     end
   end
 
@@ -73,7 +78,8 @@ defmodule FastestMCP.TestSupport.SubscriptionValidationPlug do
     ]
   end
 
-  defp subscription_messages(:pre_ack, id), do: [resource_update(id, "status://allowed")]
+  defp subscription_messages(mode, id) when mode in [:pre_ack, :pre_ack_open],
+    do: [resource_update(id, "status://allowed")]
 
   defp subscription_messages(:outside_ack, id) do
     [acknowledgement(id, %{}), resource_update(id, "status://allowed")]
@@ -117,17 +123,18 @@ defmodule FastestMCP.TestSupport.SubscriptionValidationPlug do
 end
 
 defmodule FastestMCP.ClientSubscriptionValidationTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Client
   alias FastestMCP.Error
+  alias FastestMCP.Test.ClientProbe
 
   test "accepts an acknowledged subset and routes only its notifications" do
     parent = self()
     client = start_client!(:subset)
 
     listener =
-      Client.listen(
+      Client.listen!(
         client,
         %{
           "resourceSubscriptions" => ["status://allowed", "status://optional"],
@@ -152,14 +159,14 @@ defmodule FastestMCP.ClientSubscriptionValidationTest do
                       "params" => %{"uri" => "status://allowed"}
                     }}
 
-    assert %{"resultType" => "complete"} = Client.await(listener, 1_000)
+    assert %{"resultType" => "complete"} = Client.Request.await!(listener, 1_000)
   end
 
   test "rejects acknowledgements that exceed the requested filter" do
     client = start_client!(:ack_extra)
     listener = listen(client)
 
-    error = assert_raise Error, fn -> Client.await(listener, 1_000) end
+    error = assert_raise Error, fn -> Client.Request.await!(listener, 1_000) end
     assert error.code == :invalid_request
     assert error.details.reason =~ "exceeds"
     refute_receive {:subscription_message, _message}
@@ -170,13 +177,23 @@ defmodule FastestMCP.ClientSubscriptionValidationTest do
       client = start_client!(mode)
       listener = listen(client)
 
-      error = assert_raise Error, fn -> Client.await(listener, 1_000) end
+      error = assert_raise Error, fn -> Client.Request.await!(listener, 1_000) end
       assert error.code == :invalid_request
 
       refute_receive {:subscription_message, %{"method" => "notifications/resources/updated"}}
 
-      if Client.connected?(client), do: Client.disconnect(client)
+      if Client.connected?(client), do: Client.disconnect!(client)
     end
+  end
+
+  test "a rejected stream stops the listener's worker while the server holds it open" do
+    client = start_client!(:pre_ack_open)
+    listener = listen(client)
+
+    error = assert_raise Error, fn -> Client.Request.await!(listener, 1_000) end
+    assert error.details.reason =~ "before acknowledgement"
+    assert ClientProbe.requests(client) == %{}
+    assert_eventually(fn -> ClientProbe.workers(client) == [] end)
   end
 
   test "drops an unknown subscription id without terminating the real listener" do
@@ -186,7 +203,7 @@ defmodule FastestMCP.ClientSubscriptionValidationTest do
     assert_receive {:subscription_message,
                     %{"method" => "notifications/subscriptions/acknowledged"}}
 
-    assert %{"resultType" => "complete"} = Client.await(listener, 1_000)
+    assert %{"resultType" => "complete"} = Client.Request.await!(listener, 1_000)
 
     refute_receive {:subscription_message,
                     %{
@@ -198,30 +215,21 @@ defmodule FastestMCP.ClientSubscriptionValidationTest do
   defp listen(client) do
     parent = self()
 
-    Client.listen(client, %{"resourceSubscriptions" => ["status://allowed"]},
+    Client.listen!(client, %{"resourceSubscriptions" => ["status://allowed"]},
       on_notification: fn message -> send(parent, {:subscription_message, message}) end
     )
   end
 
   defp start_client!(mode) do
-    bandit =
-      start_supervised!(
-        {Bandit,
-         plug: {FastestMCP.TestSupport.SubscriptionValidationPlug, mode: mode},
-         scheme: :http,
-         port: 0}
-      )
-
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+    %{url: url} = serve!({FastestMCP.TestSupport.SubscriptionValidationPlug, mode: mode})
 
     client =
-      Client.connect!("http://127.0.0.1:#{port}/mcp",
+      connect!(url,
         protocol_version: "2026-07-28",
         sse_reconnect: false,
         client_info: %{"name" => "subscription-validation-test", "version" => "1.0.0"}
       )
 
-    on_exit(fn -> if Client.connected?(client), do: Client.disconnect(client) end)
     client
   end
 end

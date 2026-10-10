@@ -1,26 +1,15 @@
 defmodule FastestMCP.ServerModule do
   @moduledoc ~S"""
-  Module-based API for application-owned MCP servers.
+  A server that belongs to your application, defined as a module.
 
-  Use this module when the server is part of your application and should behave
-  like the rest of your OTP infrastructure. It keeps the existing builder API,
-  but adds:
-
-    * module-owned server identity
-    * generated `child_spec/1` and `start_link/1`
-    * config resolution from `:otp_app`
-    * transport defaults for streamable HTTP and well-known HTTP endpoints
-
-  A server module still returns a normal `%FastestMCP.Server{}`. The difference
-  is that the module now owns startup, supervision, and config merging.
-
-  ## Example
+  `use FastestMCP.ServerModule` gives the module a `child_spec/1` and a
+  `start_link/1`, so it runs under your supervision tree, and `base_server/1`,
+  which returns an empty `%FastestMCP.Server{}` named after the module. You
+  implement `c:server/1` to add the server's components:
 
   ```elixir
   defmodule MyApp.MCPServer do
-    use FastestMCP.ServerModule,
-      otp_app: :my_app,
-      http: [port: 4100, allowed_hosts: :localhost]
+    use FastestMCP.ServerModule, otp_app: :my_app
 
     def server(opts) do
       base_server(opts)
@@ -29,22 +18,51 @@ defmodule FastestMCP.ServerModule do
   end
   ```
 
-  After that, `MyApp.MCPServer` can sit directly in your supervision tree:
+  Add `MyApp.MCPServer` to your supervision tree, before your Phoenix endpoint
+  if you have one. [Getting Started](getting-started.md) and
+  [Phoenix](phoenix.md) show the whole setup.
+
+  The module is also the plug of its MCP endpoint, as
+  `FastestMCP.Transport.HTTPApp` with `:server_name` set to the module, so a
+  Phoenix router forwards to it with the [HTTP options](transports.md#http-options):
 
   ```elixir
-  children = [
-    MyApp.MCPServer
-  ]
+  forward "/mcp", MyApp.MCPServer, allowed_hosts: :localhost
   ```
 
-  ## Required Callback
+  For a host that launches your program over stdio, `MyApp.MCPServer.serve_stdio()`
+  serves the module on standard input and output; see `serve_stdio/2` and
+  [Stdio](transports.md#stdio).
 
-  A server module must implement `c:server/1` and return a
-  `%FastestMCP.Server{}` whose name matches the module name. `base_server/1`
-  exists to make that the default instead of something you have to remember.
+  ## Options
+
+    * `:otp_app` - also read options from `config :my_app, MyApp.MCPServer`
+    * `:http` - start a standalone Streamable HTTP listener: `true`, or options
+      such as `[port: 4100]`. Leave it out when Phoenix serves the server; see
+      [Transports](transports.md).
+    * `:well_known_http` - start a listener for the OAuth protected resource
+      metadata document
+    * `:runtime` - runtime options, as `FastestMCP.start_server/2` takes them
+    * `:id` - the child id
+    * any other option is passed to `c:server/1`; `base_server/1` passes the
+      ones that `FastestMCP.Server.new/2` takes, so `c:server/1` can read
+      options of your own
+
+  Options from the `use` line, the application config, and the child spec are
+  merged in that order, so later ones win. Invalid `:runtime`, `:http`, and
+  `:well_known_http` options raise `ArgumentError` when the child spec is
+  built.
+
+  `c:server/1` must return a `%FastestMCP.Server{}` named after the module;
+  starting with `base_server/1` ensures that.
   """
 
   alias FastestMCP.Server
+  alias FastestMCP.ServerRuntime
+  alias FastestMCP.ServerRuntime.Config
+  alias FastestMCP.Transport.Stdio
+  alias FastestMCP.Transport.StreamableHTTP
+  alias FastestMCP.Transport.WellKnownHTTP
 
   @reserved_keys [:otp_app, :runtime, :http, :well_known_http, :id]
 
@@ -60,10 +78,7 @@ defmodule FastestMCP.ServerModule do
       def __fastest_mcp_server_module_defaults__, do: @fastest_mcp_server_module_defaults
 
       def base_server(opts \\ []) do
-        FastestMCP.server(
-          __MODULE__,
-          Keyword.drop(opts, [:otp_app, :runtime, :http, :well_known_http, :id, :name])
-        )
+        FastestMCP.server(__MODULE__, Keyword.take(opts, FastestMCP.Server.option_keys()))
       end
 
       def child_spec(opts \\ []) do
@@ -74,7 +89,23 @@ defmodule FastestMCP.ServerModule do
         FastestMCP.ServerModule.start_link(__MODULE__, opts)
       end
 
-      defoverridable child_spec: 1, start_link: 1, base_server: 1
+      @doc false
+      def init(opts),
+        do: FastestMCP.Transport.HTTPApp.init(Keyword.put(opts, :server_name, __MODULE__))
+
+      @doc false
+      def call(conn, opts), do: FastestMCP.Transport.HTTPApp.call(conn, opts)
+
+      def serve_stdio(opts \\ []) do
+        FastestMCP.ServerModule.serve_stdio(__MODULE__, opts)
+      end
+
+      defoverridable child_spec: 1,
+                     start_link: 1,
+                     base_server: 1,
+                     init: 1,
+                     call: 2,
+                     serve_stdio: 1
     end
   end
 
@@ -83,16 +114,87 @@ defmodule FastestMCP.ServerModule do
     Code.ensure_loaded?(module) and function_exported?(module, :__fastest_mcp_server_module__?, 0)
   end
 
-  @doc "Starts the process owned by this module."
+  @doc "Starts the server of `module` and its configured transports under one supervisor; what the generated `start_link/1` calls."
   def start_link(module, opts \\ []) when is_atom(module) and is_list(opts) do
     ensure_server_module!(module)
     FastestMCP.ServerInstance.start_link({module, opts})
   end
 
-  @doc "Builds a child specification for supervising this module."
-  def child_spec(module, opts \\ []) when is_atom(module) and is_list(opts) do
+  @doc """
+  Serves the server of `module` over stdio until standard input ends; what
+  the generated `serve_stdio/1` calls. It returns `:ok`, so a command that
+  runs it, such as `mix run -e` or a release's `eval`, then exits.
+
+  It first moves Logger output from standard output to standard error, which
+  keeps it there while it serves, and starts the application that `module`
+  belongs to, as `mix run` does. When that application runs the server, it
+  serves that server; otherwise it starts the server for the connection, with
+  `opts` merged over the module's options as in `child_spec/2`, and stops it
+  when the input ends. Options for a server that is already running raise
+  `ArgumentError`.
+
+  `:auth_input` is the input that the server's authenticator receives for
+  every request of the connection, as for an in-process call: a map, or a
+  function of no arguments that returns one, which it calls once, after it has
+  started the application, so the function can verify a token or load a user.
+  A host can't send credentials over stdio, so build the input from the
+  environment that the host gives the command; see
+  [Authentication over stdio](transports.md#authentication-over-stdio).
+  """
+  def serve_stdio(module, opts \\ []) when is_atom(module) and is_list(opts) do
     ensure_server_module!(module)
-    resolved = resolve_config(module, opts)
+    {auth_input, opts} = Keyword.pop(opts, :auth_input, %{})
+
+    unless is_map(auth_input) or is_function(auth_input, 0) do
+      raise ArgumentError,
+            ":auth_input must be a map or a function that returns one, got: #{inspect(auth_input)}"
+    end
+
+    Stdio.with_stdout_isolated(fn ->
+      with application when application != nil <- Application.get_application(module),
+           do: Stdio.start_application!(application)
+
+      stdio = [auth_input: resolve_auth_input(auth_input)]
+
+      case ServerRuntime.fetch(module) do
+        {:error, :not_found} ->
+          %{server: server, runtime_opts: runtime_opts} = build_definition(module, opts)
+          stdio = [server_options: runtime_opts] ++ stdio
+          Stdio.serve(server, IO.binstream(:stdio, :line), :stdio, stdio)
+
+        {:ok, _runtime} when opts == [] ->
+          Stdio.serve(module, IO.binstream(:stdio, :line), :stdio, stdio)
+
+        {:ok, _runtime} ->
+          raise ArgumentError,
+                "#{inspect(module)} is already running, so serve_stdio/1 can't apply options to it"
+      end
+    end)
+  end
+
+  defp resolve_auth_input(fun) when is_function(fun, 0) do
+    case fun.() do
+      input when is_map(input) ->
+        input
+
+      other ->
+        raise ArgumentError, "the :auth_input function must return a map, got: #{inspect(other)}"
+    end
+  end
+
+  defp resolve_auth_input(input), do: input
+
+  @doc "Returns the child spec of `module`, with `opts` merged over its configuration; what the generated `child_spec/1` calls."
+  def child_spec(module, opts \\ []) when is_atom(module) and is_list(opts) do
+    resolved = validated_config!(module, opts)
+
+    # Supervisor reports print the start arguments: a signing secret goes in
+    # wrapped.
+    opts =
+      Enum.map(opts, fn
+        {:runtime, runtime} -> {:runtime, Config.protect(runtime)}
+        option -> option
+      end)
 
     {module, opts}
     |> FastestMCP.ServerInstance.child_spec()
@@ -118,9 +220,9 @@ defmodule FastestMCP.ServerModule do
 
   @doc "Builds the runtime definition for the given server module."
   def build_definition(module, overrides \\ []) when is_atom(module) and is_list(overrides) do
-    resolved = resolve_config(module, overrides)
+    resolved = validated_config!(module, overrides)
     build_opts = Keyword.drop(resolved, @reserved_keys)
-    runtime_opts = normalize_nested_opts(Keyword.get(resolved, :runtime, []))
+    runtime_opts = Config.protect(normalize_nested_opts(Keyword.get(resolved, :runtime, [])))
     http_opts = normalize_transport_opts(Keyword.get(resolved, :http))
 
     well_known_http_opts =
@@ -135,6 +237,22 @@ defmodule FastestMCP.ServerModule do
       http_opts: http_opts,
       well_known_http_opts: well_known_http_opts
     }
+  end
+
+  # The resolved configuration. Invalid runtime and HTTP options raise
+  # `ArgumentError` here, in the caller, before anything starts.
+  defp validated_config!(module, opts) do
+    resolved = resolve_config(module, opts)
+    Config.new!(normalize_nested_opts(Keyword.get(resolved, :runtime, [])))
+
+    with http_opts when is_list(http_opts) <- normalize_transport_opts(resolved[:http]),
+         do: StreamableHTTP.validate_options!(http_opts)
+
+    with well_known_opts when is_list(well_known_opts) <-
+           normalize_transport_opts(resolved[:well_known_http]),
+         do: WellKnownHTTP.validate_options!(well_known_opts)
+
+    resolved
   end
 
   defp validate_server!(module, %Server{name: name} = server) do

@@ -70,7 +70,17 @@ defmodule FastestMCP.TestSupport.RawPeer do
 
     {:ok, %{"id" => 1, "result" => _result}, peer} = recv(peer, 2_000)
     :ok = push_stdio(peer, ProtocolTest.jsonrpc_notification("notifications/initialized"))
-    :ok = await_initialized(peer.server_name, peer.session_id, 2_000)
+
+    FastestMCP.Case.assert_eventually(
+      fn ->
+        match?(
+          {:ok, %{state: :initialized}},
+          Session.lifecycle(peer.server_name, peer.session_id)
+        )
+      end,
+      2_000
+    )
+
     peer
   end
 
@@ -314,26 +324,6 @@ defmodule FastestMCP.TestSupport.RawPeer do
         {:error, reason, peer} ->
           {:error, reason, peer}
       end
-    end
-  end
-
-  defp await_initialized(server_name, session_id, timeout_ms) do
-    deadline = System.monotonic_time(:millisecond) + timeout_ms
-    do_await_initialized(server_name, session_id, deadline)
-  end
-
-  defp do_await_initialized(server_name, session_id, deadline) do
-    case Session.lifecycle(server_name, session_id) do
-      {:ok, %{state: :initialized}} ->
-        :ok
-
-      _other ->
-        if System.monotonic_time(:millisecond) >= deadline do
-          {:error, :timeout}
-        else
-          Process.sleep(5)
-          do_await_initialized(server_name, session_id, deadline)
-        end
     end
   end
 

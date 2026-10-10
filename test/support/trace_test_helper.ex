@@ -10,6 +10,11 @@ defmodule FastestMCP.TraceTestHelper do
     Record.extract(:status, from_lib: "opentelemetry_api/include/opentelemetry.hrl")
   )
 
+  Record.defrecord(
+    :event,
+    Record.extract(:event, from_lib: "opentelemetry/include/otel_span.hrl")
+  )
+
   def set_exporter(pid) when is_pid(pid) do
     :otel_simple_processor.set_exporter(:otel_exporter_pid, pid)
   end
@@ -20,6 +25,18 @@ defmodule FastestMCP.TraceTestHelper do
         drain_spans([span_record | acc])
     after
       50 -> Enum.reverse(acc)
+    end
+  end
+
+  # Drains spans until one matching `fun` has arrived, then any that follow.
+  def drain_spans_until(fun, acc \\ []) do
+    receive do
+      {:span, span_record} ->
+        if fun.(span_record),
+          do: Enum.reverse([span_record | acc], drain_spans()),
+          else: drain_spans_until(fun, [span_record | acc])
+    after
+      1_000 -> raise "expected span not exported, got #{inspect(Enum.map(acc, &span_name/1))}"
     end
   end
 
@@ -46,5 +63,13 @@ defmodule FastestMCP.TraceTestHelper do
     span_record
     |> span(:attributes)
     |> :otel_attributes.map()
+  end
+
+  # The events of a span as `{name, attributes}`.
+  def span_events(span_record) do
+    span_record
+    |> span(:events)
+    |> :otel_events.list()
+    |> Enum.map(&{to_string(event(&1, :name)), :otel_attributes.map(event(&1, :attributes))})
   end
 end

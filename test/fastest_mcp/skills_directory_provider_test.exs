@@ -1,8 +1,7 @@
 defmodule FastestMCP.SkillsDirectoryProviderTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Provider
-  alias FastestMCP.Providers.Skills
   alias FastestMCP.Providers.SkillsDirectory
   alias FastestMCP.ServerRuntime
 
@@ -38,17 +37,14 @@ defmodule FastestMCP.SkillsDirectoryProviderTest do
     File.write!(Path.join(complex_dir, "scripts/helper.py"), "print('Hello from helper')")
 
     provider = SkillsDirectory.new(roots: skills_root)
-    server_name = unique_server_name("skills-directory")
+    server_name = unique_name("skills-directory")
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_provider(provider)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_provider(provider)
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
-
-    resources = FastestMCP.list_resources(server_name)
-    templates = FastestMCP.list_resource_templates(server_name)
+    resources = FastestMCP.list_resources!(server_name)
+    templates = FastestMCP.list_resource_templates!(server_name)
 
     assert length(resources) == 4
     assert length(templates) == 2
@@ -60,12 +56,12 @@ defmodule FastestMCP.SkillsDirectoryProviderTest do
     assert complex_main.description == "Complex Skill"
 
     assert String.contains?(
-             FastestMCP.read_resource(server_name, "skill://complex-skill/scripts/helper.py"),
+             FastestMCP.read_resource!(server_name, "skill://complex-skill/scripts/helper.py"),
              "Hello from helper"
            )
 
     assert String.contains?(
-             FastestMCP.read_resource(server_name, "skill://complex-skill/reference.md"),
+             FastestMCP.read_resource!(server_name, "skill://complex-skill/reference.md"),
              "# Reference"
            )
   end
@@ -91,16 +87,13 @@ defmodule FastestMCP.SkillsDirectoryProviderTest do
     )
 
     provider = SkillsDirectory.new(roots: [root1, root2], reload: true)
-    server_name = unique_server_name("skills-directory-reload")
+    server_name = unique_name("skills-directory-reload")
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_provider(provider)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_provider(provider)
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
-
-    initial_resources = FastestMCP.list_resources(server_name)
+    initial_resources = FastestMCP.list_resources!(server_name)
     main = Enum.find(initial_resources, &(&1.uri == "skill://duplicate-skill/SKILL.md"))
     assert main.description == "First occurrence"
 
@@ -108,7 +101,7 @@ defmodule FastestMCP.SkillsDirectoryProviderTest do
     File.mkdir_p!(new_skill)
     File.write!(Path.join(new_skill, "SKILL.md"), "---\ndescription: New skill\n---\n# New")
 
-    reloaded_resources = FastestMCP.list_resources(server_name)
+    reloaded_resources = FastestMCP.list_resources!(server_name)
     assert Enum.any?(reloaded_resources, &(&1.uri == "skill://new-skill/SKILL.md"))
   end
 
@@ -165,14 +158,11 @@ defmodule FastestMCP.SkillsDirectoryProviderTest do
     File.mkdir_p!(skill_dir)
     File.write!(Path.join(skill_dir, "SKILL.md"), "# Runtime Skill")
 
-    server_name = unique_server_name("skills-runtime-cache")
+    server_name = unique_name("skills-runtime-cache")
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_provider(SkillsDirectory.new(roots: root, reload: true))
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_provider(SkillsDirectory.new(roots: root, reload: true))
+    |> start_server!()
 
     assert {:ok, runtime} = ServerRuntime.fetch(server_name)
 
@@ -210,22 +200,19 @@ defmodule FastestMCP.SkillsDirectoryProviderTest do
     File.write!(Path.join(complex_dir, "reference.md"), "# Reference")
     File.write!(Path.join(complex_dir, "scripts/helper.py"), "print('Hello')")
 
-    provider = Skills.new(roots: skills_root, supporting_files: :resources)
-    server_name = unique_server_name("skills-directory-resources")
+    provider = SkillsDirectory.new(roots: skills_root, supporting_files: :resources)
+    server_name = unique_name("skills-directory-resources")
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_provider(provider)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_provider(provider)
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
-
-    resources = FastestMCP.list_resources(server_name)
+    resources = FastestMCP.list_resources!(server_name)
 
     assert length(resources) == 4
     assert Enum.any?(resources, &(&1.uri == "skill://complex-skill/reference.md"))
     assert Enum.any?(resources, &(&1.uri == "skill://complex-skill/scripts/helper.py"))
-    assert [] == FastestMCP.list_resource_templates(server_name)
+    assert [] == FastestMCP.list_resource_templates!(server_name)
   end
 
   defp create_skills_root(name) do
@@ -235,9 +222,5 @@ defmodule FastestMCP.SkillsDirectoryProviderTest do
     File.mkdir_p!(root)
     on_exit(fn -> File.rm_rf(root) end)
     root
-  end
-
-  defp unique_server_name(prefix) do
-    prefix <> "-" <> Integer.to_string(System.unique_integer([:positive]))
   end
 end

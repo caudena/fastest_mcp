@@ -1,14 +1,11 @@
 defmodule FastestMCP.Pagination do
-  @moduledoc """
-  Cursor pagination helpers shared by list operations.
+  @moduledoc false
+  # MCP list responses use a server-chosen page size and a signed keyset cursor
+  # bound to the method and the caller's visibility/filter scope, so a cursor
+  # cannot be replayed against another method, principal, or policy. Offset
+  # cursors are for Elixir-native callers only.
 
-  Transport pagination uses a server-selected page size and a signed keyset
-  cursor. The cursor is bound to the list method and caller visibility/filter
-  scope so it cannot be reused against another method, principal, or policy.
-
-  The older offset helpers remain available for Elixir-native callers. They are
-  deliberately not used by MCP transports.
-  """
+  import FastestMCP.Util, only: [secure_equal?: 2, stringify_keys: 1]
 
   alias FastestMCP.Error
 
@@ -16,17 +13,12 @@ defmodule FastestMCP.Pagination do
   @max_cursor_bytes 4_096
   @cursor_version 1
 
-  @doc "Returns the default server-owned MCP page size."
-  def default_page_size, do: @default_page_size
-
-  @doc "Encodes an offset for Elixir-native pagination."
   def encode_cursor(offset) when is_integer(offset) and offset >= 0 do
     %{"offset" => offset}
     |> JSON.encode!()
     |> Base.url_encode64(padding: false)
   end
 
-  @doc "Decodes an Elixir-native offset cursor."
   def decode_cursor(cursor) when is_binary(cursor) and cursor != "" do
     with true <- byte_size(cursor) <= @max_cursor_bytes,
          {:ok, decoded} <- Base.url_decode64(cursor, padding: false),
@@ -40,112 +32,72 @@ defmodule FastestMCP.Pagination do
 
   def decode_cursor(_cursor), do: {:error, :invalid_cursor}
 
-  @doc "Paginates an Elixir-native list only when `:page_size` is supplied."
+  # `{:ok, items}` without `:page_size`, else the result of `paginate/3`.
   def maybe_paginate(items, opts) when is_list(items) do
     case Keyword.get(opts, :page_size) do
-      nil -> items
+      nil -> {:ok, items}
       page_size -> paginate(items, Keyword.get(opts, :cursor), page_size)
     end
   end
 
-  @doc "Applies offset pagination for Elixir-native callers."
+  # `{:ok, %{items:, next_cursor:}}`, or a `:bad_request` error for an invalid
+  # cursor or page size.
   def paginate(items, cursor, page_size) when is_list(items) do
-    validate_page_size!(page_size)
-    offset = decode_cursor!(cursor)
-    {page, remaining} = items |> Enum.drop(offset) |> Enum.split(page_size)
-
-    %{
-      items: page,
-      next_cursor: if(remaining == [], do: nil, else: encode_cursor(offset + length(page)))
-    }
-  end
-
-  @doc """
-  Applies signed keyset pagination for an MCP list response.
-
-  Required options are `:secret` and `:scope`. `:fingerprint` binds the cursor
-  to caller-visible state. `:key` may provide a stable key function; otherwise
-  component metadata fields are used.
-  """
-  def wire_page(items, opts) when is_list(items) and is_list(opts) do
-    secret = validate_secret!(Keyword.fetch!(opts, :secret))
-    scope = normalize_binding(Keyword.fetch!(opts, :scope))
-    fingerprint = normalize_binding(Keyword.get(opts, :fingerprint, "public"))
-    page_size = Keyword.get(opts, :page_size, @default_page_size)
-    key_fun = Keyword.get(opts, :key, &default_key/1)
-    validate_page_size!(page_size)
-
-    after_key =
-      decode_wire_cursor!(Keyword.get(opts, :cursor), secret, scope, fingerprint)
-
-    remaining =
-      items
-      |> Enum.map(&{normalize_key(key_fun.(&1)), &1})
-      |> Enum.sort_by(&elem(&1, 0))
-      |> drop_through(after_key)
-
-    {selected, overflow} = Enum.split(remaining, page_size)
-    page = Enum.map(selected, &elem(&1, 1))
-
-    next_cursor =
-      case {selected, overflow} do
-        {[], _} ->
-          nil
-
-        {_selected, []} ->
-          nil
-
-        {_selected, _overflow} ->
-          last_key = selected |> List.last() |> elem(0)
-          encode_wire_cursor(last_key, secret, scope, fingerprint)
-      end
-
-    %{items: page, next_cursor: next_cursor}
-  end
-
-  @doc false
-  def wire_page(opts, source) when is_list(opts) and is_function(source, 2) do
-    secret = validate_secret!(Keyword.fetch!(opts, :secret))
-    scope = normalize_binding(Keyword.fetch!(opts, :scope))
-    fingerprint = normalize_binding(Keyword.get(opts, :fingerprint, "public"))
-    page_size = Keyword.get(opts, :page_size, @default_page_size)
-    key_fun = Keyword.get(opts, :key, &default_key/1)
-    validate_page_size!(page_size)
-
-    after_key =
-      decode_wire_cursor!(Keyword.get(opts, :cursor), secret, scope, fingerprint)
-
-    candidates = source.(after_key, page_size + 1)
-
-    unless is_list(candidates) do
-      raise Error,
-        code: :internal_error,
-        message: "pagination source must return a list"
+    with :ok <- validate_page_size(page_size),
+         {:ok, offset} <- offset(cursor) do
+      {page, remaining} = items |> Enum.drop(offset) |> Enum.split(page_size)
+      next_cursor = if remaining != [], do: encode_cursor(offset + length(page))
+      {:ok, %{items: page, next_cursor: next_cursor}}
     end
-
-    selected =
-      candidates
-      |> keyset_items(after_key, page_size + 1, key_fun)
-
-    {page, overflow} = Enum.split(selected, page_size)
-
-    next_cursor =
-      case {page, overflow} do
-        {[], _overflow} ->
-          nil
-
-        {_page, []} ->
-          nil
-
-        {_page, _overflow} ->
-          last_key = page |> List.last() |> key_fun.() |> normalize_key()
-          encode_wire_cursor(last_key, secret, scope, fingerprint)
-      end
-
-    %{items: page, next_cursor: next_cursor}
   end
 
-  @doc "Returns a bounded, stable keyset page for a provider source."
+  # Requires `:secret` and `:scope`; `:fingerprint` binds the cursor to
+  # caller-visible state, and `:key` replaces the component-metadata key.
+  def wire_page(items, opts) when is_list(items) and is_list(opts),
+    do: wire_page(opts, fn _after_key, _limit -> {:ok, items} end)
+
+  # The page of `source.(after_key, limit)`, which returns `{:ok, items}` with
+  # at least the `limit` items after `after_key` it has, or an error.
+  def wire_page(opts, source) when is_list(opts) and is_function(source, 2) do
+    with {:ok, {after_key, limit}} <- wire_position(opts),
+         {:ok, candidates} <- source.(after_key, limit) do
+      key_fun = Keyword.get(opts, :key, &default_key/1)
+
+      {page, overflow} =
+        candidates |> keyset_items(after_key, limit, key_fun) |> Enum.split(limit - 1)
+
+      next_cursor =
+        if page != [] and overflow != [] do
+          page
+          |> List.last()
+          |> key_fun.()
+          |> normalize_key()
+          |> encode_wire_cursor(signing(opts))
+        end
+
+      {:ok, %{items: page, next_cursor: next_cursor}}
+    end
+  end
+
+  # `{:ok, {after_key, limit}}`: the key a page starts after, nil for the first
+  # page, from the cursor that `wire_page/2` would read, and how many items its
+  # source returns; or an invalid cursor or page size error.
+  def wire_position(opts) when is_list(opts) do
+    page_size = Keyword.get(opts, :page_size, @default_page_size)
+    cursor = Keyword.get(opts, :cursor)
+
+    with :ok <- validate_page_size(page_size),
+         {:ok, after_key} <- decode_wire_cursor(cursor, signing(opts)),
+         do: {:ok, {after_key, page_size + 1}}
+  end
+
+  # The secret, scope, and fingerprint that sign the cursors of `opts`.
+  defp signing(opts) do
+    {validate_secret!(Keyword.fetch!(opts, :secret)),
+     normalize_binding(Keyword.fetch!(opts, :scope)),
+     normalize_binding(Keyword.get(opts, :fingerprint, "public"))}
+  end
+
   def source_page(items, after_key, limit, opts \\ [])
       when is_integer(limit) and limit > 0 and is_list(opts) do
     key_fun = Keyword.get(opts, :key, &default_key/1)
@@ -162,20 +114,15 @@ defmodule FastestMCP.Pagination do
     %{items: page, next_after: next_after}
   end
 
-  @doc false
   def normalize_source_key(nil), do: nil
   def normalize_source_key(key), do: normalize_key(key)
 
-  @doc false
+  # Items are components or their `Component.metadata/1` maps.
   def default_key(item) when is_map(item) do
-    identifier =
-      fetch(item, :name) || fetch(item, :uri) || fetch(item, :uri_template) ||
-        fetch(item, :uriTemplate) || fetch(item, :key)
-
-    if is_nil(identifier) do
-      [JSON.encode!(stringify_keys(item))]
-    else
-      [to_string(identifier), to_string(fetch(item, :version) || "")]
+    case Map.get(item, :name) || Map.get(item, :uri) || Map.get(item, :uri_template) ||
+           Map.get(item, :key) do
+      nil -> [JSON.encode!(stringify_keys(item))]
+      identifier -> [to_string(identifier), to_string(Map.get(item, :version) || "")]
     end
   end
 
@@ -216,7 +163,7 @@ defmodule FastestMCP.Pagination do
 
   defp insert_sorted([current | rest], entry), do: [current | insert_sorted(rest, entry)]
 
-  defp encode_wire_cursor(after_key, secret, scope, fingerprint) do
+  defp encode_wire_cursor(after_key, {secret, scope, fingerprint}) do
     body =
       JSON.encode!(%{
         "v" => @cursor_version,
@@ -231,9 +178,9 @@ defmodule FastestMCP.Pagination do
       "." <> Base.url_encode64(signature, padding: false)
   end
 
-  defp decode_wire_cursor!(nil, _secret, _scope, _fingerprint), do: nil
+  defp decode_wire_cursor(nil, _signing), do: {:ok, nil}
 
-  defp decode_wire_cursor!(cursor, secret, scope, fingerprint)
+  defp decode_wire_cursor(cursor, {secret, scope, fingerprint})
        when is_binary(cursor) and cursor != "" and byte_size(cursor) <= @max_cursor_bytes do
     with [encoded_body, encoded_signature] <- String.split(cursor, ".", parts: 2),
          {:ok, body} <- Base.url_decode64(encoded_body, padding: false),
@@ -247,19 +194,13 @@ defmodule FastestMCP.Pagination do
             "fingerprint" => ^fingerprint,
             "after" => after_key
           }} <- JSON.decode(body) do
-      normalize_key(after_key)
+      {:ok, normalize_key(after_key)}
     else
-      _other -> invalid_cursor!()
+      _other -> invalid_cursor()
     end
   end
 
-  defp decode_wire_cursor!(_cursor, _secret, _scope, _fingerprint), do: invalid_cursor!()
-
-  defp drop_through(items, nil), do: items
-
-  defp drop_through(items, after_key) do
-    Enum.drop_while(items, fn {key, _item} -> key <= after_key end)
-  end
+  defp decode_wire_cursor(_cursor, _signing), do: invalid_cursor()
 
   defp normalize_key(key) when is_list(key), do: Enum.map(key, &normalize_key_part/1)
   defp normalize_key(key), do: [normalize_key_part(key)]
@@ -277,41 +218,16 @@ defmodule FastestMCP.Pagination do
     raise ArgumentError, "pagination cursor secret must contain at least 32 bytes"
   end
 
-  defp validate_page_size!(page_size) when is_integer(page_size) and page_size > 0,
-    do: :ok
+  defp validate_page_size(page_size) when is_integer(page_size) and page_size > 0, do: :ok
 
-  defp validate_page_size!(_page_size) do
-    raise Error, code: :bad_request, message: "page_size must be a positive integer"
+  defp validate_page_size(_page_size),
+    do: {:error, %Error{code: :bad_request, message: "page_size must be a positive integer"}}
+
+  defp offset(nil), do: {:ok, 0}
+
+  defp offset(cursor) do
+    with {:error, :invalid_cursor} <- decode_cursor(cursor), do: invalid_cursor()
   end
 
-  defp decode_cursor!(nil), do: 0
-
-  defp decode_cursor!(cursor) do
-    case decode_cursor(cursor) do
-      {:ok, offset} -> offset
-      {:error, :invalid_cursor} -> invalid_cursor!()
-    end
-  end
-
-  defp invalid_cursor! do
-    raise Error, code: :bad_request, message: "invalid cursor"
-  end
-
-  defp secure_equal?(left, right)
-       when is_binary(left) and is_binary(right) and byte_size(left) == byte_size(right) do
-    :crypto.hash_equals(left, right)
-  end
-
-  defp secure_equal?(_left, _right), do: false
-
-  defp fetch(map, key) do
-    Map.get(map, key, Map.get(map, Atom.to_string(key)))
-  end
-
-  defp stringify_keys(value) when is_map(value) do
-    Map.new(value, fn {key, item} -> {to_string(key), stringify_keys(item)} end)
-  end
-
-  defp stringify_keys(value) when is_list(value), do: Enum.map(value, &stringify_keys/1)
-  defp stringify_keys(value), do: value
+  defp invalid_cursor, do: {:error, %Error{code: :bad_request, message: "invalid cursor"}}
 end

@@ -2,44 +2,24 @@ defmodule FastestMCP.ComponentVisibility do
   @moduledoc false
 
   alias FastestMCP.Component
+  alias FastestMCP.Component.Lookup
+  alias FastestMCP.ComponentManager
   alias FastestMCP.Context
   alias FastestMCP.Error
-  alias FastestMCP.EventBus
+  alias FastestMCP.Notifications
   alias FastestMCP.Registry
   alias FastestMCP.ServerRuntime
 
-  @component_family_map %{
-    tool: :tools,
-    resource: :resources,
-    resource_template: :resources,
-    prompt: :prompts
-  }
+  @version_comparisons %{eq: [:eq], gt: [:gt], gte: [:eq, :gt], lt: [:lt], lte: [:eq, :lt]}
 
   def enable(server_name, opts \\ []), do: update_server_rules(server_name, :enable, opts)
   def disable(server_name, opts \\ []), do: update_server_rules(server_name, :disable, opts)
 
-  def reset(server_name) do
-    server_name = normalize_server_name(server_name)
-    ensure_runtime!(server_name)
+  def reset(server_name),
+    do: update_rules(server_name, fn _rules -> [] end, [:tools, :resources, :prompts])
 
-    case Registry.reset_component_visibility_rules(server_name) do
-      :unchanged ->
-        :ok
-
-      :changed ->
-        broadcast_change(server_name, [:tools, :resources, :prompts])
-        :ok
-    end
-  end
-
-  def delete(server_name) do
-    Registry.delete_component_visibility_rules(normalize_server_name(server_name))
-  end
-
-  def server_rules(server_name) do
-    server_name = normalize_server_name(server_name)
-    Registry.component_visibility_rules(server_name)
-  end
+  def server_rules(server_name),
+    do: server_name |> normalize_server_name() |> Registry.visibility_rules()
 
   def session_rules(%Context{} = context) do
     context
@@ -58,7 +38,7 @@ defmodule FastestMCP.ComponentVisibility do
     end
   end
 
-  def normalize_rule(action, opts) when action in [:enable, :disable] and is_list(opts) do
+  defp normalize_rule(action, opts) when action in [:enable, :disable] and is_list(opts) do
     %{
       action: action,
       names: normalize_optional_string_set(opts[:names]),
@@ -70,16 +50,13 @@ defmodule FastestMCP.ComponentVisibility do
     }
   end
 
-  def component_families(opts) when is_list(opts) do
+  defp component_families(opts) when is_list(opts) do
     case normalize_component_types(opts[:components]) do
       nil ->
         [:tools, :resources, :prompts]
 
-      components ->
-        components
-        |> Enum.map(&Map.fetch!(@component_family_map, &1))
-        |> Enum.uniq()
-        |> Enum.sort()
+      kinds ->
+        kinds |> Enum.map(&Component.family/1) |> Enum.uniq() |> Enum.sort()
     end
   end
 
@@ -96,11 +73,21 @@ defmodule FastestMCP.ComponentVisibility do
   end
 
   defp update_server_rules(server_name, action, opts) do
+    rules = normalize_rules(action, opts)
+    update_rules(server_name, &(&1 ++ rules), component_families(opts))
+  end
+
+  defp update_rules(server_name, update, families) do
     server_name = normalize_server_name(server_name)
-    ensure_runtime!(server_name)
-    :ok = Registry.append_component_visibility_rules(server_name, normalize_rules(action, opts))
-    broadcast_change(server_name, component_families(opts))
-    :ok
+
+    with {:ok, runtime} <- ServerRuntime.fetch_running(server_name) do
+      if ComponentManager.update_visibility_rules(runtime.component_manager, update) == :changed,
+        do: Notifications.list_changed(runtime, families)
+
+      :ok
+    end
+  catch
+    :exit, reason -> {:error, Error.from_exit(reason)}
   end
 
   defp apply_rules(component, rules, scope) when is_list(rules) do
@@ -138,7 +125,7 @@ defmodule FastestMCP.ComponentVisibility do
   end
 
   defp visibility_rule_matches?(%{match_all: true} = rule, component) do
-    matches_component_selector?(rule.components, Component.type(component))
+    matches_component_selector?(rule.components, Component.kind(component))
   end
 
   defp visibility_rule_matches?(rule, component) do
@@ -147,7 +134,7 @@ defmodule FastestMCP.ComponentVisibility do
       key = Component.key(component)
       version = Component.version(component) && to_string(Component.version(component))
       tags = Map.get(component, :tags, MapSet.new())
-      component_type = Component.type(component)
+      component_type = Component.kind(component)
 
       matches_selector?(rule.names, identifier) and
         matches_selector?(rule.keys, key) and
@@ -192,41 +179,14 @@ defmodule FastestMCP.ComponentVisibility do
   defp matches_version_selector?(nil, _value), do: true
   defp matches_version_selector?(_selector, nil), do: false
 
-  defp matches_version_selector?(%{} = selector, version) do
-    satisfies_eq?(version, selector) and
-      satisfies_gt?(version, selector) and
-      satisfies_gte?(version, selector) and
-      satisfies_lt?(version, selector) and
-      satisfies_lte?(version, selector)
-  end
+  defp matches_version_selector?(selector, version) do
+    Enum.all?(selector, fn
+      {_operator, nil} ->
+        true
 
-  defp matches_version_selector?(expected, value), do: matches_selector?(expected, value)
-
-  defp satisfies_eq?(_version, %{eq: nil}), do: true
-
-  defp satisfies_eq?(version, %{eq: expected}),
-    do: Component.compare_versions(version, expected) == :eq
-
-  defp satisfies_gt?(_version, %{gt: nil}), do: true
-
-  defp satisfies_gt?(version, %{gt: expected}),
-    do: Component.compare_versions(version, expected) == :gt
-
-  defp satisfies_gte?(_version, %{gte: nil}), do: true
-
-  defp satisfies_gte?(version, %{gte: expected}) do
-    Component.compare_versions(version, expected) in [:eq, :gt]
-  end
-
-  defp satisfies_lt?(_version, %{lt: nil}), do: true
-
-  defp satisfies_lt?(version, %{lt: expected}),
-    do: Component.compare_versions(version, expected) == :lt
-
-  defp satisfies_lte?(_version, %{lte: nil}), do: true
-
-  defp satisfies_lte?(version, %{lte: expected}) do
-    Component.compare_versions(version, expected) in [:eq, :lt]
+      {operator, expected} ->
+        Lookup.compare_versions(version, expected) in @version_comparisons[operator]
+    end)
   end
 
   defp matches_component_selector?(nil, _component_type), do: true
@@ -259,28 +219,23 @@ defmodule FastestMCP.ComponentVisibility do
   defp normalize_version_selector(selector) when is_map(selector) or is_list(selector) do
     selector = Map.new(selector)
 
-    normalized = %{
-      eq: normalize_optional_version(Map.get(selector, :eq, Map.get(selector, "eq"))),
-      gt: normalize_optional_version(Map.get(selector, :gt, Map.get(selector, "gt"))),
-      gte: normalize_optional_version(Map.get(selector, :gte, Map.get(selector, "gte"))),
-      lt: normalize_optional_version(Map.get(selector, :lt, Map.get(selector, "lt"))),
-      lte: normalize_optional_version(Map.get(selector, :lte, Map.get(selector, "lte")))
-    }
+    normalized =
+      Map.new(@version_comparisons, fn {operator, _orders} ->
+        value = selector[operator]
+        {operator, value && to_string(value)}
+      end)
 
-    if Enum.any?(normalized, fn {_key, value} -> not is_nil(value) end) do
-      normalized
-    else
+    if Enum.all?(normalized, fn {_operator, value} -> is_nil(value) end) do
       raise ArgumentError,
             "visibility version selectors must include at least one of :eq, :gt, :gte, :lt, or :lte"
     end
+
+    normalized
   end
 
   defp normalize_version_selector(selector) do
     %{eq: to_string(selector), gt: nil, gte: nil, lt: nil, lte: nil}
   end
-
-  defp normalize_optional_version(nil), do: nil
-  defp normalize_optional_version(version), do: to_string(version)
 
   defp normalize_optional_string_set(nil), do: nil
 
@@ -293,50 +248,6 @@ defmodule FastestMCP.ComponentVisibility do
 
   defp normalize_component_types(nil), do: nil
 
-  defp normalize_component_types(values) do
-    values
-    |> List.wrap()
-    |> Enum.map(fn
-      :tool -> :tool
-      :resource -> :resource
-      :template -> :resource_template
-      :resource_template -> :resource_template
-      :prompt -> :prompt
-      "tool" -> :tool
-      "resource" -> :resource
-      "template" -> :resource_template
-      "resource_template" -> :resource_template
-      "prompt" -> :prompt
-      other -> raise ArgumentError, "unsupported component visibility selector #{inspect(other)}"
-    end)
-    |> MapSet.new()
-  end
-
-  defp ensure_runtime!(server_name) do
-    case ServerRuntime.fetch(server_name) do
-      {:ok, _runtime} ->
-        :ok
-
-      {:error, :not_found} ->
-        raise Error, code: :not_found, message: "unknown server #{inspect(server_name)}"
-
-      {:error, reason} ->
-        raise Error,
-          code: :internal_error,
-          message: "failed to fetch server runtime",
-          details: %{reason: inspect(reason)}
-    end
-  end
-
-  defp broadcast_change(server_name, families) do
-    with {:ok, runtime} <- ServerRuntime.fetch(server_name) do
-      EventBus.emit(
-        runtime.event_bus,
-        server_name,
-        [:components, :changed],
-        %{count: length(families)},
-        %{families: families}
-      )
-    end
-  end
+  defp normalize_component_types(values),
+    do: values |> List.wrap() |> MapSet.new(&Component.kind!/1)
 end

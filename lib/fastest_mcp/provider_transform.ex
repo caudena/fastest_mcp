@@ -1,41 +1,31 @@
 defmodule FastestMCP.ProviderTransform do
   @moduledoc """
-  Dispatch helpers for provider-scoped component transforms.
+  Behaviour for provider-scoped component transforms.
 
-  This module keeps one focused piece of FastestMCP behavior in a dedicated
-  place so builders, runtimes, transports, and providers can share the same
-  rules without duplicating logic.
-
-  Unless you are extending FastestMCP itself, you will usually meet this
-  module indirectly through higher-level APIs rather than calling it first.
+  A transform is a struct whose module calls `use FastestMCP.ProviderTransform`
+  and overrides either callback; it is attached with
+  `FastestMCP.add_provider_transform/2`. `transform_component/3` rewrites (or
+  drops, by returning `nil`) each component as the provider exposes it, and
+  `reverse_identifier/4` maps an exposed identifier back to the source
+  identifier, returning `:error` when the identifier cannot come from this
+  provider. The defaults leave components and identifiers unchanged.
   """
 
-  @doc "Builds a new value for this module from the supplied options."
-  def new(%module{} = transform) do
-    unless function_exported?(module, :transform_component, 3) or
-             function_exported?(module, :reverse_identifier, 4) do
-      raise ArgumentError,
-            "provider transform #{inspect(module)} must export transform_component/3 or reverse_identifier/4"
-    end
+  @callback transform_component(struct(), struct(), FastestMCP.Operation.t()) :: struct() | nil
+  @callback reverse_identifier(struct(), atom(), String.t(), FastestMCP.Operation.t()) ::
+              {:ok, String.t()} | :error
 
-    transform
-  end
+  defmacro __using__(_opts) do
+    quote do
+      @behaviour FastestMCP.ProviderTransform
 
-  @doc "Transforms a component before it is exposed."
-  def transform_component(%module{} = transform, component, operation) do
-    if function_exported?(module, :transform_component, 3) do
-      module.transform_component(transform, component, operation)
-    else
-      component
-    end
-  end
+      @doc false
+      def transform_component(_transform, component, _operation), do: component
 
-  @doc "Maps an exposed identifier back to the source identifier."
-  def reverse_identifier(%module{} = transform, component_type, identifier, operation) do
-    if function_exported?(module, :reverse_identifier, 4) do
-      module.reverse_identifier(transform, component_type, to_string(identifier), operation)
-    else
-      {:ok, to_string(identifier)}
+      @doc false
+      def reverse_identifier(_transform, _kind, identifier, _operation), do: {:ok, identifier}
+
+      defoverridable FastestMCP.ProviderTransform
     end
   end
 end

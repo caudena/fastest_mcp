@@ -1,5 +1,5 @@
 defmodule FastestMCP.SSEDecoderTest do
-  use ExUnit.Case, async: true
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Transport.SSEDecoder
 
@@ -300,104 +300,74 @@ defmodule FastestMCP.TestSupport.PrimedSSEPlug do
 end
 
 defmodule FastestMCP.SSEClientCleanupTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: false
 
   alias FastestMCP.Client
 
   test "terminal JSON responses end streamed calls without delaying reuse or disconnect" do
     server_name = "sse-terminal-response-#{System.unique_integer([:positive])}"
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
-
-    bandit =
-      start_supervised!(
-        {Bandit,
-         plug:
-           {FastestMCP.Transport.HTTPApp,
-            server_name: server_name,
-            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"],
-            json_response: true},
-         scheme: :http,
-         port: 0}
+    %{url: url} =
+      start_http!(server_name,
+        allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"],
+        json_response: true
       )
 
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
-
     client =
-      Client.connect!("http://127.0.0.1:#{port}/mcp",
+      connect!(url,
         protocol_version: "2025-11-25",
         timeout_ms: 5_000
       )
 
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
-    end)
+    assert %{structured_content: %{"sequence" => 1}} =
+             Client.call_tool!(client, "echo", %{"sequence" => 1})
 
-    assert %{"sequence" => 1} = Client.call_tool(client, "echo", %{"sequence" => 1})
-    assert %{"sequence" => 2} = Client.call_tool(client, "echo", %{"sequence" => 2})
+    assert %{structured_content: %{"sequence" => 2}} =
+             Client.call_tool!(client, "echo", %{"sequence" => 2})
 
     bounded_client =
-      Client.connect!("http://127.0.0.1:#{port}/mcp",
+      connect!(url,
         protocol_version: "2025-11-25",
         timeout_ms: 5_000,
         max_response_bytes: 512
       )
 
-    on_exit(fn ->
-      if Client.connected?(bounded_client), do: Client.disconnect(bounded_client)
-    end)
-
     bounded_error =
       assert_raise FastestMCP.Error, fn ->
-        Client.call_tool(bounded_client, "echo", %{"payload" => String.duplicate("x", 2_048)})
+        Client.call_tool!(bounded_client, "echo", %{"payload" => String.duplicate("x", 2_048)})
       end
 
     assert bounded_error.code == :bad_request
     assert bounded_error.message == "MCP response exceeds configured size limit"
     assert bounded_error.details.terminal_response_observed == false
-    assert :ok = Client.disconnect(bounded_client)
+    assert :ok = Client.disconnect!(bounded_client)
 
     started_at = System.monotonic_time(:millisecond)
-    assert :ok = Client.disconnect(client)
+    assert :ok = Client.disconnect!(client)
     assert System.monotonic_time(:millisecond) - started_at < 1_000
   end
 
   test "HTTP POST streams ignore an empty priming data event before the result" do
-    bandit =
-      start_supervised!(
-        {Bandit, plug: FastestMCP.TestSupport.PrimedSSEPlug, scheme: :http, port: 0}
-      )
+    %{url: url} = serve!(FastestMCP.TestSupport.PrimedSSEPlug)
 
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+    client = connect!(url, protocol_version: "2025-11-25")
 
-    client =
-      Client.connect!("http://127.0.0.1:#{port}/mcp", protocol_version: "2025-11-25")
-
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
-    end)
-
-    assert %{"structuredContent" => %{"primed" => true}} =
-             Client.call_tool(client, "echo", %{})
+    assert %{raw: %{"structuredContent" => %{"primed" => true}}} =
+             Client.call_tool!(client, "echo", %{})
 
     bounded_client =
-      Client.connect!("http://127.0.0.1:#{port}/mcp",
+      connect!(url,
         protocol_version: "2025-11-25",
         max_response_bytes: 512
       )
 
-    on_exit(fn ->
-      if Client.connected?(bounded_client), do: Client.disconnect(bounded_client)
-    end)
-
     error =
       assert_raise FastestMCP.Error, fn ->
-        Client.call_tool_result(bounded_client, "large", %{})
+        Client.call_tool!(bounded_client, "large", %{})
       end
 
     assert error.code == :bad_request

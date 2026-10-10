@@ -1,5 +1,7 @@
 defmodule FastestMCP.ClientHTTPCleanupTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: false
+
+  alias FastestMCP.Test.ClientProbe
 
   alias FastestMCP.Client
   alias FastestMCP.Error
@@ -26,24 +28,22 @@ defmodule FastestMCP.ClientHTTPCleanupTest do
   test "timed out request cancels its live HTTP request" do
     {url, server_ref} = start_hanging_server()
 
-    client =
-      Client.connect!(url, auto_initialize: false, protocol_version: "2025-11-25")
+    client = connect!(url, auto_initialize: false, protocol_version: "2025-11-25")
 
     mark_initialized(client)
-    on_exit(fn -> disconnect_if_alive(client) end)
 
     request_task =
       Task.async(fn ->
-        capture_client_result(fn -> Client.ping(client, timeout_ms: 500) end)
+        capture_client_result(fn -> Client.ping!(client, timeout_ms: 500) end)
       end)
 
     entry = wait_for_request_entry(client)
-    refute is_nil(entry.request_ref)
+    refute is_nil(entry.http_ref)
     assert_receive {:raw_http_request, ^server_ref, _request}, 1_000
 
     assert {:error, %Error{code: :timeout}} = Task.await(request_task, 1_000)
     assert_receive {:raw_http_closed, ^server_ref}, 750
-    assert :sys.get_state(client.pid).in_flight == %{}
+    assert ClientProbe.requests(client) == %{}
     assert Client.connected?(client)
   end
 
@@ -57,46 +57,44 @@ defmodule FastestMCP.ClientHTTPCleanupTest do
 
     request_task =
       Task.async(fn ->
-        capture_client_result(fn -> Client.ping(client, timeout_ms: 5_000) end)
+        capture_client_result(fn -> Client.ping!(client, timeout_ms: 5_000) end)
       end)
 
     assert_receive {:raw_http_request, ^server_ref, _request}, 1_000
-    %{worker_pid: worker_pid, request_ref: request_ref} = wait_for_request_entry(client)
+    %{worker: worker_pid, http_ref: request_ref} = wait_for_request_entry(client)
     refute is_nil(request_ref)
 
     started_at = System.monotonic_time(:millisecond)
-    assert :ok = Client.disconnect(client)
+    assert :ok = Client.disconnect!(client)
     elapsed_ms = System.monotonic_time(:millisecond) - started_at
 
     assert elapsed_ms < 500
     assert_receive {:raw_http_closed, ^server_ref}, 750
     refute Process.alive?(worker_pid)
-    assert {:exit, _reason} = Task.await(request_task, 1_000)
+    assert {:error, %Error{code: :not_found}} = Task.await(request_task, 1_000)
   end
 
   test "killing a request worker cannot leak its HTTP request" do
     {url, server_ref} = start_hanging_server()
 
-    client =
-      Client.connect!(url, auto_initialize: false, protocol_version: "2025-11-25")
+    client = connect!(url, auto_initialize: false, protocol_version: "2025-11-25")
 
     mark_initialized(client)
-    on_exit(fn -> disconnect_if_alive(client) end)
 
     request_task =
       Task.async(fn ->
-        capture_client_result(fn -> Client.ping(client, timeout_ms: 5_000) end)
+        capture_client_result(fn -> Client.ping!(client, timeout_ms: 5_000) end)
       end)
 
     assert_receive {:raw_http_request, ^server_ref, _request}, 1_000
-    %{worker_pid: worker_pid, request_ref: request_ref} = wait_for_request_entry(client)
+    %{worker: worker_pid, http_ref: request_ref} = wait_for_request_entry(client)
     refute is_nil(request_ref)
 
     Process.exit(worker_pid, :kill)
 
     assert {:error, %Error{code: :internal_error}} = Task.await(request_task, 1_000)
     assert_receive {:raw_http_closed, ^server_ref}, 750
-    assert :sys.get_state(client.pid).in_flight == %{}
+    assert ClientProbe.requests(client) == %{}
   end
 
   test "disconnect cancels the long-lived session stream promptly" do
@@ -107,15 +105,15 @@ defmodule FastestMCP.ClientHTTPCleanupTest do
 
     mark_initialized(client)
 
-    assert :ok = Client.open_session_stream(client)
+    assert :ok = Client.open_session_stream!(client)
     assert_receive {:raw_http_request, ^server_ref, _request}, 1_000
 
     session_stream = wait_for_session_stream_request(client)
     assert session_stream.started?
-    refute is_nil(session_stream.request_ref)
+    refute is_nil(session_stream.http_ref)
 
     started_at = System.monotonic_time(:millisecond)
-    assert :ok = Client.disconnect(client)
+    assert :ok = Client.disconnect!(client)
     elapsed_ms = System.monotonic_time(:millisecond) - started_at
 
     assert elapsed_ms < 500
@@ -124,28 +122,24 @@ defmodule FastestMCP.ClientHTTPCleanupTest do
   end
 
   test "repeated HTTP requests do not create atoms after warmup" do
-    bandit =
-      start_supervised!({Bandit, plug: JSONRPCPlug, scheme: :http, port: 0})
-
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+    %{url: url} = serve!(JSONRPCPlug)
 
     client =
-      Client.connect!("http://127.0.0.1:#{port}/mcp",
+      connect!(url,
         auto_initialize: false,
         protocol_version: "2025-11-25"
       )
 
     mark_initialized(client)
-    on_exit(fn -> disconnect_if_alive(client) end)
 
     for _iteration <- 1..3 do
-      assert %{"ok" => true} = Client.ping(client)
+      assert %{"ok" => true} = Client.ping!(client)
     end
 
     atom_count = :erlang.system_info(:atom_count)
 
     for _iteration <- 1..25 do
-      assert %{"ok" => true} = Client.ping(client)
+      assert %{"ok" => true} = Client.ping!(client)
     end
 
     assert :erlang.system_info(:atom_count) == atom_count
@@ -248,40 +242,17 @@ defmodule FastestMCP.ClientHTTPCleanupTest do
     end
   end
 
-  defp wait_for_request_entry(client, attempts \\ 100)
-
-  defp wait_for_request_entry(_client, 0), do: flunk("HTTP request reference was not stored")
-
-  defp wait_for_request_entry(client, attempts) do
-    entry =
-      client.pid
-      |> :sys.get_state()
-      |> Map.fetch!(:in_flight)
-      |> Map.values()
-      |> Enum.find(&(not is_nil(Map.get(&1, :request_ref))))
-
-    if entry do
-      entry
-    else
-      Process.sleep(5)
-      wait_for_request_entry(client, attempts - 1)
-    end
+  defp wait_for_request_entry(client) do
+    assert_eventually(fn ->
+      client |> ClientProbe.requests() |> Map.values() |> Enum.find(& &1.http_ref)
+    end)
   end
 
-  defp wait_for_session_stream_request(client, attempts \\ 100)
-
-  defp wait_for_session_stream_request(_client, 0),
-    do: flunk("session stream HTTP request reference was not stored")
-
-  defp wait_for_session_stream_request(client, attempts) do
-    session_stream = :sys.get_state(client.pid).session_stream
-
-    if is_map(session_stream) and not is_nil(Map.get(session_stream, :request_ref)) do
-      session_stream
-    else
-      Process.sleep(5)
-      wait_for_session_stream_request(client, attempts - 1)
-    end
+  defp wait_for_session_stream_request(client) do
+    assert_eventually(fn ->
+      session_stream = ClientProbe.session_stream(client)
+      is_map(session_stream) and session_stream.http_ref != nil and session_stream
+    end)
   end
 
   defp capture_client_result(fun) do
@@ -292,24 +263,11 @@ defmodule FastestMCP.ClientHTTPCleanupTest do
     :exit, reason -> {:exit, reason}
   end
 
-  defp disconnect_if_alive(client) do
-    if Client.connected?(client), do: Client.disconnect(client)
-  end
-
   defp mark_initialized(client) do
-    :sys.replace_state(client.pid, fn state ->
-      %{
-        state
-        | lifecycle_state: :initialized,
-          initialize_result: %{
-            "protocolVersion" => "2025-11-25",
-            "capabilities" => %{},
-            "serverInfo" => %{"name" => "cleanup-test", "version" => "1.0.0"}
-          },
-          advertised_client_capabilities: %{}
-      }
-    end)
-
-    :ok
+    ClientProbe.mark_initialized(client, %{
+      "protocolVersion" => "2025-11-25",
+      "capabilities" => %{},
+      "serverInfo" => %{"name" => "cleanup-test", "version" => "1.0.0"}
+    })
   end
 end

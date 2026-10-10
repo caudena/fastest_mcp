@@ -32,7 +32,6 @@ defmodule FastestMCP.Transport.SSEDecoder do
           started?: boolean()
         }
 
-  @doc "Creates a bounded incremental SSE decoder."
   @spec new(keyword()) :: t()
   def new(opts \\ []) do
     max_event_bytes = Keyword.get(opts, :max_event_bytes, @default_max_event_bytes)
@@ -51,19 +50,17 @@ defmodule FastestMCP.Transport.SSEDecoder do
     end
   end
 
-  @doc "Returns the most recent valid SSE event id observed by this decoder."
   @spec last_event_id(t()) :: binary() | nil
   def last_event_id(%__MODULE__{last_event_id: last_event_id}), do: last_event_id
 
-  @doc "Returns the most recent valid SSE retry interval in milliseconds."
   @spec retry_ms(t()) :: non_neg_integer() | :infinity | nil
   def retry_ms(%__MODULE__{retry_ms: retry_ms}), do: retry_ms
 
-  @doc "Prepares retained SSE retry/id/deduplication state for a new HTTP connection."
+  # Keeps the retry, id, and deduplication state for a new HTTP connection.
   @spec resume(t()) :: t()
   def resume(%__MODULE__{} = decoder), do: %{decoder | buffer: "", started?: false}
 
-  @doc "Feeds a possibly fragmented chunk and returns decoded JSON data events."
+  # `chunk` may split events anywhere.
   @spec feed(t(), iodata()) :: {:ok, [term()], t()} | {:error, Error.t()}
   def feed(%__MODULE__{} = decoder, chunk) do
     buffer = decoder.buffer <> IO.iodata_to_binary(chunk)
@@ -71,7 +68,7 @@ defmodule FastestMCP.Transport.SSEDecoder do
     drain(%{decoder | buffer: buffer, started?: started?}, [])
   end
 
-  @doc "Finishes a stream, accepting only trailing blank whitespace."
+  # Only trailing whitespace may remain.
   @spec finish(t()) :: :ok | {:error, Error.t()}
   def finish(%__MODULE__{buffer: buffer}) do
     if trailing_whitespace?(buffer) do

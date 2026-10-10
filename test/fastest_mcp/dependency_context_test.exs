@@ -1,5 +1,5 @@
 defmodule FastestMCP.DependencyContextTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.BackgroundTask
   alias FastestMCP.Context
@@ -31,9 +31,9 @@ defmodule FastestMCP.DependencyContextTest do
         value * div(multiplier_a + multiplier_b, 2)
       end)
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    start_server!(server)
 
-    assert 50 == FastestMCP.call_tool(server_name, "compute", %{"value" => 5})
+    assert 50 == FastestMCP.call_tool!(server_name, "compute", %{"value" => 5})
 
     assert_receive {:tool_ctx, ^server_name, true, ["multiplier"]}, 1_000
     assert_receive {:cleanup, 10, ^server_name}, 1_000
@@ -72,12 +72,12 @@ defmodule FastestMCP.DependencyContextTest do
         task: true
       )
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    start_server!(server)
 
-    task = FastestMCP.call_tool(server_name, "use_connection", %{"value" => "ok"}, task: true)
+    task = FastestMCP.call_tool!(server_name, "use_connection", %{"value" => "ok"}, task: true)
     assert %BackgroundTask{} = task
 
-    assert %{"result" => "ok:connection"} = FastestMCP.await_task(task, 1_000)
+    assert %{"result" => "ok:connection"} = FastestMCP.await_task!(task, 1_000)
     assert_receive {:task_ctx, true, ^server_name, true, true}, 1_000
     assert_receive {:cleanup, "connection"}, 1_000
     assert Agent.get(counter, & &1) == 1
@@ -103,20 +103,51 @@ defmodule FastestMCP.DependencyContextTest do
         task: true
       )
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    start_server!(server)
 
     prompt_task =
-      FastestMCP.render_prompt(server_name, "describe", %{"topic" => "tasks"}, task: true)
+      FastestMCP.render_prompt!(server_name, "describe", %{"topic" => "tasks"}, task: true)
 
-    resource_task = FastestMCP.read_resource(server_name, "file://data.txt", task: true)
+    resource_task = FastestMCP.read_resource!(server_name, "file://data.txt", task: true)
 
     assert %{
              messages: [
-               %{role: "user", content: "Prompt from " <> ^server_name <> " about tasks"}
+               %{
+                 role: "user",
+                 content: %{type: "text", text: "Prompt from " <> ^server_name <> " about tasks"}
+               }
              ]
-           } = FastestMCP.await_task(prompt_task, 1_000)
+           } = FastestMCP.await_task!(prompt_task, 1_000)
 
     assert %{"server" => ^server_name, "task_store" => true} =
-             FastestMCP.await_task(resource_task, 1_000)
+             FastestMCP.await_task!(resource_task, 1_000)
+  end
+
+  test "a KeyError raised inside a dependency resolver is not reported as an unknown dependency" do
+    parent = self()
+    server_name = unique_name("dependency-key-error")
+
+    server =
+      FastestMCP.server(server_name)
+      |> FastestMCP.add_dependency(:lookup, fn _context ->
+        raise KeyError, key: :missing, term: %{}
+      end)
+      |> FastestMCP.add_tool("probe", fn _arguments, context ->
+        for name <- [:lookup, :absent] do
+          try do
+            Context.dependency(context, name)
+          rescue
+            error -> send(parent, {:dependency_error, name, error.__struct__})
+          end
+        end
+
+        %{"ok" => true}
+      end)
+
+    start_server!(server)
+
+    assert {:ok, _result} = FastestMCP.call_tool(server_name, "probe", %{})
+    assert_receive {:dependency_error, :lookup, KeyError}
+    assert_receive {:dependency_error, :absent, ArgumentError}
   end
 end

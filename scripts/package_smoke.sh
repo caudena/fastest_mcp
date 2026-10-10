@@ -103,12 +103,12 @@ for required_path in \
   docs/auth.md \
   docs/context.md \
   docs/extensions.md \
-  docs/phoenix-deployment.md \
-  docs/progress.md \
+  docs/phoenix.md \
+  docs/getting-started.md \
   docs/protocol-versions.md \
   docs/providers-and-mounting.md \
   docs/resources.md \
-  docs/runtime-state-and-storage.md \
+  docs/production.md \
   docs/tools.md \
   docs/transports.md \
   docs/compatibility-and-scope.md \

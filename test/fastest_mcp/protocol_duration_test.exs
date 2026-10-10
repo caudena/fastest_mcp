@@ -1,5 +1,5 @@
 defmodule FastestMCP.Protocol.DurationTest do
-  use ExUnit.Case, async: true
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Protocol.Duration
 

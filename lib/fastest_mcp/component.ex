@@ -1,20 +1,14 @@
 defmodule FastestMCP.Component do
-  require Logger
+  @moduledoc false
+  # Per-kind facts (collection field, list-changed family, MCP methods, labels)
+  # and the rules every component kind shares: identifiers, keys, argument
+  # validation, execution, and result normalization.
 
-  @moduledoc """
-  Shared helpers for component metadata, lookup identifiers, version ordering, and
-  result normalization.
-
-  This module keeps one focused piece of FastestMCP behavior in a dedicated
-  place so builders, runtimes, transports, and providers can share the same
-  rules without duplicating logic.
-
-  Unless you are extending FastestMCP itself, you will usually meet this
-  module indirectly through higher-level APIs rather than calling it first.
-  """
+  import FastestMCP.Util, only: [stringify_keys: 1]
+  import FastestMCP.Protocol.Version
 
   alias FastestMCP.BackgroundTaskStore
-  alias FastestMCP.CallSupervisor
+  alias FastestMCP.Component.Lookup
   alias FastestMCP.ComponentCompiler
   alias FastestMCP.Components.Prompt
   alias FastestMCP.Components.Resource
@@ -22,339 +16,429 @@ defmodule FastestMCP.Component do
   alias FastestMCP.Components.Tool
   alias FastestMCP.Context
   alias FastestMCP.Error
-  alias FastestMCP.InputValidator
+  alias FastestMCP.InputRounds
   alias FastestMCP.JSONValue
-  alias FastestMCP.Prompts.Message, as: PromptMessage
   alias FastestMCP.Prompts.Result, as: PromptResult
+  alias FastestMCP.Protocol.Content
   alias FastestMCP.Protocol.Extensions
   alias FastestMCP.Resources.Content, as: ResourceContent
   alias FastestMCP.Resources.Result, as: ResourceResult
-  alias FastestMCP.ResultNormalizer
   alias FastestMCP.Schema
   alias FastestMCP.Schema.Compiled
+  alias FastestMCP.ServerRuntime.Calls
   alias FastestMCP.TaskConfig
   alias FastestMCP.Telemetry
-  alias FastestMCP.Tools.OutputSchema
   alias FastestMCP.Tools.Result, as: ToolResult
 
-  @duplicate_policies [:error, :warn, :ignore, :replace]
+  @kinds %{
+    tool: %{
+      collection: :tools,
+      family: :tools,
+      list_method: "tools/list",
+      call_method: "tools/call",
+      call_param: "name",
+      label: "tool",
+      key_prefix: "tool"
+    },
+    resource: %{
+      collection: :resources,
+      family: :resources,
+      list_method: "resources/list",
+      call_method: "resources/read",
+      call_param: "uri",
+      label: "resource",
+      key_prefix: "resource"
+    },
+    resource_template: %{
+      collection: :resource_templates,
+      family: :resources,
+      list_method: "resources/templates/list",
+      call_method: "resources/read",
+      call_param: "uri",
+      label: "resource",
+      key_prefix: "template"
+    },
+    prompt: %{
+      collection: :prompts,
+      family: :prompts,
+      list_method: "prompts/list",
+      call_method: "prompts/get",
+      call_param: "name",
+      label: "prompt",
+      key_prefix: "prompt"
+    }
+  }
 
-  @doc "Returns the component or provider type."
-  def type(%Tool{}), do: :tool
-  def type(%Resource{}), do: :resource
-  def type(%ResourceTemplate{}), do: :resource_template
-  def type(%Prompt{}), do: :prompt
+  # A resources/read call addresses resources; templates only match its URI.
+  @call_kinds for {kind, facts} <- @kinds,
+                  kind != :resource_template,
+                  into: %{},
+                  do: {facts.call_method, kind}
+  @list_kinds for {kind, facts} <- @kinds, into: %{}, do: {facts.list_method, kind}
 
-  @doc "Returns the stable identifier for the given component."
+  def kinds, do: Map.keys(@kinds)
+
+  def call_kind(method), do: Map.get(@call_kinds, method)
+
+  def list_kind(method), do: Map.get(@list_kinds, method)
+
+  def kind(%Tool{}), do: :tool
+  def kind(%Resource{}), do: :resource
+  def kind(%ResourceTemplate{}), do: :resource_template
+  def kind(%Prompt{}), do: :prompt
+
+  # `:template` and `"template"` mean `:resource_template`; anything else raises.
+  def kind!(kind) when is_map_key(@kinds, kind), do: kind
+  def kind!(kind) when kind in [:template, "template"], do: :resource_template
+
+  def kind!(kind) when kind in ["tool", "resource", "resource_template", "prompt"],
+    do: String.to_existing_atom(kind)
+
+  def kind!(other) do
+    raise ArgumentError,
+          "component kind must be one of #{inspect(kinds())}, got: #{inspect(other)}"
+  end
+
+  def collection(kind_or_component), do: fact(kind_or_component, :collection)
+
+  def family(kind_or_component), do: fact(kind_or_component, :family)
+
+  def list_method(kind_or_component), do: fact(kind_or_component, :list_method)
+
+  def call_method(kind_or_component), do: fact(kind_or_component, :call_method)
+
+  def call_param(kind_or_component), do: fact(kind_or_component, :call_param)
+
+  def label(kind_or_component), do: fact(kind_or_component, :label)
+
+  defp fact(kind, name) when is_map_key(@kinds, kind),
+    do: @kinds |> Map.fetch!(kind) |> Map.fetch!(name)
+
+  defp fact(component, name), do: fact(kind(component), name)
+
   def identifier(%Tool{name: name}), do: name
   def identifier(%Prompt{name: name}), do: name
   def identifier(%Resource{uri: uri}), do: uri
   def identifier(%ResourceTemplate{uri_template: uri_template}), do: uri_template
 
-  @doc "Returns the version carried by the given value."
+  def put_identifier(%Tool{} = tool, name), do: %{tool | name: name}
+  def put_identifier(%Prompt{} = prompt, name), do: %{prompt | name: name}
+  def put_identifier(%Resource{} = resource, uri), do: %{resource | uri: uri}
+
+  def put_identifier(%ResourceTemplate{} = template, uri_template) do
+    {matcher, variables, query_variables} = ResourceTemplate.compile_matcher!(uri_template)
+
+    %{
+      template
+      | uri_template: uri_template,
+        matcher: matcher,
+        variables: variables,
+        query_variables: query_variables
+    }
+  end
+
   def version(%{version: version}), do: version
-  @doc "Returns whether the component is currently enabled."
   def enabled?(%{enabled: enabled}), do: enabled
-  @doc "Returns the component visibility declared for the runtime."
   def visibility(%{visibility: visibility}), do: visibility
-  @doc "Returns the injected argument names declared for the component."
   def injected_argument_names(%{inject: inject}) when is_map(inject), do: Map.keys(inject)
   def injected_argument_names(_component), do: []
 
-  @doc "Builds the stable component key used by registries and transforms."
-  def key(component) do
-    suffix = component |> version() |> version_key()
+  def key(component), do: key(kind(component), identifier(component), version(component))
 
-    case type(component) do
-      :tool -> "tool:#{component.name}@#{suffix}"
-      :prompt -> "prompt:#{component.name}@#{suffix}"
-      :resource -> "resource:#{component.uri}@#{suffix}"
-      :resource_template -> "template:#{component.uri_template}@#{suffix}"
-    end
-  end
+  def key(kind, identifier, version),
+    do: "#{fact(kind, :key_prefix)}:#{identifier}@#{Lookup.version_key(version)}"
 
-  @doc "Builds the stable version suffix used in component keys."
-  def version_key(nil), do: ""
-  def version_key(version), do: to_string(version)
+  def describe(component), do: "#{kind(component)} #{inspect(identifier(component))}"
 
-  @doc "Returns the highest-version component from the given candidates."
-  def highest_version([]), do: nil
-
-  def highest_version([head | tail]) do
-    Enum.reduce(tail, head, fn component, best ->
-      if compare_versions(component.version, best.version) == :gt, do: component, else: best
-    end)
-  end
-
-  @doc "Compares two component versions."
-  def compare_versions(left, right)
-  def compare_versions(nil, nil), do: :eq
-  def compare_versions(nil, _right), do: :lt
-  def compare_versions(_left, nil), do: :gt
-
-  def compare_versions(left, right) do
-    left = to_string(left)
-    right = to_string(right)
-
-    case {Version.parse(left), Version.parse(right)} do
-      {{:ok, left_version}, {:ok, right_version}} ->
-        Version.compare(left_version, right_version)
-
-      _ ->
-        cond do
-          left > right -> :gt
-          left < right -> :lt
-          true -> :eq
-        end
-    end
-  end
-
-  @doc false
-  def sort_by_version_desc(components) when is_list(components) do
-    sort_by_version_desc(components, &version/1)
-  end
-
-  @doc false
-  def sort_by_version_desc(items, version_fun)
-      when is_list(items) and is_function(version_fun, 1) do
-    items
-    |> Enum.with_index()
-    |> Enum.sort(fn {left, left_index}, {right, right_index} ->
-      case compare_versions(version_fun.(left), version_fun.(right)) do
-        :gt -> true
-        :lt -> false
-        :eq -> left_index < right_index
-      end
-    end)
-    |> Enum.map(&elem(&1, 0))
-  end
-
-  @doc false
-  def normalize_duplicate_policy!(policy) when policy in @duplicate_policies, do: policy
-
-  def normalize_duplicate_policy!(other) do
-    raise ArgumentError,
-          "on_duplicate must be one of #{inspect(@duplicate_policies)}, got #{inspect(other)}"
-  end
-
-  @doc false
-  def registration_action(existing_components, component, policy)
-      when is_list(existing_components) do
-    policy = normalize_duplicate_policy!(policy)
-    validate_version_mixing!(existing_components, component)
-
-    case Enum.find(existing_components, &same_registration?(&1, component)) do
-      nil ->
-        :insert
-
-      existing ->
-        duplicate_registration_action(existing, component, policy)
-    end
-  end
-
-  @doc "Invokes the compiled handler."
   def invoke(%{compiled: compiled}, arguments, context) do
     compiled.(arguments, context)
   end
 
-  @doc "Executes a component for the given operation."
+  # `{:ok, result}` holds a `FastestMCP.BackgroundTask` handle when the operation
+  # runs as a task.
   def execute(component, operation) do
-    task_config = Map.get(component, :task, TaskConfig.new(false))
-    modern? = operation.context.negotiated_protocol_version == "2026-07-28"
-
-    server_tasks? =
-      case operation.context.server do
-        %{extensions: extensions} -> Extensions.enabled?(extensions, Extensions.tasks())
-        _other -> false
-      end
-
-    client_tasks? =
-      Extensions.enabled?(operation.context.client_capabilities, Extensions.tasks())
-
-    modern_tasks? = server_tasks? and client_tasks?
-
-    cond do
-      modern? and type(component) == :tool and server_tasks? and
-        task_config.mode == :required and not client_tasks? ->
-        raise Error,
-          code: :missing_required_client_capability,
-          message:
-            "#{type(component)} #{inspect(identifier(component))} requires the MCP Tasks extension",
-          details: %{
-            jsonrpc_code: -32_021,
-            requiredCapabilities: %{extensions: %{Extensions.tasks() => %{}}}
-          }
-
-      modern? and type(component) == :tool and modern_tasks? and
-          TaskConfig.supports_tasks?(task_config) ->
-        submit_background_task(%{component | timeout: nil}, operation)
-
-      modern? ->
+    case execution_mode(component, operation) do
+      :inline ->
         execute_inline(component, operation)
 
-      operation.task_request and not TaskConfig.supports_tasks?(task_config) ->
-        raise Error,
-          code: :method_not_found,
-          message:
-            "#{type(component)} #{inspect(identifier(component))} does not support background task execution"
-
-      not operation.task_request and task_config.mode == :required ->
-        raise Error,
-          code: :method_not_found,
-          message:
-            "#{type(component)} #{inspect(identifier(component))} requires background task execution"
-
-      operation.task_request ->
+      :background ->
         submit_background_task(%{component | timeout: nil}, operation)
 
-      true ->
-        execute_inline(component, operation)
+      :tasks_extension_required ->
+        {:error,
+         %Error{
+           code: :missing_required_client_capability,
+           message: "#{describe(component)} requires the MCP Tasks extension",
+           details: %{
+             jsonrpc_code: -32_021,
+             requiredCapabilities: %{extensions: %{Extensions.tasks() => %{}}}
+           }
+         }}
+
+      {:method_not_found, reason} ->
+        {:error, %Error{code: :method_not_found, message: "#{describe(component)} #{reason}"}}
     end
   end
+
+  # Capability negotiation belongs to the wire invocation, not to local calls
+  # made by its handler. Local calls retain their explicit `task:` contract.
+  defp execution_mode(component, %{
+         invocation: :protocol,
+         context: %{negotiated_protocol_version: modern()} = context
+       }) do
+    modern_execution_mode(
+      kind(component),
+      component.task.mode,
+      server_tasks?(context.server),
+      Extensions.enabled?(context.client_capabilities, Extensions.tasks())
+    )
+  end
+
+  defp execution_mode(component, operation),
+    do: legacy_execution_mode(component.task.mode, operation.task_request)
+
+  defp modern_execution_mode(:tool, :required, true, false), do: :tasks_extension_required
+
+  defp modern_execution_mode(:tool, :required, false, _client_tasks?),
+    do:
+      {:method_not_found,
+       "requires background task execution, which needs the Tasks extension (#{Extensions.tasks()}) on the server"}
+
+  defp modern_execution_mode(:tool, mode, true, true) when mode != :forbidden, do: :background
+  defp modern_execution_mode(_kind, _mode, _server_tasks?, _client_tasks?), do: :inline
+
+  defp legacy_execution_mode(:forbidden, true),
+    do: {:method_not_found, "does not support background task execution"}
+
+  defp legacy_execution_mode(:required, false),
+    do: {:method_not_found, "requires background task execution"}
+
+  defp legacy_execution_mode(_mode, true), do: :background
+  defp legacy_execution_mode(_mode, false), do: :inline
+
+  defp server_tasks?(%{extensions: extensions}),
+    do: Extensions.enabled?(extensions, Extensions.tasks())
+
+  defp server_tasks?(_server), do: false
 
   defp execute_inline(component, operation) do
-    timeout = Map.get(component, :timeout)
     trace_context = Telemetry.current_context()
 
-    case CallSupervisor.invoke(
-           operation.call_supervisor,
-           fn ->
-             validated_arguments =
-               component
-               |> InputValidator.validate(
-                 strip_injected_arguments(component, operation.arguments)
-               )
-               |> merge_injected_arguments(component, operation.context)
+    call = fn ->
+      arguments =
+        component
+        |> validate_arguments(strip_injected_arguments(component, operation.arguments))
+        |> merge_injected_arguments(component, operation.context)
 
-             Context.with_request(operation.context, fn ->
-               Telemetry.with_context(trace_context, fn ->
-                 invoke(component, validated_arguments, operation.context)
-               end)
-             end)
-           end,
-           timeout
-         ) do
-      {:ok, result} ->
-        normalize_result(component, result)
+      InputRounds.run(operation, fn context ->
+        Context.with_request(context, fn ->
+          Telemetry.with_context(trace_context, fn -> invoke(component, arguments, context) end)
+        end)
+      end)
+    end
 
-      {:error, :timeout} ->
-        raise Error,
-          code: :timeout,
-          message: "#{type(component)} #{inspect(identifier(component))} timed out"
-
-      {:error, :overloaded} ->
-        raise Error,
-          code: :overloaded,
-          message:
-            "#{type(component)} #{inspect(identifier(component))} was rejected because the server is overloaded",
-          details: %{resource: :calls, retry_after_seconds: 1}
-
-      {:error, {:exception, error, _stacktrace}} ->
-        case error do
-          %Error{} = error ->
-            raise error
-
-          _other ->
-            raise component_crash_error(
-                    component,
-                    "crashed: #{Exception.message(error)}",
-                    %{kind: inspect(error.__struct__)}
-                  )
-        end
-
-      {:error, {:exit, reason}} ->
-        raise component_crash_error(component, "exited: #{Exception.format_exit(reason)}")
-
-      {:error, {:crash, reason}} ->
-        raise component_crash_error(component, "crashed: #{Exception.format_exit(reason)}")
-
-      {:error, {kind, reason}} ->
-        raise component_crash_error(component, "failed with #{kind}: #{inspect(reason)}")
+    case Calls.run(operation.call_supervisor, call, Map.get(component, :timeout)) do
+      {:ok, result} -> normalize_result(component, result)
+      {:error, reason} -> {:error, call_error(component, reason)}
     end
   end
 
-  @doc "Normalizes a raw handler result for the component type."
-  def normalize_result(_component, %FastestMCP.InputRequiredResult{} = result), do: result
+  defp call_error(_component, {:error, %Error{} = error, _stacktrace}), do: error
+  defp call_error(component, :timeout), do: Error.timeout(describe(component))
+  defp call_error(component, :overloaded), do: Error.overloaded(describe(component))
 
-  def normalize_result(%Tool{} = tool, %ToolResult{} = value) do
-    normalized = value |> ToolResult.to_map() |> ResultNormalizer.normalize_tool()
-    validate_tool_output!(tool, value, normalized)
+  # The exception and its stack trace stay in the error's `:cause`, for logs
+  # and spans; clients never receive them.
+  defp call_error(component, {:error, exception, stacktrace}) do
+    error = Error.from_exception(exception, "#{describe(component)} crashed")
+    crash(component, %{error | cause: {exception, stacktrace}})
   end
+
+  defp call_error(component, {:exit, reason, _stacktrace}),
+    do: crash(component, "exited: #{Exception.format_exit(reason)}")
+
+  defp call_error(component, {:crash, reason}),
+    do: crash(component, "crashed: #{Exception.format_exit(reason)}")
+
+  defp call_error(component, {kind, reason, _stacktrace}),
+    do: crash(component, "failed with #{kind}: #{inspect(reason)}")
+
+  defp crash(component, detail) when is_binary(detail),
+    do: crash(component, %Error{message: "#{describe(component)} #{detail}"})
+
+  defp crash(component, %Error{} = error) do
+    %{
+      error
+      | code: :component_crash,
+        exposure: %{
+          mask_error_details: true,
+          component_type: kind(component),
+          identifier: identifier(component)
+        }
+    }
+  end
+
+  # No coercion: top-level atom or keyword keys become strings, and values are
+  # never parsed or cast. Invalid arguments fail with `:invalid_params`, which
+  # is JSON-RPC's -32602.
+  def validate_arguments(%Prompt{arguments: declared}, arguments) do
+    arguments = normalize_arguments(arguments)
+
+    for %{required: true, name: name} <- declared || [], not Map.has_key?(arguments, name) do
+      raise Error, code: :invalid_params, message: "missing required argument #{inspect(name)}"
+    end
+
+    arguments
+  end
+
+  def validate_arguments(component, arguments) do
+    arguments = normalize_arguments(arguments)
+
+    case argument_schema(component) do
+      nil -> arguments
+      schema -> validate_schema!(schema, arguments)
+    end
+  end
+
+  defp normalize_arguments(nil), do: %{}
+
+  defp normalize_arguments(arguments) do
+    if is_map(arguments) or Keyword.keyword?(arguments) do
+      Map.new(arguments, fn {key, value} -> {to_string(key), value} end)
+    else
+      raise Error,
+        code: :invalid_params,
+        message: "tool and template arguments must be an object"
+    end
+  end
+
+  defp argument_schema(%Tool{input_schema: schema, compiled_input_schema: compiled})
+       when not is_nil(schema),
+       do: compiled || schema
+
+  defp argument_schema(%ResourceTemplate{parameters: schema, compiled_parameters: compiled})
+       when not is_nil(schema),
+       do: compiled || schema
+
+  defp argument_schema(_component), do: nil
+
+  defp validate_schema!(schema, value) do
+    case Schema.validate_source(schema, value) do
+      {:ok, ^value} ->
+        value
+
+      {:error, schema_error} ->
+        raise Error,
+          code: :invalid_params,
+          message: schema_error.message,
+          details: %{schema: %{violations: schema_error.violations}}
+    end
+  end
+
+  # Tool content becomes wire content blocks; malformed content or a result that
+  # breaks the declared output schema is an error.
+  def normalize_result(_component, %FastestMCP.InputRequiredResult{} = result), do: {:ok, result}
 
   def normalize_result(%Tool{} = tool, value) do
-    normalized = ResultNormalizer.normalize_tool(value)
-    validate_tool_output!(tool, value, normalized)
+    validate_tool_output(tool, value, normalize_tool_result(value))
+  rescue
+    # Content normalization raises for malformed content, as on the wire.
+    error in Error -> {:error, error}
   end
 
-  def normalize_result(%Resource{}, value), do: normalize_resource_result(value)
-  def normalize_result(%ResourceTemplate{}, value), do: normalize_resource_result(value)
-  def normalize_result(%Prompt{}, value), do: normalize_prompt_result(value)
+  def normalize_result(%Prompt{}, value), do: {:ok, normalize_prompt_result(value)}
 
-  @doc false
+  def normalize_result(%module{}, value) when module in [Resource, ResourceTemplate],
+    do: {:ok, normalize_resource_result(value)}
+
   def validate_normalized_output(_component, %FastestMCP.InputRequiredResult{} = result),
-    do: result
+    do: {:ok, result}
 
-  def validate_normalized_output(%Tool{} = tool, normalized) do
-    validate_tool_output!(tool, normalized, normalized)
-  end
+  def validate_normalized_output(%Tool{} = tool, normalized),
+    do: validate_tool_output(tool, normalized, normalized)
 
-  def validate_normalized_output(_component, normalized), do: normalized
+  def validate_normalized_output(_component, normalized), do: {:ok, normalized}
 
-  @doc false
   def refresh_compiled_schemas(component, cache, schema_options \\ [])
 
   def refresh_compiled_schemas(%Tool{} = tool, cache, schema_options) do
-    input_schema = ComponentCompiler.normalize_tool_schema!(:input, tool.input_schema)
-    output_schema = ComponentCompiler.normalize_tool_schema!(:output, tool.output_schema)
-
-    %{
+    if current_schema?(tool.input_schema, tool.compiled_input_schema, :input) and
+         current_schema?(tool.output_schema, tool.compiled_output_schema, :output) do
       tool
-      | input_schema: input_schema,
-        output_schema: output_schema,
-        compiled_input_schema:
-          cached_schema(input_schema, cache, schema_options, tool.compiled_input_schema),
-        compiled_output_schema:
-          cached_schema(output_schema, cache, schema_options, tool.compiled_output_schema)
-    }
+    else
+      input_schema = ComponentCompiler.normalize_schema!(:input, tool.input_schema)
+      output_schema = ComponentCompiler.normalize_schema!(:output, tool.output_schema)
+
+      %{
+        tool
+        | input_schema: input_schema,
+          output_schema: output_schema,
+          compiled_input_schema:
+            cached_schema(input_schema, cache, schema_options, tool.compiled_input_schema),
+          compiled_output_schema:
+            cached_schema(output_schema, cache, schema_options, tool.compiled_output_schema)
+      }
+    end
   end
 
   def refresh_compiled_schemas(%ResourceTemplate{} = template, cache, schema_options) do
-    %{
+    if current_schema?(template.parameters, template.compiled_parameters, :parameters) do
       template
-      | compiled_parameters:
-          cached_schema(
-            template.parameters,
-            cache,
-            schema_options,
-            template.compiled_parameters
-          )
-    }
+    else
+      %{
+        template
+        | compiled_parameters:
+            cached_schema(
+              template.parameters,
+              cache,
+              schema_options,
+              template.compiled_parameters
+            )
+      }
+    end
   end
 
   def refresh_compiled_schemas(component, _cache, _schema_options), do: component
 
-  defp validate_tool_output!(%Tool{output_schema: nil}, _raw, normalized), do: normalized
+  # A validator compiled from exactly the stored (normalized) source is reused
+  # as is, so unchanged components skip normalizing and digesting per request.
+  defp current_schema?(nil, nil, _role), do: true
 
-  defp validate_tool_output!(%Tool{} = tool, raw, normalized) do
+  defp current_schema?(schema, %Compiled{source: source}, role),
+    do: source === schema and (role != :input or match?(%{"type" => "object"}, schema))
+
+  defp current_schema?(_schema, _compiled, _role), do: false
+
+  defp validate_tool_output(%Tool{output_schema: nil}, _raw, normalized), do: {:ok, normalized}
+
+  # MCP lets an error result leave structured content out.
+  defp validate_tool_output(
+         %Tool{},
+         %ToolResult{is_error: true, structured_content_present?: false},
+         normalized
+       ),
+       do: {:ok, normalized}
+
+  defp validate_tool_output(%Tool{} = tool, raw, normalized) do
     compiled = tool.compiled_output_schema || Schema.compile!(tool.output_schema)
 
     with {:ok, structured} <- structured_tool_output(raw, normalized),
          structured <- JSONValue.stringify_keys(structured),
          {:ok, ^structured} <- Schema.validate(compiled, structured) do
-      normalized
+      {:ok, normalized}
     else
       {:error, :missing_structured_content} ->
-        raise Error,
-          code: :internal_error,
-          message:
-            "tool #{inspect(tool.name)} declares output_schema but returned no structuredContent"
+        {:error,
+         Error.internal(
+           "tool #{inspect(tool.name)} declares output_schema but returned no structuredContent"
+         )}
 
       {:error, schema_error} ->
-        raise Error,
-          code: :internal_error,
-          message:
-            "tool #{inspect(tool.name)} returned structuredContent that does not match output_schema: #{schema_error.message}",
-          details: %{schema: %{violations: schema_error.violations}}
+        {:error,
+         Error.internal(
+           "tool #{inspect(tool.name)} returned structuredContent that does not match output_schema: #{schema_error.message}",
+           %{schema: %{violations: schema_error.violations}}
+         )}
     end
   end
 
@@ -363,22 +447,6 @@ defmodule FastestMCP.Component do
 
   defp structured_tool_output(%ToolResult{structured_content: structured}, _normalized),
     do: {:ok, structured}
-
-  defp structured_tool_output(raw, normalized) when is_map(raw) do
-    keys = [:structuredContent, "structuredContent", :structured_content, "structured_content"]
-
-    case Enum.find(keys, &Map.has_key?(raw, &1)) do
-      nil ->
-        if Map.has_key?(raw, :content) or Map.has_key?(raw, "content") do
-          {:error, :missing_structured_content}
-        else
-          {:ok, normalized}
-        end
-
-      key ->
-        {:ok, Map.get(raw, key)}
-    end
-  end
 
   defp structured_tool_output(nil, nil), do: {:ok, nil}
   defp structured_tool_output(_raw, nil), do: {:error, :missing_structured_content}
@@ -424,180 +492,98 @@ defmodule FastestMCP.Component do
 
   defp matching_compiled(_existing, _digest, _schema), do: nil
 
-  @doc "Returns the transport-facing metadata for the component."
   def metadata(component) do
-    base = %{
-      type: type(component),
+    %{
+      type: kind(component),
       key: key(component),
+      name: component.name,
       version: version(component),
-      title: Map.get(component, :title),
-      description: Map.get(component, :description),
-      icons: Map.get(component, :icons),
+      title: component.title,
+      description: component.description,
+      icons: component.icons,
       tags: component.tags |> MapSet.to_list() |> Enum.sort(),
       visibility: component.visibility,
       enabled: component.enabled,
-      meta: component.meta
+      meta: component.meta,
+      task: TaskConfig.metadata(component.task),
+      execution: task_execution_metadata(component.task)
     }
-
-    case component do
-      %Tool{} ->
-        task_config = Map.get(component, :task, TaskConfig.new(false))
-
-        Map.merge(base, %{
-          name: component.name,
-          annotations: component.annotations,
-          input_schema: public_parameters(component.input_schema),
-          task: TaskConfig.metadata(task_config),
-          execution: task_execution_metadata(task_config),
-          timeout: component.timeout,
-          output_schema: OutputSchema.prepare(component.output_schema)
-        })
-
-      %Resource{} ->
-        task_config = Map.get(component, :task, TaskConfig.new(false))
-
-        Map.merge(base, %{
-          uri: component.uri,
-          name: component.name,
-          annotations: component.annotations,
-          task: TaskConfig.metadata(task_config),
-          execution: task_execution_metadata(task_config),
-          mime_type: component.mime_type,
-          size: component.size
-        })
-
-      %ResourceTemplate{} ->
-        task_config = Map.get(component, :task, TaskConfig.new(false))
-
-        Map.merge(base, %{
-          uri_template: component.uri_template,
-          name: component.name,
-          annotations: component.annotations,
-          task: TaskConfig.metadata(task_config),
-          execution: task_execution_metadata(task_config),
-          mime_type: component.mime_type,
-          parameters: public_parameters(component.parameters),
-          variables: component.variables,
-          query_variables: component.query_variables
-        })
-
-      %Prompt{} ->
-        task_config = Map.get(component, :task, TaskConfig.new(false))
-
-        Map.merge(base, %{
-          name: component.name,
-          arguments: public_prompt_arguments(component.arguments),
-          task: TaskConfig.metadata(task_config),
-          execution: task_execution_metadata(task_config)
-        })
-    end
+    |> Map.merge(kind_metadata(component))
   end
+
+  defp kind_metadata(%Tool{} = tool) do
+    %{
+      annotations: tool.annotations,
+      input_schema: public_parameters(tool.input_schema),
+      timeout: tool.timeout,
+      output_schema: stringify_keys(tool.output_schema)
+    }
+  end
+
+  defp kind_metadata(%Resource{} = resource) do
+    %{
+      uri: resource.uri,
+      annotations: resource.annotations,
+      mime_type: resource.mime_type,
+      size: resource.size
+    }
+  end
+
+  defp kind_metadata(%ResourceTemplate{} = template) do
+    %{
+      uri_template: template.uri_template,
+      annotations: template.annotations,
+      mime_type: template.mime_type,
+      parameters: public_parameters(template.parameters),
+      variables: template.variables,
+      query_variables: template.query_variables
+    }
+  end
+
+  defp kind_metadata(%Prompt{} = prompt),
+    do: %{arguments: public_prompt_arguments(prompt.arguments)}
 
   defp submit_background_task(component, operation) do
-    case BackgroundTaskStore.submit(
-           operation.task_store,
-           operation.task_supervisor,
-           component,
-           operation,
-           fn background_operation -> execute_inline(component, background_operation) end
-         ) do
+    # The task store runs the executor inside its own exception boundary.
+    executor = &(component |> execute_inline(&1) |> Error.unwrap!())
+
+    case BackgroundTaskStore.submit(operation.task_store, component, operation, executor) do
       {:ok, handle} ->
-        handle
+        {:ok, handle}
 
       {:error, :overloaded} ->
-        raise Error,
-          code: :overloaded,
-          message:
-            "#{type(component)} #{inspect(identifier(component))} background task was rejected because the server is overloaded",
-          details: %{resource: :background_tasks, retry_after_seconds: 1}
+        {:error, Error.overloaded("#{describe(component)} background task", :background_tasks)}
 
       {:error, reason} ->
-        raise Error,
-          code: :internal_error,
-          message:
-            "#{type(component)} #{inspect(identifier(component))} background task failed to start",
-          details: %{reason: inspect(reason)}
+        {:error,
+         Error.internal("#{describe(component)} background task failed to start", %{
+           reason: inspect(reason)
+         })}
     end
   end
 
-  defp normalize_prompt_result(%PromptResult{} = value) do
-    PromptResult.to_map(value)
+  defp normalize_prompt_result(%PromptResult{} = value), do: value
+  defp normalize_prompt_result(value) when is_binary(value), do: PromptResult.new(value)
+  defp normalize_prompt_result(value), do: PromptResult.new(JSONValue.encode!(value))
+
+  defp normalize_resource_result(%ResourceResult{} = value), do: value
+  defp normalize_resource_result(%ResourceContent{} = value), do: ResourceResult.new([value])
+  # Bytes stay bytes: the serializer base64-encodes a binary blob once.
+  defp normalize_resource_result(value) when is_binary(value), do: value
+  defp normalize_resource_result(value), do: JSONValue.normalize(value)
+
+  defp normalize_tool_result(%ToolResult{} = result) do
+    content = if is_list(result.content), do: result.content, else: [result.content]
+
+    %{
+      result
+      | content: Enum.map(content, &Content.normalize/1),
+        structured_content: JSONValue.normalize(result.structured_content),
+        meta: JSONValue.normalize(result.meta)
+    }
   end
 
-  defp normalize_prompt_result(%{} = value) do
-    if Map.has_key?(value, :messages) or Map.has_key?(value, "messages") do
-      %{}
-      |> maybe_put(
-        :messages,
-        normalize_prompt_messages(Map.get(value, :messages, Map.get(value, "messages")))
-      )
-      |> maybe_put(:description, Map.get(value, :description, Map.get(value, "description")))
-      |> maybe_put(
-        :meta,
-        Map.get(
-          value,
-          :_meta,
-          Map.get(value, "_meta", Map.get(value, :meta, Map.get(value, "meta")))
-        )
-      )
-    else
-      %{messages: [%{role: "user", content: inspect(value)}]}
-    end
-  end
-
-  defp normalize_prompt_result(value) when is_binary(value) do
-    %{messages: [%{role: "user", content: value}]}
-  end
-
-  defp normalize_prompt_result(value) when is_list(value) do
-    %{messages: normalize_prompt_messages(value)}
-  end
-
-  defp normalize_prompt_result(value) do
-    %{messages: [%{role: "user", content: inspect(value)}]}
-  end
-
-  defp normalize_prompt_messages(messages) when is_list(messages) do
-    Enum.map(messages, fn
-      %PromptMessage{} = message -> PromptMessage.to_map(message)
-      %{} = message -> normalize_prompt_message(message)
-      text when is_binary(text) -> %{role: "user", content: text}
-    end)
-  end
-
-  defp normalize_prompt_messages(message) when is_binary(message) do
-    [%{role: "user", content: message}]
-  end
-
-  defp normalize_prompt_messages(other) do
-    [%{role: "user", content: inspect(other)}]
-  end
-
-  defp normalize_prompt_message(message) do
-    message
-    |> PromptMessage.from()
-    |> PromptMessage.to_map()
-  end
-
-  defp normalize_resource_result(%ResourceResult{} = value) do
-    %{}
-    |> Map.put(:contents, Enum.map(value.contents, &normalize_resource_content/1))
-    |> maybe_put(:meta, value.meta)
-  end
-
-  defp normalize_resource_result(%ResourceContent{} = value) do
-    %{contents: [normalize_resource_content(value)]}
-  end
-
-  defp normalize_resource_result(value), do: ResultNormalizer.normalize_value(value)
-
-  defp normalize_resource_content(%ResourceContent{} = content) do
-    %{}
-    |> maybe_put(:uri, content.uri)
-    |> Map.put(:content, content.content)
-    |> Map.put(:mime_type, content.mime_type)
-    |> maybe_put(:meta, content.meta)
-  end
+  defp normalize_tool_result(value), do: JSONValue.normalize(value)
 
   defp public_parameters(nil), do: nil
 
@@ -622,34 +608,9 @@ defmodule FastestMCP.Component do
   defp public_parameter_item(value) when is_map(value), do: public_parameters(value)
   defp public_parameter_item(value), do: value
 
-  defp public_prompt_arguments(arguments) when is_list(arguments) do
-    Enum.map(arguments, fn argument ->
-      %{
-        name: Map.get(argument, :name, Map.get(argument, "name")),
-        description: Map.get(argument, :description, Map.get(argument, "description")),
-        required: Map.get(argument, :required, Map.get(argument, "required", false))
-      }
-      |> maybe_put(:title, Map.get(argument, :title, Map.get(argument, "title")))
-    end)
-  end
-
-  defp public_prompt_arguments(_other), do: []
-
-  defp component_crash_error(component, detail_message, details \\ %{}) do
-    %Error{
-      code: :component_crash,
-      message: "#{type(component)} #{inspect(identifier(component))} #{detail_message}",
-      details: details,
-      exposure: %{
-        mask_error_details: true,
-        component_type: type(component),
-        identifier: identifier(component)
-      }
-    }
-  end
-
-  defp maybe_put(map, _key, nil), do: map
-  defp maybe_put(map, key, value), do: Map.put(map, key, value)
+  # `ComponentCompiler` normalized the arguments.
+  defp public_prompt_arguments(arguments),
+    do: Enum.map(arguments, &Map.take(&1, [:name, :description, :required, :title]))
 
   defp strip_injected_arguments(component, arguments) do
     Map.drop(Map.new(arguments), injected_argument_names(component))
@@ -681,57 +642,5 @@ defmodule FastestMCP.Component do
     if TaskConfig.supports_tasks?(config) do
       %{taskSupport: Atom.to_string(config.mode)}
     end
-  end
-
-  defp validate_version_mixing!(existing_components, component) do
-    siblings =
-      Enum.filter(existing_components, fn existing ->
-        type(existing) == type(component) and identifier(existing) == identifier(component)
-      end)
-
-    has_versioned? = Enum.any?(siblings, &(not is_nil(version(&1))))
-    has_unversioned? = Enum.any?(siblings, &is_nil(version(&1)))
-
-    cond do
-      is_nil(version(component)) and has_versioned? ->
-        raise ArgumentError,
-              "#{type(component)} #{inspect(identifier(component))} cannot mix unversioned and versioned definitions"
-
-      not is_nil(version(component)) and has_unversioned? ->
-        raise ArgumentError,
-              "#{type(component)} #{inspect(identifier(component))} cannot mix versioned and unversioned definitions"
-
-      true ->
-        :ok
-    end
-  end
-
-  defp same_registration?(left, right) do
-    type(left) == type(right) and identifier(left) == identifier(right) and
-      version(left) == version(right)
-  end
-
-  defp duplicate_registration_action(_existing, component, :error) do
-    raise ArgumentError, duplicate_error(component)
-  end
-
-  defp duplicate_registration_action(existing, component, :warn) do
-    Logger.warning(duplicate_warning(component))
-    {:replace, existing}
-  end
-
-  defp duplicate_registration_action(existing, _component, :ignore), do: {:ignore, existing}
-  defp duplicate_registration_action(existing, _component, :replace), do: {:replace, existing}
-
-  defp duplicate_error(component) do
-    if is_nil(version(component)) do
-      "#{type(component)} #{inspect(identifier(component))} is already defined without a version"
-    else
-      "#{type(component)} #{inspect(identifier(component))} version #{inspect(version(component))} is already defined"
-    end
-  end
-
-  defp duplicate_warning(component) do
-    duplicate_error(component) <> "; replacing existing definition"
   end
 end

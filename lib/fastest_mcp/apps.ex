@@ -12,6 +12,8 @@ defmodule FastestMCP.Apps do
   CSP source strings are likewise preserved for the consuming Host to enforce.
   """
 
+  import FastestMCP.Util, only: [maybe_put: 3, stringify_keys: 1]
+
   alias FastestMCP.Protocol.Extensions
   alias FastestMCP.Protocol.URI, as: ProtocolURI
   alias FastestMCP.Resources.Content
@@ -76,9 +78,13 @@ defmodule FastestMCP.Apps do
   end
 
   @doc "Reads canonical or deprecated Apps tool linkage metadata."
+  # A component keeps the application's `meta` keys until it is serialized.
   def resource_uri(meta) when is_map(meta) do
-    ui = map_value(meta, :ui, %{})
-    map_value(ui, :resourceUri) || map_value(meta, :"ui/resourceUri")
+    case stringify_keys(meta) do
+      %{"ui" => %{"resourceUri" => uri}} when not is_nil(uri) -> uri
+      %{"ui/resourceUri" => uri} -> uri
+      _other -> nil
+    end
   end
 
   def resource_uri(_other), do: nil
@@ -206,10 +212,4 @@ defmodule FastestMCP.Apps do
   defp merge_meta(other, _addition) do
     raise ArgumentError, "Apps metadata must be a map, got #{inspect(other)}"
   end
-
-  defp map_value(map, key, default \\ nil),
-    do: Map.get(map, key, Map.get(map, to_string(key), default))
-
-  defp maybe_put(map, _key, nil), do: map
-  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 end

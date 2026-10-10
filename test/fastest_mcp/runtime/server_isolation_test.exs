@@ -1,5 +1,5 @@
 defmodule FastestMCP.Runtime.ServerIsolationTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Context
 
@@ -15,31 +15,29 @@ defmodule FastestMCP.Runtime.ServerIsolationTest do
 
     peek = fn _args, ctx -> Context.get_session_state(ctx, :value, :missing) end
 
-    assert {:ok, _pid} =
-             FastestMCP.start_server(
-               FastestMCP.server(server_a)
-               |> FastestMCP.add_tool("remember", remember)
-               |> FastestMCP.add_tool("peek", peek)
-             )
+    start_server!(
+      FastestMCP.server(server_a)
+      |> FastestMCP.add_tool("remember", remember)
+      |> FastestMCP.add_tool("peek", peek)
+    )
 
-    assert {:ok, _pid} =
-             FastestMCP.start_server(
-               FastestMCP.server(server_b)
-               |> FastestMCP.add_tool("remember", remember)
-               |> FastestMCP.add_tool("peek", peek)
-             )
+    start_server!(
+      FastestMCP.server(server_b)
+      |> FastestMCP.add_tool("remember", remember)
+      |> FastestMCP.add_tool("peek", peek)
+    )
 
     assert "alpha" ==
-             FastestMCP.call_tool(server_a, "remember", %{"value" => "alpha"},
+             FastestMCP.call_tool!(server_a, "remember", %{"value" => "alpha"},
                session_id: session_id
              )
 
     assert "beta" ==
-             FastestMCP.call_tool(server_b, "remember", %{"value" => "beta"},
+             FastestMCP.call_tool!(server_b, "remember", %{"value" => "beta"},
                session_id: session_id
              )
 
-    assert "alpha" == FastestMCP.call_tool(server_a, "peek", %{}, session_id: session_id)
-    assert "beta" == FastestMCP.call_tool(server_b, "peek", %{}, session_id: session_id)
+    assert "alpha" == FastestMCP.call_tool!(server_a, "peek", %{}, session_id: session_id)
+    assert "beta" == FastestMCP.call_tool!(server_b, "peek", %{}, session_id: session_id)
   end
 end

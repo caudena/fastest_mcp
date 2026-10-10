@@ -1,5 +1,5 @@
 defmodule FastestMCP.ProviderTracingTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: false
 
   alias FastestMCP.TraceTestHelper
 
@@ -16,14 +16,11 @@ defmodule FastestMCP.ProviderTracingTest do
       FastestMCP.server("child-server")
       |> FastestMCP.add_tool("greet", fn _args, _ctx -> "Hello" end)
 
-    parent =
-      FastestMCP.server(parent_name)
-      |> FastestMCP.mount(child, namespace: "ns")
+    FastestMCP.server(parent_name)
+    |> FastestMCP.mount(child, namespace: "ns")
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(parent)
-    on_exit(fn -> FastestMCP.stop_server(parent_name) end)
-
-    assert "Hello" == FastestMCP.call_tool(parent_name, "ns_greet", %{})
+    assert "Hello" == FastestMCP.call_tool!(parent_name, "ns_greet", %{})
 
     spans = TraceTestHelper.drain_spans()
     parent_span = TraceTestHelper.find_span!(spans, "tools/call ns_greet")

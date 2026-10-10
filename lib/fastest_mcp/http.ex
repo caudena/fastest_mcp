@@ -1,19 +1,10 @@
 defmodule FastestMCP.HTTP do
-  @moduledoc """
-  Small HTTP helper used by runtime code that does not need the stricter auth SSRF protections.
-
-  This module keeps one focused piece of FastestMCP behavior in a dedicated
-  place so builders, runtimes, transports, and providers can share the same
-  rules without duplicating logic.
-
-  Unless you are extending FastestMCP itself, you will usually meet this
-  module indirectly through higher-level APIs rather than calling it first.
-  """
+  @moduledoc false
+  # HTTP client for runtime code that does not need the auth SSRF protections.
 
   @default_timeout 5_000
   @default_headers [{~c"accept", ~c"application/json"}, {~c"user-agent", ~c"FastestMCP/0.2"}]
 
-  @doc "Builds an elicitation request."
   def request(method, url, opts \\ [])
       when method in [:get, :post, :put, :patch, :delete] and is_binary(url) and is_list(opts) do
     case Keyword.get(opts, :requester) do
@@ -22,8 +13,6 @@ defmodule FastestMCP.HTTP do
 
       nil ->
         with {:ok, request_ref} <- async_request(method, url, opts) do
-          notify_request_started(opts, request_ref)
-
           try do
             await_response(request_ref, Keyword.get(opts, :timeout_ms, @default_timeout))
           after
@@ -34,7 +23,6 @@ defmodule FastestMCP.HTTP do
     end
   end
 
-  @doc false
   def stream_request(method, url, opts \\ [])
       when method in [:get, :post, :put, :patch, :delete] and is_binary(url) and is_list(opts) do
     if Keyword.get(opts, :live_stream, false) do
@@ -45,14 +33,10 @@ defmodule FastestMCP.HTTP do
         |> Keyword.put_new(:request_timeout_ms, :infinity)
         |> Keyword.put(:stream_response, true)
 
-      with {:ok, request_ref} <- async_request(method, url, request_opts) do
-        notify_request_started(opts, request_ref)
-        {:ok, request_ref}
-      end
+      async_request(method, url, request_opts)
     end
   end
 
-  @doc false
   def bounded_request(method, url, max_body_bytes, opts \\ [])
       when method in [:get, :post, :put, :patch, :delete] and is_binary(url) and
              is_integer(max_body_bytes) and max_body_bytes > 0 and is_list(opts) do
@@ -73,7 +57,6 @@ defmodule FastestMCP.HTTP do
     end
   end
 
-  @doc false
   def cancel_request(nil), do: :ok
 
   def cancel_request({:fastest_mcp_mint_stream, relay_pid, request_ref})
@@ -102,7 +85,6 @@ defmodule FastestMCP.HTTP do
     receive do
       {^start_ref, :ok} ->
         Process.demonitor(monitor_ref, [:flush])
-        notify_request_started(opts, request_ref)
         {:ok, request_ref}
 
       {^start_ref, {:error, reason}} ->
@@ -158,8 +140,8 @@ defmodule FastestMCP.HTTP do
     path = mint_request_path(uri)
 
     {headers, body} =
-      @default_headers
-      |> Kernel.++(normalize_headers(Keyword.get(opts, :headers, [])))
+      opts
+      |> request_headers()
       |> mint_request_payload(method, opts)
 
     headers = Enum.map(headers, fn {key, value} -> {to_string(key), to_string(value)} end)
@@ -327,8 +309,8 @@ defmodule FastestMCP.HTTP do
       |> then(fn default_url -> Keyword.get(opts, :request_url, default_url) end)
 
     headers =
-      @default_headers
-      |> Kernel.++(normalize_headers(Keyword.get(opts, :headers, [])))
+      opts
+      |> request_headers()
       |> maybe_add_content_type(opts)
 
     timeout = Keyword.get(opts, :timeout_ms, @default_timeout)
@@ -515,13 +497,6 @@ defmodule FastestMCP.HTTP do
     end
   end
 
-  defp notify_request_started(opts, request_ref) do
-    case Keyword.get(opts, :request_started) do
-      callback when is_function(callback, 1) -> callback.(request_ref)
-      nil -> :ok
-    end
-  end
-
   defp flush_response_messages(request_ref) do
     receive do
       {:http, {^request_ref, _message}} ->
@@ -547,8 +522,14 @@ defmodule FastestMCP.HTTP do
 
   defp normalize_headers(headers) do
     Enum.map(headers, fn {key, value} ->
-      {to_charlist(to_string(key)), to_charlist(to_string(value))}
+      {key |> to_string() |> String.downcase() |> to_charlist(), to_charlist(to_string(value))}
     end)
+  end
+
+  defp request_headers(opts) do
+    explicit = normalize_headers(Keyword.get(opts, :headers, []))
+    names = MapSet.new(explicit, &elem(&1, 0))
+    Enum.reject(@default_headers, fn {name, _} -> MapSet.member?(names, name) end) ++ explicit
   end
 
   defp normalize_response_headers(headers) do
@@ -640,15 +621,11 @@ defmodule FastestMCP.HTTP do
     |> IO.iodata_to_binary()
   end
 
-  defp multipart_part_content(name, %{filename: filename, content: content} = part) do
-    content_type = Map.get(part, :content_type, Map.get(part, "content_type"))
-    multipart_file_content(name, filename, content, content_type)
-  end
+  defp multipart_part_content(name, %{filename: filename, content: content} = part),
+    do: multipart_file_content(name, filename, content, part[:content_type])
 
-  defp multipart_part_content(name, %{"filename" => filename, "content" => content} = part) do
-    content_type = Map.get(part, "content_type", Map.get(part, :content_type))
-    multipart_file_content(name, filename, content, content_type)
-  end
+  defp multipart_part_content(name, %{"filename" => filename, "content" => content} = part),
+    do: multipart_file_content(name, filename, content, part["content_type"])
 
   defp multipart_part_content(name, {filename, content}) do
     multipart_file_content(name, filename, content, nil)

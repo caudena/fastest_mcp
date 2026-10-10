@@ -1,11 +1,9 @@
 defmodule FastestMCP.ServerModuleTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: false
 
   alias FastestMCP.Context
-  alias FastestMCP.Registry
   alias FastestMCP.ServerRuntime
   alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
-  alias FastestMCP.TestSupport.ServerSupervisorIsolation
 
   defmodule ConfiguredServer do
     use FastestMCP.ServerModule,
@@ -53,24 +51,22 @@ defmodule FastestMCP.ServerModuleTest do
       runtime: [max_concurrent_calls: 7]
     )
 
-    on_exit(fn ->
-      Application.delete_env(:fastest_mcp, ConfiguredServer)
-    end)
+    on_exit(fn -> Application.delete_env(:fastest_mcp, ConfiguredServer) end)
 
     assert {:ok, _pid} = start_supervised(ConfiguredServer)
 
-    assert [%{name: "repo_name"}] = FastestMCP.list_tools(ConfiguredServer)
+    assert [%{name: "repo_name"}] = FastestMCP.list_tools!(ConfiguredServer)
 
     assert %{
              repo: ":app_repo",
              server_name: server_name
-           } = FastestMCP.call_tool(ConfiguredServer, "repo_name", %{})
+           } = FastestMCP.call_tool!(ConfiguredServer, "repo_name", %{})
 
     assert server_name == to_string(ConfiguredServer)
 
     assert {:ok, runtime} = ServerRuntime.fetch(ConfiguredServer)
-    assert runtime.opts[:max_sessions] == 5
-    assert runtime.opts[:max_concurrent_calls] == 7
+    assert runtime.config.max_sessions == 5
+    assert runtime.config.max_concurrent_calls == 7
   end
 
   test "server module merges child overrides over app config and module defaults" do
@@ -79,67 +75,161 @@ defmodule FastestMCP.ServerModuleTest do
       runtime: [max_concurrent_calls: 7, max_sessions: 6]
     )
 
-    on_exit(fn ->
-      Application.delete_env(:fastest_mcp, ConfiguredServer)
-    end)
+    on_exit(fn -> Application.delete_env(:fastest_mcp, ConfiguredServer) end)
 
     assert {:ok, _pid} =
              start_supervised(
                {ConfiguredServer, repo: :override_repo, runtime: [max_sessions: 9]}
              )
 
-    assert %{repo: ":override_repo"} = FastestMCP.call_tool(ConfiguredServer, "repo_name", %{})
+    assert %{repo: ":override_repo"} = FastestMCP.call_tool!(ConfiguredServer, "repo_name", %{})
 
     assert {:ok, runtime} = ServerRuntime.fetch(ConfiguredServer)
-    assert runtime.opts[:max_concurrent_calls] == 7
-    assert runtime.opts[:max_sessions] == 9
+    assert runtime.config.max_concurrent_calls == 7
+    assert runtime.config.max_sessions == 9
   end
 
   test "FastestMCP.start_server/2 accepts server modules and stop_server/1 stops the instance" do
     assert {:ok, owner_pid} = FastestMCP.start_server(HTTPServer, [])
     assert Process.alive?(owner_pid)
 
-    on_exit(fn ->
-      _ = FastestMCP.stop_server(HTTPServer)
-    end)
+    on_exit(fn -> _ = FastestMCP.stop_server(HTTPServer) end)
 
-    assert [%{name: "echo"}] = FastestMCP.list_tools(HTTPServer)
-    assert %{"message" => "hi"} = FastestMCP.call_tool(HTTPServer, "echo", %{message: "hi"})
+    assert [%{name: "echo"}] = FastestMCP.list_tools!(HTTPServer)
+    assert %{"message" => "hi"} = FastestMCP.call_tool!(HTTPServer, "echo", %{message: "hi"})
 
     assert :ok = FastestMCP.stop_server(HTTPServer)
     refute Process.alive?(owner_pid)
     assert {:error, :not_found} = ServerRuntime.fetch(HTTPServer)
   end
 
-  test "server module restores its owner claim after Registry replacement" do
-    assert {:ok, owner_pid} = FastestMCP.start_server(HTTPServer, [])
-    :ok = ServerSupervisorIsolation.terminate_unrelated_servers!(owner_pid)
+  test "child specs, start arguments, and supervisor reports leave a signing secret out" do
+    secret = String.duplicate("secret-in-start-args-", 2)
+    inspect_all = &inspect(&1, limit: :infinity, printable_limit: :infinity)
 
-    on_exit(fn ->
-      if Process.alive?(owner_pid), do: FastestMCP.stop_server(HTTPServer)
-    end)
+    for runtime <- [[signing_secret: secret], %{signing_secret: secret}] do
+      refute inspect_all.(HTTPServer.child_spec(runtime: runtime)) =~ secret
+    end
 
-    assert {:ok, old_runtime} = Registry.lookup_server(HTTPServer)
-    old_registry = Process.whereis(Registry)
-    Process.exit(old_registry, :kill)
+    # From the app config, the secret never enters a child spec.
+    Application.put_env(:fastest_mcp, ConfiguredServer,
+      repo: :app_repo,
+      runtime: [signing_secret: secret]
+    )
 
-    assert_eventually(fn ->
-      with registry when is_pid(registry) and registry != old_registry <-
-             Process.whereis(Registry),
-           {:ok, ^owner_pid} <- Registry.lookup_server_owner(HTTPServer),
-           {:ok, runtime} when runtime != old_runtime <- Registry.lookup_server(HTTPServer) do
-        Process.alive?(runtime)
-      else
-        _other -> false
-      end
-    end)
+    on_exit(fn -> Application.delete_env(:fastest_mcp, ConfiguredServer) end)
+    handle_sasl_reports()
 
-    assert Process.alive?(owner_pid)
-    assert [%{name: "echo"}] = FastestMCP.list_tools(HTTPServer)
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        start_supervised!({HTTPServer, runtime: [signing_secret: secret]})
+        :ok = stop_supervised!(HTTPServer)
 
-    assert :ok = FastestMCP.stop_server(HTTPServer)
-    assert_eventually(fn -> not Process.alive?(owner_pid) end)
-    assert {:error, :not_found} = Registry.lookup_server_owner(HTTPServer)
+        assert {:ok, _pid} =
+                 FastestMCP.start_server(HTTPServer, runtime: [signing_secret: secret])
+
+        :ok = FastestMCP.stop_server(HTTPServer)
+
+        # The server's supervisor keeps it wrapped in its own start argument.
+        instance = start_supervised!(ConfiguredServer)
+        refute inspect_all.(:sys.get_status(instance)) =~ secret
+        assert {:ok, %{signing_secret: %{value: ^secret}}} = ServerRuntime.fetch(ConfiguredServer)
+      end)
+
+    assert log =~ "Start Call: FastestMCP.ServerInstance.start_link"
+    refute log =~ secret
+  end
+
+  test "inspect output and supervisor reports leave the options of an authenticator out" do
+    token = "token-in-the-authenticator-options"
+    inspect_all = &inspect(&1, limit: :infinity, printable_limit: :infinity)
+
+    server =
+      FastestMCP.server(unique_name("auth-options"))
+      |> FastestMCP.add_auth(FastestMCP.Auth.StaticToken,
+        tokens: %{token => %{client_id: "local-dev", scopes: []}}
+      )
+      |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+
+    refute inspect_all.(server) =~ token
+    handle_sasl_reports()
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:ok, _pid} = FastestMCP.start_server(server)
+
+        # The authenticator still receives its options.
+        assert %{"a" => 1} ==
+                 FastestMCP.call_tool!(server.name, "echo", %{"a" => 1},
+                   auth_input: %{"authorization" => "Bearer " <> token}
+                 )
+
+        :ok = FastestMCP.stop_server(server.name)
+      end)
+
+    # The runtime's children start with the server definition.
+    assert log =~ "Start Call: FastestMCP.ServerRuntime.Lifecycle.start_link({%FastestMCP.Server{"
+    assert log =~ "auth: #FastestMCP.Auth<provider: FastestMCP.Auth.StaticToken, ...>"
+    refute log =~ token
+  end
+
+  test "invalid runtime and http options of a server module raise in the caller" do
+    assert_raise ArgumentError, ~r/unknown keys \[:ip\]/, fn ->
+      HTTPServer.child_spec(http: [port: 0, ip: {0, 0, 0, 0}])
+    end
+
+    assert_raise ArgumentError, ~r/unknown keys \[:ip\]/, fn ->
+      HTTPServer.child_spec(well_known_http: [port: 0, ip: {0, 0, 0, 0}])
+    end
+
+    assert_raise ArgumentError, ~r/max_sessions must be a positive integer/, fn ->
+      FastestMCP.start_server(HTTPServer, runtime: [max_sessions: 0])
+    end
+
+    assert {:error, :not_found} = ServerRuntime.fetch(HTTPServer)
+  end
+
+  test "a server module reports its module name in serverInfo" do
+    start_supervised!(HTTPServer)
+    name = inspect(HTTPServer)
+
+    assert %{"serverInfo" => %{"name" => ^name}} =
+             FastestMCP.initialize!(HTTPServer, ProtocolTest.initialize_params())
+
+    discover = ProtocolTest.modern_http_request(HTTPServer, 1, "server/discover")
+
+    assert %{
+             "result" => %{
+               "_meta" => %{"io.modelcontextprotocol/serverInfo" => %{"name" => ^name}}
+             }
+           } =
+             JSON.decode!(discover.resp_body)
+  end
+
+  test "a server module is the plug of its own endpoint" do
+    start_supervised!(HTTPServer)
+
+    # As `forward "/mcp", HTTPServer, allowed_hosts: :localhost` runs it in a router.
+    opts = HTTPServer.init(allowed_hosts: :localhost, json_response: true)
+    assert Keyword.fetch!(opts, :server_name) == HTTPServer
+
+    response =
+      Plug.Test.conn(:post, "/mcp", JSON.encode!(ProtocolTest.modern_request(1, "tools/list")))
+      |> Map.put(:host, "localhost")
+      |> Plug.Conn.put_req_header("content-type", "application/json")
+      |> Plug.Conn.put_req_header("accept", "application/json, text/event-stream")
+      |> Plug.Conn.put_req_header("mcp-protocol-version", "2026-07-28")
+      |> Plug.Conn.put_req_header("mcp-method", "tools/list")
+      |> HTTPServer.call(opts)
+
+    assert %{"result" => %{"tools" => [%{"name" => "echo"}]}} = JSON.decode!(response.resp_body)
+
+    client = connect!(serve!({HTTPServer, allowed_hosts: :localhost}).url)
+
+    assert %{structured_content: %{"value" => 1}} =
+             FastestMCP.Client.call_tool!(client, "echo", %{"value" => 1})
+
+    assert_raise ArgumentError, ~r/unknown keys \[:ip\]/, fn -> HTTPServer.init(ip: :any) end
   end
 
   test "server module child_spec can start streamable HTTP transport" do
@@ -185,6 +275,228 @@ defmodule FastestMCP.ServerModuleTest do
              "id" => 7,
              "result" => %{"structuredContent" => %{"message" => "hello"}}
            } = JSON.decode!(response.body)
+  end
+
+  # The child BEAMs below run code compiled by this test run.
+  @child_env """
+  Application.put_env(:opentelemetry, :span_processor, :simple)
+  Application.put_env(:opentelemetry, :traces_exporter, :none)
+  Application.put_env(:opentelemetry, :create_application_tracers, false)
+  """
+
+  test "serve_stdio/1 serves a server module over stdio, built with its options" do
+    code = """
+    #{@child_env}
+    defmodule StdioDemo.MCPServer do
+      use FastestMCP.ServerModule, otp_app: :stdio_demo, greeting: "from the use line"
+
+      def server(opts) do
+        base_server(opts)
+        |> FastestMCP.add_tool("greet", fn _args, _ctx ->
+          {:ok, runtime} = FastestMCP.ServerRuntime.fetch(__MODULE__)
+
+          %{
+            greeting: Keyword.fetch!(opts, :greeting),
+            max_concurrent_calls: runtime.config.max_concurrent_calls
+          }
+        end)
+      end
+    end
+
+    Application.put_env(:stdio_demo, StdioDemo.MCPServer, greeting: "from the config")
+    :ok = StdioDemo.MCPServer.serve_stdio(runtime: [max_concurrent_calls: 3])
+    """
+
+    client = connect!({:stdio, elixir!(), child_args(code)})
+
+    assert %{structured_content: %{"greeting" => "from the config", "max_concurrent_calls" => 3}} =
+             FastestMCP.Client.call_tool!(client, "greet", %{})
+  end
+
+  test "serve_stdio/1 starts the module's application first and keeps stdout for the protocol" do
+    stderr_path =
+      Path.join(
+        System.tmp_dir!(),
+        "fastest-mcp-serve-stdio-#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm(stderr_path) end)
+
+    # The application runs the server in its supervision tree and logs while
+    # it starts; the handler prints and logs.
+    code = """
+    #{@child_env}
+    require Logger
+
+    defmodule StdioApp.MCPServer do
+      use FastestMCP.ServerModule
+
+      def server(opts) do
+        base_server(opts)
+        |> FastestMCP.add_tool("started_by", fn _args, _ctx ->
+          IO.puts("handler output")
+          Logger.warning("handler log")
+          %{started_by: Application.get_env(:stdio_app, :started_by)}
+        end)
+      end
+    end
+
+    defmodule StdioApp.Application do
+      use Application
+
+      def start(_type, _args) do
+        Logger.warning("application log")
+        Application.put_env(:stdio_app, :started_by, "the application")
+        Supervisor.start_link([StdioApp.MCPServer], strategy: :one_for_one)
+      end
+    end
+
+    :ok =
+      :application.load(
+        {:application, :stdio_app,
+         description: ~c"stdio app",
+         vsn: ~c"1.0.0",
+         modules: [StdioApp.MCPServer, StdioApp.Application],
+         registered: [],
+         applications: [:kernel, :stdlib, :elixir, :logger, :fastest_mcp],
+         mod: {StdioApp.Application, []}}
+      )
+
+    StdioApp.MCPServer.serve_stdio()
+    """
+
+    shell = System.find_executable("sh") || flunk("sh executable not found on PATH")
+
+    port =
+      Port.open({:spawn_executable, shell}, [
+        :binary,
+        :exit_status,
+        {:line, 1_048_576},
+        args:
+          ["-c", ~S(stderr="$1"; shift; exec "$@" 2>"$stderr"), "sh", stderr_path, elixir!()] ++
+            child_args(code)
+      ])
+
+    on_exit(fn -> if Port.info(port), do: Port.close(port) end)
+
+    send_line(
+      port,
+      ProtocolTest.jsonrpc_request(1, "initialize", ProtocolTest.initialize_params())
+    )
+
+    assert %{"id" => 1, "result" => %{"protocolVersion" => _version}} = receive_json(port)
+
+    send_line(port, ProtocolTest.jsonrpc_notification("notifications/initialized"))
+    send_line(port, ProtocolTest.jsonrpc_request(2, "tools/call", %{"name" => "started_by"}))
+
+    assert %{
+             "id" => 2,
+             "result" => %{"structuredContent" => %{"started_by" => "the application"}}
+           } =
+             receive_json(port)
+
+    Port.close(port)
+    stderr = File.read!(stderr_path)
+
+    for output <- ["application log", "handler output", "handler log"],
+        do: assert(stderr =~ output)
+  end
+
+  test "serve_stdio/1 gives the authenticator of every request its auth_input" do
+    code = """
+    #{@child_env}
+    defmodule StdioAuth.MCPServer do
+      use FastestMCP.ServerModule
+
+      def server(opts) do
+        base_server(opts)
+        |> FastestMCP.add_auth(
+          FastestMCP.Auth.from_assign(:user, principal: fn user -> %{"sub" => user.id} end)
+        )
+        |> FastestMCP.add_tool("whoami", fn _args, ctx -> ctx.principal end)
+      end
+    end
+
+    # The function runs once the applications have started: Plug.Crypto's key
+    # cache is running then.
+    :ok =
+      StdioAuth.MCPServer.serve_stdio(
+        auth_input: fn ->
+          secret = String.duplicate("secret-key-base-", 4)
+          token = Plug.Crypto.sign(secret, "mcp", "user-7")
+          {:ok, id} = Plug.Crypto.verify(secret, "mcp", token)
+          %{"assigns" => %{"user" => %{id: id}}}
+        end
+      )
+    """
+
+    client = connect!({:stdio, elixir!(), child_args(code)})
+
+    assert %{structured_content: %{"sub" => "user-7"}} =
+             FastestMCP.Client.call_tool!(client, "whoami", %{})
+
+    # The input it is given wins over credentials a client sends in `_meta`.
+    server_name = unique_name("stdio-auth-input")
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_auth(FastestMCP.Auth.from_assign(:user, principal: & &1))
+    |> FastestMCP.add_tool("whoami", fn _args, ctx -> %{user: ctx.principal} end)
+    |> start_server!()
+
+    meta = %{"fastestmcp" => %{"auth" => %{"assigns" => %{"user" => "mallory"}}}}
+
+    assert %{"result" => %{"structuredContent" => %{"user" => "alice"}}} =
+             ProtocolTest.modern_stdio_request(
+               server_name,
+               1,
+               "tools/call",
+               %{"name" => "whoami", "_meta" => meta},
+               auth_input: %{"assigns" => %{"user" => "alice"}}
+             )
+  end
+
+  test "serve_stdio/1 refuses options for a running server, and modules that aren't servers" do
+    start_supervised!(HTTPServer)
+
+    assert_raise ArgumentError, ~r/already running/, fn ->
+      HTTPServer.serve_stdio(runtime: [max_sessions: 1])
+    end
+
+    assert_raise ArgumentError, ~r/:auth_input must be a map or a function/, fn ->
+      HTTPServer.serve_stdio(auth_input: "Bearer token")
+    end
+
+    assert_raise ArgumentError, ~r/is not a FastestMCP server module/, fn ->
+      FastestMCP.ServerModule.serve_stdio(String)
+    end
+  end
+
+  defp elixir!, do: System.find_executable("elixir") || flunk("elixir executable not found")
+
+  defp child_args(code) do
+    Mix.Project.build_path()
+    |> Path.join("lib/*/ebin")
+    |> Path.wildcard()
+    |> Enum.flat_map(&["-pa", &1])
+    |> Kernel.++(["-e", code])
+  end
+
+  defp send_line(port, message), do: true = Port.command(port, [JSON.encode!(message), "\n"])
+
+  # Every line on stdout must be a JSON-RPC message.
+  defp receive_json(port) do
+    receive do
+      {^port, {:data, {:eol, line}}} ->
+        case JSON.decode(line) do
+          {:ok, message} -> message
+          {:error, _reason} -> flunk("stdout carried a line that isn't JSON: #{inspect(line)}")
+        end
+
+      {^port, {:exit_status, status}} ->
+        flunk("the stdio server exited with status #{status}")
+    after
+      10_000 -> flunk("no response from the stdio server")
+    end
   end
 
   defp post_json(port, payload, session_id \\ nil) do
@@ -245,22 +557,6 @@ defmodule FastestMCP.ServerModuleTest do
     case :gen_tcp.recv(socket, 0, 1_000) do
       {:ok, chunk} -> recv_all(socket, acc <> chunk)
       {:error, :closed} -> {:ok, acc}
-    end
-  end
-
-  defp assert_eventually(fun, attempts \\ 500)
-
-  defp assert_eventually(fun, attempts) do
-    cond do
-      fun.() ->
-        :ok
-
-      attempts == 0 ->
-        flunk("condition did not become true")
-
-      true ->
-        Process.sleep(10)
-        assert_eventually(fun, attempts - 1)
     end
   end
 end

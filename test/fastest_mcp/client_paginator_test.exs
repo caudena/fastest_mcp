@@ -1,5 +1,5 @@
 defmodule FastestMCP.ClientPaginatorTest do
-  use ExUnit.Case, async: true
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Client.Paginator
   alias FastestMCP.Error

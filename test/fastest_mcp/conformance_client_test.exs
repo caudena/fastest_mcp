@@ -1,5 +1,5 @@
 defmodule FastestMCP.ConformanceClientTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: false
 
   @moduletag :conformance
   @moduletag timeout: 600_000

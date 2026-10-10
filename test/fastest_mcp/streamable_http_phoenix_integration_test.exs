@@ -1,5 +1,5 @@
 defmodule FastestMCP.StreamableHTTPPhoenixIntegrationTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   import Plug.Test
 
@@ -9,15 +9,9 @@ defmodule FastestMCP.StreamableHTTPPhoenixIntegrationTest do
   test "streamable HTTP accepts JSON-RPC payloads from pre-parsed Phoenix body_params" do
     server_name = "phoenix-body-params-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-
-    on_exit(fn ->
-      FastestMCP.stop_server(server_name)
-    end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+    |> start_server!()
 
     {session_id, _initialize_response, initialized_response} =
       ProtocolTest.initialize_http(server_name)
@@ -56,15 +50,9 @@ defmodule FastestMCP.StreamableHTTPPhoenixIntegrationTest do
     server_name =
       "phoenix-forwarded-path-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-
-    on_exit(fn ->
-      FastestMCP.stop_server(server_name)
-    end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+    |> start_server!()
 
     initialize_response =
       forwarded_request(
@@ -109,11 +97,7 @@ defmodule FastestMCP.StreamableHTTPPhoenixIntegrationTest do
     server_name =
       "phoenix-batch-body-params-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    assert {:ok, _pid} = FastestMCP.start_server(FastestMCP.server(server_name))
-
-    on_exit(fn ->
-      FastestMCP.stop_server(server_name)
-    end)
+    start_server!(FastestMCP.server(server_name))
 
     parsed_conn =
       conn(

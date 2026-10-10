@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
+# Builds a fresh Mix project from the Getting Started server (the files in
+# test/support/docs/my_app/, which docs/getting-started.md shows verbatim) and
+# checks the in-process results that step 3 of the tutorial prints.
 
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 tmp_dir="$(mktemp -d)"
-project_dir="$tmp_dir/docs_smoke"
+project_dir="$tmp_dir/my_app"
 
 cleanup() {
   rm -rf "$tmp_dir"
@@ -12,16 +15,16 @@ cleanup() {
 
 trap cleanup EXIT
 
-mix new --sup "$project_dir" --module DocsSmoke >/dev/null
+mix new --sup "$project_dir" --module MyApp >/dev/null
 cd "$project_dir"
 
 cat > mix.exs <<EOF
-defmodule DocsSmoke.MixProject do
+defmodule MyApp.MixProject do
   use Mix.Project
 
   def project do
     [
-      app: :docs_smoke,
+      app: :my_app,
       version: "0.1.0",
       elixir: "~> 1.19",
       start_permanent: Mix.env() == :prod,
@@ -32,7 +35,7 @@ defmodule DocsSmoke.MixProject do
   def application do
     [
       extra_applications: [:logger],
-      mod: {DocsSmoke.Application, []}
+      mod: {MyApp.Application, []}
     ]
   end
 
@@ -44,43 +47,40 @@ defmodule DocsSmoke.MixProject do
 end
 EOF
 
-cat > lib/docs_smoke/application.ex <<'EOF'
-defmodule DocsSmoke.Application do
+cp "$repo_root/test/support/docs/my_app/notes.ex" lib/my_app/notes.ex
+cp "$repo_root/test/support/docs/my_app/mcp_server.ex" lib/my_app/mcp_server.ex
+
+cat > lib/my_app/application.ex <<'EOF'
+defmodule MyApp.Application do
   use Application
 
   def start(_type, _args) do
     children = [
-      DocsSmoke.MCPServer
+      MyApp.Notes,
+      MyApp.MCPServer
     ]
 
-    Supervisor.start_link(children, strategy: :one_for_one, name: DocsSmoke.Supervisor)
-  end
-end
-EOF
-
-cat > lib/docs_smoke/mcp_server.ex <<'EOF'
-defmodule DocsSmoke.MCPServer do
-  use FastestMCP.ServerModule
-
-  alias FastestMCP.Context
-
-  def server(opts) do
-    base_server(opts)
-    |> FastestMCP.add_tool("sum", fn %{"a" => a, "b" => b}, _ctx -> a + b end)
-    |> FastestMCP.add_tool("visit", fn _arguments, ctx ->
-      visits = Context.get_session_state(ctx, :visits, 0) + 1
-      :ok = Context.put_session_state(ctx, :visits, visits)
-      %{visits: visits}
-    end)
+    Supervisor.start_link(children, strategy: :one_for_one, name: MyApp.Supervisor)
   end
 end
 EOF
 
 mix deps.get >/dev/null
 mix run -e '
-result = FastestMCP.call_tool(DocsSmoke.MCPServer, "sum", %{"a" => 20, "b" => 22})
+note =
+  FastestMCP.call_tool!(MyApp.MCPServer, "add_note", %{
+    "title" => "Release",
+    "body" => "Ship the notes server on Friday"
+  })
 
-unless result == 42 do
-  raise "expected onboarding example to return 42, got: #{inspect(result)}"
-end
+expected = %{id: "1", title: "Release", body: "Ship the notes server on Friday"}
+unless note == expected, do: raise("add_note returned #{inspect(note)}")
+
+found = FastestMCP.call_tool!(MyApp.MCPServer, "search_notes", %{"query" => "friday"})
+unless found == %{notes: [expected]}, do: raise("search_notes returned #{inspect(found)}")
+
+read = FastestMCP.read_resource!(MyApp.MCPServer, "notes://1")
+unless read == expected, do: raise("notes://1 returned #{inspect(read)}")
+
+IO.puts("Getting Started smoke test passed")
 '

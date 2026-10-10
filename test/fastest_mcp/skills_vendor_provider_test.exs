@@ -1,53 +1,55 @@
 defmodule FastestMCP.SkillsVendorProviderTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
-  alias FastestMCP.Providers.Skills.Claude
-  alias FastestMCP.Providers.Skills.Codex
-  alias FastestMCP.Providers.Skills.Copilot
-  alias FastestMCP.Providers.Skills.Cursor
-  alias FastestMCP.Providers.Skills.Gemini
-  alias FastestMCP.Providers.Skills.Goose
-  alias FastestMCP.Providers.Skills.OpenCode
-  alias FastestMCP.Providers.Skills.VSCode
+  alias FastestMCP.Providers.Skills
+  alias FastestMCP.Providers.SkillsDirectory
+
+  # Relative roots are under the home directory; earlier roots take precedence.
+  @vendor_roots %{
+    claude: [".claude/skills"],
+    codex: ["/etc/codex/skills", ".codex/skills"],
+    copilot: [".copilot/skills"],
+    cursor: [".cursor/skills"],
+    gemini: [".gemini/skills"],
+    goose: [".config/agents/skills"],
+    opencode: [".config/opencode/skills"],
+    vscode: [".copilot/skills"]
+  }
 
   test "vendor providers use the expected roots and options" do
     home = "/tmp/fake-home"
 
-    assert Claude.new(home: home).roots == [Path.join(home, ".claude/skills")]
-    assert Cursor.new(home: home).roots == [Path.join(home, ".cursor/skills")]
-    assert VSCode.new(home: home).roots == [Path.join(home, ".copilot/skills")]
-    assert Gemini.new(home: home).roots == [Path.join(home, ".gemini/skills")]
-    assert Goose.new(home: home).roots == [Path.join(home, ".config/agents/skills")]
-    assert Copilot.new(home: home).roots == [Path.join(home, ".copilot/skills")]
-    assert OpenCode.new(home: home).roots == [Path.join(home, ".config/opencode/skills")]
+    for {vendor, roots} <- @vendor_roots do
+      provider = Skills.vendor(vendor, home: home)
+
+      assert %SkillsDirectory{reload: false, supporting_files: :template} = provider
+      assert provider.roots == Enum.map(roots, &Path.expand(&1, home))
+    end
 
     codex =
-      Codex.new(
+      Skills.vendor(:codex,
         home: home,
-        system_root: "/etc/codex/skills",
+        system_root: "/opt/codex/skills",
         reload: true,
         supporting_files: :resources
       )
 
-    assert codex.roots == ["/etc/codex/skills", Path.join(home, ".codex/skills")]
+    assert codex.roots == ["/opt/codex/skills", Path.join(home, ".codex/skills")]
     assert codex.reload == true
     assert codex.supporting_files == :resources
     assert codex.main_file_name == "SKILL.md"
   end
 
   test "vendor providers handle nonexistent roots gracefully" do
-    providers = [
-      Claude.new(home: "/tmp/no-home"),
-      Cursor.new(home: "/tmp/no-home"),
-      VSCode.new(home: "/tmp/no-home"),
-      Gemini.new(home: "/tmp/no-home"),
-      Goose.new(home: "/tmp/no-home"),
-      Copilot.new(home: "/tmp/no-home"),
-      OpenCode.new(home: "/tmp/no-home")
-    ]
-
-    for provider <- providers do
+    for vendor <- Map.keys(@vendor_roots) do
+      provider = Skills.vendor(vendor, home: "/tmp/no-home", system_root: "/tmp/no-home/etc")
       assert provider.providers == []
+    end
+  end
+
+  test "unknown vendors are rejected" do
+    assert_raise ArgumentError, ~r/unknown skills vendor :unknown/, fn ->
+      Skills.vendor(:unknown, home: "/tmp/no-home")
     end
   end
 end

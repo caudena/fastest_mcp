@@ -1,18 +1,13 @@
 defmodule FastestMCP.ComponentCompiler do
-  @moduledoc """
-  Shared callable compiler used by tools, resources, templates, and prompts.
-  This is the central "compile once, execute many times" path required by the
-  reviewed milestone-1 plan.
+  @moduledoc false
+  # Servers, providers, the component manager, and middleware compile every
+  # component here once; it then executes many times. Options are validated
+  # per kind.
 
-  This module keeps one focused piece of FastestMCP behavior in a dedicated
-  place so builders, runtimes, transports, and providers can share the same
-  rules without duplicating logic.
-
-  Unless you are extending FastestMCP itself, you will usually meet this
-  module indirectly through higher-level APIs rather than calling it first.
-  """
+  import FastestMCP.Util, only: [maybe_put: 3, optional_map!: 2, string_keys: 1]
 
   alias FastestMCP.Authorization
+  alias FastestMCP.Component
   alias FastestMCP.Components.Prompt
   alias FastestMCP.Components.Resource
   alias FastestMCP.Components.ResourceTemplate
@@ -22,180 +17,218 @@ defmodule FastestMCP.ComponentCompiler do
   alias FastestMCP.Schema
   alias FastestMCP.TaskConfig
 
-  @doc "Compiles the given handler into a runtime component."
-  def compile(:tool, server_name, name, handler, opts) do
+  @common_options [
+    :version,
+    :title,
+    :description,
+    :icons,
+    :inject,
+    :task,
+    :timeout,
+    :authorization,
+    :auth,
+    :tags,
+    :visibility,
+    enabled: true,
+    meta: %{},
+    schema_options: []
+  ]
+
+  @kind_options %{
+    tool: [:annotations, :input_schema, :output_schema, :completions],
+    resource: [:name, :annotations, :size, :mime_type],
+    resource_template: [
+      :name,
+      :annotations,
+      :parameters,
+      :completions,
+      :mime_type,
+      resource_security: :inherit
+    ],
+    prompt: [:arguments]
+  }
+
+  # A component you define (`:local`) follows MCP's rules for tool names and
+  # resource annotations; one that describes a peer's (`:remote`, as a proxy
+  # builds) keeps what the peer sent.
+  def compile(kind, identifier, handler, opts, source \\ :local) do
+    opts = Keyword.validate!(opts, @common_options ++ Map.fetch!(@kind_options, kind))
     inject = normalize_inject(opts[:inject])
-    schema_opts = Keyword.get(opts, :schema_options, [])
 
-    {input_schema, compiled_input_schema} =
-      compile_tool_schema!(:input, opts[:input_schema], schema_opts)
+    kind
+    |> compile_kind(identifier, inject, opts, source)
+    |> struct!(
+      version: normalize_version(opts[:version]),
+      title: opts[:title],
+      description: opts[:description],
+      icons: normalize_icons(opts[:icons]),
+      inject: inject,
+      task: TaskConfig.new(opts[:task]),
+      timeout: opts[:timeout],
+      authorization: Authorization.normalize(Keyword.get(opts, :authorization, opts[:auth])),
+      tags: normalize_tags(opts[:tags]),
+      enabled: opts[:enabled],
+      visibility: normalize_visibility(opts[:visibility]),
+      meta: Map.new(opts[:meta]),
+      compiled: normalize_callable!(handler)
+    )
+  end
 
-    {output_schema, compiled_output_schema} =
-      compile_tool_schema!(:output, opts[:output_schema], schema_opts)
-
-    completions = normalize_completions(opts[:completions])
+  defp compile_kind(:tool, name, inject, opts, source) do
+    {input_schema, compiled_input_schema} = compile_schema!(:input, opts[:input_schema], opts)
+    {output_schema, compiled_output_schema} = compile_schema!(:output, opts[:output_schema], opts)
     validate_injected_keys!(:tool, schema_property_keys(input_schema), inject)
 
     %Tool{
-      server_name: server_name,
-      name: to_string(name),
-      version: normalize_version(opts[:version]),
-      title: opts[:title],
-      description: opts[:description],
-      icons: normalize_icons(opts[:icons]),
-      annotations: normalize_annotations(opts[:annotations]),
+      name: if(source == :local, do: tool_name!(name), else: to_string(name)),
+      annotations: optional_map!(opts[:annotations], "component annotations"),
       input_schema: input_schema,
       compiled_input_schema: compiled_input_schema,
-      completions: completions,
-      inject: inject,
-      task: normalize_task(opts[:task]),
-      authorization: normalize_authorization(opts),
-      tags: normalize_tags(opts[:tags]),
-      enabled: Keyword.get(opts, :enabled, true),
-      visibility: normalize_visibility(opts[:visibility]),
-      meta: Map.new(Keyword.get(opts, :meta, %{})),
-      timeout: opts[:timeout],
       output_schema: output_schema,
       compiled_output_schema: compiled_output_schema,
-      compiled: normalize_callable!(:tool, handler)
+      completions: normalize_completions(opts[:completions])
     }
   end
 
-  def compile(:resource, server_name, uri, handler, opts) do
-    uri = uri |> to_string() |> ProtocolURI.validate!("resource URI")
-
+  defp compile_kind(:resource, uri, _inject, opts, source) do
     %Resource{
-      server_name: server_name,
-      uri: uri,
+      uri: uri |> to_string() |> ProtocolURI.validate!("resource URI"),
       name: normalize_optional_string(opts[:name]),
-      version: normalize_version(opts[:version]),
-      title: opts[:title],
-      description: opts[:description],
-      icons: normalize_icons(opts[:icons]),
-      annotations: normalize_annotations(opts[:annotations]),
-      inject: normalize_inject(opts[:inject]),
-      task: normalize_task(opts[:task]),
-      authorization: normalize_authorization(opts),
-      tags: normalize_tags(opts[:tags]),
-      enabled: Keyword.get(opts, :enabled, true),
-      visibility: normalize_visibility(opts[:visibility]),
-      meta: Map.new(Keyword.get(opts, :meta, %{})),
-      timeout: opts[:timeout],
-      mime_type: Keyword.get(opts, :mime_type, "application/json"),
-      size: normalize_resource_size(opts[:size]),
-      compiled: normalize_callable!(:resource, handler)
+      annotations: resource_annotations!(opts[:annotations], source),
+      mime_type: opts[:mime_type],
+      size: normalize_resource_size(opts[:size])
     }
   end
 
-  def compile(:resource_template, server_name, uri_template, handler, opts) do
-    {regex, variables, query_variables} =
-      ResourceTemplate.compile_matcher!(to_string(uri_template))
+  defp compile_kind(:resource_template, uri_template, inject, opts, source) do
+    template = Component.put_identifier(%ResourceTemplate{}, to_string(uri_template))
+    {parameters, compiled_parameters} = compile_schema!(:parameters, opts[:parameters], opts)
 
-    inject = normalize_inject(opts[:inject])
-    {parameters, compiled_parameters} = compile_optional_schema!(opts[:parameters], opts)
-    completions = normalize_completions(opts[:completions])
+    public_keys =
+      template.variables ++ template.query_variables ++ schema_property_keys(parameters)
 
-    validate_injected_keys!(
-      :resource_template,
-      Enum.uniq(variables ++ query_variables ++ schema_property_keys(parameters)),
-      inject
-    )
+    validate_injected_keys!(:resource_template, Enum.uniq(public_keys), inject)
 
-    %ResourceTemplate{
-      server_name: server_name,
-      uri_template: to_string(uri_template),
-      name: normalize_optional_string(opts[:name]),
-      version: normalize_version(opts[:version]),
-      title: opts[:title],
-      description: opts[:description],
-      icons: normalize_icons(opts[:icons]),
-      annotations: normalize_annotations(opts[:annotations]),
-      inject: inject,
-      completions: completions,
-      parameters: parameters,
-      compiled_parameters: compiled_parameters,
-      task: normalize_task(opts[:task]),
-      resource_security:
-        normalize_resource_security(Keyword.get(opts, :resource_security, :inherit)),
-      authorization: normalize_authorization(opts),
-      tags: normalize_tags(opts[:tags]),
-      enabled: Keyword.get(opts, :enabled, true),
-      visibility: normalize_visibility(opts[:visibility]),
-      meta: Map.new(Keyword.get(opts, :meta, %{})),
-      timeout: opts[:timeout],
-      mime_type: Keyword.get(opts, :mime_type, "application/json"),
-      variables: variables,
-      query_variables: query_variables,
-      matcher: regex,
-      compiled: normalize_callable!(:resource_template, handler)
+    %{
+      template
+      | name: normalize_optional_string(opts[:name]),
+        annotations: resource_annotations!(opts[:annotations], source),
+        parameters: parameters,
+        compiled_parameters: compiled_parameters,
+        completions: normalize_completions(opts[:completions]),
+        mime_type: opts[:mime_type],
+        resource_security: normalize_resource_security(opts[:resource_security])
     }
   end
 
-  def compile(:prompt, server_name, name, handler, opts) do
+  defp compile_kind(:prompt, name, inject, opts, _source) do
     arguments = normalize_prompt_arguments(opts[:arguments])
-    inject = normalize_inject(opts[:inject])
     validate_injected_keys!(:prompt, Enum.map(arguments, & &1.name), inject)
 
     %Prompt{
-      server_name: server_name,
       name: to_string(name),
-      version: normalize_version(opts[:version]),
-      title: opts[:title],
-      description: opts[:description],
-      icons: normalize_icons(opts[:icons]),
       arguments: arguments,
-      inject: inject,
-      completion?: Enum.any?(arguments, &(not is_nil(Map.get(&1, :completion)))),
-      task: normalize_task(opts[:task]),
-      authorization: normalize_authorization(opts),
-      tags: normalize_tags(opts[:tags]),
-      enabled: Keyword.get(opts, :enabled, true),
-      visibility: normalize_visibility(opts[:visibility]),
-      meta: Map.new(Keyword.get(opts, :meta, %{})),
-      timeout: opts[:timeout],
-      compiled: normalize_callable!(:prompt, handler)
+      completion?: Enum.any?(arguments, &(not is_nil(&1.completion)))
     }
   end
 
-  defp compile_tool_schema!(_kind, nil, _schema_opts), do: {nil, nil}
+  @doc false
+  # MCP's naming rules for tools: 1 to 128 ASCII letters, digits, `_`, `-`,
+  # and `.`. A namespace prefixes names with `namespace_`, so it takes the
+  # same characters.
+  def name_characters?(name), do: String.match?(name, ~r/\A[A-Za-z0-9_.-]+\z/)
 
-  defp compile_tool_schema!(kind, schema, schema_opts) do
-    normalized = normalize_tool_schema!(kind, schema)
-    {normalized, Schema.compile!(normalized, schema_opts)}
+  @doc false
+  def tool_name!(name) do
+    name = to_string(name)
+
+    if byte_size(name) <= 128 and name_characters?(name) do
+      name
+    else
+      raise ArgumentError,
+            ~s(tool name must be 1 to 128 letters, digits, "_", "-", or ".", got: #{inspect(name)})
+    end
   end
 
   @doc false
-  def normalize_tool_schema!(_kind, nil), do: nil
+  # A transform, such as a mount namespace, builds `name` from the name of the
+  # tool `source`, and must stay within MCP's 128 characters; a name that was
+  # longer already, as a proxied tool's may be, is left as it is.
+  def check_built_tool_name!(source, name) do
+    if byte_size(name) > 128 and byte_size(source) <= 128 do
+      raise ArgumentError,
+            ~s(tool #{inspect(source)} becomes #{inspect(name)}, which is longer than 128 characters)
+    end
 
-  def normalize_tool_schema!(:input, schema) do
-    with {:ok, normalized} <- Schema.normalize(schema),
-         true <- Schema.object_root?(normalized) do
-      normalized
-    else
-      false ->
-        raise ArgumentError,
-              "tool input_schema must be a JSON Schema object with type: \"object\" at the root"
+    name
+  end
+
+  # Resource annotations are an open map; the keys MCP defines must hold the
+  # values it defines.
+  defp resource_annotations!(annotations, source) do
+    annotations = optional_map!(annotations, "component annotations")
+
+    if source == :local and annotations do
+      Enum.each(annotations, fn {key, value} -> resource_annotation!(to_string(key), value) end)
+    end
+
+    annotations
+  end
+
+  defp resource_annotation!("audience", audience) do
+    unless is_list(audience) and
+             Enum.all?(audience, &(&1 in ["user", "assistant", :user, :assistant])) do
+      raise ArgumentError,
+            ~s(resource annotation audience must be a list of "user" and "assistant", got: #{inspect(audience)})
+    end
+  end
+
+  defp resource_annotation!("priority", priority)
+       when is_number(priority) and priority >= 0 and priority <= 1,
+       do: :ok
+
+  defp resource_annotation!("priority", priority) do
+    raise ArgumentError,
+          "resource annotation priority must be a number from 0 to 1, got: #{inspect(priority)}"
+  end
+
+  defp resource_annotation!("lastModified", %struct{})
+       when struct in [DateTime, NaiveDateTime, Date],
+       do: :ok
+
+  defp resource_annotation!("lastModified", value) do
+    unless is_binary(value) and
+             (match?({:ok, _, _}, DateTime.from_iso8601(value)) or
+                match?({:ok, _}, NaiveDateTime.from_iso8601(value)) or
+                match?({:ok, _}, Date.from_iso8601(value))) do
+      raise ArgumentError,
+            "resource annotation lastModified must be an ISO 8601 date or date and time, got: #{inspect(value)}"
+    end
+  end
+
+  defp resource_annotation!(_key, _value), do: :ok
+
+  defp compile_schema!(_role, nil, _opts), do: {nil, nil}
+
+  defp compile_schema!(role, schema, opts) do
+    normalized = normalize_schema!(role, schema)
+    {normalized, Schema.compile!(normalized, opts[:schema_options])}
+  end
+
+  def normalize_schema!(_role, nil), do: nil
+
+  def normalize_schema!(role, schema) do
+    case Schema.normalize(schema) do
+      {:ok, normalized} ->
+        if role == :input and not Schema.object_root?(normalized) do
+          raise ArgumentError,
+                "tool input_schema must be a JSON Schema object with type: \"object\" at the root"
+        end
+
+        normalized
 
       {:error, error} ->
         raise error
-    end
-  end
-
-  def normalize_tool_schema!(:output, schema) do
-    case Schema.normalize(schema) do
-      {:ok, normalized} -> normalized
-      {:error, error} -> raise error
-    end
-  end
-
-  defp compile_optional_schema!(nil, _opts), do: {nil, nil}
-
-  defp compile_optional_schema!(schema, opts) do
-    schema_opts = Keyword.get(opts, :schema_options, [])
-
-    case Schema.normalize(schema) do
-      {:ok, normalized} -> {normalized, Schema.compile!(normalized, schema_opts)}
-      {:error, error} -> raise error
     end
   end
 
@@ -203,7 +236,7 @@ defmodule FastestMCP.ComponentCompiler do
   defp normalize_resource_security(:inherit), do: :inherit
   defp normalize_resource_security(policy), do: ResourceSecurity.new(policy)
 
-  defp normalize_callable!(_type, handler) when is_function(handler) do
+  defp normalize_callable!(handler) when is_function(handler) do
     case :erlang.fun_info(handler, :arity) do
       {:arity, 0} ->
         fn _arguments, _context -> handler.() end
@@ -248,16 +281,9 @@ defmodule FastestMCP.ComponentCompiler do
     end
   end
 
-  defp schema_property_keys(nil), do: []
-
-  defp schema_property_keys(schema) when is_map(schema) do
-    schema
-    |> Map.get(:properties, Map.get(schema, "properties", %{}))
-    |> Map.keys()
-    |> Enum.map(&to_string/1)
-  end
-
-  defp schema_property_keys(_other), do: []
+  # A normalized schema has string keys.
+  defp schema_property_keys(%{"properties" => %{} = properties}), do: Map.keys(properties)
+  defp schema_property_keys(_schema), do: []
 
   defp normalize_version(nil), do: nil
 
@@ -274,14 +300,6 @@ defmodule FastestMCP.ComponentCompiler do
   defp normalize_optional_string(nil), do: nil
   defp normalize_optional_string(value), do: to_string(value)
 
-  defp normalize_authorization(opts) do
-    opts
-    |> Keyword.get(:authorization, Keyword.get(opts, :auth))
-    |> Authorization.normalize()
-  end
-
-  defp normalize_task(value), do: TaskConfig.new(value)
-
   defp normalize_icons(nil), do: nil
   defp normalize_icons(icons) when is_list(icons), do: Enum.map(icons, &normalize_icon/1)
   defp normalize_icons(icon), do: [normalize_icon(icon)]
@@ -290,13 +308,6 @@ defmodule FastestMCP.ComponentCompiler do
 
   defp normalize_icon(icon) do
     raise ArgumentError, "component icons must be maps, got #{inspect(icon)}"
-  end
-
-  defp normalize_annotations(nil), do: nil
-  defp normalize_annotations(%{} = annotations), do: Map.new(annotations)
-
-  defp normalize_annotations(annotations) do
-    raise ArgumentError, "component annotations must be a map, got #{inspect(annotations)}"
   end
 
   defp normalize_resource_size(nil), do: nil
@@ -320,21 +331,18 @@ defmodule FastestMCP.ComponentCompiler do
     raise ArgumentError, "prompt arguments must be a list, got #{inspect(arguments)}"
   end
 
+  # Applications give argument maps with atom keys, proxied MCP descriptors
+  # with string keys.
   defp normalize_prompt_argument(%{} = argument) do
-    normalized = %{
-      name: required_prompt_arg(argument, :name),
-      description: Map.get(argument, :description, Map.get(argument, "description")),
-      required: Map.get(argument, :required, Map.get(argument, "required", false)),
-      completion:
-        normalize_optional_completion(
-          Map.get(argument, :completion, Map.get(argument, "completion"))
-        )
-    }
+    argument = string_keys(argument)
 
-    case Map.get(argument, :title, Map.get(argument, "title")) do
-      nil -> normalized
-      title -> Map.put(normalized, :title, title)
-    end
+    %{
+      name: prompt_argument_name!(argument["name"]),
+      description: argument["description"],
+      required: Map.get(argument, "required", false),
+      completion: normalize_optional_completion(argument["completion"])
+    }
+    |> maybe_put(:title, argument["title"])
   end
 
   defp normalize_prompt_argument({name, description}) do
@@ -350,15 +358,10 @@ defmodule FastestMCP.ComponentCompiler do
           "prompt arguments must be maps or {name, description[, required]} tuples, got #{inspect(argument)}"
   end
 
-  defp required_prompt_arg(argument, key) do
-    case Map.get(argument, key, Map.get(argument, Atom.to_string(key))) do
-      value when is_binary(value) and value != "" ->
-        value
+  defp prompt_argument_name!(name) when is_binary(name) and name != "", do: name
 
-      value ->
-        raise ArgumentError,
-              "prompt argument #{key} must be a non-empty string, got #{inspect(value)}"
-    end
+  defp prompt_argument_name!(name) do
+    raise ArgumentError, "prompt argument name must be a non-empty string, got #{inspect(name)}"
   end
 
   defp normalize_completions(nil), do: %{}

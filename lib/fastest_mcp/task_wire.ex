@@ -1,207 +1,147 @@
 defmodule FastestMCP.TaskWire do
   @moduledoc false
+  # Task payloads of both task eras, with the string keys of the wire.
 
-  alias FastestMCP.BackgroundTask
+  import FastestMCP.Util, only: [maybe_put: 3]
+  import FastestMCP.Protocol.Version
+
   alias FastestMCP.Error
   alias FastestMCP.ErrorExposure
   alias FastestMCP.Protocol
   alias FastestMCP.Transport.JSONRPC
   alias FastestMCP.Transport.Serializer
 
-  def create_task_result(%BackgroundTask{} = task, opts \\ []) do
-    case profile(opts) do
+  @related_task "io.modelcontextprotocol/related-task"
+
+  # The result of a task-augmented request: a task that has just started.
+  def create_task_result(task, opts \\ []) do
+    id = task_id(task)
+    profile = profile(opts)
+
+    created =
+      payload(
+        %{
+          id: id,
+          status: :working,
+          submitted_at: task.submitted_at,
+          updated_at: task.submitted_at,
+          ttl_ms: task.ttl_ms,
+          poll_interval_ms: task.poll_interval_ms
+        },
+        "Task submitted",
+        profile,
+        opts
+      )
+
+    case profile do
       :modern ->
-        task
-        |> created_task_payload(:modern)
-        |> Map.put("resultType", "task")
+        Map.put(created, "resultType", "task")
 
       :legacy ->
-        %{}
-        |> Map.put(:task, created_task_payload(task, :legacy))
-        |> maybe_put(:_meta, create_task_meta(task, opts))
+        %{
+          "task" => created,
+          "_meta" =>
+            related_task_meta(id, %{"status" => "working", "statusMessage" => "Task submitted"})
+        }
     end
   end
 
-  def task(task, opts \\ []) when is_map(task) do
-    task
-    |> ErrorExposure.public_task(opts)
-    |> task_payload(nil, nil, profile(opts), opts)
+  def task(task, opts \\ []) do
+    profile = profile(opts)
+    payload = task |> ErrorExposure.public_task(opts) |> payload(nil, profile, opts)
+    if profile == :modern, do: Map.put(payload, "resultType", "complete"), else: payload
   end
 
-  def acknowledgement(opts \\ []) do
-    if profile(opts) == :modern, do: %{"resultType" => "complete"}, else: %{}
-  end
+  def acknowledgement(opts \\ []),
+    do: if(profile(opts) == :modern, do: %{"resultType" => "complete"}, else: %{})
 
-  def task_list(%{tasks: tasks, next_cursor: next_cursor}, opts \\ []) do
-    %{tasks: Enum.map(tasks, &task(&1, opts))}
-    |> maybe_put(:nextCursor, next_cursor)
-  end
+  def task_list(%{tasks: tasks, next_cursor: next_cursor}, opts \\ []),
+    do: maybe_put(%{"tasks" => Enum.map(tasks, &task(&1, opts))}, "nextCursor", next_cursor)
 
-  def task_result(result, task_id) when is_map(result) do
-    put_related_task_meta(result, task_id)
-  end
+  def task_result(result, task_id) when is_map(result),
+    do: attach_related_task_meta(result, task_id)
 
   def task_result(result, _task_id), do: result
 
-  def status_notification(
-        task,
-        status_override \\ nil,
-        status_message_override \\ nil,
-        opts \\ []
-      ) do
-    task = ErrorExposure.public_task(task, opts)
-
+  # `message` overrides the status message derived from the task.
+  def status_notification(task, message \\ nil, opts \\ []) do
     profile = profile(opts)
 
     %{
-      jsonrpc: "2.0",
-      method:
+      "jsonrpc" => "2.0",
+      "method" =>
         if(profile == :modern, do: "notifications/tasks", else: "notifications/tasks/status"),
-      params: task_payload(task, status_override, status_message_override, profile, opts, false)
+      "params" => task |> ErrorExposure.public_task(opts) |> payload(message, profile, opts)
     }
   end
 
-  def related_task_meta(task_id, attrs \\ %{}) do
-    %{
-      "io.modelcontextprotocol/related-task" =>
-        attrs
-        |> Map.put_new(:taskId, to_string(task_id))
-    }
-  end
+  def related_task_meta(task_id, attrs \\ %{}),
+    do: %{@related_task => Map.put(attrs, "taskId", to_string(task_id))}
 
   def attach_related_task_meta(%{} = payload, task_id, attrs \\ %{}) do
-    related_meta = related_task_meta(task_id, attrs)
+    meta = related_task_meta(task_id, attrs)
 
-    cond do
-      Map.has_key?(payload, "_meta") ->
-        Map.update!(payload, "_meta", &Map.merge(&1, related_meta))
-
-      Map.has_key?(payload, :_meta) ->
-        Map.update!(payload, :_meta, &Map.merge(&1, related_meta))
-
-      true ->
-        Map.put(payload, :_meta, related_meta)
-    end
+    if Map.has_key?(payload, :_meta),
+      do: Map.update!(payload, :_meta, &Map.merge(&1, meta)),
+      else: Map.update(payload, "_meta", meta, &Map.merge(&1, meta))
   end
 
-  def task_event_metadata(task, notification) do
-    related_task =
-      %{}
-      |> Map.put(:taskId, task.id)
-      |> Map.put(:status, status_string(task.status))
-      |> maybe_put(:statusMessage, status_message(task))
-      |> maybe_put(:elicitation, interaction_meta(task))
-
+  def task_event_metadata(task, %{"params" => params} = notification) do
     %{
       task_id: task.id,
-      owner_fingerprint: Map.get(task, :owner_fingerprint),
+      owner_fingerprint: task.owner_fingerprint,
       session_id: task.session_id,
       request_id: task.request_id,
       origin_request_id: task.origin_request_id,
-      status: status_string(task.status),
+      status: params["status"],
       notification: notification,
-      related_task: related_task
+      related_task:
+        params
+        |> Map.take(["taskId", "status", "statusMessage"])
+        |> maybe_put("elicitation", elicitation(task))
     }
   end
 
-  defp create_task_meta(task, opts) do
-    attrs =
-      %{}
-      |> Map.put(:taskId, task.task_id)
-      |> Map.put(:status, "working")
-      |> maybe_put(:statusMessage, Keyword.get(opts, :status_message, "Task submitted"))
+  defp payload(task, message, profile, opts) do
+    status = to_string(task.status)
 
-    related_task_meta(task.task_id, attrs)
+    %{
+      "taskId" => task_id(task),
+      "status" => status,
+      "createdAt" => iso8601(task.submitted_at),
+      "lastUpdatedAt" => iso8601(task.updated_at || task.submitted_at)
+    }
+    |> maybe_put("statusMessage", message || status_message(task))
+    |> era_fields(task, status, profile, opts)
   end
 
-  defp put_related_task_meta(result, task_id) do
-    attach_related_task_meta(result, task_id)
+  defp era_fields(payload, task, _status, :legacy, _opts) do
+    payload
+    |> Map.put("ttl", task.ttl_ms)
+    |> Map.put("pollInterval", task.poll_interval_ms)
+    |> maybe_put("_meta", fastestmcp_meta(task))
   end
 
-  defp created_task_payload(%BackgroundTask{} = task, :legacy) do
-    %{}
-    |> Map.put(:taskId, task.task_id)
-    |> Map.put(:status, "working")
-    |> Map.put(:createdAt, iso8601(task.submitted_at))
-    |> Map.put(:lastUpdatedAt, iso8601(task.submitted_at))
-    |> Map.put(:ttl, task.ttl_ms)
-    |> Map.put(:pollInterval, task.poll_interval_ms)
-    |> Map.put(:statusMessage, "Task submitted")
-  end
-
-  defp created_task_payload(%BackgroundTask{} = task, :modern) do
-    %{}
-    |> Map.put("taskId", task.task_id)
-    |> Map.put("status", "working")
-    |> Map.put("createdAt", iso8601(task.submitted_at))
-    |> Map.put("lastUpdatedAt", iso8601(task.submitted_at))
+  defp era_fields(payload, task, status, :modern, opts) do
+    payload
     |> Map.put("ttlMs", task.ttl_ms)
-    |> Map.put("pollIntervalMs", task.poll_interval_ms)
-    |> Map.put("statusMessage", "Task submitted")
-  end
-
-  defp task_payload(
-         task,
-         status_override,
-         status_message_override,
-         profile,
-         opts,
-         result_type? \\ true
-       )
-
-  defp task_payload(
-         task,
-         status_override,
-         status_message_override,
-         :legacy,
-         _opts,
-         _result_type?
-       ) do
-    %{}
-    |> Map.put(:taskId, task_id(task))
-    |> Map.put(:status, status_override || status_string(task_status(task)))
-    |> Map.put(:createdAt, iso8601(submitted_at(task)))
-    |> Map.put(:lastUpdatedAt, iso8601(updated_at(task) || submitted_at(task)))
-    |> Map.put(:ttl, ttl_ms(task))
-    |> Map.put(:pollInterval, poll_interval_ms(task))
-    |> maybe_put(:statusMessage, status_message_override || status_message(task))
-    |> maybe_put_fastestmcp_meta(:elicitation, interaction_meta(task))
-  end
-
-  defp task_payload(task, status_override, status_message_override, :modern, opts, result_type?) do
-    status = status_override || status_string(task_status(task))
-
-    %{}
-    |> Map.put("taskId", task_id(task))
-    |> Map.put("status", status)
-    |> Map.put("createdAt", iso8601(submitted_at(task)))
-    |> Map.put("lastUpdatedAt", iso8601(updated_at(task) || submitted_at(task)))
-    |> Map.put("ttlMs", ttl_ms(task))
-    |> maybe_put("pollIntervalMs", poll_interval_ms(task))
-    |> maybe_put("statusMessage", status_message_override || status_message(task))
+    |> maybe_put("pollIntervalMs", task.poll_interval_ms)
     |> maybe_put("inputRequests", if(status == "input_required", do: input_requests(task)))
     |> maybe_put("result", if(status == "completed", do: serialized_result(task, opts)))
     |> maybe_put("error", if(status == "failed", do: serialized_error(task)))
-    |> maybe_put("resultType", if(result_type?, do: "complete"))
   end
 
-  defp maybe_put_fastestmcp_meta(payload, _key, nil), do: payload
-
-  defp maybe_put_fastestmcp_meta(payload, key, value) do
-    Map.put(payload, :_meta, %{"fastestmcp" => %{to_string(key) => value}})
+  defp fastestmcp_meta(task) do
+    case elicitation(task) do
+      nil -> nil
+      elicitation -> %{"fastestmcp" => %{"elicitation" => elicitation}}
+    end
   end
 
-  defp interaction_meta(%{
-         elicitation: %{request_id: request_id, message: message, requested_schema: schema}
-       }) do
-    %{
-      requestId: request_id,
-      message: message,
-      requestedSchema: schema
-    }
-  end
+  defp elicitation(%{elicitation: %{request_id: id, message: message, requested_schema: schema}}),
+    do: %{"requestId" => id, "message" => message, "requestedSchema" => schema}
 
-  defp interaction_meta(_task), do: nil
+  defp elicitation(_task), do: nil
 
   defp input_requests(%{input_requests: requests}) when is_map(requests), do: requests
   defp input_requests(_task), do: %{}
@@ -214,98 +154,58 @@ defmodule FastestMCP.TaskWire do
   end
 
   defp serialize_component_result(
-         %{component_type: :tool, component_descriptor: descriptor},
+         %{component_type: :tool, component_descriptor: %{} = descriptor},
          result
        ) do
     Serializer.tool_result(result, descriptor)
   end
 
   defp serialize_component_result(
-         %{component_type: :resource, target: uri, component_descriptor: descriptor},
+         %{component_type: :resource, target: uri, component_descriptor: %{} = descriptor},
          result
        ) do
     Serializer.resource_result(uri, Map.get(descriptor, :mime_type), result)
   end
 
-  defp serialize_component_result(%{component_type: :prompt}, result) do
-    Serializer.prompt_result(result)
-  end
+  defp serialize_component_result(%{component_type: :prompt}, result),
+    do: Serializer.prompt_result(result)
 
   defp serialize_component_result(_task, result) when is_map(result), do: result
   defp serialize_component_result(_task, result), do: %{"value" => result}
 
-  defp serialized_error(%{error: %Error{} = error}),
+  defp serialized_error(%{error: %Error{} = error}), do: error_object(error)
+
+  defp serialized_error(%{failure_message: message}) when is_binary(message),
+    do: error_object(%Error{code: :internal_error, message: message})
+
+  defp serialized_error(_task),
+    do: error_object(%Error{code: :internal_error, message: "background task failed"})
+
+  defp error_object(error),
     do: JSONRPC.error_object(error, protocol_version: Protocol.current_version())
 
-  defp serialized_error(%{failure_message: message}) when is_binary(message) do
-    JSONRPC.error_object(%Error{code: :internal_error, message: message},
-      protocol_version: Protocol.current_version()
-    )
-  end
-
-  defp serialized_error(_task) do
-    JSONRPC.error_object(
-      %Error{code: :internal_error, message: "background task failed"},
-      protocol_version: Protocol.current_version()
-    )
-  end
-
-  defp task_id(%{task_id: value}), do: to_string(value)
-  defp task_id(%{id: value}), do: to_string(value)
-
-  defp task_status(%{status: status}), do: status
-
-  defp submitted_at(%{submitted_at: value}), do: value
-  defp updated_at(%{updated_at: value}), do: value
-  defp ttl_ms(%{ttl_ms: value}), do: value
-  defp poll_interval_ms(%{poll_interval_ms: value}), do: value
+  defp task_id(%{task_id: id}), do: to_string(id)
+  defp task_id(%{id: id}), do: to_string(id)
 
   defp status_message(%{status: :failed, failure_message: message})
-       when is_binary(message) and message != "" do
-    message
-  end
+       when is_binary(message) and message != "",
+       do: message
 
-  defp status_message(%{status: :failed, error: %Error{} = error}), do: error.message
+  defp status_message(%{status: :failed, error: %Error{message: message}}), do: message
   defp status_message(%{status: :cancelled}), do: "Task cancelled"
 
   defp status_message(%{status: :input_required, elicitation: %{message: message}})
-       when is_binary(message) do
-    message
-  end
+       when is_binary(message),
+       do: message
 
-  defp status_message(%{interaction_status_message: message}) when is_binary(message), do: message
   defp status_message(%{progress: %{message: message}}) when is_binary(message), do: message
-  defp status_message(%{progress: %{"message" => message}}) when is_binary(message), do: message
   defp status_message(_task), do: nil
-
-  defp status_string(:working), do: "working"
-  defp status_string(:input_required), do: "input_required"
-  defp status_string(:completed), do: "completed"
-  defp status_string(:failed), do: "failed"
-  defp status_string(:cancelled), do: "cancelled"
-  defp status_string(other), do: to_string(other)
 
   defp iso8601(nil), do: nil
 
-  defp iso8601(milliseconds) when is_integer(milliseconds) do
-    milliseconds
-    |> DateTime.from_unix!(:millisecond)
-    |> DateTime.to_iso8601()
-  end
+  defp iso8601(milliseconds),
+    do: milliseconds |> DateTime.from_unix!(:millisecond) |> DateTime.to_iso8601()
 
-  defp maybe_put(map, _key, nil), do: map
-  defp maybe_put(map, key, value), do: Map.put(map, key, value)
-
-  defp profile(opts) do
-    case Keyword.get(opts, :profile) do
-      profile when profile in [:legacy, :modern] ->
-        profile
-
-      _other ->
-        case Protocol.profile(Keyword.get(opts, :protocol_version)) do
-          :modern -> :modern
-          _legacy_or_unnegotiated -> :legacy
-        end
-    end
-  end
+  defp profile(opts),
+    do: if(is_modern(Keyword.get(opts, :protocol_version)), do: :modern, else: :legacy)
 end

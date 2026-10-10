@@ -1,34 +1,11 @@
 defmodule FastestMCP.ComponentPolicy do
-  @moduledoc """
-  Applies component visibility and policy rules for a given operation.
-
-  This module keeps one focused piece of FastestMCP behavior in a dedicated
-  place so builders, runtimes, transports, and providers can share the same
-  rules without duplicating logic.
-
-  Unless you are extending FastestMCP itself, you will usually meet this
-  module indirectly through higher-level APIs rather than calling it first.
-  """
+  @moduledoc false
 
   alias FastestMCP.Authorization
   alias FastestMCP.Component
   alias FastestMCP.ComponentVisibility
   alias FastestMCP.Error
 
-  @doc "Applies the current policy or transform."
-  def apply(server, component, operation, opts \\ []) do
-    raise_on_filtered = Keyword.get(opts, :raise_on_filtered, true)
-
-    case apply_result(server, component, operation) do
-      {:ok, transformed} ->
-        transformed
-
-      {:error, %Error{} = error} ->
-        filtered(raise_on_filtered, error)
-    end
-  end
-
-  @doc false
   def apply_result(server, component, operation) do
     with {:ok, transformed} <- prepare_result(server, component, operation),
          {:ok, authorized} <- authorize_result(transformed, operation) do
@@ -36,12 +13,10 @@ defmodule FastestMCP.ComponentPolicy do
     end
   end
 
-  @doc false
   def prepare_result(server, component, operation) do
     transformed =
-      Enum.reduce(server.transforms, component, fn transform, current ->
-        if current, do: transform.(current, operation), else: nil
-      end)
+      server.transforms
+      |> transform(component, operation)
       |> ComponentVisibility.apply_server_rules(operation.server_name)
       |> ComponentVisibility.apply_session_rules(operation.context)
 
@@ -73,7 +48,6 @@ defmodule FastestMCP.ComponentPolicy do
     end
   end
 
-  @doc false
   def authorize_result(component, operation) do
     case Authorization.authorize_component(component, operation.context, operation) do
       :ok -> {:ok, component}
@@ -81,6 +55,24 @@ defmodule FastestMCP.ComponentPolicy do
     end
   end
 
-  defp filtered(true, %Error{} = error), do: raise(error)
-  defp filtered(false, %Error{}), do: nil
+  # Server transforms run in order, and nil hides the component. Schemas a
+  # transform changed are compiled again, as for provider transforms.
+  defp transform([], component, _operation), do: component
+
+  defp transform(transforms, component, operation) do
+    transformed =
+      Enum.reduce_while(transforms, component, fn transform, current ->
+        case transform.(current, operation) do
+          nil -> {:halt, nil}
+          transformed -> {:cont, transformed}
+        end
+      end)
+
+    transformed &&
+      Component.refresh_compiled_schemas(
+        transformed,
+        operation.schema_cache,
+        operation.schema_options || []
+      )
+  end
 end

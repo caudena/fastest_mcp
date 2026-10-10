@@ -213,58 +213,30 @@ defmodule FastestMCP.ApplicationSession do
      }}
   end
 
-  defp principal_partition(%Context{authenticated: false}) do
+  defp principal_partition(%Context{authenticated: true, principal: principal})
+       when not is_nil(principal),
+       do: {:ok, {:principal, Auth.principal_fingerprint(principal)}}
+
+  defp principal_partition(%Context{}) do
     {:error,
      %Error{
        code: :unauthorized,
        message: "an authenticated principal is required for application sessions"
      }}
-  end
-
-  defp principal_partition(%Context{authenticated: true, principal: nil}) do
-    {:error,
-     %Error{
-       code: :unauthorized,
-       message: "an authenticated principal is required for application sessions"
-     }}
-  end
-
-  defp principal_partition(%Context{authenticated: true, principal: principal}) do
-    {:ok, {:principal, Auth.principal_fingerprint(principal)}}
-  rescue
-    error ->
-      {:error,
-       %Error{
-         code: :internal_error,
-         message: "failed to identify the application-session principal",
-         details: %{reason: Exception.message(error)}
-       }}
   end
 
   defp explicit_partition(%Context{} = context) do
-    case principal_partition(context) do
-      {:ok, partition} ->
-        {:ok, partition}
-
-      {:error, %Error{code: :unauthorized}} = error ->
-        if allow_anonymous?(context), do: {:ok, :anonymous}, else: error
-
-      {:error, %Error{}} = error ->
-        error
-    end
+    with {:error, _unauthorized} = error <- principal_partition(context),
+         do: if(allow_anonymous?(context), do: {:ok, :anonymous}, else: error)
   end
 
   defp fetch_partitions(%Context{} = context) do
     case principal_partition(context) do
       {:ok, partition} ->
-        partitions = if allow_anonymous?(context), do: [partition, :anonymous], else: [partition]
-        {:ok, partitions}
+        {:ok, if(allow_anonymous?(context), do: [partition, :anonymous], else: [partition])}
 
-      {:error, %Error{code: :unauthorized}} = error ->
+      error ->
         if allow_anonymous?(context), do: {:ok, [:anonymous]}, else: error
-
-      {:error, %Error{}} = error ->
-        error
     end
   end
 

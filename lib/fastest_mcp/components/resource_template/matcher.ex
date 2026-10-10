@@ -1,24 +1,23 @@
 defmodule FastestMCP.Components.ResourceTemplate.Matcher do
   @moduledoc false
 
-  @supported_operators [:default, "+", "#", ".", "/", ";", "?", "&"]
-  @invalid_percent_encoding ~r/%(?![0-9A-Fa-f]{2})/
+  alias FastestMCP.URIPolicy
 
-  @doc false
+  @supported_operators [:default, "+", "#", ".", "/", ";", "?", "&"]
+
   def validate(template) when is_binary(template) do
-    parsed = parse!(template)
-    validate_operators!(parsed.parts, template)
-    :ok
-  rescue
-    error in [ArgumentError, Protocol.UndefinedError] ->
-      {:error, {:invalid_uri_template, Exception.message(error)}}
+    with {:ok, _parsed} <- parse(template), do: :ok
   end
 
   def validate(_template), do: {:error, :invalid_uri_template}
 
   def compile!(template) when is_binary(template) do
-    parsed = parse!(template)
-    validate_operators!(parsed.parts, template)
+    parsed =
+      case parse(template) do
+        {:ok, parsed} -> parsed
+        {:error, {:invalid_uri_template, message}} -> raise ArgumentError, message
+      end
+
     parts = coalesce_expressions(parsed.parts)
 
     {source, expressions, _next_index} =
@@ -49,28 +48,32 @@ defmodule FastestMCP.Components.ResourceTemplate.Matcher do
 
   def match(_matcher, _uri), do: nil
 
-  defp parse!(template) do
+  # The parsed template with only supported operators, or
+  # `{:error, {:invalid_uri_template, message}}`.
+  defp parse(template) do
     {parser_input, variable_names, literal_placeholders} = normalize_parser_input(template)
 
     case Texture.UriTemplate.parse(parser_input) do
       {:ok, parsed} ->
-        %{
-          parsed
-          | raw: template,
-            parts: normalize_parsed_parts(parsed.parts, variable_names, literal_placeholders)
-        }
+        parts = normalize_parsed_parts(parsed.parts, variable_names, literal_placeholders)
+
+        with :ok <- check_operators(parts, template),
+             do: {:ok, %{parsed | raw: template, parts: parts}}
 
       {:error, reason} ->
-        raise ArgumentError,
-              "invalid RFC 6570 resource template #{inspect(template)}: #{inspect(reason)}"
+        invalid_template(template, inspect(reason))
     end
   rescue
+    # Texture raises for some malformed templates.
     error in [ArgumentError, Protocol.UndefinedError] ->
-      reraise ArgumentError.exception(
-                "invalid RFC 6570 resource template #{inspect(template)}: #{Exception.message(error)}"
-              ),
-              __STACKTRACE__
+      invalid_template(template, Exception.message(error))
   end
+
+  defp invalid_template(template, reason),
+    do:
+      {:error,
+       {:invalid_uri_template,
+        "invalid RFC 6570 resource template #{inspect(template)}: #{reason}"}}
 
   # Texture is the parser and renderer used by FastestMCP. Its current parser
   # has two narrower-than-RFC edges: it rejects the RFC 3986 apostrophe literal
@@ -124,7 +127,7 @@ defmodule FastestMCP.Components.ResourceTemplate.Matcher do
   end
 
   defp normalize_percent_encoded_variable(name, modifier, variables, names, index) do
-    if String.contains?(name, "%") and not Regex.match?(@invalid_percent_encoding, name) do
+    if String.contains?(name, "%") and URIPolicy.valid_percent_encoding?(name) do
       placeholder = "fastestmcp_pct_var_#{index}"
       {[placeholder <> modifier | variables], Map.put(names, placeholder, name), index + 1}
     else
@@ -243,18 +246,19 @@ defmodule FastestMCP.Components.ResourceTemplate.Matcher do
     raise ArgumentError, "literal is not valid UTF-8"
   end
 
-  defp validate_operators!(parts, template) do
-    Enum.each(parts, fn
-      {:expr, operator, _variables} when operator in @supported_operators ->
+  defp check_operators(parts, template) do
+    case Enum.find(
+           parts,
+           &match?({:expr, operator, _} when operator not in @supported_operators, &1)
+         ) do
+      nil ->
         :ok
 
       {:expr, operator, _variables} ->
-        raise ArgumentError,
-              "unsupported RFC 6570 operator #{inspect(operator)} in resource template #{inspect(template)}"
-
-      _other ->
-        :ok
-    end)
+        {:error,
+         {:invalid_uri_template,
+          "unsupported RFC 6570 operator #{inspect(operator)} in resource template #{inspect(template)}"}}
+    end
   end
 
   # Adjacent path-style expressions are equivalent to one expression for
@@ -284,7 +288,12 @@ defmodule FastestMCP.Components.ResourceTemplate.Matcher do
   defp take_expressions(rest, _operator), do: {[], rest}
 
   defp compile_part({:lit, literal}, {source, expressions, index}) do
-    {source <> Regex.escape(literal), expressions, index}
+    pattern =
+      Regex.replace(~r/%[0-9A-Fa-f]{2}/, Regex.escape(literal), fn triplet ->
+        "(?i:" <> triplet <> ")"
+      end)
+
+    {source <> pattern, expressions, index}
   end
 
   defp compile_part({:expr, operator, variables}, {source, expressions, index}) do
@@ -654,18 +663,18 @@ defmodule FastestMCP.Components.ResourceTemplate.Matcher do
   defp collapse_values(values), do: values
 
   defp decode_value(value) do
-    if Regex.match?(@invalid_percent_encoding, value) do
-      :error
-    else
+    if URIPolicy.valid_percent_encoding?(value) do
       decoded = URI.decode(value)
       if String.valid?(decoded), do: {:ok, decoded}, else: :error
+    else
+      :error
     end
   end
 
   defp validate_concrete_uri(uri) do
     cond do
       not String.valid?(uri) -> :error
-      Regex.match?(@invalid_percent_encoding, uri) -> :error
+      not URIPolicy.valid_percent_encoding?(uri) -> :error
       Enum.any?(:binary.bin_to_list(uri), &(&1 <= 0x20 or &1 == 0x7F)) -> :error
       true -> :ok
     end

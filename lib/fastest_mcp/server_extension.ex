@@ -9,6 +9,8 @@ defmodule FastestMCP.ServerExtension do
   the existing operation pipeline and lifespan machinery.
   """
 
+  import FastestMCP.Protocol.Version
+
   alias FastestMCP.Lifespan
   alias FastestMCP.Protocol.Extensions
   alias FastestMCP.Schema
@@ -26,21 +28,33 @@ defmodule FastestMCP.ServerExtension do
           }
   end
 
-  defstruct [:identifier, :tool_interceptor, :lifespan, settings: %{}, methods: []]
+  defstruct [
+    :identifier,
+    :tool_interceptor,
+    :lifespan,
+    settings: %{},
+    methods: [],
+    auto_register: false
+  ]
 
   @type t :: %__MODULE__{
           identifier: String.t(),
           settings: map(),
+          auto_register: boolean(),
           methods: [Method.t()],
           tool_interceptor:
             nil
-            | (FastestMCP.Operation.t(), (FastestMCP.Operation.t() -> any()) -> any()),
+            | (FastestMCP.Operation.t(),
+               (FastestMCP.Operation.t() -> FastestMCP.Middleware.result()) ->
+                 FastestMCP.Middleware.result()),
           lifespan: term() | nil
         }
 
   @doc "Builds an executable extension declaration."
   def new(identifier, opts \\ []) when is_list(opts) do
     identifier = to_string(identifier)
+    auto_register = Keyword.get(opts, :auto_register, false)
+    unless is_boolean(auto_register), do: raise(ArgumentError, "auto_register must be a boolean")
 
     settings =
       identifier
@@ -66,6 +80,7 @@ defmodule FastestMCP.ServerExtension do
 
     %__MODULE__{
       identifier: identifier,
+      auto_register: auto_register,
       settings: settings,
       methods: methods,
       tool_interceptor: normalize_interceptor!(Keyword.get(opts, :tool_interceptor)),
@@ -108,6 +123,7 @@ defmodule FastestMCP.ServerExtension do
   def normalize!(%__MODULE__{} = extension, schema_options \\ []) when is_list(schema_options) do
     normalized =
       new(extension.identifier,
+        auto_register: extension.auto_register,
         settings: extension.settings,
         methods: extension.methods,
         tool_interceptor: extension.tool_interceptor,
@@ -119,13 +135,22 @@ defmodule FastestMCP.ServerExtension do
   end
 
   @doc false
+  def declaration(%__MODULE__{} = extension) do
+    %{
+      extension
+      | auto_register: false,
+        methods: Enum.map(extension.methods, &%{&1 | compiled_params_schema: nil})
+    }
+  end
+
+  @doc false
   def interceptor_middleware(%__MODULE__{tool_interceptor: nil}), do: nil
 
   def interceptor_middleware(%__MODULE__{} = extension) do
     fn operation, next ->
       negotiated? =
         operation.method == "tools/call" and
-          operation.context.negotiated_protocol_version == "2026-07-28" and
+          is_modern(operation.context.negotiated_protocol_version) and
           Extensions.enabled?(operation.context.client_capabilities, extension.identifier)
 
       if negotiated? do

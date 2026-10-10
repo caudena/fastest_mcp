@@ -13,7 +13,6 @@ defmodule FastestMCP.Protocol.Subscriptions do
     "notifications/prompts/list_changed" => "promptsListChanged"
   }
 
-  @doc false
   def normalize_filter!(filter, opts \\ []) do
     case normalize_filter(filter, opts) do
       {:ok, normalized} -> normalized
@@ -21,7 +20,6 @@ defmodule FastestMCP.Protocol.Subscriptions do
     end
   end
 
-  @doc false
   def normalize_filter(filter, opts \\ [])
 
   def normalize_filter(filter, opts) when is_map(filter) do
@@ -39,7 +37,6 @@ defmodule FastestMCP.Protocol.Subscriptions do
 
   def normalize_filter(_filter, _opts), do: {:error, "subscription filter must be an object"}
 
-  @doc false
   def narrow(requested, capabilities, resource_uris, task_ids) do
     requested = normalize_filter!(requested)
     resource_uris = MapSet.new(resource_uris)
@@ -77,7 +74,6 @@ defmodule FastestMCP.Protocol.Subscriptions do
     end)
   end
 
-  @doc false
   def acknowledged_subset(requested, accepted) do
     with {:ok, requested} <- normalize_filter(requested),
          {:ok, accepted} <- normalize_filter(accepted, reject_unknown: true),
@@ -89,7 +85,6 @@ defmodule FastestMCP.Protocol.Subscriptions do
     end
   end
 
-  @doc false
   def compile_filter(filter) do
     filter = normalize_filter!(filter)
 
@@ -100,7 +95,6 @@ defmodule FastestMCP.Protocol.Subscriptions do
     }
   end
 
-  @doc false
   def notification_allowed?(compiled, %{"method" => method, "params" => params})
       when is_map(params) do
     filter = Map.fetch!(compiled, :filter)

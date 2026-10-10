@@ -1,15 +1,11 @@
 defmodule FastestMCP.PathSafety do
-  @moduledoc """
-  Canonical-path helpers for filesystem-backed providers and resources.
-
-  The resolver follows symlinks one segment at a time, detects cycles, and
-  returns explicit filesystem errors. Containment checks operate on canonical
-  absolute paths so sibling prefixes cannot be mistaken for descendants.
-  """
+  @moduledoc false
+  # Symlinks are followed one segment at a time with cycle detection, and
+  # containment compares canonical absolute paths, so a sibling that shares a
+  # prefix is not mistaken for a descendant.
 
   @max_symlinks 40
 
-  @doc "Resolves an existing path to its canonical absolute path."
   def realpath(path) do
     path
     |> to_string()
@@ -18,7 +14,6 @@ defmodule FastestMCP.PathSafety do
     |> resolve_segments("/", %{}, 0)
   end
 
-  @doc "Resolves an existing path, raising `File.Error` on failure."
   def realpath!(path) do
     case realpath(path) do
       {:ok, resolved_path} ->
@@ -29,7 +24,7 @@ defmodule FastestMCP.PathSafety do
     end
   end
 
-  @doc "Returns whether a canonical path is the root itself or one of its descendants."
+  # True for the root itself or a descendant; both paths must be canonical.
   def within?(root, path) when is_binary(root) and is_binary(path) do
     root = normalize_root(root)
     path = normalize_root(path)
@@ -37,7 +32,6 @@ defmodule FastestMCP.PathSafety do
     root == "/" or path == root or String.starts_with?(path, root <> "/")
   end
 
-  @doc "Resolves a path and verifies that it remains inside a canonical root."
   def safe_realpath(root, path) do
     with {:ok, real_root} <- realpath(root),
          {:ok, real_path} <- realpath(path),

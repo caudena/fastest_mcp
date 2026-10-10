@@ -11,10 +11,11 @@ defmodule FastestMCP.Middleware.ToolSearch do
   alias FastestMCP.Apps
   alias FastestMCP.Component
   alias FastestMCP.Error
-  alias FastestMCP.InputValidator
   alias FastestMCP.Middleware.ToolInjection
+  @behaviour FastestMCP.Middleware
+
   alias FastestMCP.Operation
-  alias FastestMCP.OperationPipeline
+  alias FastestMCP.OperationPipeline.Resolver
   alias FastestMCP.Protocol
   alias FastestMCP.Server
   alias FastestMCP.Transport.Serializer
@@ -27,7 +28,6 @@ defmodule FastestMCP.Middleware.ToolSearch do
   @token_pattern ~r/[\p{L}\p{N}]+/u
 
   defstruct [
-    :middleware,
     :injection,
     search_tool_name: @default_search_tool_name,
     call_tool_name: @default_call_tool_name,
@@ -37,7 +37,6 @@ defmodule FastestMCP.Middleware.ToolSearch do
   ]
 
   @type t :: %__MODULE__{
-          middleware: (Operation.t(), (Operation.t() -> any()) -> any()),
           injection: struct(),
           search_tool_name: String.t(),
           call_tool_name: String.t(),
@@ -107,7 +106,7 @@ defmodule FastestMCP.Middleware.ToolSearch do
       max_scan: max_scan
     }
 
-    %{tool_search | middleware: fn operation, next -> call(tool_search, operation, next) end}
+    tool_search
   end
 
   def new(other) do
@@ -120,14 +119,14 @@ defmodule FastestMCP.Middleware.ToolSearch do
   end
 
   @doc false
+  @impl FastestMCP.Middleware
   def call(%__MODULE__{} = tool_search, %Operation{method: "tools/list"} = operation, _next) do
-    ensure_no_collisions!(tool_search, operation)
-    catalog_operation = OperationPipeline.tool_catalog_operation(operation)
-
-    pinned = OperationPipeline.visible_tools_named(catalog_operation, tool_search.pinned)
-    synthetic = ToolInjection.visible_tools(tool_search.injection, catalog_operation)
-
-    Enum.map(pinned ++ synthetic, &Component.metadata/1)
+    with :ok <- ensure_no_collisions(tool_search, operation) do
+      catalog_operation = Resolver.catalog_operation(operation)
+      pinned = Resolver.visible_tools_named(catalog_operation, tool_search.pinned)
+      synthetic = ToolInjection.visible_tools(tool_search.injection, catalog_operation)
+      {:ok, %{operation | result: Enum.map(pinned ++ synthetic, &Component.metadata/1)}}
+    end
   end
 
   def call(
@@ -135,34 +134,33 @@ defmodule FastestMCP.Middleware.ToolSearch do
         %Operation{method: "tools/call", target: target} = operation,
         next
       ) do
-    ensure_no_collisions!(tool_search, operation)
-
     with_synthetic_tool(tool_search, target, operation, next, fn tool ->
-      arguments = InputValidator.validate(tool, operation.arguments)
-      tokens = normalized_query_tokens!(Map.fetch!(arguments, "query"))
+      arguments = Component.validate_arguments(tool, operation.arguments)
 
-      {ranked, scan} =
-        OperationPipeline.fold_visible_tools(
-          operation,
-          tool_search.max_scan,
-          [],
-          fn candidate, best ->
-            case search_rank(candidate, tokens) do
-              nil -> best
-              rank -> bounded_insert(best, {rank, candidate}, tool_search.max_results)
+      with {:ok, tokens} <- normalized_query_tokens(Map.fetch!(arguments, "query")) do
+        {ranked, scan} =
+          Resolver.fold_visible_tools(
+            operation,
+            tool_search.max_scan,
+            [],
+            fn candidate, best ->
+              case search_rank(candidate, tokens) do
+                nil -> best
+                rank -> bounded_insert(best, {rank, candidate}, tool_search.max_results)
+              end
             end
-          end
-        )
+          )
 
-      result = %{
-        "tools" =>
-          Enum.map(ranked, fn {_rank, candidate} ->
-            search_descriptor(candidate, operation)
-          end),
-        "truncated" => scan.truncated
-      }
+        result = %{
+          "tools" =>
+            Enum.map(ranked, fn {_rank, candidate} ->
+              search_descriptor(candidate, operation)
+            end),
+          "truncated" => scan.truncated
+        }
 
-      record_synthetic_result(tool, operation, result)
+        synthetic_result(tool, operation, result)
+      end
     end)
   end
 
@@ -171,30 +169,23 @@ defmodule FastestMCP.Middleware.ToolSearch do
         %Operation{method: "tools/call", target: target} = operation,
         next
       ) do
-    ensure_no_collisions!(tool_search, operation)
-
     with_synthetic_tool(tool_search, target, operation, next, fn tool ->
-      arguments = InputValidator.validate(tool, operation.arguments)
+      arguments = Component.validate_arguments(tool, operation.arguments)
       delegated_name = Map.fetch!(arguments, "name")
 
-      if delegated_name in reserved_names(tool_search) do
-        recursion_error!()
+      if delegated_name in reserved_names(tool_search) or recursion_active?(operation) do
+        {:error,
+         %Error{code: :bad_request, message: "recursive tool-search delegation is not allowed"}}
+      else
+        next.(%{
+          operation
+          | target: delegated_name,
+            audience: :model,
+            arguments: Map.get(arguments, "arguments", %{}),
+            component: nil,
+            context: mark_recursion(operation.context)
+        })
       end
-
-      if recursion_active?(operation) do
-        recursion_error!()
-      end
-
-      delegated_context = mark_recursion(operation.context)
-
-      next.(%{
-        operation
-        | target: delegated_name,
-          audience: :model,
-          arguments: Map.get(arguments, "arguments", %{}),
-          component: nil,
-          context: delegated_context
-      })
     end)
   end
 
@@ -205,31 +196,33 @@ defmodule FastestMCP.Middleware.ToolSearch do
   defp with_synthetic_tool(tool_search, target, operation, next, fun) do
     model_operation = %{operation | audience: :model}
 
-    case ToolInjection.prepare_tool(tool_search.injection, target, model_operation) do
-      {:ok, tool} -> fun.(tool)
-      :hidden -> next.(operation)
-      :not_found -> next.(operation)
-      {:error, %Error{} = error} -> raise error
+    with :ok <- ensure_no_collisions(tool_search, operation) do
+      case ToolInjection.prepare_tool(tool_search.injection, target, model_operation) do
+        {:ok, tool} -> fun.(tool)
+        {:error, %Error{}} = error -> error
+        _hidden_or_missing -> next.(operation)
+      end
     end
   end
 
-  defp record_synthetic_result(tool, operation, result) do
+  defp synthetic_result(tool, operation, result) do
     operation = %{operation | component: tool}
     FastestMCP.Telemetry.annotate_span(operation)
-    OperationPipeline.record_resolved_component(operation.context, tool)
-    Component.normalize_result(tool, result)
+
+    with {:ok, result} <- Component.normalize_result(tool, result),
+         do: {:ok, %{operation | result: result}}
   end
 
-  defp ensure_no_collisions!(tool_search, operation) do
-    case OperationPipeline.tool_name_collisions(operation, reserved_names(tool_search)) do
+  defp ensure_no_collisions(tool_search, operation) do
+    case Resolver.tool_name_collisions(operation, reserved_names(tool_search)) do
       [] ->
         :ok
 
       _collisions ->
-        raise Error,
-          code: :internal_error,
-          message:
-            "tool search is unavailable because its reserved names collide with the catalog"
+        {:error,
+         Error.internal(
+           "tool search is unavailable because its reserved names collide with the catalog"
+         )}
     end
   end
 
@@ -244,26 +237,22 @@ defmodule FastestMCP.Middleware.ToolSearch do
     }
   end
 
-  defp recursion_error! do
-    raise Error,
-      code: :bad_request,
-      message: "recursive tool-search delegation is not allowed"
-  end
+  defp normalized_query_tokens(query) when is_binary(query) do
+    case tokenize(query) do
+      [] ->
+        {:error,
+         %Error{
+           code: :bad_request,
+           message: "tool search query must contain at least one letter or number"
+         }}
 
-  defp normalized_query_tokens!(query) when is_binary(query) do
-    tokens = tokenize(query)
-
-    if tokens == [] do
-      raise Error,
-        code: :bad_request,
-        message: "tool search query must contain at least one letter or number"
+      tokens ->
+        {:ok, %{text: query |> String.trim() |> normalize_search_text(), tokens: tokens}}
     end
-
-    %{text: query |> String.trim() |> String.downcase(), tokens: tokens}
   end
 
   defp search_rank(tool, %{text: query, tokens: query_tokens}) do
-    name = tool.name |> to_string() |> String.downcase()
+    name = normalize_search_text(tool.name)
     name_tokens = tokenize(name)
 
     descriptive_tokens =
@@ -307,7 +296,9 @@ defmodule FastestMCP.Middleware.ToolSearch do
         server_extensions
       )
 
+    # The metadata `tools/list` serializes, so a found tool is described alike.
     tool
+    |> Component.metadata()
     |> Map.put(:meta, filtered_meta)
     |> Serializer.tool_metadata(protocol_version: operation.context.negotiated_protocol_version)
   end
@@ -318,11 +309,11 @@ defmodule FastestMCP.Middleware.ToolSearch do
     end)
   end
 
+  # A compiled tool's input schema has string keys.
   defp public_parameter_tokens(tool) do
     properties =
-      case Map.get(tool, :input_schema) do
+      case tool.input_schema do
         %{"properties" => %{} = properties} -> properties
-        %{properties: %{} = properties} -> properties
         _other -> %{}
       end
 
@@ -351,20 +342,20 @@ defmodule FastestMCP.Middleware.ToolSearch do
        when is_binary(description),
        do: tokenize(description)
 
-  defp parameter_description_tokens(%{description: description}) when is_binary(description),
-    do: tokenize(description)
-
   defp parameter_description_tokens(_schema), do: []
 
   defp put_tokens(tokens, values), do: Enum.reduce(values, tokens, &MapSet.put(&2, &1))
 
   defp tokenize(value) do
     value
-    |> to_string()
-    |> String.downcase()
+    |> normalize_search_text()
     |> then(&Regex.scan(@token_pattern, &1))
     |> Enum.map(&List.first/1)
     |> Enum.uniq()
+  end
+
+  defp normalize_search_text(value) do
+    value |> to_string() |> String.normalize(:nfkc) |> :string.casefold()
   end
 
   defp bounded_insert(entries, entry, limit) do

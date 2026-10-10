@@ -1,29 +1,41 @@
 defmodule FastestMCP.TaskBackend do
   @moduledoc """
-  Behaviour for background-task storage backends.
+  Behaviour for background-task storage.
 
-  FastestMCP keeps task execution orchestration in `FastestMCP.BackgroundTaskStore`
-  and delegates storage concerns to a backend. The split is intentional:
+  Each running server keeps its task records in one backend, configured with
+  the `task_backend:` option of `FastestMCP.start_server/2` (default
+  `FastestMCP.TaskBackend.Memory`):
 
-      BackgroundTaskStore
-      -> owns process coordination, waiters, and EventBus emission
-      -> asks TaskBackend to persist, fetch, paginate, and expire task state
+  ```elixir
+  FastestMCP.start_server(server, task_backend: {MyApp.TaskBackend, shard: :local})
+  ```
 
-  That keeps the current OTP runtime simple while making room for ETS-backed or
-  distributed implementations without changing the public task API.
+  A backend is a set of functions over its own state. When the server starts,
+  its task store calls `c:init/1` with the configured options, then passes the
+  state to every callback and keeps the state each write returns. Every
+  callback runs in the task store process, which owns anything `c:init/1`
+  creates, such as an ETS table.
+
+  Task records are `FastestMCP.TaskRecord` structs keyed by their `:id`;
+  store and return them unchanged. The task store applies session and owner scoping, expiry, and
+  pagination itself. It deletes a finished task when its TTL elapses and hides
+  expired records from reads until then. On startup it lists the stored tasks:
+  tasks a previous runtime left running fail, and expired ones are deleted.
+
+  A callback error fails the pending work of the tasks involved; an error from
+  `c:init/1` or the startup listing keeps the server from starting.
   """
 
-  @type store_ref :: pid() | atom()
-  @type task :: map()
-  @type list_result :: %{tasks: [task()], next_cursor: String.t() | nil}
+  @typedoc "Backend state, returned by `c:init/1` and by every write."
+  @type state :: term()
 
-  @callback start_link(opts :: keyword()) :: GenServer.on_start()
-  @callback put_task(store :: store_ref(), task()) :: :ok | {:error, term()}
-  @callback fetch_task(store :: store_ref(), task_id :: String.t(), opts :: keyword()) ::
+  @typedoc "A task record."
+  @type task :: FastestMCP.TaskRecord.t()
+
+  @callback init(opts :: keyword()) :: {:ok, state()} | {:error, term()}
+  @callback put_task(state(), task()) :: {:ok, state()} | {:error, term()}
+  @callback fetch_task(state(), task_id :: String.t()) ::
               {:ok, task()} | {:error, :not_found | term()}
-  @callback delete_task(store :: store_ref(), task_id :: String.t()) :: :ok | {:error, term()}
-  @callback list_tasks(store :: store_ref(), opts :: keyword()) ::
-              {:ok, list_result()} | {:error, term()}
-  @callback expire_tasks(store :: store_ref(), now_ms :: integer()) ::
-              {:ok, [String.t()]} | {:error, term()}
+  @callback delete_task(state(), task_id :: String.t()) :: {:ok, state()} | {:error, term()}
+  @callback list_tasks(state()) :: {:ok, [task()]} | {:error, term()}
 end

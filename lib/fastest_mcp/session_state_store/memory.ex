@@ -13,7 +13,7 @@ defmodule FastestMCP.SessionStateStore.Memory do
 
   @behaviour FastestMCP.SessionStateStore
 
-  @doc "Starts the process owned by this module."
+  @doc "Starts an empty store."
   @impl true
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts)

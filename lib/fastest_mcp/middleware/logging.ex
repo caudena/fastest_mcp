@@ -1,23 +1,22 @@
 defmodule FastestMCP.Middleware.Logging do
-  @moduledoc """
-  Request logging middleware with optional structured output and payload details.
-
-  Middleware modules in FastestMCP are configured as explicit structs that
-  carry options plus a ready-to-run `middleware` function. That keeps runtime
-  assembly cheap while making the configured value easy to inspect in tests.
-
-  Most applications reach this module through `FastestMCP.Middleware` helper
-  functions or by adding the configured struct directly with
-  `FastestMCP.Server.add_middleware/2`.
-  """
+  @moduledoc false
 
   require Logger
 
+  @behaviour FastestMCP.Middleware
+
+  alias FastestMCP.Component
+  alias FastestMCP.Middleware.Timing
   alias FastestMCP.Operation
+
+  @payload_types %{
+    "tools/call" => "CallToolRequestParams",
+    "resources/read" => "ReadResourceRequestParams",
+    "prompts/get" => "GetPromptRequestParams"
+  }
 
   defstruct [
     :log_fn,
-    :middleware,
     :payload_serializer,
     log_level: :info,
     include_payloads: false,
@@ -30,7 +29,6 @@ defmodule FastestMCP.Middleware.Logging do
 
   @type t :: %__MODULE__{
           log_fn: (atom(), String.t() -> any()),
-          middleware: (Operation.t(), (Operation.t() -> any()) -> any()),
           payload_serializer: (any() -> String.t()) | nil,
           log_level: atom(),
           include_payloads: boolean(),
@@ -41,10 +39,9 @@ defmodule FastestMCP.Middleware.Logging do
           structured_logging: boolean()
         }
 
-  @doc "Builds a new value for this module from the supplied options."
   def new(opts \\ []) do
     middleware = %__MODULE__{
-      log_fn: Keyword.get(opts, :log_fn, &default_log/2),
+      log_fn: Keyword.get(opts, :log_fn, &Logger.log/2),
       payload_serializer: Keyword.get(opts, :payload_serializer),
       log_level: Keyword.get(opts, :log_level, :info),
       include_payloads: Keyword.get(opts, :include_payloads, false),
@@ -55,31 +52,31 @@ defmodule FastestMCP.Middleware.Logging do
       structured_logging: Keyword.get(opts, :structured_logging, false)
     }
 
-    %{middleware | middleware: fn operation, next -> call(middleware, operation, next) end}
+    middleware
   end
 
-  @doc "Runs the middleware around the next operation."
+  @impl FastestMCP.Middleware
   def call(%__MODULE__{} = middleware, %Operation{} = operation, next)
       when is_function(next, 1) do
     if log_method?(middleware, operation.method) do
       emit(middleware, before_message(middleware, operation))
       started_at = System.monotonic_time()
+      result = next.(operation)
 
-      try do
-        result = next.(operation)
-        emit(middleware, after_message(middleware, operation, started_at))
-        result
-      rescue
-        error ->
+      case result do
+        {:ok, _operation} ->
+          emit(middleware, after_message(middleware, operation, started_at))
+
+        {:error, error} ->
           emit(middleware, error_message(middleware, operation, started_at, error), :error)
-          reraise error, __STACKTRACE__
       end
+
+      result
     else
       next.(operation)
     end
   end
 
-  @doc "Builds the log payload emitted before execution."
   def before_message(%__MODULE__{} = middleware, %Operation{} = operation) do
     payload = serialized_payload(middleware, operation)
 
@@ -90,33 +87,30 @@ defmodule FastestMCP.Middleware.Logging do
         source: "server"
       }
       |> maybe_put_payload_length(payload, middleware)
-      |> maybe_put_payload(payload, payload_type(operation), middleware)
+      |> maybe_put_payload(payload, Map.get(@payload_types, operation.method, "Map"), middleware)
 
     base
   end
 
-  @doc "Builds the log payload emitted after execution."
   def after_message(_middleware, %Operation{} = operation, started_at) do
     %{
       event: "request_success",
       method: operation.method,
       source: "server",
-      duration_ms: duration_ms(started_at)
+      duration_ms: Timing.elapsed_ms(started_at)
     }
   end
 
-  @doc "Builds the log payload emitted on failure."
   def error_message(_middleware, %Operation{} = operation, started_at, error) do
     %{
       event: "request_error",
       method: operation.method,
       source: "server",
-      duration_ms: duration_ms(started_at),
+      duration_ms: Timing.elapsed_ms(started_at),
       error: Exception.message(error)
     }
   end
 
-  @doc "Formats the final log message."
   def format_message(%__MODULE__{structured_logging: true}, message) do
     JSON.encode!(message)
   end
@@ -189,42 +183,28 @@ defmodule FastestMCP.Middleware.Logging do
   defp maybe_put(message, _key, _value, false), do: message
   defp maybe_put(message, key, value, true), do: Map.put(message, key, value)
 
-  defp request_payload(%Operation{method: "tools/call"} = operation) do
-    %{"name" => operation.target, "arguments" => operation.arguments}
+  defp request_payload(%Operation{method: method} = operation)
+       when method in ["initialize", "ping"],
+       do: operation.arguments
+
+  defp request_payload(%Operation{} = operation) do
+    case Component.call_kind(operation.method) do
+      nil ->
+        %{}
+
+      :resource ->
+        %{"uri" => operation.target}
+
+      kind ->
+        %{Component.call_param(kind) => operation.target, "arguments" => operation.arguments}
+    end
   end
-
-  defp request_payload(%Operation{method: "resources/read"} = operation) do
-    %{"uri" => operation.target}
-  end
-
-  defp request_payload(%Operation{method: "prompts/get"} = operation) do
-    %{"name" => operation.target, "arguments" => operation.arguments}
-  end
-
-  defp request_payload(%Operation{method: "initialize"} = operation), do: operation.arguments
-  defp request_payload(%Operation{method: "ping"} = operation), do: operation.arguments
-  defp request_payload(%Operation{}), do: %{}
-
-  defp payload_type(%Operation{method: "tools/call"}), do: "CallToolRequestParams"
-  defp payload_type(%Operation{method: "resources/read"}), do: "ReadResourceRequestParams"
-  defp payload_type(%Operation{method: "prompts/get"}), do: "GetPromptRequestParams"
-  defp payload_type(%Operation{}), do: "Map"
 
   defp log_method?(%__MODULE__{methods: nil}, _method), do: true
   defp log_method?(%__MODULE__{methods: methods}, method), do: method in methods
 
-  defp duration_ms(started_at) do
-    System.monotonic_time()
-    |> Kernel.-(started_at)
-    |> System.convert_time_unit(:native, :microsecond)
-    |> Kernel./(1_000)
-    |> Float.round(2)
-  end
-
   defp normalize_methods(nil), do: nil
   defp normalize_methods(methods), do: Enum.map(methods, &to_string/1)
-
-  defp default_log(level, message), do: Logger.log(level, message)
 
   defp ordered_entries(message) do
     preferred = [

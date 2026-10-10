@@ -1,379 +1,167 @@
 # FastestMCP
 
-**OTP-native MCP servers and clients for Elixir.**
+**MCP servers and clients for Elixir and Phoenix.**
 
-FastestMCP provides supervised server runtimes, connected clients, strict
-protocol handling, authorization, tasks, middleware, and providers for ordinary
-Elixir and Phoenix applications. It is designed around explicit lifecycles,
-bounded work, and familiar OTP supervision rather than a separate runtime.
+The [Model Context Protocol](https://modelcontextprotocol.io) (MCP) lets AI
+applications such as Claude, ChatGPT, Cursor, and AI-enabled editors use your
+software: the model calls your *tools*, reads your *resources*, and offers your
+*prompts* to the user. FastestMCP turns your Elixir or Phoenix application into
+an MCP server, with ordinary functions as handlers and OTP supervision
+underneath, and includes a client for calling other MCP servers.
 
-[Protocol support](#protocol-support) · [Installation](#installation) ·
-[Quick start](#quick-start) · [Examples](#server-and-component-dsl) ·
-[Phoenix and authentication](#phoenix-and-authentication) ·
-[Documentation](#documentation)
-
-## Protocol support
-
-FastestMCP supports both MCP revisions from the same server, process, and
-endpoint:
-
-| Revision | Profile | Startup and state | Tasks |
-| --- | --- | --- | --- |
-| MCP `2026-07-28` | Modern and preferred | `server/discover`; request-scoped protocol metadata; sessionless HTTP | Optional `io.modelcontextprotocol/tasks` v2 extension |
-| MCP `2025-11-25` | Legacy compatibility | `initialize`, then `notifications/initialized`; server-issued HTTP session | Optional legacy Tasks v1 |
-
-Both profiles are available over Streamable HTTP and stdio. Connected clients
-prefer `2026-07-28` by default, with transport-specific compatibility fallback.
-Exact version pins are available for migrations and compatibility testing.
-
-```elixir
-FastestMCP.supported_protocol_versions()
-# => ["2026-07-28", "2025-11-25"]
-
-FastestMCP.current_protocol_version()
-# => "2026-07-28"
-```
-
-A single running server may serve modern and legacy clients concurrently;
-protocol state belongs to each request or legacy session, not to a global
-server switch. See [Protocol Versions](docs/protocol-versions.md) for the wire
-and lifecycle differences.
-
-## Highlights
-
-| Area | What FastestMCP provides |
-| --- | --- |
-| Server runtime | Module-owned or dynamic servers with supervised execution, bounded concurrency, overload control, and isolated lifecycles |
-| Connected client | Supervised Streamable HTTP, stdio, and in-process connections with callbacks, progress, subscriptions, Tasks, automatic protocol negotiation, and end-to-end OpenTelemetry |
-| Components | Tools, resources, resource templates, prompts, completion, runtime mutation, transforms, and visibility policies |
-| Security | Pluggable authentication, RFC 9728 protected-resource metadata, scope-aware authorization, and secure-by-default lexical resource-template screening |
-| Extensibility | Middleware, providers, mounted servers, active negotiated extensions, request-scoped proxying, and bounded tool search |
-| Protocol features | MRTR, modern and legacy Tasks, MCP Apps metadata/resources, pagination, logging, cancellation, and JSON Schema validation |
-| State and operations | Request state, legacy transport sessions, application sessions, background tasks, telemetry, and structured cleanup |
+[Getting Started](docs/getting-started.md) ·
+[Core Concepts](docs/concepts.md) ·
+[Phoenix](docs/phoenix.md) ·
+[All guides](#documentation)
 
 ## Installation
 
-Add FastestMCP to your dependencies:
+Add `fastest_mcp` to your dependencies in `mix.exs`:
 
 ```elixir
 def deps do
   [
-    {:fastest_mcp, "~> 0.3.1"}
+    {:fastest_mcp, "~> 1.0"}
   ]
 end
 ```
 
-Then fetch dependencies:
+FastestMCP requires Elixir 1.19 or later.
 
-```bash
-mix deps.get
-```
+## Quick start with Phoenix
 
-## Quick Start
-
-Start with a module-owned server:
+Define a server module. Each tool is a function plus a description and a JSON
+Schema that tell the model how to call it. The handlers call `MyApp.Notes`,
+one of your application's contexts; [Getting Started](docs/getting-started.md)
+builds it as a small notes store:
 
 ```elixir
+# lib/my_app/mcp_server.ex
 defmodule MyApp.MCPServer do
-  use FastestMCP.ServerModule,
-    http: [port: 4100, allowed_hosts: :localhost]
-
-  alias FastestMCP.Context
+  use FastestMCP.ServerModule
 
   def server(opts) do
     base_server(opts)
-    |> FastestMCP.add_tool("sum", fn %{"a" => a, "b" => b}, _ctx -> a + b end)
-    |> FastestMCP.add_tool("visit", fn _arguments, ctx ->
-      visits = Context.get_state(ctx, :visits, 0) + 1
-      :ok = Context.set_state(ctx, :visits, visits)
-      %{visits: visits, server: ctx.server_name}
+    |> FastestMCP.add_tool(
+      "search_notes",
+      fn %{"query" => query}, _ctx -> %{notes: MyApp.Notes.search(query)} end,
+      description: "Find the notes that contain a word or phrase.",
+      input_schema: %{
+        "type" => "object",
+        "properties" => %{"query" => %{"type" => "string"}},
+        "required" => ["query"]
+      }
+    )
+    |> FastestMCP.add_resource_template("notes://{id}", fn %{"id" => id}, _ctx ->
+      MyApp.Notes.get(id)
     end)
   end
 end
+```
 
+Start it with your application, before the endpoint:
+
+```elixir
+# In lib/my_app/application.ex
 children = [
-  MyApp.MCPServer
-]
-
-FastestMCP.call_tool(MyApp.MCPServer, "sum", %{"a" => 20, "b" => 22})
-# => 42
-```
-
-Connect over HTTP with automatic latest-first negotiation:
-
-```elixir
-client =
-  FastestMCP.Client.connect!("http://localhost:4100/mcp",
-    protocol_version: :auto,
-    client_info: %{"name" => "my_app", "version" => "1.0.0"}
-  )
-
-FastestMCP.Client.protocol_version(client)
-# => "2026-07-28"
-
-%FastestMCP.Client.ToolResult{structured_content: 42} =
-  FastestMCP.Client.call_tool_result(client, "sum", %{"a" => 20, "b" => 22})
-
-request =
-  FastestMCP.Client.start_tool_result(client, "slow_sum", %{"a" => 20, "b" => 22})
-
-# This remains valid if tools/call becomes a negotiated remote task.
-:ok = FastestMCP.Client.cancel_tool_result(request, "no longer needed")
-
-:ok = FastestMCP.Client.disconnect(client)
-```
-
-Production applications can supervise and name the connection instead of
-holding a manually connected handle:
-
-```elixir
-children = [
-  {FastestMCP.Client,
-   target: "http://localhost:4100/mcp",
-   name: MyApp.MCPClient,
-   protocol_version: :auto}
-]
-
-:ok = FastestMCP.Client.await_ready(MyApp.MCPClient, 10_000)
-%{items: tools} = FastestMCP.Client.list_tools(MyApp.MCPClient)
-```
-
-Client operations create OpenTelemetry CLIENT spans and propagate W3C trace
-context through MCP request metadata, so Phoenix request traces continue across
-the remote MCP call without application glue.
-
-The full onboarding path, including transport startup and the first connected
-client call, lives in [docs/onboarding.md](docs/onboarding.md).
-
-## Server and component DSL
-
-The builder API composes every component onto one server definition. Tools,
-resources, templates, and prompts then share the same middleware,
-authorization, visibility, task, and telemetry pipeline.
-
-```elixir
-input_schema = %{
-  "type" => "object",
-  "properties" => %{
-    "environment" => %{
-      "type" => "string",
-      "enum" => ["staging", "production"]
-    }
-  },
-  "required" => ["environment"]
-}
-
-server =
-  FastestMCP.server("operations")
-  |> FastestMCP.add_tool(
-    "deployment_status",
-    fn %{"environment" => environment}, _ctx ->
-      FastestMCP.Tools.Result.new(
-        "#{environment} is healthy",
-        structured_content: %{environment: environment, status: "healthy"}
-      )
-    end,
-    description: "Read the current deployment status",
-    input_schema: input_schema
-  )
-  |> FastestMCP.add_resource("config://environments", fn _arguments, _ctx ->
-    %{environments: ["staging", "production"]}
-  end)
-  |> FastestMCP.add_resource_template(
-    "deployments://{environment}/latest",
-    fn %{"environment" => environment}, _ctx ->
-      %{environment: environment, revision: "2026.08.14", status: "healthy"}
-    end
-  )
-  |> FastestMCP.add_prompt(
-    "review_deployment",
-    fn %{"environment" => environment}, _ctx ->
-      "Review the latest #{environment} deployment and identify operational risks."
-    end,
-    arguments: [%{name: "environment", required: true}]
-  )
-
-{:ok, _pid} = FastestMCP.start_server(server)
-```
-
-Use `FastestMCP.ServerModule` when the definition belongs in an application
-supervision tree, as shown in the quick start. Use `FastestMCP.server/2` for
-dynamic definitions, tests, and provider composition.
-
-## MCP Apps
-
-MCP Apps link an ordinary tool to a `ui://` HTML resource. The tool must keep a
-useful text fallback, while a negotiated Apps-capable client receives the UI
-metadata and document.
-
-```elixir
-alias FastestMCP.Apps
-
-app_uri = "ui://reports/summary.html"
-app_options = [
-  csp: %{"connectDomains" => ["https://api.example.com"]},
-  prefers_border: true
-]
-
-server =
-  FastestMCP.server("reports",
-    extensions: %{Apps.extension_id() => %{}}
-  )
-  |> FastestMCP.add_tool(
-    "show_report",
-    fn _arguments, _ctx ->
-      FastestMCP.Tools.Result.new(
-        "The report is ready.",
-        structured_content: %{status: "ready"}
-      )
-    end,
-    meta: Apps.tool_meta(app_uri)
-  )
-  |> FastestMCP.add_resource(
-    app_uri,
-    fn _arguments, _ctx ->
-      Apps.result(
-        app_uri,
-        "<!doctype html><html><body><main>Report</main></body></html>",
-        app_options
-      )
-    end,
-    mime_type: Apps.mime_type(),
-    meta: Apps.resource_meta(app_options)
-  )
-```
-
-The connected client opts in with the supported Apps MIME type:
-
-```elixir
-client =
-  FastestMCP.Client.connect!(endpoint,
-    extensions: %{Apps.extension_id() => Apps.client_settings()}
-  )
-```
-
-FastestMCP owns the MCP metadata and resource boundary. The consuming Host owns
-HTML rendering, iframe sandboxing, CSP enforcement, permissions, consent, and
-the Host/View bridge.
-
-## Phoenix and authentication
-
-When Phoenix owns the listener, supervise the MCP server without its standalone
-HTTP transport. Normalize the identity already verified by your application and
-apply component scopes on the same server definition:
-
-```elixir
-defmodule MyApp.MCPServer do
-  use FastestMCP.ServerModule,
-    otp_app: :my_app,
-    protected_resource: [
-      resource: "https://mcp.example.com/mcp",
-      authorization_servers: ["https://auth.example.com"],
-      scopes_supported: ["reports:read", "reports:write"],
-      required_scopes: ["reports:read"]
-    ]
-
-  def server(opts) do
-    base_server(opts)
-    |> FastestMCP.add_auth(
-      FastestMCP.Auth.from_assign(:mcp_identity,
-        principal: fn identity -> {identity.issuer, identity.subject} end,
-        audiences: fn identity -> identity.verified_audiences end,
-        scopes: fn identity -> identity.verified_scopes end,
-        auth: fn identity -> %{source: :phoenix, subject: identity.subject} end
-      )
-    )
-    |> FastestMCP.add_tool(
-      "create_report",
-      fn arguments, ctx -> MyApp.Reports.create!(arguments, actor: ctx.principal) end,
-      auth: FastestMCP.Authorization.require_scopes(["reports:write"])
-    )
-  end
-end
-```
-
-Add `MyApp.MCPServer` before `MyAppWeb.Endpoint` in the application supervision
-tree:
-
-```elixir
-children = [
-  MyApp.Repo,
   MyApp.MCPServer,
   MyAppWeb.Endpoint
 ]
 ```
 
-Mount RFC 9728 discovery publicly, then mount the MCP endpoint behind a
-non-halting identity verifier:
+Route `/mcp` to it, in a scope of its own and without the `:browser` or `:api`
+pipeline; the server module is the plug of its endpoint:
 
 ```elixir
-pipeline :mcp_auth do
-  # Verifies signature/introspection, issuer, expiry, audience, and scopes.
-  # It assigns :mcp_identity when valid, but never redirects or halts.
-  plug MyAppWeb.MCPBearerVerifier
-end
-
+# In lib/my_app_web/router.ex
 scope "/" do
-  forward "/.well-known/oauth-protected-resource/mcp",
-          FastestMCP.Transport.WellKnownHTTP,
-    server_name: MyApp.MCPServer,
-    path: "/mcp",
-    base_url: "https://mcp.example.com",
-    allowed_hosts: ["mcp.example.com"]
-end
-
-scope "/" do
-  pipe_through :mcp_auth
-
-  forward "/mcp", FastestMCP.Transport.HTTPApp,
-    server_name: MyApp.MCPServer,
-    path: "/mcp",
-    base_url: "https://mcp.example.com",
-    allowed_hosts: ["mcp.example.com"],
-    auth_assigns: [:mcp_identity]
+  forward "/mcp", MyApp.MCPServer
 end
 ```
 
-The verifier must not issue its own redirect or challenge: FastestMCP owns the
-MCP `401`/`403` and `WWW-Authenticate` response. Keep the well-known route
-outside authentication, use a narrow `auth_assigns:` allowlist, and return only
-audiences and scopes that the host actually verified. FastestMCP is the
-protected resource server; token issuance, JWT verification, introspection,
-and login UI remain application or authorization-server responsibilities.
+Your app now serves MCP at `http://localhost:4000/mcp`. Connect an MCP client
+to it, for example Claude Code:
 
-## Upgrading
+```bash
+claude mcp add --transport http notes http://localhost:4000/mcp
+```
 
-FastestMCP `0.3.x` keeps the complete MCP `2025-11-25` profile while adding
-`2026-07-28` as the preferred modern profile. Existing `0.2.x` deployments may
-pin `protocol_version: "2025-11-25"` during a staged migration, then move to
-`:auto` when modern peers are ready.
+or call it from your own code and tests:
 
-Applications coming from `0.1.x` must also adopt the JSON-RPC-only Streamable
-HTTP boundary introduced in `0.2.0`. Review the
-[changelog](CHANGELOG.md#020---2026-08-12) and
-[transport migration guide](docs/transports.md#migrating-from-01) before
-deploying.
+```elixir
+FastestMCP.call_tool!(MyApp.MCPServer, "search_notes", %{"query" => "release"})
+```
+
+[Getting Started](docs/getting-started.md) walks through the whole setup,
+including testing it, and [Phoenix](docs/phoenix.md) covers hosts,
+authentication, and deployment. Without Phoenix, give the server its own
+listener with `use FastestMCP.ServerModule, http: [port: 4100]`, or run it over
+stdio; see [Transports](docs/transports.md).
+
+## What you can build
+
+| You want to | Use | Guide |
+| --- | --- | --- |
+| Let a model call functions in your app | Tools | [Tools](docs/tools.md) |
+| Let an AI application read your data by URI | Resources and resource templates | [Resources](docs/resources.md) |
+| Offer ready-made prompts to users | Prompts | [Prompts](docs/prompts.md) |
+| Serve MCP from your Phoenix app | A `forward` in your router | [Phoenix](docs/phoenix.md) |
+| Run a local server that a desktop app launches | The stdio transport | [Transports](docs/transports.md) |
+| Require tokens or OAuth scopes | Authentication and authorization | [Authentication and Authorization](docs/auth.md) |
+| Log to the client, report progress, keep state | The handler context | [Context](docs/context.md) |
+| Share connections and services with handlers | Lifespans and dependencies | [Lifespans and Dependencies](docs/lifespans-and-dependencies.md) |
+| Ask the user to confirm, or ask the model to write | Elicitation and sampling | [Sampling and Elicitation](docs/sampling-and-elicitation.md) |
+| Run long jobs that clients can follow and cancel | Background tasks | [Background Tasks](docs/background-tasks.md) |
+| Add logging, rate limits, or caching | Middleware | [Middleware](docs/middleware.md) |
+| Combine servers, proxy a remote server, or turn an OpenAPI spec into tools | Providers and mounting | [Providers and Mounting](docs/providers-and-mounting.md) |
+| Change the tools on offer while the server runs | Dynamic components and visibility | [Dynamic Components](docs/dynamic-components.md) |
+| Show an interactive UI from a tool (MCP Apps) | Protocol extensions | [Extensions](docs/extensions.md) |
+| Call other MCP servers from Elixir | The client | [Client](docs/client.md) |
+| Test your server | In-process calls and clients | [Testing](docs/testing.md) |
+| Trace and monitor it | Telemetry and OpenTelemetry | [Observability](docs/observability.md) |
+
+## Protocol support
+
+FastestMCP implements MCP `2026-07-28` and `2025-11-25` over Streamable HTTP and
+stdio. Clients and servers agree on a version automatically, and one running
+server serves clients of both versions at once. See
+[Protocol Versions](docs/protocol-versions.md) and
+[Compatibility and Scope](docs/compatibility-and-scope.md).
 
 ## Documentation
 
-| Path | Guides |
-| --- | --- |
-| Start here | [Onboarding](docs/onboarding.md) · [Why FastestMCP](docs/why-fastest-mcp.md) · [Protocol Versions](docs/protocol-versions.md) · [Compatibility and Scope](docs/compatibility-and-scope.md) |
-| Build | [Components](docs/components.md) · [Tools](docs/tools.md) · [Resources](docs/resources.md) · [Prompts](docs/prompts.md) · [Context](docs/context.md) · [Dependency Injection](docs/dependency-injection.md) · [Lifespan](docs/lifespan.md) |
-| Connect and extend | [Client](docs/client.md) · [Transports](docs/transports.md) · [Providers and Mounting](docs/providers-and-mounting.md) · [Protocol Extensions](docs/extensions.md) · [Sampling and Interaction](docs/sampling-and-interaction.md) · [Pagination](docs/pagination.md) · [Progress](docs/progress.md) |
-| Secure and operate | [Auth](docs/auth.md) · [Phoenix Deployment](docs/phoenix-deployment.md) · [Middleware](docs/middleware.md) · [Background Tasks](docs/background-tasks.md) · [Runtime State and Storage](docs/runtime-state-and-storage.md) · [Logging](docs/logging.md) · [Telemetry](docs/telemetry.md) · [Testing](docs/testing.md) |
-| Advanced | [Dynamic Component Manager](docs/component-manager.md) · [Transforms](docs/transforms.md) · [Versioning and Visibility](docs/versioning-and-visibility.md) · [Schema Validation](docs/schema-validation.md) |
+- **Start here:** [Getting Started](docs/getting-started.md) ·
+  [Core Concepts](docs/concepts.md)
+- **Build servers:** [Tools](docs/tools.md) · [Resources](docs/resources.md) ·
+  [Prompts](docs/prompts.md) · [Context](docs/context.md) ·
+  [Lifespans and Dependencies](docs/lifespans-and-dependencies.md) ·
+  [Sampling and Elicitation](docs/sampling-and-elicitation.md) ·
+  [Background Tasks](docs/background-tasks.md) ·
+  [Authentication and Authorization](docs/auth.md)
+- **Phoenix and HTTP:** [Phoenix](docs/phoenix.md) ·
+  [Transports](docs/transports.md) · [Testing](docs/testing.md)
+- **Operations:** [Observability](docs/observability.md) ·
+  [Production](docs/production.md) · [Troubleshooting](docs/troubleshooting.md)
+- **Client:** [Client](docs/client.md) ·
+  [Client Callbacks](docs/client-callbacks.md) ·
+  [Client Authentication](docs/client-auth.md)
+- **Advanced:** [Middleware](docs/middleware.md) ·
+  [Providers and Mounting](docs/providers-and-mounting.md) ·
+  [Transforms](docs/transforms.md) ·
+  [Versioning and Visibility](docs/versioning-and-visibility.md) ·
+  [Dynamic Components](docs/dynamic-components.md) ·
+  [Extensions](docs/extensions.md)
+- **Reference:** [Protocol Versions](docs/protocol-versions.md) ·
+  [Pagination](docs/pagination.md) ·
+  [Schema Validation](docs/schema-validation.md) ·
+  [Compatibility and Scope](docs/compatibility-and-scope.md) ·
+  [Migrating to 1.0](docs/migrating-to-1.0.md) · [Changelog](CHANGELOG.md)
 
-## Known boundaries
+## Contributing
 
-FastestMCP intentionally does not provide:
+See [CONTRIBUTING.md](https://github.com/caudena/fastest_mcp/blob/master/CONTRIBUTING.md)
+for the checks to run and how the docs are written.
 
-- standalone SSE transport compatibility
-- legacy method-specific MCP routes or JSON-RPC batches
-- CLI tooling
-- distributed multi-node runtime behavior out of the box
-- a browser/native Apps Host and View runtime
+## License
 
-HTTP support means Streamable HTTP at the configured MCP endpoint, `/mcp` by
-default. FastestMCP preserves MCP Apps metadata and resources, but rendering,
-sandboxing, and the Host/View bridge belong to the consuming host.
+Apache-2.0; see [LICENSE](https://github.com/caudena/fastest_mcp/blob/master/LICENSE).

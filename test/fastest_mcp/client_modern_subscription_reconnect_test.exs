@@ -110,7 +110,9 @@ defmodule FastestMCP.TestSupport.ModernSubscriptionReconnectPlug do
 end
 
 defmodule FastestMCP.ClientModernSubscriptionReconnectTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
+
+  alias FastestMCP.Test.ClientProbe
 
   alias FastestMCP.Client
 
@@ -118,31 +120,21 @@ defmodule FastestMCP.ClientModernSubscriptionReconnectTest do
     {:ok, attempts} = Agent.start_link(fn -> 0 end)
     parent = self()
 
-    bandit =
-      start_supervised!(
-        {Bandit,
-         plug:
-           {FastestMCP.TestSupport.ModernSubscriptionReconnectPlug,
-            parent: parent, attempts: attempts},
-         scheme: :http,
-         port: 0}
+    %{url: url} =
+      serve!(
+        {FastestMCP.TestSupport.ModernSubscriptionReconnectPlug,
+         parent: parent, attempts: attempts}
       )
 
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
-
     client =
-      Client.connect!("http://127.0.0.1:#{port}/mcp",
+      connect!(url,
         protocol_version: "2026-07-28",
         sse_reconnect: [max_attempts: 2, min_retry_ms: 0, max_retry_ms: 0],
         client_info: %{"name" => "listener-reconnect-test", "version" => "1.0.0"}
       )
 
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
-    end)
-
     listener =
-      Client.listen(client, %{"resourceSubscriptions" => ["status://reconnect"]},
+      Client.listen!(client, %{"resourceSubscriptions" => ["status://reconnect"]},
         on_notification: fn notification ->
           send(parent, {:listener_notification, notification})
         end
@@ -199,10 +191,10 @@ defmodule FastestMCP.ClientModernSubscriptionReconnectTest do
                     }},
                    1_000
 
-    assert :ok = Client.cancel(listener, "test complete")
+    assert :ok = Client.Request.cancel!(listener, "test complete")
     send(second_pid, :close_listener)
 
     refute_receive {:modern_listener_request, 3, _pid, _method, _headers, _request}, 250
-    assert :sys.get_state(client.pid).in_flight == %{}
+    assert ClientProbe.requests(client) == %{}
   end
 end

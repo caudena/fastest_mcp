@@ -1,5 +1,5 @@
 defmodule FastestMCP.ActiveServerExtensionsTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Client
   alias FastestMCP.Context
@@ -61,17 +61,21 @@ defmodule FastestMCP.ActiveServerExtensionsTest do
     end
   end
 
-  test "mounted children cannot install active extensions" do
+  test "mounted children require an explicit root declaration unless opted into auto-registration" do
     child =
       FastestMCP.server("active-child",
         active_extensions: [ServerExtension.new(@extension_id)]
       )
 
-    root = FastestMCP.server("active-root")
+    root = FastestMCP.server(unique_name("active-root"))
 
-    assert_raise ArgumentError, ~r/mounted child servers cannot declare active_extensions/, fn ->
-      FastestMCP.mount(root, child)
-    end
+    server = FastestMCP.mount(root, child)
+    assert {:error, %ArgumentError{message: message}} = FastestMCP.start_server(server)
+    assert message =~ "requires an explicit root declaration"
+
+    server
+    |> FastestMCP.add_extension(ServerExtension.new(@extension_id))
+    |> start_server!()
   end
 
   test "discovery merges active settings without mutating passive extensions" do
@@ -150,14 +154,12 @@ defmodule FastestMCP.ActiveServerExtensionsTest do
       {:ok, %{principal: {"https://issuer.example", "user-1"}}}
     end
 
-    server =
-      FastestMCP.server(server_name,
-        auth: auth,
-        middleware: [middleware],
-        active_extensions: [extension]
-      )
-
-    start_server!(server)
+    FastestMCP.server(server_name,
+      auth: auth,
+      middleware: [middleware],
+      active_extensions: [extension]
+    )
+    |> start_server!()
 
     result =
       Engine.dispatch!(
@@ -196,16 +198,14 @@ defmodule FastestMCP.ActiveServerExtensionsTest do
       params
     end
 
-    server =
-      FastestMCP.server(server_name,
-        active_extensions: [
-          ServerExtension.new(@extension_id,
-            methods: [ServerExtension.method("example/run", handler)]
-          )
-        ]
-      )
-
-    start_server!(server)
+    FastestMCP.server(server_name,
+      active_extensions: [
+        ServerExtension.new(@extension_id,
+          methods: [ServerExtension.method("example/run", handler)]
+        )
+      ]
+    )
+    |> start_server!()
 
     error =
       assert_raise Error, fn ->
@@ -242,18 +242,16 @@ defmodule FastestMCP.ActiveServerExtensionsTest do
   test "active method results must remain JSON objects" do
     server_name = unique_name("active-result-shape")
 
-    server =
-      FastestMCP.server(server_name,
-        active_extensions: [
-          ServerExtension.new(@extension_id,
-            methods: [
-              ServerExtension.method("example/run", fn _params, _context -> "invalid" end)
-            ]
-          )
-        ]
-      )
-
-    start_server!(server)
+    FastestMCP.server(server_name,
+      active_extensions: [
+        ServerExtension.new(@extension_id,
+          methods: [
+            ServerExtension.method("example/run", fn _params, _context -> "invalid" end)
+          ]
+        )
+      ]
+    )
+    |> start_server!()
 
     error =
       assert_raise Error, fn ->
@@ -283,13 +281,11 @@ defmodule FastestMCP.ActiveServerExtensionsTest do
         ]
       )
 
-    server =
-      FastestMCP.server(server_name,
-        lifespan: fn _server -> %{"root-state" => true} end,
-        active_extensions: [extension]
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    FastestMCP.server(server_name,
+      lifespan: fn _server -> %{"root-state" => true} end,
+      active_extensions: [extension]
+    )
+    |> start_server!()
 
     result =
       Engine.dispatch!(
@@ -327,11 +323,9 @@ defmodule FastestMCP.ActiveServerExtensionsTest do
         end
       )
 
-    server =
-      FastestMCP.server(server_name, active_extensions: [first, second])
-      |> FastestMCP.mount(child, namespace: "child")
-
-    start_server!(server)
+    FastestMCP.server(server_name, active_extensions: [first, second])
+    |> FastestMCP.mount(child, namespace: "child")
+    |> start_server!()
 
     params = %{"name" => "child_echo", "arguments" => %{"ok" => true}}
 
@@ -364,70 +358,52 @@ defmodule FastestMCP.ActiveServerExtensionsTest do
       }
     end
 
-    server =
-      FastestMCP.server(server_name,
-        active_extensions: [
-          ServerExtension.new(@extension_id,
-            settings: %{"server" => true},
-            methods: [ServerExtension.method("example/run", handler)]
-          )
-        ]
-      )
+    FastestMCP.server(server_name,
+      active_extensions: [
+        ServerExtension.new(@extension_id,
+          settings: %{"server" => true},
+          methods: [ServerExtension.method("example/run", handler)]
+        )
+      ]
+    )
+    |> start_server!()
 
-    start_server!(server)
-
-    bandit =
-      start_supervised!(
-        {Bandit,
-         plug:
-           {FastestMCP.Transport.HTTPApp,
-            server_name: server_name, path: "/mcp", allowed_hosts: ["127.0.0.1", "localhost"]},
-         scheme: :http,
-         port: 0}
-      )
-
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
-    endpoint = "http://127.0.0.1:#{port}/mcp"
+    %{url: url} = start_http!(server_name, allowed_hosts: ["127.0.0.1", "localhost"])
+    endpoint = url
 
     client =
-      Client.connect!(endpoint,
+      connect!(endpoint,
         protocol_version: @modern_version,
         extensions: %{@extension_id => %{"client" => true}}
       )
 
-    unnegotiated = Client.connect!(endpoint, protocol_version: @modern_version)
+    unnegotiated = connect!(endpoint, protocol_version: @modern_version)
 
     legacy =
-      Client.connect!(endpoint,
+      connect!(endpoint,
         protocol_version: "2025-11-25",
         extensions: %{@extension_id => %{}}
       )
-
-    on_exit(fn ->
-      for connected_client <- [client, unnegotiated, legacy] do
-        if Client.connected?(connected_client), do: Client.disconnect(connected_client)
-      end
-    end)
 
     assert %{
              "params" => %{"value" => 11},
              "clientSettings" => %{"client" => true},
              "resultType" => "complete"
-           } = Client.request(client, "example/run", %{"value" => 11})
+           } = Client.request!(client, "example/run", %{"value" => 11})
 
-    request = Client.request_async(client, "example/run", %{"value" => 12})
-    assert get_in(Client.await(request), ["params", "value"]) == 12
+    request = Client.request_async!(client, "example/run", %{"value" => 12})
+    assert get_in(Client.Request.await!(request), ["params", "value"]) == 12
 
     negotiation_error =
       assert_raise Error, fn ->
-        Client.request(unnegotiated, "example/run", %{"value" => 13})
+        Client.request!(unnegotiated, "example/run", %{"value" => 13})
       end
 
     assert negotiation_error.code == :missing_required_client_capability
 
     legacy_error =
       assert_raise Error, fn ->
-        Client.request(legacy, "example/run", %{"value" => 14})
+        Client.request!(legacy, "example/run", %{"value" => 14})
       end
 
     assert legacy_error.code == :method_not_found
@@ -455,11 +431,4 @@ defmodule FastestMCP.ActiveServerExtensionsTest do
   defp extension_capabilities do
     %{"extensions" => %{@extension_id => %{}}}
   end
-
-  defp start_server!(server) do
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server.name) end)
-  end
-
-  defp unique_name(prefix), do: "#{prefix}-#{System.unique_integer([:positive])}"
 end

@@ -1,8 +1,10 @@
 defmodule FastestMCP.SessionCoordinatorTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
+  alias FastestMCP.Context
   alias FastestMCP.Error
   alias FastestMCP.Registry
+  alias FastestMCP.ServerRuntime
   alias FastestMCP.Session
   alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
 
@@ -480,10 +482,10 @@ defmodule FastestMCP.SessionCoordinatorTest do
     assert :ok = Session.detach_sink(server_name, session_id, sink_ref)
 
     assert {:ok, %{queued: true}} =
-             Session.send_notification(server_name, session_id, "example/first")
+             send_notification(server_name, session_id, "example/first")
 
     assert {:error, :queue_overloaded} =
-             Session.send_notification(server_name, session_id, "example/second")
+             send_notification(server_name, session_id, "example/second")
 
     assert {:ok, %{sink_ref: next_sink_ref, queued: 1}} =
              Session.attach_sink(server_name, session_id, self(), kind: :get)
@@ -494,7 +496,7 @@ defmodule FastestMCP.SessionCoordinatorTest do
     assert :ok = Session.detach_sink(server_name, session_id, next_sink_ref)
 
     assert {:error, :queue_overloaded} =
-             Session.send_notification(
+             send_notification(
                server_name,
                session_id,
                "example/oversized",
@@ -504,7 +506,7 @@ defmodule FastestMCP.SessionCoordinatorTest do
 
   test "receiver tasks hold idle expiry and retain progress ownership until terminal status" do
     {server_name, session_id, sink_ref} =
-      start_session_with_sink!(session_idle_ttl: 1_000)
+      start_session_with_sink!(session_idle_ttl: 500)
 
     assert {:ok, session_pid} = Registry.lookup_session(server_name, session_id)
     worker = spawn(fn -> Process.sleep(:infinity) end)
@@ -598,13 +600,10 @@ defmodule FastestMCP.SessionCoordinatorTest do
              )
 
     Process.exit(duplicate_worker, :kill)
+    monitor = Process.monitor(session_pid)
     assert :ok = Session.detach_sink(server_name, session_id, sink_ref)
-    assert :sys.get_state(session_pid).expiry_generation == nil
-
-    stale_generation = make_ref()
-    send(session_pid, {:expire_if_idle, stale_generation})
-    Process.sleep(10)
-    assert Process.alive?(session_pid)
+    # The unfinished receiver task holds the session past its idle ttl.
+    refute_receive {:DOWN, ^monitor, _, _, _}, 1_000
 
     assert :ok = Session.receiver_task_finished(server_name, session_id, "receiver-task")
 
@@ -621,17 +620,12 @@ defmodule FastestMCP.SessionCoordinatorTest do
 
     assert :deliver = Session.finish_inbound_request(server_name, session_id, 42)
     Process.exit(reuse_worker, :kill)
-
-    expiry_generation = :sys.get_state(session_pid).expiry_generation
-    assert is_reference(expiry_generation)
-    monitor = Process.monitor(session_pid)
-    send(session_pid, {:expire_if_idle, expiry_generation})
-    assert_receive {:DOWN, ^monitor, :process, ^session_pid, :normal}, 1_000
+    assert_receive {:DOWN, ^monitor, :process, ^session_pid, :normal}, 3_000
   end
 
   test "requester peer tasks hold expiry until a terminal task status arrives" do
     {server_name, session_id, sink_ref} =
-      start_session_with_sink!(session_idle_ttl: 1_000)
+      start_session_with_sink!(session_idle_ttl: 500)
 
     assert {:ok, session_pid} = Registry.lookup_session(server_name, session_id)
     parent = self()
@@ -689,12 +683,10 @@ defmodule FastestMCP.SessionCoordinatorTest do
                progress_token: "peer-task-progress"
              )
 
+    monitor = Process.monitor(session_pid)
     assert :ok = Session.detach_sink(server_name, session_id, sink_ref)
-    assert :sys.get_state(session_pid).expiry_generation == nil
-
-    send(session_pid, {:expire_if_idle, make_ref()})
-    Process.sleep(10)
-    assert Process.alive?(session_pid)
+    # The working peer task holds the session past its idle ttl.
+    refute_receive {:DOWN, ^monitor, _, _, _}, 1_000
 
     completed = %{
       task
@@ -705,42 +697,31 @@ defmodule FastestMCP.SessionCoordinatorTest do
     assert :ok = Session.receive_peer_task_status(server_name, session_id, completed)
     assert :ignored = Session.receive_peer_task_status(server_name, session_id, task)
     assert :ignored = Session.receive_peer_progress(server_name, session_id, progress)
-
-    expiry_generation = :sys.get_state(session_pid).expiry_generation
-    assert is_reference(expiry_generation)
-
-    monitor = Process.monitor(session_pid)
-    send(session_pid, {:expire_if_idle, expiry_generation})
-    assert_receive {:DOWN, ^monitor, :process, ^session_pid, :normal}, 1_000
+    assert_receive {:DOWN, ^monitor, :process, ^session_pid, :normal}, 3_000
   end
 
   test "retained SSE replay records do not hold idle expiry" do
     {server_name, session_id, sink_ref} =
-      start_session_with_sink!(session_idle_ttl: 1_000)
+      start_session_with_sink!(session_idle_ttl: 500)
 
     assert {:ok, session_pid} = Registry.lookup_session(server_name, session_id)
 
     assert {:ok, %{event_id: event_id}} =
-             Session.send_notification(
+             send_notification(
                server_name,
                session_id,
-               "notifications/resources/list_changed"
+               "notifications/com.example/replayed"
              )
 
     assert is_binary(event_id)
 
     assert_receive {:fastest_mcp_session_message, ^sink_ref, ^event_id,
-                    %{"method" => "notifications/resources/list_changed"}}
+                    %{"method" => "notifications/com.example/replayed"}}
 
     assert :sys.get_state(session_pid).replay.total_bytes > 0
-    assert :ok = Session.detach_sink(server_name, session_id, sink_ref)
-
-    expiry_generation = :sys.get_state(session_pid).expiry_generation
-    assert is_reference(expiry_generation)
-
     monitor = Process.monitor(session_pid)
-    send(session_pid, {:expire_if_idle, expiry_generation})
-    assert_receive {:DOWN, ^monitor, :process, ^session_pid, :normal}, 1_000
+    assert :ok = Session.detach_sink(server_name, session_id, sink_ref)
+    assert_receive {:DOWN, ^monitor, :process, ^session_pid, :normal}, 3_000
   end
 
   test "a resumed stream exclusively owns live delivery while the old sink remains a routing anchor" do
@@ -827,7 +808,7 @@ defmodule FastestMCP.SessionCoordinatorTest do
     assert :ok = Session.detach_sink(server_name, session_id, original_ref)
 
     assert {:ok, %{delivery_sink_ref: ^repeated_ref}} =
-             Session.send_notification(server_name, session_id, "notifications/current-owner")
+             send_notification(server_name, session_id, "notifications/current-owner")
 
     assert_receive {:repeated,
                     {:fastest_mcp_session_message, ^repeated_ref, _event_id,
@@ -890,10 +871,10 @@ defmodule FastestMCP.SessionCoordinatorTest do
     assert {:ok, session_pid} = Registry.lookup_session(server_name, session_id)
 
     assert {:error, :sse_replay_unavailable} =
-             Session.send_notification(
+             send_notification(
                server_name,
                session_id,
-               "notifications/resources/list_changed"
+               "notifications/com.example/replayed"
              )
 
     refute_receive {:fastest_mcp_session_message, ^sink_ref, _event_id, _envelope}
@@ -995,8 +976,7 @@ defmodule FastestMCP.SessionCoordinatorTest do
     session_id = "session-#{System.unique_integer([:positive])}"
     server = FastestMCP.server(server_name)
 
-    assert {:ok, _pid} = FastestMCP.start_server(server, runtime_opts)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server, runtime_opts)
 
     ProtocolTest.initialize_session(server_name, session_id, %{
       "capabilities" => %{
@@ -1007,6 +987,12 @@ defmodule FastestMCP.SessionCoordinatorTest do
     })
 
     {server_name, session_id}
+  end
+
+  # A notification of the server's own, as a handler in the session sends it.
+  defp send_notification(server_name, session_id, method, params \\ %{}) do
+    {:ok, runtime} = ServerRuntime.fetch(server_name)
+    Context.send_notification(Context.new(runtime, session_id: session_id), method, params)
   end
 
   defp start_session_with_sink!(runtime_opts \\ []) do
@@ -1026,9 +1012,7 @@ defmodule FastestMCP.SessionCoordinatorTest do
         sink_relay(target, tag)
       end)
 
-    on_exit(fn ->
-      if Process.alive?(pid), do: Process.exit(pid, :kill)
-    end)
+    on_exit(fn -> if Process.alive?(pid), do: Process.exit(pid, :kill) end)
 
     pid
   end
@@ -1040,17 +1024,4 @@ defmodule FastestMCP.SessionCoordinatorTest do
         sink_relay(target, tag)
     end
   end
-
-  defp assert_eventually(fun, attempts \\ 100)
-
-  defp assert_eventually(fun, attempts) when attempts > 0 do
-    if fun.() do
-      :ok
-    else
-      Process.sleep(10)
-      assert_eventually(fun, attempts - 1)
-    end
-  end
-
-  defp assert_eventually(_fun, 0), do: flunk("condition did not become true")
 end

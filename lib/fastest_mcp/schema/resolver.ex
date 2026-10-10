@@ -1,39 +1,37 @@
 defmodule FastestMCP.Schema.Resolver do
-  @moduledoc """
-  Bounded adapter for explicitly supplied application JSON Schema resolvers.
-
-  Application resolver functions receive one absolute URI and return
-  `{:ok, schema}` or `{:error, reason}`. Resolver modules using the
-  `JSV.Resolver` contract are accepted as well. Every successfully resolved
-  resource is checked against the same source, nesting, reference, dialect,
-  and resource-count limits as the root schema.
-  """
+  @moduledoc false
+  # Adapter for application JSON Schema resolvers: a function from one absolute
+  # URI to `{:ok, schema}` or `{:error, reason}`, or a `JSV.Resolver` module.
+  # Each resolved resource gets the source, nesting, reference, dialect, and
+  # resource-count limits of the root schema.
 
   @behaviour JSV.Resolver
+  alias FastestMCP.Schema.Policy
 
   @draft_2020_12 "https://json-schema.org/draft/2020-12/schema"
-  @draft_7 "http://json-schema.org/draft-07/schema"
-  @supported_dialects [@draft_2020_12, @draft_7]
-  @default_max_schema_bytes 1_048_576
-  @default_max_depth 128
-  @default_max_refs 256
-  @default_max_resolved_resources 256
+  @default_max_resolved_resources Policy.default(:max_resolved_resources)
 
   @impl true
   def resolve(uri, opts) when is_binary(uri) and is_list(opts) do
-    with {:ok, schema} <- invoke_resolver(uri, Keyword.get(opts, :resolver)),
-         {:ok, normalized} <- normalize_remote_schema(uri, schema, opts) do
-      {:normal, normalized}
-    end
+    guard(fn ->
+      with {:ok, schema} <- invoke_resolver(uri, Keyword.get(opts, :resolver)),
+           {:ok, normalized} <- normalize_remote_schema(uri, schema, opts) do
+        {:normal, normalized}
+      end
+    end)
+  end
+
+  def resolve(uri, _opts), do: {:error, {:invalid_remote_schema_uri, uri}}
+
+  # Turns a failing resolver into a resolution error naming only its kind.
+  def guard(resolve) do
+    resolve.()
   rescue
     error -> {:error, {:resolver_exception, error.__struct__}}
   catch
     kind, _reason -> {:error, {:resolver_failure, kind}}
   end
 
-  def resolve(uri, _opts), do: {:error, {:invalid_remote_schema_uri, uri}}
-
-  @doc false
   def normalize_remote_schema(uri, schema, opts)
       when is_binary(uri) and (is_map(schema) or is_boolean(schema)) and is_list(opts) do
     with {:ok, normalized} <- normalize(schema),
@@ -94,15 +92,13 @@ defmodule FastestMCP.Schema.Resolver do
     end
   end
 
-  defp normalize_dialect(value) when is_binary(value) do
-    dialect = String.trim_trailing(value, "#")
-
-    if dialect in @supported_dialects,
-      do: {:ok, dialect},
-      else: {:error, :unsupported_remote_schema_dialect}
+  defp normalize_dialect(value) do
+    case Policy.normalize_dialect(value) do
+      {:ok, dialect} -> {:ok, dialect}
+      {:error, :invalid_dialect} -> {:error, :invalid_remote_schema_dialect}
+      {:error, _} -> {:error, :unsupported_remote_schema_dialect}
+    end
   end
-
-  defp normalize_dialect(_value), do: {:error, :invalid_remote_schema_dialect}
 
   defp validate_definition(schema, dialect) do
     case FastestMCP.Schema.validate_schema_definition(schema, dialect) do
@@ -112,51 +108,15 @@ defmodule FastestMCP.Schema.Resolver do
   end
 
   defp validate_source(schema, opts) do
-    max_schema_bytes = Keyword.get(opts, :max_schema_bytes, @default_max_schema_bytes)
-    max_depth = Keyword.get(opts, :max_depth, @default_max_depth)
-    max_refs = Keyword.get(opts, :max_refs, @default_max_refs)
-
-    with :ok <- positive_limit(max_schema_bytes, :max_schema_bytes),
-         :ok <- positive_limit(max_depth, :max_depth),
-         :ok <- positive_limit(max_refs, :max_refs),
-         {:ok, encoded} <- encode(schema),
-         :ok <- limit(byte_size(encoded), max_schema_bytes, :remote_schema_too_large),
-         {:ok, refs} <- stats(schema, 0, max_depth, 0),
-         :ok <- limit(refs, max_refs, :remote_schema_has_too_many_references) do
-      :ok
+    case Policy.check(schema, opts) do
+      {:ok, _stats} -> :ok
+      {:error, :not_json} -> {:error, :remote_schema_is_not_json_compatible}
+      {:error, {:invalid_limit, key, _}} -> {:error, {:invalid_remote_schema_limit, key}}
+      {:error, {:exceeded, :max_depth, _, _}} -> {:error, :remote_schema_is_too_deep}
+      {:error, {:exceeded, :max_schema_bytes, _, _}} -> {:error, :remote_schema_too_large}
+      {:error, {:exceeded, :max_refs, _, _}} -> {:error, :remote_schema_has_too_many_references}
     end
   end
-
-  defp encode(schema) do
-    {:ok, JSON.encode!(schema)}
-  rescue
-    _error -> {:error, :remote_schema_is_not_json_compatible}
-  end
-
-  defp stats(_value, depth, max_depth, _refs) when depth > max_depth,
-    do: {:error, :remote_schema_is_too_deep}
-
-  defp stats(value, depth, max_depth, refs) when is_map(value) do
-    Enum.reduce_while(value, {:ok, refs}, fn {key, child}, {:ok, count} ->
-      count = count + if(key in ["$ref", "$dynamicRef", "$recursiveRef"], do: 1, else: 0)
-
-      case stats(child, depth + 1, max_depth, count) do
-        {:ok, next_count} -> {:cont, {:ok, next_count}}
-        {:error, reason} -> {:halt, {:error, reason}}
-      end
-    end)
-  end
-
-  defp stats(value, depth, max_depth, refs) when is_list(value) do
-    Enum.reduce_while(value, {:ok, refs}, fn child, {:ok, count} ->
-      case stats(child, depth + 1, max_depth, count) do
-        {:ok, next_count} -> {:cont, {:ok, next_count}}
-        {:error, reason} -> {:halt, {:error, reason}}
-      end
-    end)
-  end
-
-  defp stats(_value, _depth, _max_depth, refs), do: {:ok, refs}
 
   defp claim_resource(uri, opts) do
     max = Keyword.get(opts, :max_resolved_resources, @default_max_resolved_resources)
@@ -193,9 +153,6 @@ defmodule FastestMCP.Schema.Resolver do
 
   defp positive_limit(value, _name) when is_integer(value) and value > 0, do: :ok
   defp positive_limit(_value, name), do: {:error, {:invalid_remote_schema_limit, name}}
-
-  defp limit(actual, maximum, _reason) when actual <= maximum, do: :ok
-  defp limit(_actual, _maximum, reason), do: {:error, reason}
 
   defp resolver_kind(value) do
     cond do

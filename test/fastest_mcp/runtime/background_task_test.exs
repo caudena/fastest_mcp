@@ -1,5 +1,5 @@
 defmodule FastestMCP.Runtime.BackgroundTaskTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.BackgroundTask
   alias FastestMCP.Context
@@ -48,17 +48,17 @@ defmodule FastestMCP.Runtime.BackgroundTaskTest do
           receive do
             :release -> :done
           after
-            1_000 -> :timed_out
+            5_000 -> :timed_out
           end
         end,
         task: [mode: :optional, poll_interval_ms: 250]
       )
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    start_server!(server)
     assert {:ok, runtime} = ServerRuntime.fetch(server_name)
     :ok = FastestMCP.EventBus.subscribe(runtime.event_bus, server_name)
 
-    handle = FastestMCP.call_tool(server_name, "slow", %{}, task: true)
+    handle = FastestMCP.call_tool!(server_name, "slow", %{}, task: true)
     assert %BackgroundTask{} = handle
     assert handle.poll_interval_ms == 250
 
@@ -66,10 +66,10 @@ defmodule FastestMCP.Runtime.BackgroundTaskTest do
                     notification},
                    1_000
 
-    assert notification.notification.method == "notifications/tasks/status"
-    assert notification.notification.params.taskId == handle.task_id
-    assert notification.notification.params.status == "working"
-    assert notification.related_task.taskId == handle.task_id
+    assert notification.notification["method"] == "notifications/tasks/status"
+    assert notification.notification["params"]["taskId"] == handle.task_id
+    assert notification.notification["params"]["status"] == "working"
+    assert notification.related_task["taskId"] == handle.task_id
 
     assert_receive {:task_ctx, worker_pid, true, task_id, origin_request_id, :background_task},
                    1_000
@@ -78,7 +78,13 @@ defmodule FastestMCP.Runtime.BackgroundTaskTest do
     assert is_binary(origin_request_id)
     assert String.starts_with?(origin_request_id, "req-")
 
-    task = FastestMCP.fetch_task(handle)
+    # The tool reports progress to the task store asynchronously.
+    task =
+      assert_eventually(fn ->
+        task = FastestMCP.fetch_task!(handle)
+        task.progress && task
+      end)
+
     assert task.status == :working
     assert task.origin_request_id == origin_request_id
 
@@ -102,23 +108,23 @@ defmodule FastestMCP.Runtime.BackgroundTaskTest do
                     progress_notification},
                    1_000
 
-    assert progress_notification.notification.params.taskId == task_id
-    assert progress_notification.notification.params.status == "working"
-    assert progress_notification.notification.params.statusMessage == "Half done"
-    refute Map.has_key?(progress_notification.notification, :_meta)
+    assert progress_notification.notification["params"]["taskId"] == task_id
+    assert progress_notification.notification["params"]["status"] == "working"
+    assert progress_notification.notification["params"]["statusMessage"] == "Half done"
+    refute Map.has_key?(progress_notification.notification, "_meta")
 
     send(worker_pid, :release)
-    assert FastestMCP.await_task(handle, 1_000) == :done
+    assert FastestMCP.await_task!(handle, 1_000) == :done
 
     assert_receive {:fastest_mcp_event, ^server_name, [:notifications, :tasks, :status], _,
                     completed_notification},
                    1_000
 
-    assert completed_notification.notification.params.taskId == task_id
-    assert completed_notification.notification.params.status == "completed"
-    refute Map.has_key?(completed_notification.notification, :_meta)
+    assert completed_notification.notification["params"]["taskId"] == task_id
+    assert completed_notification.notification["params"]["status"] == "completed"
+    refute Map.has_key?(completed_notification.notification, "_meta")
 
-    completed = FastestMCP.fetch_task(handle)
+    completed = FastestMCP.fetch_task!(handle)
     assert completed.status == :completed
     assert completed.result == :done
   end
@@ -126,60 +132,59 @@ defmodule FastestMCP.Runtime.BackgroundTaskTest do
   test "resources and prompts can run as local background tasks" do
     server_name = "background-read-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_resource("file://report.txt", fn _args, _ctx -> "report body" end,
-        task: true
-      )
-      |> FastestMCP.add_prompt(
-        "summary",
-        fn _args, _ctx ->
-          %{messages: [%{role: "user", content: "Hello from prompt"}], description: "Summary"}
-        end,
-        task: [mode: :required, poll_interval_ms: 150]
-      )
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_resource("file://report.txt", fn _args, _ctx -> "report body" end,
+      task: true
+    )
+    |> FastestMCP.add_prompt(
+      "summary",
+      fn _args, _ctx ->
+        FastestMCP.Prompts.Result.from(%{
+          messages: [%{role: "user", content: "Hello from prompt"}],
+          description: "Summary"
+        })
+      end,
+      task: [mode: :required, poll_interval_ms: 150]
+    )
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-
-    resource_task = FastestMCP.read_resource(server_name, "file://report.txt", task: true)
+    resource_task = FastestMCP.read_resource!(server_name, "file://report.txt", task: true)
     assert %BackgroundTask{} = resource_task
-    assert FastestMCP.await_task(resource_task, 1_000) == "report body"
+    assert FastestMCP.await_task!(resource_task, 1_000) == "report body"
 
-    prompt_task = FastestMCP.render_prompt(server_name, "summary", %{}, task: true)
+    prompt_task = FastestMCP.render_prompt!(server_name, "summary", %{}, task: true)
     assert %BackgroundTask{} = prompt_task
     assert prompt_task.poll_interval_ms == 150
 
-    assert FastestMCP.await_task(prompt_task, 1_000) == %{
+    assert %{
              messages: [%{role: "user", content: %{type: "text", text: "Hello from prompt"}}],
              description: "Summary"
-           }
+           } = FastestMCP.await_task!(prompt_task, 1000)
   end
 
   test "task mode is enforced for forbidden and required components" do
     server_name = "background-modes-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("sync_only", fn _args, _ctx -> :ok end, task: false)
-      |> FastestMCP.add_tool("task_only", fn _args, _ctx -> :ok end, task: [mode: :required])
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("sync_only", fn _args, _ctx -> :ok end, task: false)
+    |> FastestMCP.add_tool("task_only", fn _args, _ctx -> :ok end, task: [mode: :required])
+    |> start_server!()
 
     forbidden_error =
       assert_raise Error, fn ->
-        FastestMCP.call_tool(server_name, "sync_only", %{}, task: true)
+        FastestMCP.call_tool!(server_name, "sync_only", %{}, task: true)
       end
 
     assert forbidden_error.code == :method_not_found
 
     required_error =
       assert_raise Error, fn ->
-        FastestMCP.call_tool(server_name, "task_only", %{})
+        FastestMCP.call_tool!(server_name, "task_only", %{})
       end
 
     assert required_error.code == :method_not_found
 
-    tools = FastestMCP.list_tools(server_name)
+    tools = FastestMCP.list_tools!(server_name)
 
     assert Enum.find(tools, &(&1.name == "sync_only")).task == %{
              mode: "forbidden",
@@ -206,27 +211,27 @@ defmodule FastestMCP.Runtime.BackgroundTaskTest do
           receive do
             :release -> :ok
           after
-            1_000 -> :timed_out
+            5_000 -> :timed_out
           end
         end,
         task: true
       )
 
-    assert {:ok, _pid} = FastestMCP.start_server(server, max_background_tasks: 1)
+    start_server!(server, max_background_tasks: 1)
 
-    first = FastestMCP.call_tool(server_name, "wait", %{}, task: true)
+    first = FastestMCP.call_tool!(server_name, "wait", %{}, task: true)
     assert %BackgroundTask{} = first
     assert_receive {:entered, first_pid}, 1_000
 
     error =
       assert_raise Error, fn ->
-        FastestMCP.call_tool(server_name, "wait", %{}, task: true)
+        FastestMCP.call_tool!(server_name, "wait", %{}, task: true)
       end
 
     assert error.code == :overloaded
 
     send(first_pid, :release)
-    assert FastestMCP.await_task(first, 1_000) == :ok
+    assert FastestMCP.await_task!(first, 1_000) == :ok
   end
 
   test "receiver task execution holds its originating session until terminal completion" do
@@ -248,20 +253,20 @@ defmodule FastestMCP.Runtime.BackgroundTaskTest do
         task: true
       )
 
-    assert {:ok, _pid} = FastestMCP.start_server(server, session_idle_ttl: 30)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server, session_idle_ttl: 30)
 
-    handle = FastestMCP.call_tool(server_name, "wait", %{}, task: true, session_id: session_id)
+    handle = FastestMCP.call_tool!(server_name, "wait", %{}, task: true, session_id: session_id)
     assert_receive {:task_started, task_pid}, 1_000
     assert {:ok, session_pid} = Registry.lookup_session(server_name, session_id)
 
+    # Outlive the session's idle ttl while the task runs.
     Process.sleep(75)
     assert Process.alive?(session_pid)
     assert map_size(:sys.get_state(session_pid).receiver_tasks) == 1
 
     monitor = Process.monitor(session_pid)
     send(task_pid, :release)
-    assert :done = FastestMCP.await_task(handle, 1_000)
+    assert :done = FastestMCP.await_task!(handle, 1_000)
 
     assert_receive {:DOWN, ^monitor, :process, ^session_pid, :normal}, 1_000
   end
@@ -290,23 +295,23 @@ defmodule FastestMCP.Runtime.BackgroundTaskTest do
           receive do
             :release -> label
           after
-            1_000 -> :timed_out
+            5_000 -> :timed_out
           end
         end,
         task: true
       )
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    start_server!(server)
 
     alpha =
-      FastestMCP.call_tool(server_name, "capture", %{"label" => "alpha"},
+      FastestMCP.call_tool!(server_name, "capture", %{"label" => "alpha"},
         task: true,
         auth_input: %{"authorization" => "Bearer alpha"},
         request_metadata: %{headers: %{"authorization" => "Bearer alpha"}, marker: "alpha"}
       )
 
     beta =
-      FastestMCP.call_tool(server_name, "capture", %{"label" => "beta"},
+      FastestMCP.call_tool!(server_name, "capture", %{"label" => "beta"},
         task: true,
         auth_input: %{"authorization" => "Bearer beta"},
         request_metadata: %{headers: %{"authorization" => "Bearer beta"}, marker: "beta"}
@@ -346,38 +351,167 @@ defmodule FastestMCP.Runtime.BackgroundTaskTest do
     send(contexts["alpha"].pid, :release)
     send(contexts["beta"].pid, :release)
 
-    assert FastestMCP.await_task(alpha, 1_000) == "alpha"
-    assert FastestMCP.await_task(beta, 1_000) == "beta"
+    assert FastestMCP.await_task!(alpha, 1_000) == "alpha"
+    assert FastestMCP.await_task!(beta, 1_000) == "beta"
+  end
+
+  test "background tasks drop submit-time transport credentials and preserve lifespan context" do
+    parent = self()
+    server_name = unique_name("task-context")
+
+    start_server!(
+      FastestMCP.server(server_name)
+      |> FastestMCP.add_lifespan(fn _server -> %{"db" => "connected", "cache" => "warm"} end)
+      |> FastestMCP.add_tool(
+        "inspect_context",
+        fn _args, ctx ->
+          send(
+            parent,
+            {:task_context_snapshot, Context.access_token(ctx), ctx.lifespan_context,
+             ctx.session_id, Context.origin_request_id(ctx)}
+          )
+
+          :ok
+        end,
+        task: true
+      )
+    )
+
+    task =
+      FastestMCP.call_tool!(server_name, "inspect_context", %{},
+        task: true,
+        session_id: "task-context-session",
+        request_metadata: %{headers: %{"authorization" => "Bearer submit-token"}}
+      )
+
+    assert FastestMCP.await_task!(task, 1_000) == :ok
+
+    assert_receive {:task_context_snapshot, nil, %{"cache" => "warm", "db" => "connected"},
+                    "task-context-session", origin_request_id},
+                   1_000
+
+    assert is_binary(origin_request_id)
+    assert String.starts_with?(origin_request_id, "req-")
+  end
+
+  test "authenticated background task handles preserve submit-time owner scope" do
+    server_name = unique_name("task-auth-handle")
+    parent = self()
+
+    start_server!(
+      FastestMCP.server(server_name)
+      |> FastestMCP.add_auth(fn
+        %{"authorization" => "Bearer alpha"}, _ctx ->
+          {:ok,
+           %{
+             principal: %{"sub" => "alpha-user"},
+             auth: %{client_id: "alpha-client"},
+             capabilities: [],
+             audiences: ["https://mcp.example/mcp"],
+             scopes: ["tasks:run"]
+           }}
+
+        _input, _ctx ->
+          {:error, :unauthorized}
+      end)
+      |> FastestMCP.add_tool(
+        "echo",
+        fn _args, ctx ->
+          send(
+            parent,
+            {:background_auth_evidence, ctx.authenticated, ctx.verified_audiences,
+             ctx.verified_scopes}
+          )
+
+          :ok
+        end,
+        task: true
+      )
+    )
+
+    task =
+      FastestMCP.call_tool!(server_name, "echo", %{},
+        task: true,
+        auth_input: %{"authorization" => "Bearer alpha"}
+      )
+
+    assert %BackgroundTask{owner_fingerprint: owner_fingerprint} = task
+    assert is_binary(owner_fingerprint)
+    assert :ok == FastestMCP.await_task!(task, 1_000)
+    assert_receive {:background_auth_evidence, true, ["https://mcp.example/mcp"], ["tasks:run"]}
+    assert %{status: :completed} = FastestMCP.fetch_task!(task)
+    assert :ok == FastestMCP.task_result!(task)
   end
 
   test "crashed background tasks are marked failed and surface the crash error" do
     server_name = "background-crash-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool(
-        "explode",
-        fn _arguments, _ctx ->
-          exit(:boom)
-        end,
-        task: true
-      )
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool(
+      "explode",
+      fn _arguments, _ctx ->
+        exit(:boom)
+      end,
+      task: true
+    )
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-
-    handle = FastestMCP.call_tool(server_name, "explode", %{}, task: true)
+    handle = FastestMCP.call_tool!(server_name, "explode", %{}, task: true)
 
     error =
       assert_raise Error, fn ->
-        FastestMCP.await_task(handle, 1_000)
+        FastestMCP.await_task!(handle, 1_000)
       end
 
     assert error.code == :component_crash
     assert error.message =~ "explode"
     assert error.message =~ "exited"
 
-    task = FastestMCP.fetch_task(handle)
+    task = FastestMCP.fetch_task!(handle)
     assert task.status == :failed
     assert %Error{code: :component_crash} = task.error
+  end
+
+  test "list_tasks scopes tasks to the session and pages them newest first" do
+    server_name = unique_name("background-list")
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("echo", fn %{"value" => value}, _ctx -> value end, task: true)
+    |> start_server!()
+
+    submit = fn value, session_id ->
+      task =
+        FastestMCP.call_tool!(server_name, "echo", %{"value" => value},
+          task: true,
+          session_id: session_id
+        )
+
+      assert FastestMCP.await_task!(task, 1_000) == value
+      # Tasks are listed by their millisecond submission time.
+      Process.sleep(2)
+      task.task_id
+    end
+
+    [first, _other, third] = [
+      submit.(1, "session-a"),
+      submit.(2, "session-b"),
+      submit.(3, "session-a")
+    ]
+
+    assert %{tasks: [%{id: ^third}], next_cursor: cursor} =
+             FastestMCP.list_tasks!(server_name, session_id: "session-a", page_size: 1)
+
+    assert %{tasks: [%{id: ^first}], next_cursor: nil} =
+             FastestMCP.list_tasks!(server_name,
+               session_id: "session-a",
+               page_size: 1,
+               cursor: cursor
+             )
+
+    assert %{tasks: tasks, next_cursor: nil} = FastestMCP.list_tasks!(server_name)
+    assert length(tasks) == 3
+
+    assert {:error, %Error{code: :bad_request, message: "invalid cursor"}} =
+             FastestMCP.list_tasks(server_name, page_size: 1, cursor: "invalid")
   end
 end

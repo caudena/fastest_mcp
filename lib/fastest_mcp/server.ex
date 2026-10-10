@@ -59,21 +59,52 @@ defmodule FastestMCP.Server do
 
   This policy only applies to the local server definition. Provider precedence
   and mount ordering remain separate runtime concerns.
+
+  ## Component Options
+
+  `add_tool/4`, `add_resource/4`, `add_resource_template/4`, and `add_prompt/4`
+  take a handler of the arguments map and the `FastestMCP.Context` (arity 0
+  and 1 are accepted too) and these options; any other key raises
+  `ArgumentError`:
+
+    * every kind - `:title`, `:description`, `:icons`, `:version`, `:tags`,
+      `:meta`, `:enabled` (default `true`), `:visibility` (default `[:model]`),
+      `:inject`, `:task`, `:timeout`, `:authorization` (or `:auth`), and
+      `:schema_options`
+    * tools - `:input_schema`, `:output_schema`, `:annotations`, `:completions`
+    * resources - `:name`, `:mime_type` (without it, each read names the type
+      of its value), `:size`, `:annotations`
+    * resource templates - `:name`, `:mime_type`, `:parameters`,
+      `:completions`, `:annotations`, `:resource_security` (default `:inherit`)
+    * prompts - `:arguments`
+
+  A tool name has 1 to 128 letters, digits, `_`, `-`, or `.`, and resource
+  annotations hold the values MCP defines for `audience`, `priority`, and
+  `lastModified`; anything else raises `ArgumentError` too.
+
+  The [tools](tools.md), [resources](resources.md), and [prompts](prompts.md)
+  guides describe each option.
   """
+
+  import FastestMCP.Util, only: [maybe_put: 3, stringify_keys: 1]
 
   alias FastestMCP.Auth
   alias FastestMCP.Auth.ProtectedResource
   alias FastestMCP.Component
+  alias FastestMCP.Middleware
   alias FastestMCP.ComponentCompiler
+  alias FastestMCP.ComponentStore
   alias FastestMCP.Elicitation.URL, as: URLElicitation
   alias FastestMCP.Middleware.ToolInjection
   alias FastestMCP.Middleware.ToolSearch
   alias FastestMCP.Protocol.Extensions
+  alias FastestMCP.Protocol.Schema, as: ProtocolSchema
+  alias FastestMCP.Options
   alias FastestMCP.Provider
+  alias FastestMCP.ProviderTransforms.Namespace
   alias FastestMCP.Providers.MountedServer, as: MountedServerProvider
   alias FastestMCP.Providers.Proxy, as: ProxyProvider
   alias FastestMCP.ResourceSecurity
-  alias FastestMCP.Schema
   alias FastestMCP.ServerExtension
   alias FastestMCP.TaskConfig
 
@@ -106,9 +137,11 @@ defmodule FastestMCP.Server do
 
   @type transform :: (struct(), FastestMCP.Operation.t() -> struct() | nil)
   @type middleware ::
-          (FastestMCP.Operation.t(), (FastestMCP.Operation.t() -> any()) -> any())
+          (FastestMCP.Operation.t(),
+           (FastestMCP.Operation.t() -> FastestMCP.Middleware.result()) ->
+             FastestMCP.Middleware.result())
 
-  @type middleware_entry :: middleware() | %{middleware: middleware()}
+  @type middleware_entry :: middleware() | struct()
 
   @type t :: %__MODULE__{
           name: String.t(),
@@ -137,9 +170,60 @@ defmodule FastestMCP.Server do
           prompts: [struct()]
         }
 
-  @doc "Builds a new value for this module from the supplied options."
+  @option_keys [
+    :on_duplicate,
+    :auth,
+    :protected_resource,
+    :middleware,
+    :transforms,
+    :lifespans,
+    :lifespan,
+    :dependencies,
+    :tasks,
+    :tool_search,
+    :metadata,
+    :experimental_capabilities,
+    :extensions,
+    :active_extensions,
+    :application_sessions,
+    :resource_security,
+    :url_elicitation_allowed_hosts,
+    :mask_error_details,
+    :schema_options
+  ]
+
+  @doc """
+  Builds an empty server definition named `name` (an atom or a string).
+
+  Options (any other key raises `ArgumentError`):
+
+    * `:on_duplicate` - the duplicate registration policy above (default `:error`)
+    * `:auth` - an authenticator, as `FastestMCP.Auth.new/2` accepts it
+    * `:protected_resource` - RFC 9728 metadata for
+      `FastestMCP.Auth.ProtectedResource.new/1` (atom keys)
+    * `:middleware`, `:transforms`, `:lifespans` (or one `:lifespan`),
+      `:dependencies` - initial entries, as `add_middleware/2`,
+      `add_transform/2`, `add_lifespan/2`, and `add_dependency/3` add them
+    * `:tasks` - the default `task:` option of the components added later:
+      `false` (default), `true`, or `[mode: :optional | :required,
+      poll_interval_ms: ms]`
+    * `:tool_search` - `true` or the options of `enable_tool_search/2`
+    * `:metadata` - server metadata with atom keys; `:capabilities` is merged
+      into the advertised capabilities
+    * `:experimental_capabilities` - a map advertised as `capabilities.experimental`
+    * `:extensions` - passive extension capabilities, see `FastestMCP.Protocol.Extensions`
+    * `:active_extensions` - `FastestMCP.ServerExtension` definitions
+    * `:application_sessions` - `[allow_anonymous: boolean]`, see
+      `FastestMCP.ApplicationSession`
+    * `:resource_security` - a `FastestMCP.ResourceSecurity` policy
+    * `:url_elicitation_allowed_hosts` - the HTTPS hosts URL elicitations may use
+    * `:mask_error_details` - hide the details of unexpected handler and
+      authenticator failures from clients (default `false`)
+    * `:schema_options` - JSON Schema options, see `FastestMCP.Schema`
+  """
   def new(name, opts \\ []) do
     validate_removed_options!(opts)
+    Options.keys!(opts, @option_keys)
 
     schema_options = normalize_schema_options(Keyword.get(opts, :schema_options, []))
     extensions = Extensions.normalize(Keyword.get(opts, :extensions))
@@ -158,14 +242,12 @@ defmodule FastestMCP.Server do
       url_elicitation_allowed_hosts:
         normalize_url_elicitation_allowed_hosts(Keyword.get(opts, :url_elicitation_allowed_hosts)),
       mask_error_details: Keyword.get(opts, :mask_error_details, false),
-      on_duplicate:
-        Component.normalize_duplicate_policy!(Keyword.get(opts, :on_duplicate, :error)),
+      on_duplicate: ComponentStore.policy!(Keyword.get(opts, :on_duplicate, :error)),
       metadata:
-        opts
-        |> Keyword.get(:metadata, %{})
-        |> Map.new()
-        |> put_experimental_capabilities(Keyword.get(opts, :experimental_capabilities))
-        |> validate_experimental_capabilities!(),
+        normalize_metadata(
+          Keyword.get(opts, :metadata, %{}),
+          Keyword.get(opts, :experimental_capabilities)
+        ),
       extensions: extensions,
       active_extensions: active_extensions,
       http_routes: [],
@@ -187,55 +269,36 @@ defmodule FastestMCP.Server do
     server
   end
 
-  @doc "Adds a tool component to the current definition."
-  def add_tool(%__MODULE__{} = server, name, handler, opts \\ []) do
-    put_component(
-      server,
-      :tools,
-      ComponentCompiler.compile(:tool, server.name, name, handler, component_opts(server, opts))
-    )
-  end
+  @doc false
+  # The options of `new/2`.
+  def option_keys, do: @option_keys
 
-  @doc "Adds a resource component to the current definition."
-  def add_resource(%__MODULE__{} = server, uri, handler, opts \\ []) do
-    put_component(
-      server,
-      :resources,
-      ComponentCompiler.compile(
-        :resource,
-        server.name,
-        uri,
-        handler,
-        component_opts(server, opts)
-      )
-    )
-  end
+  @doc "Adds a tool; see [Component Options](#module-component-options)."
+  def add_tool(%__MODULE__{} = server, name, handler, opts \\ []),
+    do: add_component(server, :tool, name, handler, opts)
 
-  @doc "Adds a resource-template component to the current value."
-  def add_resource_template(%__MODULE__{} = server, uri_template, handler, opts \\ []) do
-    put_component(
-      server,
-      :resource_templates,
-      ComponentCompiler.compile(
-        :resource_template,
-        server.name,
-        uri_template,
-        handler,
-        component_opts(server, opts)
-      )
-    )
-  end
+  @doc """
+  Adds a resource at `uri`; its handler gets empty arguments. See
+  [Component Options](#module-component-options).
+  """
+  def add_resource(%__MODULE__{} = server, uri, handler, opts \\ []),
+    do: add_component(server, :resource, uri, handler, opts)
 
-  @doc "Adds a prompt component to the current definition."
-  def add_prompt(%__MODULE__{} = server, name, handler, opts \\ []) do
-    put_component(
-      server,
-      :prompts,
-      ComponentCompiler.compile(:prompt, server.name, name, handler, component_opts(server, opts))
-    )
-  end
+  @doc """
+  Adds an RFC 6570 resource template; its handler gets the matched parameters.
+  See [Component Options](#module-component-options).
+  """
+  def add_resource_template(%__MODULE__{} = server, uri_template, handler, opts \\ []),
+    do: add_component(server, :resource_template, uri_template, handler, opts)
 
-  @doc "Registers a dependency resolver on the current definition."
+  @doc "Adds a prompt; see [Component Options](#module-component-options)."
+  def add_prompt(%__MODULE__{} = server, name, handler, opts \\ []),
+    do: add_component(server, :prompt, name, handler, opts)
+
+  @doc """
+  Registers `resolver` as dependency `name` for handlers to read with
+  `FastestMCP.Context.dependency/2`; see [Dependencies](lifespans-and-dependencies.md#dependencies).
+  """
   def add_dependency(%__MODULE__{} = server, name, resolver) do
     %{
       server
@@ -248,25 +311,35 @@ defmodule FastestMCP.Server do
     }
   end
 
-  @doc "Adds an HTTP route to the current definition."
+  @doc """
+  Adds an HTTP route served next to the MCP endpoint: `handler` is a
+  `fn conn -> conn end` or a `{plug, opts}` tuple.
+  """
   def add_http_route(%__MODULE__{} = server, method, path, handler)
       when is_binary(path) and (is_function(handler, 1) or is_tuple(handler)) do
     route = {method, path, handler}
     %{server | http_routes: server.http_routes ++ [route]}
   end
 
-  @doc "Adds middleware to the current definition."
+  @doc """
+  Appends middleware: a `fn operation, next -> result end` function or a
+  struct whose module implements `FastestMCP.Middleware`. Middleware added
+  earlier wraps middleware added later.
+  """
   def add_middleware(%__MODULE__{} = server, middleware) when is_function(middleware, 2) do
     %{server | middleware: server.middleware ++ [middleware]}
   end
 
-  def add_middleware(%__MODULE__{} = server, %{middleware: middleware} = entry)
-      when is_function(middleware, 2) do
+  def add_middleware(%__MODULE__{} = server, %_{} = entry) do
+    entry = Middleware.validate!(entry)
     validate_tool_search_middleware_collisions!([entry], server.tool_search)
     %{server | middleware: server.middleware ++ [entry]}
   end
 
-  @doc "Enables bounded model-visible tool search on the server."
+  @doc """
+  Enables bounded model-visible tool search; see
+  [Bounded Tool Search](tools.md#bounded-tool-search) for the options.
+  """
   def enable_tool_search(%__MODULE__{} = server, opts \\ []) when is_list(opts) do
     tool_search = ToolSearch.new(Keyword.put(opts, :schema_options, server.schema_options))
     validate_tool_search_collisions!(server.tools, tool_search)
@@ -275,44 +348,139 @@ defmodule FastestMCP.Server do
     %{server | tool_search: tool_search}
   end
 
-  @doc "Adds lifespan hooks to the current definition."
+  @doc "Adds a lifespan, in any shape `FastestMCP.Lifespan` accepts."
   def add_lifespan(%__MODULE__{} = server, lifespan) do
     %{server | lifespans: server.lifespans ++ normalize_lifespans(lifespan)}
   end
 
+  @doc "Adds a lifespan from separate `enter` and `exit` functions; see `FastestMCP.Lifespan.new/2`."
   def add_lifespan(%__MODULE__{} = server, enter, exit)
       when is_function(enter, 1) and
              (is_nil(exit) or is_function(exit, 0) or is_function(exit, 1) or is_function(exit, 2)) do
     add_lifespan(server, {enter, exit})
   end
 
-  @doc "Adds a transform to the current definition."
+  @doc """
+  Adds a transform, a `fn component, operation -> component | nil end`
+  applied to every component the server lists or resolves; `nil` hides the
+  component.
+  """
   def add_transform(%__MODULE__{} = server, transform) when is_function(transform, 2) do
     %{server | transforms: server.transforms ++ [transform]}
   end
 
-  @doc "Adds a provider to the current definition."
+  @doc "Adds a component provider; see `FastestMCP.Provider`."
   def add_provider(%__MODULE__{} = server, provider) do
     provider = Provider.new(provider)
-    validate_mounted_active_extensions!(provider)
     validate_tool_search_provider!(server.tool_search, provider)
     %{server | providers: server.providers ++ [provider]}
   end
 
-  @doc "Mounts another server or provider-backed definition."
+  @doc "Adds an explicit root extension; it overrides any provider bundle with the same identifier."
+  def add_extension(%__MODULE__{} = server, %ServerExtension{} = extension) do
+    extensions =
+      server.active_extensions ++ [ServerExtension.normalize!(extension, server.schema_options)]
+
+    validate_active_extensions!(server.extensions, extensions)
+    %{server | active_extensions: extensions}
+  end
+
+  @doc false
+  def prepare_for_runtime(%__MODULE__{} = server) do
+    explicit = Map.new(server.active_extensions, &{&1.identifier, &1})
+    {providers, requirements} = prepare_provider_extensions(server.providers)
+
+    {_, bundled} =
+      Enum.reduce(requirements, {%{}, []}, fn extension, {seen, ordered} ->
+        id = extension.identifier
+
+        cond do
+          Map.has_key?(explicit, id) ->
+            {seen, ordered}
+
+          not extension.auto_register ->
+            raise ArgumentError, "extension #{inspect(id)} requires an explicit root declaration"
+
+          Map.has_key?(seen, id) ->
+            unless ServerExtension.declaration(seen[id]) == ServerExtension.declaration(extension) do
+              raise ArgumentError,
+                    "conflicting provider extension #{inspect(id)}; declare it explicitly on the root"
+            end
+
+            {seen, ordered}
+
+          true ->
+            {Map.put(seen, id, extension), [extension | ordered]}
+        end
+      end)
+
+    extensions =
+      server.active_extensions ++
+        Enum.map(Enum.reverse(bundled), &ServerExtension.normalize!(&1, server.schema_options))
+
+    validate_active_extensions!(server.extensions, extensions)
+
+    %{
+      server
+      | active_extensions: extensions,
+        providers: providers
+    }
+  end
+
+  defp prepare_provider_extensions(providers) do
+    {providers, requirements} =
+      Enum.map_reduce(providers, [], fn
+        %Provider{inner: %MountedServerProvider{} = mount} = provider, acc ->
+          {children, nested} = prepare_provider_extensions(mount.server.providers)
+          required = mount.server.active_extensions ++ nested
+          child = %{mount.server | active_extensions: [], providers: children}
+          ids = required |> Enum.map(& &1.identifier) |> Enum.uniq()
+          {%{provider | inner: %{mount | server: child, extension_ids: ids}}, [required | acc]}
+
+        provider, acc ->
+          {provider, [Provider.Dispatch.required_extensions(provider) | acc]}
+      end)
+
+    {providers, requirements |> Enum.reverse() |> List.flatten()}
+  end
+
+  @doc """
+  Exposes the components of `mounted_server` through `server`.
+
+  Options: `:namespace` prefixes the mounted names and URIs, and
+  `:include_tags` and `:exclude_tags` filter the mounted components. Other
+  options raise `ArgumentError`.
+  """
   def mount(%__MODULE__{} = server, %__MODULE__{} = mounted_server, opts \\ []) do
     if server.name == mounted_server.name do
       raise ArgumentError, "cannot mount a server into itself"
     end
 
-    add_provider(server, MountedServerProvider.new(mounted_server, opts))
+    {namespace, opts} = Keyword.pop(opts, :namespace)
+    provider = MountedServerProvider.new(mounted_server, opts)
+
+    if namespace do
+      transform = Namespace.new(namespace)
+
+      for tool <- mounted_server.tools do
+        ComponentCompiler.check_built_tool_name!(
+          tool.name,
+          Namespace.transform_component(transform, tool, nil).name
+        )
+      end
+
+      add_provider(server, Provider.add_transform(provider, transform))
+    else
+      add_provider(server, provider)
+    end
   end
 
-  @doc "Adds auth configuration to the current definition."
+  @doc "Sets the authenticator: a `FastestMCP.Auth` struct, or a provider as for `add_auth/3`."
   def add_auth(%__MODULE__{} = server, %Auth{} = auth) do
     %{server | auth: Auth.new(auth)}
   end
 
+  @doc "Sets the authenticator `FastestMCP.Auth.new/2` builds from `provider` and `opts`."
   def add_auth(%__MODULE__{} = server, provider, opts \\ []) do
     %{server | auth: Auth.new(provider, opts)}
   end
@@ -364,69 +532,39 @@ defmodule FastestMCP.Server do
   defp normalize_name(name) when is_atom(name), do: Atom.to_string(name)
   defp normalize_name(name) when is_binary(name), do: name
 
-  defp put_experimental_capabilities(metadata, nil), do: metadata
+  # Server metadata takes atom keys; its `:capabilities`, which take the
+  # `experimental_capabilities` option, keep the string keys of the wire.
+  defp normalize_metadata(metadata, experimental) do
+    unless is_nil(experimental) or is_map(experimental) do
+      raise ArgumentError,
+            "experimental_capabilities must be a map of capability names to objects, got #{inspect(experimental)}"
+    end
 
-  defp put_experimental_capabilities(metadata, experimental) when is_map(experimental) do
+    metadata = Map.new(metadata)
+
     capabilities =
-      metadata
-      |> map_value(:capabilities, %{})
-      |> normalize_string_key_map()
-      |> Map.put("experimental", normalize_string_key_map(experimental))
+      case metadata[:capabilities] do
+        %{} = capabilities -> stringify_keys(capabilities)
+        _none -> %{}
+      end
+      |> maybe_put("experimental", experimental && stringify_keys(experimental))
 
-    metadata
-    |> Map.delete(:capabilities)
-    |> Map.delete("capabilities")
-    |> Map.put(:capabilities, capabilities)
+    validate_experimental_capabilities!(capabilities["experimental"])
+    Map.put(metadata, :capabilities, capabilities)
   end
 
-  defp put_experimental_capabilities(_metadata, experimental) do
-    raise ArgumentError,
-          "experimental_capabilities must be a map of capability names to objects, got #{inspect(experimental)}"
-  end
+  defp validate_experimental_capabilities!(nil), do: :ok
 
-  defp validate_experimental_capabilities!(metadata) do
-    experimental =
-      metadata
-      |> map_value(:capabilities, %{})
-      |> map_value(:experimental, nil)
-
-    case experimental do
-      nil ->
-        metadata
-
-      %{} ->
-        Enum.each(experimental, fn {name, value} ->
-          unless is_map(value) do
-            raise ArgumentError,
-                  "experimental capability #{inspect(name)} must be an object, got #{inspect(value)}"
-          end
-        end)
-
-        metadata
-
-      value ->
-        raise ArgumentError,
-              "metadata capabilities.experimental must be an object, got #{inspect(value)}"
+  defp validate_experimental_capabilities!(%{} = experimental) do
+    for {name, value} <- experimental, not is_map(value) do
+      raise ArgumentError,
+            "experimental capability #{inspect(name)} must be an object, got #{inspect(value)}"
     end
   end
 
-  defp normalize_string_key_map(map) when is_map(map) do
-    Map.new(map, fn {key, value} ->
-      value =
-        if is_map(value) do
-          normalize_string_key_map(value)
-        else
-          value
-        end
-
-      {to_string(key), value}
-    end)
-  end
-
-  defp normalize_string_key_map(_value), do: %{}
-
-  defp map_value(map, key, default) when is_map(map) do
-    Map.get(map, key, Map.get(map, Atom.to_string(key), default))
+  defp validate_experimental_capabilities!(value) do
+    raise ArgumentError,
+          "metadata capabilities.experimental must be an object, got #{inspect(value)}"
   end
 
   defp normalize_auth(nil), do: nil
@@ -526,7 +664,7 @@ defmodule FastestMCP.Server do
             "active extension method ownership is duplicated: #{Enum.join(duplicate_methods, ", ")}"
     end
 
-    shadowed = methods |> Enum.filter(&Schema.built_in_method?/1) |> Enum.sort()
+    shadowed = methods |> Enum.filter(&ProtocolSchema.built_in_method?/1) |> Enum.sort()
 
     if shadowed != [] do
       raise ArgumentError,
@@ -544,15 +682,6 @@ defmodule FastestMCP.Server do
     |> Enum.sort()
   end
 
-  defp validate_mounted_active_extensions!(%Provider{
-         inner: %MountedServerProvider{server: %__MODULE__{active_extensions: [_ | _]}}
-       }) do
-    raise ArgumentError,
-          "mounted child servers cannot declare active_extensions; configure executable extensions on the root server"
-  end
-
-  defp validate_mounted_active_extensions!(%Provider{}), do: :ok
-
   defp normalize_resource_security(nil), do: nil
   defp normalize_resource_security(policy), do: ResourceSecurity.new(policy)
 
@@ -566,15 +695,14 @@ defmodule FastestMCP.Server do
   end
 
   defp normalize_application_sessions(options) when is_map(options) do
-    unknown = Map.keys(options) -- [:allow_anonymous, "allow_anonymous"]
+    unknown = Map.keys(options) -- [:allow_anonymous]
 
     if unknown != [] do
       raise ArgumentError,
             "unknown application_sessions options: #{inspect(unknown)}"
     end
 
-    allow_anonymous =
-      Map.get(options, :allow_anonymous, Map.get(options, "allow_anonymous", false))
+    allow_anonymous = Map.get(options, :allow_anonymous, false)
 
     if is_boolean(allow_anonymous) do
       %{allow_anonymous: allow_anonymous}
@@ -652,9 +780,7 @@ defmodule FastestMCP.Server do
 
   defp normalize_middleware_entry(middleware) when is_function(middleware, 2), do: middleware
 
-  defp normalize_middleware_entry(%{middleware: middleware} = entry)
-       when is_function(middleware, 2),
-       do: entry
+  defp normalize_middleware_entry(%_{} = entry), do: Middleware.validate!(entry)
 
   defp normalize_middleware_entry(other) do
     raise ArgumentError,
@@ -676,25 +802,23 @@ defmodule FastestMCP.Server do
           "tool_search must be false, true, or a keyword list, got: #{inspect(other)}"
   end
 
-  defp component_opts(server, opts) do
-    opts
-    |> Keyword.put_new(:task, server.tasks)
-    |> Keyword.put_new(:schema_options, server.schema_options)
-  end
+  defp add_component(%__MODULE__{} = server, kind, identifier, handler, opts) do
+    opts =
+      opts
+      |> Keyword.put_new(:task, server.tasks)
+      |> Keyword.put_new(:schema_options, server.schema_options)
 
-  defp put_component(%__MODULE__{} = server, key, component) do
-    validate_tool_search_component!(server, key, component)
-    existing_components = Map.fetch!(server, key)
+    component = %{
+      ComponentCompiler.compile(kind, identifier, handler, opts)
+      | server_name: server.name
+    }
 
-    case Component.registration_action(existing_components, component, server.on_duplicate) do
-      :insert ->
-        Map.replace!(server, key, existing_components ++ [component])
+    validate_tool_search_component!(server, Component.collection(kind), component)
 
-      {:replace, _existing} ->
-        replace_duplicate(server, key, component)
-
-      {:ignore, _existing} ->
-        server
+    case ComponentStore.put(server, component, server.on_duplicate) do
+      {:ok, server} -> server
+      {:ignore, _existing} -> server
+      {:error, error} -> raise error
     end
   end
 
@@ -772,20 +896,4 @@ defmodule FastestMCP.Server do
   end
 
   defp proxy_provider?(%Provider{}), do: false
-
-  defp replace_duplicate(%__MODULE__{} = server, key, component) do
-    updated =
-      server
-      |> Map.fetch!(key)
-      |> Enum.map(fn existing ->
-        if Component.identifier(existing) == Component.identifier(component) and
-             Component.version(existing) == Component.version(component) do
-          component
-        else
-          existing
-        end
-      end)
-
-    Map.replace!(server, key, updated)
-  end
 end

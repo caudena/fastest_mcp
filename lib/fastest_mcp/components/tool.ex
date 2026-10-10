@@ -1,64 +1,45 @@
 defmodule FastestMCP.Components.Tool do
   @moduledoc """
-  Defines the runtime struct used for tool components.
+  A compiled tool,
+  as server transforms (`FastestMCP.add_transform/2`) and provider transforms
+  (`FastestMCP.ProviderTransform`) receive it, and as a custom provider's
+  `c:FastestMCP.Provider.list_components/3` returns it.
 
-  These structs are the compiled component shapes used by the runtime. The
-  builder APIs, providers, registry, serializers, and transports all agree
-  on this explicit representation so they do not need to keep the original
-  DSL input around.
-
-  Applications usually do not construct these structs by hand. Prefer the
-  corresponding `FastestMCP.Server` or provider helpers and let compilation
-  produce the runtime shape for you.
+  Build one with `new/3`; `FastestMCP.add_tool/4` builds the same struct. Its
+  descriptive fields are `name`, `version`, `title`, `description`, `icons`,
+  `annotations`, `tags` (a `MapSet`), `meta`, `enabled`, and `visibility`; the
+  others hold compiled schemas and the handler. A transform that changes
+  `input_schema` or `output_schema` leaves the compiled schemas alone:
+  FastestMCP compiles the new schema.
   """
 
-  defstruct [
-    :server_name,
-    :name,
-    :version,
-    :title,
-    :description,
-    :icons,
-    :annotations,
-    :input_schema,
-    :compiled_input_schema,
-    :completions,
-    :inject,
-    :task,
-    :timeout,
-    :output_schema,
-    :compiled_output_schema,
-    :compiled,
-    authorization: [],
-    policy_state: %{},
-    tags: MapSet.new(),
-    enabled: true,
-    visibility: [:model],
-    meta: %{}
-  ]
+  alias FastestMCP.Component.Fields
+  alias FastestMCP.ComponentCompiler
+
+  defstruct Fields.common() ++
+              [
+                :annotations,
+                :input_schema,
+                :compiled_input_schema,
+                :completions,
+                :output_schema,
+                :compiled_output_schema
+              ]
 
   @type t :: %__MODULE__{
-          server_name: String.t() | atom() | nil,
-          name: String.t() | nil,
-          version: String.t() | nil,
-          title: String.t() | nil,
-          description: String.t() | nil,
-          icons: list() | nil,
+          name: String.t(),
           annotations: map() | nil,
           input_schema: boolean() | map() | nil,
-          compiled_input_schema: term(),
-          completions: term(),
-          inject: term(),
-          task: term(),
-          timeout: non_neg_integer() | nil,
           output_schema: boolean() | map() | nil,
-          compiled_output_schema: term(),
-          compiled: term(),
-          authorization: list(),
-          policy_state: map(),
-          tags: MapSet.t(),
-          enabled: boolean(),
-          visibility: list(),
-          meta: map()
+          timeout: non_neg_integer() | nil
         }
+
+  @doc """
+  Builds a tool named `name` that runs `handler` with the arguments map and the
+  `FastestMCP.Context`. Takes the tool options listed under "Component Options"
+  in `FastestMCP.Server`; any other option, or a name other than 1 to 128
+  letters, digits, `_`, `-`, or `.`, raises `ArgumentError`.
+  """
+  @spec new(String.t(), function(), keyword()) :: t()
+  def new(name, handler, opts \\ []), do: ComponentCompiler.compile(:tool, name, handler, opts)
 end

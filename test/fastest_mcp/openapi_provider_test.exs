@@ -1,5 +1,5 @@
 defmodule FastestMCP.OpenAPIProviderTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   defp simple_spec do
     %{
@@ -105,10 +105,9 @@ defmodule FastestMCP.OpenAPIProviderTest do
       )
 
     assert server.name == server_name
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
-    tools = FastestMCP.list_tools(server_name)
+    tools = FastestMCP.list_tools!(server_name)
     assert Enum.map(tools, & &1.name) == ["create_user", "get_user"]
 
     get_user = Enum.find(tools, &(&1.name == "get_user"))
@@ -124,6 +123,15 @@ defmodule FastestMCP.OpenAPIProviderTest do
     assert create_user.input_schema["properties"]["email"]["format"] == "email"
   end
 
+  test "from_openapi rejects unknown options, naming the allowed ones" do
+    assert_raise ArgumentError,
+                 "unknown keys [:base_uri], the allowed keys are: " <>
+                   "[:name, :base_url, :timeout_ms, :headers, :schema_options, :requester]",
+                 fn ->
+                   FastestMCP.from_openapi(simple_spec(), base_uri: "https://api.example.com")
+                 end
+  end
+
   test "provider execution maps path query header and body arguments into HTTP requests" do
     parent = self()
     server_name = "openapi-exec-" <> Integer.to_string(System.unique_integer([:positive]))
@@ -134,11 +142,10 @@ defmodule FastestMCP.OpenAPIProviderTest do
     end
 
     server = FastestMCP.from_openapi(simple_spec(), name: server_name, requester: requester)
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
     assert %{"ok" => true} ==
-             FastestMCP.call_tool(server_name, "get_user", %{
+             FastestMCP.call_tool!(server_name, "get_user", %{
                "id" => 123,
                "include_details" => true,
                "X-API-Key" => "secret"
@@ -149,13 +156,50 @@ defmodule FastestMCP.OpenAPIProviderTest do
     assert get_opts[:headers] == [{"X-API-Key", "secret"}]
 
     assert %{"ok" => true} ==
-             FastestMCP.call_tool(server_name, "create_user", %{
+             FastestMCP.call_tool!(server_name, "create_user", %{
                "name" => "Nate",
                "email" => "nate@example.com"
              })
 
     assert_receive {:request, :post, "https://api.example.com/users", post_opts}, 1_000
     assert post_opts[:json] == %{"name" => "Nate", "email" => "nate@example.com"}
+  end
+
+  test "headers: sends fixed or computed headers, which stop being arguments" do
+    parent = self()
+    server_name = unique_name("openapi-headers")
+
+    requester = fn method, url, opts ->
+      send(parent, {:request, method, url, opts})
+      {:ok, 200, [{"content-type", "application/json"}], JSON.encode!(%{"ok" => true})}
+    end
+
+    FastestMCP.from_openapi(simple_spec(),
+      name: server_name,
+      requester: requester,
+      headers: %{
+        "x-api-key" => "secret",
+        "authorization" => fn -> "Bearer token-1" end,
+        "x-request-id" => fn ctx -> ctx.request_id end
+      }
+    )
+    |> start_server!()
+
+    get_user = Enum.find(FastestMCP.list_tools!(server_name), &(&1.name == "get_user"))
+    assert get_user.input_schema["required"] == ["id"]
+    refute Map.has_key?(get_user.input_schema["properties"], "X-API-Key")
+
+    assert %{"ok" => true} == FastestMCP.call_tool!(server_name, "get_user", %{"id" => 7})
+    assert_receive {:request, :get, "https://api.example.com/users/7", opts}
+
+    assert [{"authorization", "Bearer token-1"}, {"x-api-key", "secret"}, {"x-request-id", id}] =
+             Enum.sort(opts[:headers])
+
+    assert "req-" <> _rest = id
+
+    assert_raise ArgumentError, ~r/headers must be/, fn ->
+      FastestMCP.from_openapi(simple_spec(), requester: requester, headers: "x-api-key: secret")
+    end
   end
 
   test "server variable defaults are expanded when deriving base url" do
@@ -190,10 +234,9 @@ defmodule FastestMCP.OpenAPIProviderTest do
     end
 
     server = FastestMCP.from_openapi(spec, name: server_name, requester: requester)
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
-    assert %{"ok" => true} == FastestMCP.call_tool(server_name, "ping", %{})
+    assert %{"ok" => true} == FastestMCP.call_tool!(server_name, "ping", %{})
 
     assert_receive {:request, :get, "https://staging.example.com/v1/ping", _opts}, 1_000
   end
@@ -248,15 +291,14 @@ defmodule FastestMCP.OpenAPIProviderTest do
     end
 
     server = FastestMCP.from_openapi(spec, name: server_name, requester: requester)
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
-    [tool] = FastestMCP.list_tools(server_name)
+    [tool] = FastestMCP.list_tools!(server_name)
     assert tool.input_schema["properties"]["nickname"]["type"] == ["string", "null"]
     assert tool.output_schema["properties"]["display_name"]["type"] == ["string", "null"]
 
     assert %{"ok" => true} ==
-             FastestMCP.call_tool(server_name, "create_profile", %{"nickname" => nil})
+             FastestMCP.call_tool!(server_name, "create_profile", %{"nickname" => nil})
 
     assert_receive {:request, :post, "https://nullable.example.com/profiles", opts}, 1_000
     assert opts[:json] == %{"nickname" => nil}

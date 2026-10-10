@@ -1,27 +1,85 @@
 defmodule FastestMCP.VisibilityTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Component
   alias FastestMCP.ComponentVisibility
   alias FastestMCP.Context
   alias FastestMCP.Error
-  alias FastestMCP.Registry
 
   test "audience filtering hides components outside their visibility" do
     server_name = "visibility-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("model-only", fn _args, _ctx -> :ok end, visibility: [:model])
-      |> FastestMCP.add_tool("app-only", fn _args, _ctx -> :ok end, visibility: [:app])
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("model-only", fn _args, _ctx -> :ok end, visibility: [:model])
+    |> FastestMCP.add_tool("app-only", fn _args, _ctx -> :ok end, visibility: [:app])
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-
-    assert [%{name: "model-only"}] = FastestMCP.list_tools(server_name, audience: :model)
-    assert [%{name: "app-only"}] = FastestMCP.list_tools(server_name, audience: :app)
+    assert [%{name: "model-only"}] = FastestMCP.list_tools!(server_name, audience: :model)
+    assert [%{name: "app-only"}] = FastestMCP.list_tools!(server_name, audience: :app)
 
     assert_raise Error, ~r/not visible/, fn ->
-      FastestMCP.call_tool(server_name, "app-only", %{}, audience: :model)
+      FastestMCP.call_tool!(server_name, "app-only", %{}, audience: :model)
+    end
+  end
+
+  test "over MCP a hidden component answers like an unknown one; in process the code stays" do
+    server_name = unique_name("visibility-wire-unknown")
+
+    hide_filtered = fn
+      %FastestMCP.Components.Tool{name: "filtered"}, _operation -> nil
+      component, _operation -> component
+    end
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_transform(hide_filtered)
+    |> FastestMCP.add_tool("visible", fn _args, _ctx -> :ok end)
+    |> FastestMCP.add_tool("disabled", fn _args, _ctx -> :ok end, enabled: false)
+    |> FastestMCP.add_tool("app_only", fn _args, _ctx -> :ok end, visibility: [:app])
+    |> FastestMCP.add_tool("filtered", fn _args, _ctx -> :ok end)
+    |> FastestMCP.add_prompt("visible", fn _args, _ctx -> "ok" end)
+    |> FastestMCP.add_prompt("draft", fn _args, _ctx -> "draft" end, enabled: false)
+    |> FastestMCP.add_resource("notes://visible", fn _args, _ctx -> "ok" end)
+    |> FastestMCP.add_resource("notes://draft", fn _args, _ctx -> "draft" end, enabled: false)
+    |> FastestMCP.add_resource_template("drafts://{id}", fn _args, _ctx -> "draft" end,
+      enabled: false
+    )
+    |> start_server!()
+
+    assert {:error, %Error{code: :disabled}} = FastestMCP.call_tool(server_name, "disabled")
+    assert {:error, %Error{code: :not_visible}} = FastestMCP.call_tool(server_name, "app_only")
+    assert {:error, %Error{code: :filtered}} = FastestMCP.call_tool(server_name, "filtered")
+    assert {:error, %Error{code: :disabled}} = FastestMCP.render_prompt(server_name, "draft")
+
+    {connection_id, _initialize} = ProtocolTest.initialize_stdio(server_name)
+    id = fn -> System.unique_integer([:positive]) end
+
+    legacy = fn method, params ->
+      ProtocolTest.stdio_request(server_name, connection_id, id.(), method, params)["error"]
+    end
+
+    for name <- ["disabled", "app_only", "filtered", "missing"] do
+      assert %{
+               "code" => -32_602,
+               "message" => message,
+               "data" => %{"fastestmcp" => %{"code" => "not_found"}}
+             } = legacy.("tools/call", %{"name" => name, "arguments" => %{}})
+
+      assert message == "unknown tool #{inspect(name)}"
+    end
+
+    assert %{"code" => -32_602, "message" => ~s(unknown prompt "draft")} =
+             legacy.("prompts/get", %{"name" => "draft"})
+
+    for uri <- ["notes://draft", "drafts://7"] do
+      assert %{"code" => -32_002, "message" => message} =
+               legacy.("resources/read", %{"uri" => uri})
+
+      assert message == "unknown resource #{inspect(uri)}"
+
+      assert %{"error" => %{"code" => -32_602, "data" => %{"uri" => ^uri}}} =
+               ProtocolTest.modern_stdio_request(server_name, id.(), "resources/read", %{
+                 "uri" => uri
+               })
     end
   end
 
@@ -36,18 +94,16 @@ defmodule FastestMCP.VisibilityTest do
       end
     end
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_transform(transform)
-      |> FastestMCP.add_tool("public", fn _args, _ctx -> :ok end)
-      |> FastestMCP.add_tool("internal", fn _args, _ctx -> :ok end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_transform(transform)
+    |> FastestMCP.add_tool("public", fn _args, _ctx -> :ok end)
+    |> FastestMCP.add_tool("internal", fn _args, _ctx -> :ok end)
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-
-    assert [%{name: "public"}] = FastestMCP.list_tools(server_name)
+    assert [%{name: "public"}] = FastestMCP.list_tools!(server_name)
 
     assert_raise Error, ~r/disabled/, fn ->
-      FastestMCP.call_tool(server_name, "internal", %{})
+      FastestMCP.call_tool!(server_name, "internal", %{})
     end
   end
 
@@ -55,64 +111,61 @@ defmodule FastestMCP.VisibilityTest do
     server_name =
       "session-visibility-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("visible", fn _args, _ctx -> %{ok: true} end)
-      |> FastestMCP.add_tool("hide_visible", fn _args, ctx ->
-        :ok = Context.disable_components(ctx, names: ["visible"], components: [:tool])
-        %{ok: true}
-      end)
-      |> FastestMCP.add_tool("show_visible", fn _args, ctx ->
-        :ok = Context.enable_components(ctx, names: ["visible"], components: [:tool])
-        %{ok: true}
-      end)
-      |> FastestMCP.add_tool("reset_visibility", fn _args, ctx ->
-        :ok = Context.reset_visibility(ctx)
-        %{ok: true}
-      end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("visible", fn _args, _ctx -> %{ok: true} end)
+    |> FastestMCP.add_tool("hide_visible", fn _args, ctx ->
+      :ok = Context.disable_components(ctx, names: ["visible"], components: [:tool])
+      %{ok: true}
+    end)
+    |> FastestMCP.add_tool("show_visible", fn _args, ctx ->
+      :ok = Context.enable_components(ctx, names: ["visible"], components: [:tool])
+      %{ok: true}
+    end)
+    |> FastestMCP.add_tool("reset_visibility", fn _args, ctx ->
+      :ok = Context.reset_visibility(ctx)
+      %{ok: true}
+    end)
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
-
-    assert Enum.map(FastestMCP.list_tools(server_name, session_id: "session-a"), & &1.name) ==
+    assert Enum.map(FastestMCP.list_tools!(server_name, session_id: "session-a"), & &1.name) ==
              ["hide_visible", "reset_visibility", "show_visible", "visible"]
 
     assert %{ok: true} ==
-             FastestMCP.call_tool(server_name, "hide_visible", %{}, session_id: "session-a")
+             FastestMCP.call_tool!(server_name, "hide_visible", %{}, session_id: "session-a")
 
     refute Enum.any?(
-             FastestMCP.list_tools(server_name, session_id: "session-a"),
+             FastestMCP.list_tools!(server_name, session_id: "session-a"),
              &(&1.name == "visible")
            )
 
     assert Enum.any?(
-             FastestMCP.list_tools(server_name, session_id: "session-b"),
+             FastestMCP.list_tools!(server_name, session_id: "session-b"),
              &(&1.name == "visible")
            )
 
     assert_raise Error, ~r/disabled/, fn ->
-      FastestMCP.call_tool(server_name, "visible", %{}, session_id: "session-a")
+      FastestMCP.call_tool!(server_name, "visible", %{}, session_id: "session-a")
     end
 
     assert %{ok: true} ==
-             FastestMCP.call_tool(server_name, "visible", %{}, session_id: "session-b")
+             FastestMCP.call_tool!(server_name, "visible", %{}, session_id: "session-b")
 
     assert %{ok: true} ==
-             FastestMCP.call_tool(server_name, "show_visible", %{}, session_id: "session-a")
+             FastestMCP.call_tool!(server_name, "show_visible", %{}, session_id: "session-a")
 
     assert Enum.any?(
-             FastestMCP.list_tools(server_name, session_id: "session-a"),
+             FastestMCP.list_tools!(server_name, session_id: "session-a"),
              &(&1.name == "visible")
            )
 
     assert %{ok: true} ==
-             FastestMCP.call_tool(server_name, "hide_visible", %{}, session_id: "session-a")
+             FastestMCP.call_tool!(server_name, "hide_visible", %{}, session_id: "session-a")
 
     assert %{ok: true} ==
-             FastestMCP.call_tool(server_name, "reset_visibility", %{}, session_id: "session-a")
+             FastestMCP.call_tool!(server_name, "reset_visibility", %{}, session_id: "session-a")
 
     assert Enum.any?(
-             FastestMCP.list_tools(server_name, session_id: "session-a"),
+             FastestMCP.list_tools!(server_name, session_id: "session-a"),
              &(&1.name == "visible")
            )
   end
@@ -134,11 +187,10 @@ defmodule FastestMCP.VisibilityTest do
         %{count: length(Context.get_state(ctx, {:fastest_mcp, :visibility_rules}, []))}
       end)
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
     refute Enum.any?(
-             FastestMCP.list_tools(server_name, session_id: "session-a"),
+             FastestMCP.list_tools!(server_name, session_id: "session-a"),
              &(&1.name == "finance_tool")
            )
 
@@ -154,40 +206,37 @@ defmodule FastestMCP.VisibilityTest do
                }
              ]
            } =
-             FastestMCP.call_tool(server_name, "activate_finance", %{}, session_id: "session-a")
+             FastestMCP.call_tool!(server_name, "activate_finance", %{}, session_id: "session-a")
 
     assert Enum.sort(tags) == ["finance"]
 
     assert Enum.any?(
-             FastestMCP.list_tools(server_name, session_id: "session-a"),
+             FastestMCP.list_tools!(server_name, session_id: "session-a"),
              &(&1.name == "finance_tool")
            )
 
     refute Enum.any?(
-             FastestMCP.list_tools(server_name, session_id: "session-b"),
+             FastestMCP.list_tools!(server_name, session_id: "session-b"),
              &(&1.name == "finance_tool")
            )
 
     assert %{count: 1} ==
-             FastestMCP.call_tool(server_name, "check_rules", %{}, session_id: "session-a")
+             FastestMCP.call_tool!(server_name, "check_rules", %{}, session_id: "session-a")
   end
 
   test "version selectors enable only matching versions" do
     server_name =
       "session-version-rules-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> globally_disable(names: ["old_tool", "new_tool"])
-      |> FastestMCP.add_tool("old_tool", fn _args, _ctx -> "old" end, version: "1.0.0")
-      |> FastestMCP.add_tool("new_tool", fn _args, _ctx -> "new" end, version: "2.0.0")
-      |> FastestMCP.add_tool("enable_v2_only", fn _args, ctx ->
-        :ok = Context.enable_components(ctx, version: %{gte: "2.0.0"})
-        %{rules: Context.get_state(ctx, {:fastest_mcp, :visibility_rules}, [])}
-      end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> globally_disable(names: ["old_tool", "new_tool"])
+    |> FastestMCP.add_tool("old_tool", fn _args, _ctx -> "old" end, version: "1.0.0")
+    |> FastestMCP.add_tool("new_tool", fn _args, _ctx -> "new" end, version: "2.0.0")
+    |> FastestMCP.add_tool("enable_v2_only", fn _args, ctx ->
+      :ok = Context.enable_components(ctx, version: %{gte: "2.0.0"})
+      %{rules: Context.get_state(ctx, {:fastest_mcp, :visibility_rules}, [])}
+    end)
+    |> start_server!()
 
     assert %{
              rules: [
@@ -196,10 +245,10 @@ defmodule FastestMCP.VisibilityTest do
                  version: %{eq: nil, gt: nil, gte: "2.0.0", lt: nil, lte: nil}
                }
              ]
-           } = FastestMCP.call_tool(server_name, "enable_v2_only", %{}, session_id: "session-a")
+           } = FastestMCP.call_tool!(server_name, "enable_v2_only", %{}, session_id: "session-a")
 
     visible =
-      FastestMCP.list_tools(server_name, session_id: "session-a")
+      FastestMCP.list_tools!(server_name, session_id: "session-a")
       |> Enum.map(&{&1.name, &1.version})
 
     assert {"new_tool", "2.0.0"} in visible
@@ -210,17 +259,14 @@ defmodule FastestMCP.VisibilityTest do
     server_name =
       "session-rule-order-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("test_tool", fn _args, _ctx -> "test" end, tags: ["test"])
-      |> FastestMCP.add_tool("toggle_test", fn _args, ctx ->
-        :ok = Context.enable_components(ctx, tags: ["test"])
-        :ok = Context.disable_components(ctx, tags: ["test"])
-        %{rules: Context.get_state(ctx, {:fastest_mcp, :visibility_rules}, [])}
-      end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("test_tool", fn _args, _ctx -> "test" end, tags: ["test"])
+    |> FastestMCP.add_tool("toggle_test", fn _args, ctx ->
+      :ok = Context.enable_components(ctx, tags: ["test"])
+      :ok = Context.disable_components(ctx, tags: ["test"])
+      %{rules: Context.get_state(ctx, {:fastest_mcp, :visibility_rules}, [])}
+    end)
+    |> start_server!()
 
     assert %{
              rules: [
@@ -228,10 +274,10 @@ defmodule FastestMCP.VisibilityTest do
                %{action: :disable, tags: ["test"]}
              ]
            } =
-             FastestMCP.call_tool(server_name, "toggle_test", %{}, session_id: "session-a")
+             FastestMCP.call_tool!(server_name, "toggle_test", %{}, session_id: "session-a")
 
     refute Enum.any?(
-             FastestMCP.list_tools(server_name, session_id: "session-a"),
+             FastestMCP.list_tools!(server_name, session_id: "session-a"),
              &(&1.name == "test_tool")
            )
   end
@@ -240,95 +286,93 @@ defmodule FastestMCP.VisibilityTest do
     server_name =
       "session-surface-visibility-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> globally_disable(tags: ["finance"])
-      |> FastestMCP.add_resource("resource://finance", fn _args, _ctx -> "finance data" end,
-        tags: ["finance"]
-      )
-      |> FastestMCP.add_prompt(
-        "finance_prompt",
-        fn _args, _ctx ->
-          %{messages: [%{role: "user", content: %{type: "text", text: "finance prompt"}}]}
-        end,
-        tags: ["finance"]
-      )
-      |> FastestMCP.add_tool("activate_finance", fn _args, ctx ->
-        :ok = Context.enable_components(ctx, tags: ["finance"])
-        %{ok: true}
-      end)
-      |> FastestMCP.add_tool("clear_rules", fn _args, ctx ->
-        :ok = Context.reset_visibility(ctx)
-        %{count: length(Context.get_state(ctx, {:fastest_mcp, :visibility_rules}, []))}
-      end)
+    FastestMCP.server(server_name)
+    |> globally_disable(tags: ["finance"])
+    |> FastestMCP.add_resource("resource://finance", fn _args, _ctx -> "finance data" end,
+      tags: ["finance"]
+    )
+    |> FastestMCP.add_prompt(
+      "finance_prompt",
+      fn _args, _ctx ->
+        FastestMCP.Prompts.Result.from(%{
+          messages: [%{role: "user", content: %{type: "text", text: "finance prompt"}}]
+        })
+      end,
+      tags: ["finance"]
+    )
+    |> FastestMCP.add_tool("activate_finance", fn _args, ctx ->
+      :ok = Context.enable_components(ctx, tags: ["finance"])
+      %{ok: true}
+    end)
+    |> FastestMCP.add_tool("clear_rules", fn _args, ctx ->
+      :ok = Context.reset_visibility(ctx)
+      %{count: length(Context.get_state(ctx, {:fastest_mcp, :visibility_rules}, []))}
+    end)
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
-
-    assert [] == FastestMCP.list_resources(server_name, session_id: "session-a")
-    assert [] == FastestMCP.list_prompts(server_name, session_id: "session-a")
+    assert [] == FastestMCP.list_resources!(server_name, session_id: "session-a")
+    assert [] == FastestMCP.list_prompts!(server_name, session_id: "session-a")
 
     assert %{ok: true} ==
-             FastestMCP.call_tool(server_name, "activate_finance", %{}, session_id: "session-a")
+             FastestMCP.call_tool!(server_name, "activate_finance", %{}, session_id: "session-a")
 
     assert [%{uri: "resource://finance"}] =
-             FastestMCP.list_resources(server_name, session_id: "session-a")
+             FastestMCP.list_resources!(server_name, session_id: "session-a")
 
     assert [%{name: "finance_prompt"}] =
-             FastestMCP.list_prompts(server_name, session_id: "session-a")
+             FastestMCP.list_prompts!(server_name, session_id: "session-a")
 
     assert "finance data" ==
-             FastestMCP.read_resource(server_name, "resource://finance", session_id: "session-a")
+             FastestMCP.read_resource!(server_name, "resource://finance", session_id: "session-a")
 
     assert %{messages: [%{content: %{text: "finance prompt"}}]} =
-             FastestMCP.render_prompt(server_name, "finance_prompt", %{}, session_id: "session-a")
+             FastestMCP.render_prompt!(server_name, "finance_prompt", %{},
+               session_id: "session-a"
+             )
 
     assert %{count: 0} ==
-             FastestMCP.call_tool(server_name, "clear_rules", %{}, session_id: "session-a")
+             FastestMCP.call_tool!(server_name, "clear_rules", %{}, session_id: "session-a")
 
-    assert [] == FastestMCP.list_resources(server_name, session_id: "session-a")
-    assert [] == FastestMCP.list_prompts(server_name, session_id: "session-a")
+    assert [] == FastestMCP.list_resources!(server_name, session_id: "session-a")
+    assert [] == FastestMCP.list_prompts!(server_name, session_id: "session-a")
   end
 
   test "repeated disable and reset cycles restore visibility every time" do
     server_name =
       "session-reset-loop-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("create_project", fn _args, _ctx -> "created" end, tags: ["system"])
-      |> FastestMCP.add_tool("enter_env", fn _args, ctx ->
-        :ok = Context.disable_components(ctx, tags: ["system"])
-        %{ok: true}
-      end)
-      |> FastestMCP.add_tool("exit_env", fn _args, ctx ->
-        :ok = Context.reset_visibility(ctx)
-        %{ok: true}
-      end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("create_project", fn _args, _ctx -> "created" end, tags: ["system"])
+    |> FastestMCP.add_tool("enter_env", fn _args, ctx ->
+      :ok = Context.disable_components(ctx, tags: ["system"])
+      %{ok: true}
+    end)
+    |> FastestMCP.add_tool("exit_env", fn _args, ctx ->
+      :ok = Context.reset_visibility(ctx)
+      %{ok: true}
+    end)
+    |> start_server!()
 
     for _iteration <- 1..3 do
       assert Enum.any?(
-               FastestMCP.list_tools(server_name, session_id: "session-a"),
+               FastestMCP.list_tools!(server_name, session_id: "session-a"),
                &(&1.name == "create_project")
              )
 
       assert %{ok: true} ==
-               FastestMCP.call_tool(server_name, "enter_env", %{}, session_id: "session-a")
+               FastestMCP.call_tool!(server_name, "enter_env", %{}, session_id: "session-a")
 
       refute Enum.any?(
-               FastestMCP.list_tools(server_name, session_id: "session-a"),
+               FastestMCP.list_tools!(server_name, session_id: "session-a"),
                &(&1.name == "create_project")
              )
 
       assert %{ok: true} ==
-               FastestMCP.call_tool(server_name, "exit_env", %{}, session_id: "session-a")
+               FastestMCP.call_tool!(server_name, "exit_env", %{}, session_id: "session-a")
     end
 
     assert Enum.any?(
-             FastestMCP.list_tools(server_name, session_id: "session-a"),
+             FastestMCP.list_tools!(server_name, session_id: "session-a"),
              &(&1.name == "create_project")
            )
   end
@@ -337,23 +381,22 @@ defmodule FastestMCP.VisibilityTest do
     server_name =
       "session-leak-check-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("shared_tool", fn _args, _ctx -> "shared" end, tags: ["system"])
-      |> FastestMCP.add_tool("disable_system", fn _args, ctx ->
-        :ok = Context.disable_components(ctx, tags: ["system"])
-        %{ok: true}
-      end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("shared_tool", fn _args, _ctx -> "shared" end, tags: ["system"])
+    |> FastestMCP.add_tool("disable_system", fn _args, ctx ->
+      :ok = Context.disable_components(ctx, tags: ["system"])
+      %{ok: true}
+    end)
+    |> start_server!()
 
     parent = self()
 
     session_a =
       Task.async(fn ->
         assert %{ok: true} ==
-                 FastestMCP.call_tool(server_name, "disable_system", %{}, session_id: "session-a")
+                 FastestMCP.call_tool!(server_name, "disable_system", %{},
+                   session_id: "session-a"
+                 )
 
         send(parent, :session_a_disabled)
         :timer.sleep(200)
@@ -363,7 +406,7 @@ defmodule FastestMCP.VisibilityTest do
 
     assert Task.async(fn ->
              Enum.any?(
-               FastestMCP.list_tools(server_name, session_id: "session-b"),
+               FastestMCP.list_tools!(server_name, session_id: "session-b"),
                &(&1.name == "shared_tool")
              )
            end)
@@ -372,7 +415,7 @@ defmodule FastestMCP.VisibilityTest do
     Task.await(session_a, 1_000)
 
     assert Enum.any?(
-             FastestMCP.list_tools(server_name, session_id: "session-c"),
+             FastestMCP.list_tools!(server_name, session_id: "session-c"),
              &(&1.name == "shared_tool")
            )
   end
@@ -381,17 +424,14 @@ defmodule FastestMCP.VisibilityTest do
     server_name =
       "many-session-isolation-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> globally_disable(tags: ["premium"])
-      |> FastestMCP.add_tool("premium_tool", fn _args, _ctx -> "premium" end, tags: ["premium"])
-      |> FastestMCP.add_tool("activate_premium", fn _args, ctx ->
-        :ok = Context.enable_components(ctx, tags: ["premium"])
-        %{ok: true}
-      end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> globally_disable(tags: ["premium"])
+    |> FastestMCP.add_tool("premium_tool", fn _args, _ctx -> "premium" end, tags: ["premium"])
+    |> FastestMCP.add_tool("activate_premium", fn _args, ctx ->
+      :ok = Context.enable_components(ctx, tags: ["premium"])
+      %{ok: true}
+    end)
+    |> start_server!()
 
     activated =
       0..4
@@ -400,13 +440,13 @@ defmodule FastestMCP.VisibilityTest do
           session_id = "activated-#{index}"
 
           assert %{ok: true} ==
-                   FastestMCP.call_tool(server_name, "activate_premium", %{},
+                   FastestMCP.call_tool!(server_name, "activate_premium", %{},
                      session_id: session_id
                    )
 
           {session_id,
            Enum.any?(
-             FastestMCP.list_tools(server_name, session_id: session_id),
+             FastestMCP.list_tools!(server_name, session_id: session_id),
              &(&1.name == "premium_tool")
            )}
         end,
@@ -422,7 +462,7 @@ defmodule FastestMCP.VisibilityTest do
 
           {session_id,
            Enum.any?(
-             FastestMCP.list_tools(server_name, session_id: session_id),
+             FastestMCP.list_tools!(server_name, session_id: session_id),
              &(&1.name == "premium_tool")
            )}
         end,
@@ -442,18 +482,12 @@ defmodule FastestMCP.VisibilityTest do
       "visibility-owner-surviving-" <> Integer.to_string(System.unique_integer([:positive]))
 
     for server_name <- [removed_server, surviving_server] do
-      server =
-        FastestMCP.server(server_name)
-        |> FastestMCP.add_tool("visible", fn _args, _ctx -> :ok end)
+      FastestMCP.server(server_name)
+      |> FastestMCP.add_tool("visible", fn _args, _ctx -> :ok end)
+      |> start_server!()
 
-      assert {:ok, _pid} = FastestMCP.start_server(server)
-      :ok = FastestMCP.disable_components(server_name, names: ["visible"])
+      :ok = FastestMCP.disable_components!(server_name, names: ["visible"])
     end
-
-    on_exit(fn -> FastestMCP.stop_server(surviving_server) end)
-
-    assert :ets.info(:fastest_mcp_component_visibility, :owner) ==
-             Process.whereis(Registry)
 
     readers =
       for _index <- 1..32 do
@@ -462,7 +496,7 @@ defmodule FastestMCP.VisibilityTest do
             assert [%{action: :disable}] =
                      ComponentVisibility.server_rules(surviving_server)
 
-            Process.sleep(0)
+            :erlang.yield()
           end
         end)
       end
@@ -472,44 +506,38 @@ defmodule FastestMCP.VisibilityTest do
 
     assert [] == ComponentVisibility.server_rules(removed_server)
     assert [%{action: :disable}] = ComponentVisibility.server_rules(surviving_server)
-
-    assert :ets.info(:fastest_mcp_component_visibility, :owner) ==
-             Process.whereis(Registry)
   end
 
   test "server-scoped visibility is authoritative over session re-enables" do
     server_name =
       "global-visibility-authority-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("finance_tool", fn _args, _ctx -> "finance" end, tags: ["finance"])
-      |> FastestMCP.add_tool("activate_finance", fn _args, ctx ->
-        :ok = Context.enable_components(ctx, tags: ["finance"], components: [:tool])
-        %{ok: true}
-      end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("finance_tool", fn _args, _ctx -> "finance" end, tags: ["finance"])
+    |> FastestMCP.add_tool("activate_finance", fn _args, ctx ->
+      :ok = Context.enable_components(ctx, tags: ["finance"], components: [:tool])
+      %{ok: true}
+    end)
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    :ok = FastestMCP.disable_components!(server_name, tags: ["finance"], components: [:tool])
 
-    :ok = FastestMCP.disable_components(server_name, tags: ["finance"], components: [:tool])
-
-    refute Enum.any?(FastestMCP.list_tools(server_name), &(&1.name == "finance_tool"))
+    refute Enum.any?(FastestMCP.list_tools!(server_name), &(&1.name == "finance_tool"))
 
     assert_raise Error, ~r/disabled/, fn ->
-      FastestMCP.call_tool(server_name, "finance_tool", %{})
+      FastestMCP.call_tool!(server_name, "finance_tool", %{})
     end
 
     assert %{ok: true} ==
-             FastestMCP.call_tool(server_name, "activate_finance", %{}, session_id: "session-a")
+             FastestMCP.call_tool!(server_name, "activate_finance", %{}, session_id: "session-a")
 
     refute Enum.any?(
-             FastestMCP.list_tools(server_name, session_id: "session-a"),
+             FastestMCP.list_tools!(server_name, session_id: "session-a"),
              &(&1.name == "finance_tool")
            )
 
     assert_raise Error, ~r/disabled/, fn ->
-      FastestMCP.call_tool(server_name, "finance_tool", %{}, session_id: "session-a")
+      FastestMCP.call_tool!(server_name, "finance_tool", %{}, session_id: "session-a")
     end
   end
 
@@ -517,26 +545,23 @@ defmodule FastestMCP.VisibilityTest do
     server_name =
       "global-visibility-only-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("finance_tool", fn _args, _ctx -> "finance" end, tags: ["finance"])
-      |> FastestMCP.add_tool("ops_tool", fn _args, _ctx -> "ops" end, tags: ["ops"])
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("finance_tool", fn _args, _ctx -> "finance" end, tags: ["finance"])
+    |> FastestMCP.add_tool("ops_tool", fn _args, _ctx -> "ops" end, tags: ["ops"])
+    |> start_server!()
 
     :ok =
-      FastestMCP.enable_components(server_name,
+      FastestMCP.enable_components!(server_name,
         tags: ["finance"],
         components: [:tool],
         only: true
       )
 
-    assert ["finance_tool"] == Enum.map(FastestMCP.list_tools(server_name), & &1.name)
-    assert "finance" == FastestMCP.call_tool(server_name, "finance_tool", %{})
+    assert ["finance_tool"] == Enum.map(FastestMCP.list_tools!(server_name), & &1.name)
+    assert "finance" == FastestMCP.call_tool!(server_name, "finance_tool", %{})
 
     assert_raise Error, ~r/disabled/, fn ->
-      FastestMCP.call_tool(server_name, "ops_tool", %{})
+      FastestMCP.call_tool!(server_name, "ops_tool", %{})
     end
   end
 
@@ -544,32 +569,29 @@ defmodule FastestMCP.VisibilityTest do
     server_name =
       "session-visibility-only-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("finance_tool", fn _args, _ctx -> "finance" end, tags: ["finance"])
-      |> FastestMCP.add_tool("ops_tool", fn _args, _ctx -> "ops" end, tags: ["ops"])
-      |> FastestMCP.add_tool(
-        "focus_finance",
-        fn _args, ctx ->
-          :ok = Context.enable_components(ctx, tags: ["finance"], components: [:tool], only: true)
-          %{ok: true}
-        end,
-        tags: ["finance"]
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("finance_tool", fn _args, _ctx -> "finance" end, tags: ["finance"])
+    |> FastestMCP.add_tool("ops_tool", fn _args, _ctx -> "ops" end, tags: ["ops"])
+    |> FastestMCP.add_tool(
+      "focus_finance",
+      fn _args, ctx ->
+        :ok = Context.enable_components(ctx, tags: ["finance"], components: [:tool], only: true)
+        %{ok: true}
+      end,
+      tags: ["finance"]
+    )
+    |> start_server!()
 
     assert %{ok: true} ==
-             FastestMCP.call_tool(server_name, "focus_finance", %{}, session_id: "session-a")
+             FastestMCP.call_tool!(server_name, "focus_finance", %{}, session_id: "session-a")
 
     assert ["finance_tool", "focus_finance"] ==
-             FastestMCP.list_tools(server_name, session_id: "session-a")
+             FastestMCP.list_tools!(server_name, session_id: "session-a")
              |> Enum.map(& &1.name)
              |> Enum.sort()
 
     assert ["finance_tool", "focus_finance", "ops_tool"] ==
-             FastestMCP.list_tools(server_name, session_id: "session-b")
+             FastestMCP.list_tools!(server_name, session_id: "session-b")
              |> Enum.map(& &1.name)
              |> Enum.sort()
   end
@@ -578,35 +600,32 @@ defmodule FastestMCP.VisibilityTest do
     server_name =
       "global-visibility-selectors-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("alpha", fn _args, _ctx -> "alpha" end)
-      |> FastestMCP.add_tool("beta", fn _args, _ctx -> "beta" end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("alpha", fn _args, _ctx -> "alpha" end)
+    |> FastestMCP.add_tool("beta", fn _args, _ctx -> "beta" end)
+    |> start_server!()
 
     beta_key =
-      FastestMCP.list_tools(server_name)
+      FastestMCP.list_tools!(server_name)
       |> Enum.find(&(&1.name == "beta"))
       |> Map.fetch!(:key)
 
-    :ok = FastestMCP.disable_components(server_name, keys: [beta_key], components: [:tool])
+    :ok = FastestMCP.disable_components!(server_name, keys: [beta_key], components: [:tool])
 
-    assert ["alpha"] == Enum.map(FastestMCP.list_tools(server_name), & &1.name)
-    assert "alpha" == FastestMCP.call_tool(server_name, "alpha", %{})
+    assert ["alpha"] == Enum.map(FastestMCP.list_tools!(server_name), & &1.name)
+    assert "alpha" == FastestMCP.call_tool!(server_name, "alpha", %{})
 
     assert_raise Error, ~r/disabled/, fn ->
-      FastestMCP.call_tool(server_name, "beta", %{})
+      FastestMCP.call_tool!(server_name, "beta", %{})
     end
 
-    :ok = FastestMCP.reset_component_visibility(server_name)
-    :ok = FastestMCP.disable_components(server_name, components: [:tool], match_all: true)
+    :ok = FastestMCP.reset_component_visibility!(server_name)
+    :ok = FastestMCP.disable_components!(server_name, components: [:tool], match_all: true)
 
-    assert [] == FastestMCP.list_tools(server_name)
+    assert [] == FastestMCP.list_tools!(server_name)
 
     assert_raise Error, ~r/disabled/, fn ->
-      FastestMCP.call_tool(server_name, "alpha", %{})
+      FastestMCP.call_tool!(server_name, "alpha", %{})
     end
   end
 

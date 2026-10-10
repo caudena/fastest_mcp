@@ -2,29 +2,47 @@ defmodule FastestMCP.Client.Request do
   @moduledoc """
   Opaque handle for an asynchronous connected-client request.
 
-  Use `FastestMCP.Client.await/2` to receive the result or
-  `FastestMCP.Client.cancel/2` to explicitly issue an MCP cancellation.
+  Use `await/2` to receive the result or `cancel/2` to explicitly issue an MCP
+  cancellation. Only the process that started the request may await it. Once
+  that process cancels the request, or its `await/2` times out, no reply
+  reaches its mailbox, and `await/2` returns the `:cancelled` error.
   """
 
-  @enforce_keys [:client, :ref, :request_id, :method, :owner]
-  defstruct [:client, :ref, :request_id, :method, :owner, task_augmented: false]
+  alias FastestMCP.Client.Requests
+  alias FastestMCP.Error
 
-  @type t :: %__MODULE__{
-          client: FastestMCP.Client.t(),
-          ref: reference(),
-          request_id: String.t() | integer(),
-          method: String.t(),
-          owner: pid(),
-          task_augmented: boolean()
-        }
+  @enforce_keys [:client, :ref, :request_id, :method, :owner]
+  defstruct [
+    :client,
+    :ref,
+    :request_id,
+    :method,
+    :owner,
+    :monitor,
+    :cancelled,
+    task_augmented: false
+  ]
+
+  @opaque t :: %__MODULE__{
+            client: FastestMCP.Client.t(),
+            ref: reference(),
+            request_id: String.t() | integer(),
+            method: String.t(),
+            owner: pid(),
+            monitor: reference(),
+            cancelled: :atomics.atomics_ref(),
+            task_augmented: boolean()
+          }
 
   @doc "Waits for the request result."
-  def await(%__MODULE__{} = request, timeout \\ :infinity) do
-    FastestMCP.Client.await(request, timeout)
-  end
+  defdelegate await(request, timeout \\ :infinity), to: Requests
 
   @doc "Cancels the request with an optional human-readable reason."
-  def cancel(%__MODULE__{} = request, reason \\ nil) do
-    FastestMCP.Client.cancel(request, reason)
-  end
+  defdelegate cancel(request, reason \\ nil), to: Requests
+
+  @doc "Raising variant of `await/2`."
+  def await!(request, timeout \\ :infinity), do: Error.unwrap!(await(request, timeout))
+
+  @doc "Raising variant of `cancel/2`."
+  def cancel!(request, reason \\ nil), do: Error.unwrap!(cancel(request, reason))
 end

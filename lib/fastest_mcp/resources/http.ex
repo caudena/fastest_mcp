@@ -2,59 +2,86 @@ defmodule FastestMCP.Resources.HTTP do
   @moduledoc """
   Helper for serving HTTP-backed resources.
 
-  This is a thin wrapper around `:httpc` so resource handlers can fetch remote
-  data without rebuilding the same transport glue repeatedly.
+  `read/1` fetches the URL and returns its body as text or binary resource
+  content. Each read is bounded: it fails when the response takes longer than
+  `:timeout_ms` or its body exceeds `:max_body_bytes`.
   """
 
+  import FastestMCP.Util, only: [maybe_put: 3]
+
   alias FastestMCP.Error
+  alias FastestMCP.HTTP
   alias FastestMCP.MIME
+  alias FastestMCP.Options
   alias FastestMCP.Resources.Binary
   alias FastestMCP.Resources.Result
   alias FastestMCP.Resources.Text
 
-  defstruct [:url, :method, :headers, :mime_type, :body]
+  @options [
+    method: {:any, :get},
+    headers: {:any, []},
+    body: {:any, nil},
+    mime_type: {:any, nil},
+    timeout_ms: {:pos_integer, 5_000},
+    max_body_bytes: {:pos_integer, 10_485_760}
+  ]
+
+  @enforce_keys [:url]
+  defstruct [:url, :body, :mime_type, :timeout_ms, :max_body_bytes, method: :get, headers: %{}]
 
   @type t :: %__MODULE__{
           url: String.t(),
-          method: atom(),
-          headers: [{charlist(), charlist()}],
+          method: :get | :post | :put | :patch | :delete,
+          headers: %{String.t() => String.t()},
+          body: iodata() | nil,
           mime_type: String.t() | nil,
-          body: iodata() | nil
+          timeout_ms: pos_integer(),
+          max_body_bytes: pos_integer()
         }
 
-  @doc "Builds an HTTP-backed resource helper."
+  @doc """
+  Builds an HTTP-backed resource helper.
+
+  Options: `:method` (default `:get`), `:headers` (a map or list of name-value
+  pairs), `:body` (sent with `:post`, `:put`, and `:patch`), `:mime_type`
+  (overrides the response content type), `:timeout_ms` (default 5 seconds),
+  and `:max_body_bytes` (default 10 MiB).
+  """
   def new(url, opts \\ []) do
-    %__MODULE__{
-      url: to_string(url),
-      method: Keyword.get(opts, :method, :get),
-      headers: normalize_headers(Keyword.get(opts, :headers, [])),
-      mime_type: Keyword.get(opts, :mime_type),
-      body: Keyword.get(opts, :body)
-    }
+    opts = Options.validate!(opts, @options)
+
+    headers =
+      Map.new(opts.headers, fn {name, value} ->
+        {String.downcase(to_string(name)), to_string(value)}
+      end)
+
+    # Without an explicit Accept header, any representation is acceptable.
+    struct!(
+      __MODULE__,
+      Map.merge(opts, %{url: to_string(url), headers: Map.put_new(headers, "accept", "*/*")})
+    )
   end
 
   @doc "Fetches the remote resource and returns a normalized result."
   def read(%__MODULE__{} = resource) do
-    request = {String.to_charlist(resource.url), resource.headers}
+    request_opts =
+      maybe_put(
+        [headers: resource.headers, timeout_ms: resource.timeout_ms],
+        :body,
+        resource.body
+      )
 
-    request =
-      case resource.body do
-        nil ->
-          request
-
-        body ->
-          {String.to_charlist(resource.url), resource.headers, ~c"application/octet-stream",
-           IO.iodata_to_binary(body)}
-      end
-
-    http_options = []
-
-    case :httpc.request(resource.method, request, http_options, body_format: :binary) do
-      {:ok, {{_version, status, _reason}, headers, body}} when status in 200..299 ->
-        mime_type = resource.mime_type || header_value(headers, ~c"content-type")
+    case HTTP.bounded_request(
+           resource.method,
+           resource.url,
+           resource.max_body_bytes,
+           request_opts
+         ) do
+      {:ok, status, headers, body} when status in 200..299 ->
+        mime_type = resource.mime_type || content_type(headers)
 
         content =
-          if is_binary(body) and String.valid?(body) and not binary_mime_type?(mime_type) do
+          if String.valid?(body) and not MIME.binary?(mime_type) do
             Text.new(body, mime_type: mime_type || "text/plain")
           else
             Binary.new(body, mime_type: mime_type || "application/octet-stream")
@@ -62,10 +89,10 @@ defmodule FastestMCP.Resources.HTTP do
 
         Result.new([content], meta: %{status: status})
 
-      {:ok, {{_version, status, reason}, _headers, _body}} ->
+      {:ok, status, _headers, _body} ->
         raise Error,
           code: :internal_error,
-          message: "HTTP resource fetch failed with status #{status} #{reason}"
+          message: "HTTP resource fetch failed with status #{status}"
 
       {:error, reason} ->
         raise Error,
@@ -74,26 +101,7 @@ defmodule FastestMCP.Resources.HTTP do
     end
   end
 
-  defp normalize_headers(headers) when is_map(headers) do
-    Enum.map(headers, fn {key, value} ->
-      {String.to_charlist(to_string(key)), String.to_charlist(to_string(value))}
-    end)
+  defp content_type(headers) do
+    with {_name, value} <- List.keyfind(headers, "content-type", 0), do: value
   end
-
-  defp normalize_headers(headers) when is_list(headers) do
-    Enum.map(headers, fn {key, value} ->
-      {String.to_charlist(to_string(key)), String.to_charlist(to_string(value))}
-    end)
-  end
-
-  defp header_value(headers, name) do
-    headers
-    |> Enum.find_value(fn {key, value} ->
-      if String.downcase(to_string(key)) == String.downcase(to_string(name)),
-        do: to_string(value),
-        else: nil
-    end)
-  end
-
-  defp binary_mime_type?(mime_type), do: MIME.binary?(mime_type)
 end

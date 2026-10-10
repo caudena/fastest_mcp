@@ -23,7 +23,7 @@ defmodule FastestMCP.PeerTask do
           target: String.t() | nil
         }
 
-  @doc "Builds a peer-task handle from validated attributes."
+  @doc "Builds a peer-task handle from validated attributes, given with atom keys."
   def new(attrs) when is_map(attrs) or is_list(attrs) do
     attrs = Map.new(attrs)
 
@@ -37,47 +37,40 @@ defmodule FastestMCP.PeerTask do
   end
 
   @doc "Fetches the latest task state from the connected peer."
-  def fetch(%__MODULE__{} = task, opts \\ []) do
-    session_call(:peer_task_fetch, task, opts)
-  end
+  def fetch(%__MODULE__{} = task, opts \\ []),
+    do: Session.peer_task_fetch(task.server_name, task.session_id, task.task_id, opts)
 
   @doc "Waits for the peer task to reach a requested or terminal state."
-  def wait(%__MODULE__{} = task, opts \\ []) do
-    session_call(:peer_task_wait, task, opts)
-  end
+  def wait(%__MODULE__{} = task, opts \\ []),
+    do: Session.peer_task_wait(task.server_name, task.session_id, task.task_id, opts)
 
   @doc "Fetches the peer task's terminal result."
-  def result(%__MODULE__{} = task, opts \\ []) do
-    session_call(:peer_task_result, task, opts)
-  end
+  def result(%__MODULE__{} = task, opts \\ []),
+    do: Session.peer_task_result(task.server_name, task.session_id, task.task_id, opts)
 
   @doc "Requests cancellation of the peer-owned task."
-  def cancel(%__MODULE__{} = task, opts \\ []) do
-    session_call(:peer_task_cancel, task, opts)
-  end
+  def cancel(%__MODULE__{} = task, opts \\ []),
+    do: Session.peer_task_cancel(task.server_name, task.session_id, task.task_id, opts)
 
   @doc "Registers a callback for peer task status changes."
-  def on_status_change(%__MODULE__{} = task, callback) when is_function(callback) do
-    session_call(:peer_task_on_status_change, task, callback)
-  end
-
-  defp session_call(function, task, argument) do
-    if function_exported?(Session, function, 4) do
-      apply(Session, function, [task.server_name, task.session_id, task.task_id, argument])
-    else
-      {:error, :session_unavailable}
-    end
-  end
+  def on_status_change(%__MODULE__{} = task, callback) when is_function(callback, 1),
+    do:
+      Session.peer_task_on_status_change(
+        task.server_name,
+        task.session_id,
+        task.task_id,
+        callback
+      )
 
   defp required_string!(attrs, key) do
-    case Map.get(attrs, key, Map.get(attrs, Atom.to_string(key))) do
+    case attrs[key] do
       value when is_binary(value) and value != "" -> value
       other -> raise ArgumentError, "#{key} must be a non-empty string, got: #{inspect(other)}"
     end
   end
 
   defp optional_string!(attrs, key) do
-    case Map.get(attrs, key, Map.get(attrs, Atom.to_string(key))) do
+    case attrs[key] do
       nil -> nil
       value when is_binary(value) and value != "" -> value
       other -> raise ArgumentError, "#{key} must be a non-empty string, got: #{inspect(other)}"

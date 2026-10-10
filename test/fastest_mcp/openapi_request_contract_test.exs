@@ -1,7 +1,24 @@
 defmodule FastestMCP.OpenAPIRequestContractTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.HTTP
+
+  test "explicit HTTP headers replace case-insensitive defaults rather than duplicating them" do
+    {url, ref} = start_one_shot_http_server()
+
+    assert {:ok, 200, _, _} =
+             HTTP.request(:post, url,
+               json: %{},
+               headers: [
+                 {"Accept", "application/json, text/event-stream"},
+                 {"User-Agent", "test-peer"}
+               ]
+             )
+
+    assert_receive {:raw_http_request, ^ref, request}
+    assert header_values(request, "accept") == ["application/json, text/event-stream"]
+    assert header_values(request, "user-agent") == ["test-peer"]
+  end
 
   test "generated input aliases do not overwrite explicit OpenAPI names" do
     parent = self()
@@ -61,11 +78,10 @@ defmodule FastestMCP.OpenAPIRequestContractTest do
     assert MapSet.new(tool.input_schema["required"]) ==
              MapSet.new(["id", "id__path", "id__path_1"])
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
     assert %{"ok" => true} ==
-             FastestMCP.call_tool(server_name, "update_item", %{
+             FastestMCP.call_tool!(server_name, "update_item", %{
                "id" => "body-id",
                "id__path" => "explicit-query",
                "id__path_1" => "path-id"
@@ -140,17 +156,16 @@ defmodule FastestMCP.OpenAPIRequestContractTest do
     assert required_inputs(tools["required_array"]) == ["body"]
     assert required_inputs(tools["required_empty_object"]) == []
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
-    assert %{"ok" => true} == FastestMCP.call_tool(server_name, "optional_object", %{})
+    assert %{"ok" => true} == FastestMCP.call_tool!(server_name, "optional_object", %{})
 
     assert_receive {:request, :post, "https://body-required.example.com/optional-object",
                     optional_opts}
 
     refute Keyword.has_key?(optional_opts, :json)
 
-    assert %{"ok" => true} == FastestMCP.call_tool(server_name, "required_empty_object", %{})
+    assert %{"ok" => true} == FastestMCP.call_tool!(server_name, "required_empty_object", %{})
 
     assert_receive {:request, :post, "https://body-required.example.com/required-empty-object",
                     required_opts}
@@ -204,10 +219,6 @@ defmodule FastestMCP.OpenAPIRequestContractTest do
   end
 
   defp required_inputs(tool), do: Map.get(tool.input_schema, "required", [])
-
-  defp unique_name(prefix) do
-    prefix <> "-" <> Integer.to_string(System.unique_integer([:positive]))
-  end
 
   defp start_one_shot_http_server do
     {:ok, listen_socket} =

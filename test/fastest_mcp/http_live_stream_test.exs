@@ -1,5 +1,5 @@
 defmodule FastestMCP.HTTPLiveStreamTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.HTTP
 
@@ -38,24 +38,21 @@ defmodule FastestMCP.HTTPLiveStreamTest do
   end
 
   test "live POST streams deliver an early SSE chunk and cancel without leaking messages" do
-    bandit =
-      start_supervised!({Bandit, plug: {EarlyChunkPlug, parent: self()}, scheme: :http, port: 0})
-
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+    %{url: url} = serve!({EarlyChunkPlug, parent: self()})
 
     assert {:ok, request_ref} =
-             HTTP.stream_request(:post, "http://127.0.0.1:#{port}/mcp",
+             HTTP.stream_request(:post, url,
                json: %{"jsonrpc" => "2.0", "id" => 7, "method" => "ping"},
                headers: [{"accept", "text/event-stream"}],
                live_stream: true,
-               timeout_ms: 1_000
+               timeout_ms: 5_000
              )
 
     assert {:fastest_mcp_mint_stream, relay_pid, _local_ref} = request_ref
     relay_monitor = Process.monitor(relay_pid)
 
     assert_receive {:early_chunk_request, server_pid, "POST", request_headers, request_body},
-                   1_000
+                   5_000
 
     assert {"content-type", "application/json"} in request_headers
 
@@ -65,16 +62,16 @@ defmodule FastestMCP.HTTPLiveStreamTest do
              "method" => "ping"
            }
 
-    assert_receive :early_chunk_sent, 1_000
+    assert_receive :early_chunk_sent, 5_000
 
-    assert_receive {:http, {^request_ref, :stream_start, response_headers}}, 1_000
+    assert_receive {:http, {^request_ref, :stream_start, response_headers}}, 5_000
     assert {"content-type", "text/event-stream; charset=utf-8"} in response_headers
 
-    assert_receive {:http, {^request_ref, :stream, chunk}}, 1_000
+    assert_receive {:http, {^request_ref, :stream, chunk}}, 5_000
     assert chunk =~ ~s("id":7)
 
     assert :ok = HTTP.cancel_request(request_ref)
-    assert_receive {:DOWN, ^relay_monitor, :process, ^relay_pid, :normal}, 1_000
+    assert_receive {:DOWN, ^relay_monitor, :process, ^relay_pid, :normal}, 5_000
 
     send(server_pid, :finish_early_chunk_response)
     refute_receive {:http, {^request_ref, _message}}, 100

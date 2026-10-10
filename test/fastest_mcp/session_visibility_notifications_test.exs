@@ -1,13 +1,12 @@
 defmodule FastestMCP.SessionVisibilityNotificationsTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Client
   alias FastestMCP.Component
   alias FastestMCP.ComponentManager
   alias FastestMCP.Context
-  alias FastestMCP.Error
 
-  test "enabling hidden components cannot add unadvertised families to an existing session" do
+  test "enabling hidden components notifies every family that changed, even one empty at connect" do
     parent = self()
 
     server_name =
@@ -23,7 +22,9 @@ defmodule FastestMCP.SessionVisibilityNotificationsTest do
       |> FastestMCP.add_prompt(
         "finance_prompt",
         fn _args, _ctx ->
-          %{messages: [%{role: "user", content: %{type: "text", text: "finance prompt"}}]}
+          FastestMCP.Prompts.Result.from(%{
+            messages: [%{role: "user", content: %{type: "text", text: "finance prompt"}}]
+          })
         end,
         tags: ["finance"]
       )
@@ -32,24 +33,24 @@ defmodule FastestMCP.SessionVisibilityNotificationsTest do
         %{ok: true}
       end)
 
-    {client, cleanup} = start_http_client(server_name, server, parent)
+    client = start_http_client(server, parent)
 
-    try do
-      assert_not_negotiated(fn -> Client.list_resources(client) end, "resources/list")
-      assert_not_negotiated(fn -> Client.list_prompts(client) end, "prompts/list")
-      refute Enum.any?(Client.list_tools(client).items, &(&1["name"] == "finance_tool"))
+    assert %{items: []} = Client.list_resources!(client)
+    assert %{items: []} = Client.list_prompts!(client)
+    refute Enum.any?(Client.list_tools!(client).items, &(&1["name"] == "finance_tool"))
 
-      assert %{"ok" => true} = Client.call_tool(client, "activate_finance", %{})
+    assert %{structured_content: %{"ok" => true}} =
+             Client.call_tool!(client, "activate_finance", %{})
 
-      assert receive_notification_methods(1) == ["notifications/tools/list_changed"]
-      refute_receive {:visibility_notification, _payload}, 200
+    assert Enum.sort(receive_notification_methods(3)) == [
+             "notifications/prompts/list_changed",
+             "notifications/resources/list_changed",
+             "notifications/tools/list_changed"
+           ]
 
-      assert Enum.any?(Client.list_tools(client).items, &(&1["name"] == "finance_tool"))
-      assert_not_negotiated(fn -> Client.list_resources(client) end, "resources/list")
-      assert_not_negotiated(fn -> Client.list_prompts(client) end, "prompts/list")
-    after
-      cleanup.()
-    end
+    assert Enum.any?(Client.list_tools!(client).items, &(&1["name"] == "finance_tool"))
+    assert %{items: [%{"uri" => "resource://finance"}]} = Client.list_resources!(client)
+    assert %{items: [%{"name" => "finance_prompt"}]} = Client.list_prompts!(client)
   end
 
   test "disabling visible components sends list-changed notifications for all changed families" do
@@ -67,7 +68,9 @@ defmodule FastestMCP.SessionVisibilityNotificationsTest do
       |> FastestMCP.add_prompt(
         "finance_prompt",
         fn _args, _ctx ->
-          %{messages: [%{role: "user", content: %{type: "text", text: "finance prompt"}}]}
+          FastestMCP.Prompts.Result.from(%{
+            messages: [%{role: "user", content: %{type: "text", text: "finance prompt"}}]
+          })
         end,
         tags: ["finance"]
       )
@@ -76,31 +79,28 @@ defmodule FastestMCP.SessionVisibilityNotificationsTest do
         %{ok: true}
       end)
 
-    {client, cleanup} = start_http_client(server_name, server, parent)
+    client = start_http_client(server, parent)
 
-    try do
-      assert Enum.any?(Client.list_tools(client).items, &(&1["name"] == "finance_tool"))
+    assert Enum.any?(Client.list_tools!(client).items, &(&1["name"] == "finance_tool"))
 
-      assert %{items: [%{"uri" => "resource://finance"}], next_cursor: nil} =
-               Client.list_resources(client)
+    assert %{items: [%{"uri" => "resource://finance"}], next_cursor: nil} =
+             Client.list_resources!(client)
 
-      assert %{items: [%{"name" => "finance_prompt"}], next_cursor: nil} =
-               Client.list_prompts(client)
+    assert %{items: [%{"name" => "finance_prompt"}], next_cursor: nil} =
+             Client.list_prompts!(client)
 
-      assert %{"ok" => true} = Client.call_tool(client, "deactivate_finance", %{})
+    assert %{structured_content: %{"ok" => true}} =
+             Client.call_tool!(client, "deactivate_finance", %{})
 
-      assert Enum.sort(receive_notification_methods(3)) == [
-               "notifications/prompts/list_changed",
-               "notifications/resources/list_changed",
-               "notifications/tools/list_changed"
-             ]
+    assert Enum.sort(receive_notification_methods(3)) == [
+             "notifications/prompts/list_changed",
+             "notifications/resources/list_changed",
+             "notifications/tools/list_changed"
+           ]
 
-      refute Enum.any?(Client.list_tools(client).items, &(&1["name"] == "finance_tool"))
-      assert %{items: [], next_cursor: nil} = Client.list_resources(client)
-      assert %{items: [], next_cursor: nil} = Client.list_prompts(client)
-    after
-      cleanup.()
-    end
+    refute Enum.any?(Client.list_tools!(client).items, &(&1["name"] == "finance_tool"))
+    assert %{items: [], next_cursor: nil} = Client.list_resources!(client)
+    assert %{items: [], next_cursor: nil} = Client.list_prompts!(client)
   end
 
   test "reset_visibility sends notifications when it restores the visible sets" do
@@ -119,7 +119,9 @@ defmodule FastestMCP.SessionVisibilityNotificationsTest do
       |> FastestMCP.add_prompt(
         "finance_prompt",
         fn _args, _ctx ->
-          %{messages: [%{role: "user", content: %{type: "text", text: "finance prompt"}}]}
+          FastestMCP.Prompts.Result.from(%{
+            messages: [%{role: "user", content: %{type: "text", text: "finance prompt"}}]
+          })
         end,
         tags: ["finance"]
       )
@@ -132,25 +134,28 @@ defmodule FastestMCP.SessionVisibilityNotificationsTest do
         %{ok: true}
       end)
 
-    {client, cleanup} = start_http_client(server_name, server, parent)
+    client = start_http_client(server, parent)
 
-    try do
-      assert %{"ok" => true} = Client.call_tool(client, "activate_finance", %{})
+    assert %{structured_content: %{"ok" => true}} =
+             Client.call_tool!(client, "activate_finance", %{})
 
-      assert receive_notification_methods(1) == ["notifications/tools/list_changed"]
-      refute_receive {:visibility_notification, _payload}, 200
+    assert length(receive_notification_methods(3)) == 3
+    refute_receive {:visibility_notification, _payload}, 200
 
-      assert %{"ok" => true} = Client.call_tool(client, "clear_rules", %{})
+    assert %{structured_content: %{"ok" => true}} =
+             Client.call_tool!(client, "clear_rules", %{})
 
-      assert receive_notification_methods(1) == ["notifications/tools/list_changed"]
-      refute_receive {:visibility_notification, _payload}, 200
+    assert Enum.sort(receive_notification_methods(3)) == [
+             "notifications/prompts/list_changed",
+             "notifications/resources/list_changed",
+             "notifications/tools/list_changed"
+           ]
 
-      refute Enum.any?(Client.list_tools(client).items, &(&1["name"] == "finance_tool"))
-      assert_not_negotiated(fn -> Client.list_resources(client) end, "resources/list")
-      assert_not_negotiated(fn -> Client.list_prompts(client) end, "prompts/list")
-    after
-      cleanup.()
-    end
+    refute_receive {:visibility_notification, _payload}, 200
+
+    refute Enum.any?(Client.list_tools!(client).items, &(&1["name"] == "finance_tool"))
+    assert %{items: []} = Client.list_resources!(client)
+    assert %{items: []} = Client.list_prompts!(client)
   end
 
   test "component hints limit list-changed notifications to the changed family" do
@@ -169,7 +174,9 @@ defmodule FastestMCP.SessionVisibilityNotificationsTest do
       |> FastestMCP.add_prompt(
         "finance_prompt",
         fn _args, _ctx ->
-          %{messages: [%{role: "user", content: %{type: "text", text: "finance prompt"}}]}
+          FastestMCP.Prompts.Result.from(%{
+            messages: [%{role: "user", content: %{type: "text", text: "finance prompt"}}]
+          })
         end,
         tags: ["finance"]
       )
@@ -178,20 +185,59 @@ defmodule FastestMCP.SessionVisibilityNotificationsTest do
         %{ok: true}
       end)
 
-    {client, cleanup} = start_http_client(server_name, server, parent)
+    client = start_http_client(server, parent)
 
-    try do
-      assert %{"ok" => true} = Client.call_tool(client, "activate_tools_only", %{})
+    assert %{structured_content: %{"ok" => true}} =
+             Client.call_tool!(client, "activate_tools_only", %{})
 
-      assert receive_notification_methods(1) == ["notifications/tools/list_changed"]
-      refute_receive {:visibility_notification, _payload}, 200
+    assert receive_notification_methods(1) == ["notifications/tools/list_changed"]
+    refute_receive {:visibility_notification, _payload}, 200
 
-      assert Enum.any?(Client.list_tools(client).items, &(&1["name"] == "finance_tool"))
-      assert_not_negotiated(fn -> Client.list_resources(client) end, "resources/list")
-      assert_not_negotiated(fn -> Client.list_prompts(client) end, "prompts/list")
-    after
-      cleanup.()
-    end
+    assert Enum.any?(Client.list_tools!(client).items, &(&1["name"] == "finance_tool"))
+    assert %{items: []} = Client.list_resources!(client)
+    assert %{items: []} = Client.list_prompts!(client)
+  end
+
+  test "a session's visibility change notifies that session only, never 2026-07-28 listeners" do
+    test_pid = self()
+    server_name = unique_name("visibility-notify-scope")
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("search", fn _args, _ctx -> "found" end)
+    |> FastestMCP.add_tool("hide_search", fn _args, ctx ->
+      :ok = Context.disable_components(ctx, names: ["search"])
+      "hidden"
+    end)
+    |> start_server!()
+
+    legacy =
+      connect!({:in_process, server_name},
+        protocol_version: "2025-11-25",
+        notification_handler: &send(test_pid, {:legacy, &1["method"]})
+      )
+
+    modern = connect!({:in_process, server_name}, protocol_version: "2026-07-28")
+
+    listener =
+      Client.listen!(modern, %{"toolsListChanged" => true},
+        on_notification: &send(test_pid, {:modern, &1["method"]})
+      )
+
+    assert_receive {:modern, "notifications/subscriptions/acknowledged"}
+
+    Client.call_tool!(legacy, "hide_search", %{})
+    assert_receive {:legacy, "notifications/tools/list_changed"}
+
+    "hidden" = FastestMCP.call_tool!(server_name, "hide_search", %{}, session_id: "chat-2")
+    refute_receive {:modern, "notifications/tools/list_changed"}, 200
+    refute_receive {:legacy, _method}, 50
+
+    # A change for every client reaches both.
+    :ok = FastestMCP.disable_components!(server_name, names: ["hide_search"])
+    assert_receive {:legacy, "notifications/tools/list_changed"}
+    assert_receive {:modern, "notifications/tools/list_changed"}
+
+    assert :ok = Client.Request.cancel!(listener, "test complete")
   end
 
   test "server-scoped visibility updates emit list-changed notifications" do
@@ -209,44 +255,42 @@ defmodule FastestMCP.SessionVisibilityNotificationsTest do
       |> FastestMCP.add_prompt(
         "finance_prompt",
         fn _args, _ctx ->
-          %{messages: [%{role: "user", content: %{type: "text", text: "finance prompt"}}]}
+          FastestMCP.Prompts.Result.from(%{
+            messages: [%{role: "user", content: %{type: "text", text: "finance prompt"}}]
+          })
         end,
         tags: ["finance"]
       )
 
-    {client, cleanup} = start_http_client(server_name, server, parent)
+    client = start_http_client(server, parent)
 
-    try do
-      :ok = FastestMCP.disable_components(server_name, tags: ["finance"])
+    :ok = FastestMCP.disable_components!(server_name, tags: ["finance"])
 
-      assert Enum.sort(receive_notification_methods(3)) == [
-               "notifications/prompts/list_changed",
-               "notifications/resources/list_changed",
-               "notifications/tools/list_changed"
-             ]
+    assert Enum.sort(receive_notification_methods(3)) == [
+             "notifications/prompts/list_changed",
+             "notifications/resources/list_changed",
+             "notifications/tools/list_changed"
+           ]
 
-      refute Enum.any?(Client.list_tools(client).items, &(&1["name"] == "finance_tool"))
-      assert %{items: [], next_cursor: nil} = Client.list_resources(client)
-      assert %{items: [], next_cursor: nil} = Client.list_prompts(client)
+    refute Enum.any?(Client.list_tools!(client).items, &(&1["name"] == "finance_tool"))
+    assert %{items: [], next_cursor: nil} = Client.list_resources!(client)
+    assert %{items: [], next_cursor: nil} = Client.list_prompts!(client)
 
-      :ok = FastestMCP.reset_component_visibility(server_name)
+    :ok = FastestMCP.reset_component_visibility!(server_name)
 
-      assert Enum.sort(receive_notification_methods(3)) == [
-               "notifications/prompts/list_changed",
-               "notifications/resources/list_changed",
-               "notifications/tools/list_changed"
-             ]
+    assert Enum.sort(receive_notification_methods(3)) == [
+             "notifications/prompts/list_changed",
+             "notifications/resources/list_changed",
+             "notifications/tools/list_changed"
+           ]
 
-      assert Enum.any?(Client.list_tools(client).items, &(&1["name"] == "finance_tool"))
+    assert Enum.any?(Client.list_tools!(client).items, &(&1["name"] == "finance_tool"))
 
-      assert %{items: [%{"uri" => "resource://finance"}], next_cursor: nil} =
-               Client.list_resources(client)
+    assert %{items: [%{"uri" => "resource://finance"}], next_cursor: nil} =
+             Client.list_resources!(client)
 
-      assert %{items: [%{"name" => "finance_prompt"}], next_cursor: nil} =
-               Client.list_prompts(client)
-    after
-      cleanup.()
-    end
+    assert %{items: [%{"name" => "finance_prompt"}], next_cursor: nil} =
+             Client.list_prompts!(client)
   end
 
   test "server-scoped component hints limit notifications to the changed family" do
@@ -264,29 +308,27 @@ defmodule FastestMCP.SessionVisibilityNotificationsTest do
       |> FastestMCP.add_prompt(
         "finance_prompt",
         fn _args, _ctx ->
-          %{messages: [%{role: "user", content: %{type: "text", text: "finance prompt"}}]}
+          FastestMCP.Prompts.Result.from(%{
+            messages: [%{role: "user", content: %{type: "text", text: "finance prompt"}}]
+          })
         end,
         tags: ["finance"]
       )
 
-    {client, cleanup} = start_http_client(server_name, server, parent)
+    client = start_http_client(server, parent)
 
-    try do
-      :ok = FastestMCP.disable_components(server_name, tags: ["finance"], components: [:tool])
+    :ok = FastestMCP.disable_components!(server_name, tags: ["finance"], components: [:tool])
 
-      assert receive_notification_methods(1) == ["notifications/tools/list_changed"]
-      refute_receive {:visibility_notification, _payload}, 200
+    assert receive_notification_methods(1) == ["notifications/tools/list_changed"]
+    refute_receive {:visibility_notification, _payload}, 200
 
-      refute Enum.any?(Client.list_tools(client).items, &(&1["name"] == "finance_tool"))
+    refute Enum.any?(Client.list_tools!(client).items, &(&1["name"] == "finance_tool"))
 
-      assert %{items: [%{"uri" => "resource://finance"}], next_cursor: nil} =
-               Client.list_resources(client)
+    assert %{items: [%{"uri" => "resource://finance"}], next_cursor: nil} =
+             Client.list_resources!(client)
 
-      assert %{items: [%{"name" => "finance_prompt"}], next_cursor: nil} =
-               Client.list_prompts(client)
-    after
-      cleanup.()
-    end
+    assert %{items: [%{"name" => "finance_prompt"}], next_cursor: nil} =
+             Client.list_prompts!(client)
   end
 
   test "replacing a descriptor under the same tool name emits and invalidates the client catalog" do
@@ -297,60 +339,45 @@ defmodule FastestMCP.SessionVisibilityNotificationsTest do
       FastestMCP.server(server_name)
       |> FastestMCP.add_tool("anchor", fn _arguments, _ctx -> %{anchor: true} end)
 
-    {client, cleanup} = start_http_client(server_name, server, parent)
+    client = start_http_client(server, parent)
 
-    try do
-      manager = FastestMCP.component_manager(server_name)
+    manager = FastestMCP.component_manager!(server_name)
 
-      assert {:ok, _tool} =
-               ComponentManager.add_tool(
-                 manager,
-                 "dynamic",
-                 fn _arguments, _ctx -> %{old: true} end,
-                 version: "1.0.0",
-                 output_schema: object_output_schema("old")
-               )
+    assert {:ok, _tool} =
+             ComponentManager.add_tool(
+               manager,
+               "dynamic",
+               fn _arguments, _ctx -> %{old: true} end,
+               version: "1.0.0",
+               output_schema: object_output_schema("old")
+             )
 
-      assert receive_notification_methods(1) == ["notifications/tools/list_changed"]
-      assert %{"old" => true} = Client.call_tool(client, "dynamic", %{})
+    assert receive_notification_methods(1) == ["notifications/tools/list_changed"]
+    assert %{structured_content: %{"old" => true}} = Client.call_tool!(client, "dynamic", %{})
 
-      assert {:ok, _tool} =
-               ComponentManager.add_tool(
-                 manager,
-                 "dynamic",
-                 fn _arguments, _ctx -> %{new: true} end,
-                 version: "1.0.0",
-                 output_schema: object_output_schema("new"),
-                 on_duplicate: :replace
-               )
+    assert {:ok, _tool} =
+             ComponentManager.add_tool(
+               manager,
+               "dynamic",
+               fn _arguments, _ctx -> %{new: true} end,
+               version: "1.0.0",
+               output_schema: object_output_schema("new"),
+               on_duplicate: :replace
+             )
 
-      assert receive_notification_methods(1) == ["notifications/tools/list_changed"]
-      assert %{"new" => true} = Client.call_tool(client, "dynamic", %{})
-    after
-      cleanup.()
-    end
+    assert receive_notification_methods(1) == ["notifications/tools/list_changed"]
+    assert %{structured_content: %{"new" => true}} = Client.call_tool!(client, "dynamic", %{})
   end
 
-  defp start_http_client(server_name, server, parent) do
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+  defp start_http_client(server, parent) do
+    start_server!(server)
 
-    bandit =
-      start_supervised!(
-        {Bandit,
-         plug:
-           {FastestMCP.Transport.HTTPApp,
-            server_name: server_name,
-            path: "/mcp",
-            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
-         scheme: :http,
-         port: 0}
-      )
-
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+    %{url: url} =
+      start_http!(server.name, allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"])
 
     client =
-      Client.connect!(
-        "http://127.0.0.1:#{port}/mcp",
+      connect!(
+        url,
         protocol_version: "2025-11-25",
         session_stream: true,
         notification_handler: fn payload ->
@@ -358,15 +385,8 @@ defmodule FastestMCP.SessionVisibilityNotificationsTest do
         end
       )
 
-    assert wait_for_session_stream(client) == :ok
-
-    cleanup = fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
-      Supervisor.stop(bandit)
-      FastestMCP.stop_server(server_name)
-    end
-
-    {client, cleanup}
+    assert_eventually(fn -> Client.info!(client).session_stream_open? end)
+    client
   end
 
   defp receive_notification_methods(count) do
@@ -379,12 +399,6 @@ defmodule FastestMCP.SessionVisibilityNotificationsTest do
     end
   end
 
-  defp assert_not_negotiated(fun, method) do
-    error = assert_raise Error, fun
-    assert error.code == :method_not_found
-    assert error.message == "server did not advertise support for #{method}"
-  end
-
   defp object_output_schema(required_property) do
     %{
       "type" => "object",
@@ -392,25 +406,6 @@ defmodule FastestMCP.SessionVisibilityNotificationsTest do
       "required" => [required_property],
       "additionalProperties" => false
     }
-  end
-
-  defp wait_for_session_stream(client, timeout \\ 1_000) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-    do_wait_for_session_stream(client, deadline)
-  end
-
-  defp do_wait_for_session_stream(client, deadline) do
-    cond do
-      Client.session_stream_open?(client) ->
-        :ok
-
-      System.monotonic_time(:millisecond) >= deadline ->
-        flunk("timed out waiting for the client session stream to open")
-
-      true ->
-        Process.sleep(10)
-        do_wait_for_session_stream(client, deadline)
-    end
   end
 
   defp globally_disable(server, opts) do

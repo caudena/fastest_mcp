@@ -1,7 +1,23 @@
 defmodule FastestMCP.ResourceTemplateRFC6570Test do
-  use ExUnit.Case, async: true
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Components.ResourceTemplate
+
+  test "literal percent triplets ignore hex case without changing URI case or captures" do
+    {matcher, _, _} = ResourceTemplate.compile_matcher!("data://catalog/café/{id}")
+
+    assert ResourceTemplate.match_compiled(matcher, "data://catalog/caf%c3%a9/AbC") == %{
+             "id" => "AbC"
+           }
+
+    assert ResourceTemplate.match_compiled(matcher, "data://catalog/caf%C3%A9/AbC") == %{
+             "id" => "AbC"
+           }
+
+    refute ResourceTemplate.match_compiled(matcher, "data://catalog/CAF%C3%A9/AbC")
+    refute ResourceTemplate.match_compiled(matcher, "data://catalog/café/AbC")
+    refute ResourceTemplate.match_compiled(matcher, "data://catalog/caf%C3%/AbC")
+  end
 
   @rfc6570_variables %{
     "var" => "value",

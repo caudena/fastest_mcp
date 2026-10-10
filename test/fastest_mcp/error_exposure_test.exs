@@ -1,5 +1,5 @@
 defmodule FastestMCP.ErrorExposureTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Error
   alias FastestMCP.EventBus
@@ -14,18 +14,15 @@ defmodule FastestMCP.ErrorExposureTest do
     server_name =
       "error-exposure-default-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("explode", fn _arguments, _ctx ->
-        raise "secret token 123"
-      end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("explode", fn _arguments, _ctx ->
+      raise "secret token 123"
+    end)
+    |> start_server!()
 
     local_error =
       assert_raise Error, fn ->
-        FastestMCP.call_tool(server_name, "explode", %{})
+        FastestMCP.call_tool!(server_name, "explode", %{})
       end
 
     assert local_error.message =~ "secret token 123"
@@ -57,33 +54,32 @@ defmodule FastestMCP.ErrorExposureTest do
     server_name =
       "error-exposure-masked-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name,
-        mask_error_details: true
-      )
-      |> FastestMCP.add_auth(FastestMCP.Auth.StaticToken,
-        tokens: %{"valid-token" => %{client_id: "docs-client"}}
-      )
-      |> FastestMCP.add_tool("explode", fn _arguments, _ctx ->
-        raise "secret token 123"
-      end)
-      |> FastestMCP.add_tool("explicit", fn _arguments, _ctx ->
-        raise Error, code: :bad_request, message: "safe failure"
-      end)
-      |> FastestMCP.add_tool("sum", fn %{"a" => a}, _ctx -> a end,
-        input_schema: %{
-          "type" => "object",
-          "properties" => %{"a" => %{"type" => "integer"}},
-          "required" => ["a"]
-        }
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name,
+      mask_error_details: true
+    )
+    |> FastestMCP.add_auth(FastestMCP.Auth.StaticToken,
+      tokens: %{"valid-token" => %{client_id: "docs-client"}}
+    )
+    |> FastestMCP.add_tool("explode", fn _arguments, _ctx ->
+      raise "secret token 123"
+    end)
+    |> FastestMCP.add_tool("explicit", fn _arguments, _ctx ->
+      raise Error, code: :bad_request, message: "safe failure"
+    end)
+    |> FastestMCP.add_tool("sum", fn %{"a" => a}, _ctx -> a end,
+      input_schema: %{
+        "type" => "object",
+        "properties" => %{"a" => %{"type" => "integer"}},
+        "required" => ["a"]
+      }
+    )
+    |> start_server!()
 
     local_error =
       assert_raise Error, fn ->
-        FastestMCP.call_tool(server_name, "explode", %{}, auth_input: %{"token" => "valid-token"})
+        FastestMCP.call_tool!(server_name, "explode", %{},
+          auth_input: %{"token" => "valid-token"}
+        )
       end
 
     assert local_error.message =~ "secret token 123"
@@ -127,7 +123,7 @@ defmodule FastestMCP.ErrorExposureTest do
 
     validation_error = json_body(validation_response)["error"]
     assert validation_error["code"] == -32_602
-    assert get_in(validation_error, ["data", "fastestmcp", "code"]) == "bad_request"
+    assert get_in(validation_error, ["data", "fastestmcp", "code"]) == "invalid_params"
 
     assert is_list(
              get_in(validation_error, [
@@ -168,20 +164,17 @@ defmodule FastestMCP.ErrorExposureTest do
           {unmasked_server_name, false},
           {masked_server_name, true}
         ] do
-      server =
-        FastestMCP.server(server_name, mask_error_details: mask?)
-        |> FastestMCP.add_resource("file://secret", fn _arguments, _ctx ->
-          raise "resource secret"
-        end)
-        |> FastestMCP.add_resource_template("user://{id}", fn _arguments, _ctx ->
-          raise "template secret"
-        end)
-        |> FastestMCP.add_prompt("explode_prompt", fn _arguments, _ctx ->
-          raise "prompt secret"
-        end)
-
-      assert {:ok, _pid} = FastestMCP.start_server(server)
-      on_exit(fn -> FastestMCP.stop_server(server_name) end)
+      FastestMCP.server(server_name, mask_error_details: mask?)
+      |> FastestMCP.add_resource("file://secret", fn _arguments, _ctx ->
+        raise "resource secret"
+      end)
+      |> FastestMCP.add_resource_template("user://{id}", fn _arguments, _ctx ->
+        raise "template secret"
+      end)
+      |> FastestMCP.add_prompt("explode_prompt", fn _arguments, _ctx ->
+        raise "prompt secret"
+      end)
+      |> start_server!()
     end
 
     resource_default =
@@ -227,51 +220,49 @@ defmodule FastestMCP.ErrorExposureTest do
   test "masked task public surfaces sanitize unexpected failures while local APIs stay rich" do
     server_name = "error-exposure-task-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name, mask_error_details: true)
-      |> FastestMCP.add_tool(
-        "explode",
-        fn _arguments, _ctx ->
-          raise "database password 123"
-        end,
-        task: true
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name, mask_error_details: true)
+    |> FastestMCP.add_tool(
+      "explode",
+      fn _arguments, _ctx ->
+        raise "database password 123"
+      end,
+      task: true
+    )
+    |> start_server!()
 
     subscribe_to_task_events(server_name)
 
     handle =
-      FastestMCP.call_tool(server_name, "explode", %{}, task: true, session_id: "task-session")
+      FastestMCP.call_tool!(server_name, "explode", %{}, task: true, session_id: "task-session")
 
     local_error =
       assert_raise Error, fn ->
-        FastestMCP.await_task(handle, 1_000)
+        FastestMCP.await_task!(handle, 1_000)
       end
 
     assert local_error.message =~ "database password 123"
 
-    local_task = FastestMCP.fetch_task(handle)
+    local_task = FastestMCP.fetch_task!(handle)
     assert local_task.error.message =~ "database password 123"
 
     failed_notification =
       await_task_notification(server_name, handle.task_id, "failed")
 
-    assert failed_notification.notification.params.statusMessage == ~s(tool "explode" failed)
+    assert failed_notification.notification["params"]["statusMessage"] ==
+             ~s(tool "explode" failed)
 
     status =
       task_status(server_name, "task-session", handle.task_id)
 
-    assert status.status == "failed"
-    assert status.statusMessage == ~s(tool "explode" failed)
+    assert status["status"] == "failed"
+    assert status["statusMessage"] == ~s(tool "explode" failed)
 
     listed =
       task_list(server_name, "task-session")
 
     assert Enum.any?(
-             listed.tasks,
-             &(&1.taskId == handle.task_id and &1.statusMessage == ~s(tool "explode" failed))
+             listed["tasks"],
+             &(&1["taskId"] == handle.task_id and &1["statusMessage"] == ~s(tool "explode" failed))
            )
 
     http_result =
@@ -310,7 +301,7 @@ defmodule FastestMCP.ErrorExposureTest do
       )
 
     assert_raise Error, fn ->
-      FastestMCP.await_task(server_name, stdio_task_id, 1_000, session_id: stdio_session_id)
+      FastestMCP.await_task!(server_name, stdio_task_id, 1_000, session_id: stdio_session_id)
     end
 
     stdio_result =
@@ -337,27 +328,24 @@ defmodule FastestMCP.ErrorExposureTest do
     server_name =
       "error-exposure-task-explicit-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name, mask_error_details: true)
-      |> FastestMCP.add_tool(
-        "explicit",
-        fn _arguments, _ctx ->
-          raise Error, code: :bad_request, message: "safe task failure"
-        end,
-        task: true
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name, mask_error_details: true)
+    |> FastestMCP.add_tool(
+      "explicit",
+      fn _arguments, _ctx ->
+        raise Error, code: :bad_request, message: "safe task failure"
+      end,
+      task: true
+    )
+    |> start_server!()
 
     subscribe_to_task_events(server_name)
 
     handle =
-      FastestMCP.call_tool(server_name, "explicit", %{}, task: true, session_id: "task-session")
+      FastestMCP.call_tool!(server_name, "explicit", %{}, task: true, session_id: "task-session")
 
     error =
       assert_raise Error, fn ->
-        FastestMCP.await_task(handle, 1_000)
+        FastestMCP.await_task!(handle, 1_000)
       end
 
     assert error.message == "safe task failure"
@@ -365,10 +353,10 @@ defmodule FastestMCP.ErrorExposureTest do
     failed_notification =
       await_task_notification(server_name, handle.task_id, "failed")
 
-    assert failed_notification.notification.params.statusMessage == "safe task failure"
+    assert failed_notification.notification["params"]["statusMessage"] == "safe task failure"
 
     status = task_status(server_name, "task-session", handle.task_id)
-    assert status.statusMessage == "safe task failure"
+    assert status["statusMessage"] == "safe task failure"
 
     result =
       jsonrpc_http(
@@ -426,9 +414,8 @@ defmodule FastestMCP.ErrorExposureTest do
     timeout = max(deadline - System.monotonic_time(:millisecond), 0)
 
     receive do
-      {:fastest_mcp_event, ^server_name, [:notifications, :tasks, :status], _, notification}
-      when notification.notification.params.taskId == task_id and
-             notification.notification.params.status == status ->
+      {:fastest_mcp_event, ^server_name, [:notifications, :tasks, :status], _,
+       %{notification: %{"params" => %{"taskId" => ^task_id, "status" => ^status}}} = notification} ->
         notification
 
       {:fastest_mcp_event, ^server_name, [:notifications, :tasks, :status], _, _notification} ->
@@ -445,7 +432,7 @@ defmodule FastestMCP.ErrorExposureTest do
       transport: :stdio,
       session_id: session_id,
       payload: %{"taskId" => task_id},
-      request_metadata: %{session_id_provided: true}
+      session_id_provided?: true
     })
   end
 
@@ -455,7 +442,7 @@ defmodule FastestMCP.ErrorExposureTest do
       transport: :stdio,
       session_id: session_id,
       payload: %{},
-      request_metadata: %{session_id_provided: true}
+      session_id_provided?: true
     })
   end
 end

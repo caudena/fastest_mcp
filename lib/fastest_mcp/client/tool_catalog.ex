@@ -1,11 +1,17 @@
 defmodule FastestMCP.Client.ToolCatalog do
   @moduledoc false
 
-  alias FastestMCP.Component
+  alias FastestMCP.Component.Lookup
   alias FastestMCP.Protocol.HTTPHeaders
   alias FastestMCP.Schema
 
-  defstruct generation: 0, descriptors: %{}, errors: %{}, expires_at_ms: nil
+  defstruct generation: 0,
+            descriptors: %{},
+            errors: %{},
+            preferred: %{},
+            expires_at_ms: nil,
+            raw: [],
+            page_count: 0
 
   @type descriptor :: %{
           name: String.t(),
@@ -19,19 +25,20 @@ defmodule FastestMCP.Client.ToolCatalog do
 
   @type t :: %__MODULE__{
           generation: non_neg_integer(),
+          raw: [map()],
+          page_count: non_neg_integer(),
           descriptors: %{optional({String.t(), String.t() | nil}) => descriptor()},
           errors: map(),
+          preferred: %{optional(String.t()) => map()},
           expires_at_ms: integer() | nil
         }
 
-  def new(generation \\ 0) when is_integer(generation) and generation >= 0,
-    do: %__MODULE__{generation: generation}
-
   def build(tools, generation, schema_options)
       when is_list(tools) and is_integer(generation) and is_list(schema_options) do
-    Enum.reduce(tools, new(generation), fn tool, catalog ->
+    Enum.reduce(tools, %__MODULE__{generation: generation, raw: tools}, fn tool, catalog ->
       put_tool(catalog, tool, schema_options)
     end)
+    |> index_preferred()
   end
 
   def build(tools, generation, schema_options, ttl_ms)
@@ -53,18 +60,33 @@ defmodule FastestMCP.Client.ToolCatalog do
     name = to_string(name)
     version = if is_nil(version), do: nil, else: to_string(version)
 
-    candidates =
-      catalog.descriptors
-      |> Map.values()
-      |> Kernel.++(Map.values(catalog.errors))
-      |> Enum.filter(&(&1.name == name and (is_nil(version) or &1.version == version)))
-      |> Component.sort_by_version_desc(& &1.version)
+    entry =
+      if is_nil(version) do
+        Map.get(catalog.preferred, name)
+      else
+        Map.get(catalog.errors, {name, version}) || Map.get(catalog.descriptors, {name, version})
+      end
 
-    case candidates do
-      [%{descriptor: descriptor} | _rest] -> {:ok, descriptor}
-      [%{error: error} | _rest] -> {:error, error}
-      [] -> :error
+    case entry do
+      %{descriptor: descriptor} -> {:ok, descriptor}
+      %{error: error} -> {:error, error}
+      nil -> :error
     end
+  end
+
+  defp index_preferred(catalog) do
+    preferred =
+      Enum.reduce([catalog.descriptors, catalog.errors], %{}, fn entries, preferred ->
+        Enum.reduce(entries, preferred, fn {{name, _version}, entry}, acc ->
+          Map.update(acc, name, entry, fn existing ->
+            if Lookup.compare_versions(entry.version, existing.version) == :gt,
+              do: entry,
+              else: existing
+          end)
+        end)
+      end)
+
+    %{catalog | preferred: preferred}
   end
 
   defp put_tool(catalog, %{"name" => name} = tool, schema_options)

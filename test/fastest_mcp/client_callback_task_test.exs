@@ -1,11 +1,14 @@
 defmodule FastestMCP.ClientCallbackTaskTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
+
+  alias FastestMCP.Test.ClientProbe
 
   import Plug.Conn
 
   alias FastestMCP.Client
   alias FastestMCP.Client.CallbackContext
   alias FastestMCP.Client.URLElicitation
+  alias FastestMCP.Context
   alias FastestMCP.Error
   alias FastestMCP.SamplingTool
 
@@ -29,25 +32,10 @@ defmodule FastestMCP.ClientCallbackTaskTest do
 
     def init(opts), do: opts
 
+    # Called by the test once the client has opened its session stream.
     def push(state, payload) do
-      wait_for_stream(state)
-      %{stream: stream} = Agent.get(state, & &1)
+      stream = assert_eventually(fn -> Agent.get(state, &Map.get(&1, :stream)) end)
       send(stream, {:push_event, payload})
-    end
-
-    defp wait_for_stream(state, attempts \\ 50)
-
-    defp wait_for_stream(_state, 0), do: raise("timed out waiting for client session stream")
-
-    defp wait_for_stream(state, attempts) do
-      case Agent.get(state, &Map.get(&1, :stream)) do
-        pid when is_pid(pid) ->
-          :ok
-
-        _other ->
-          Process.sleep(20)
-          wait_for_stream(state, attempts - 1)
-      end
     end
 
     def call(conn, opts) do
@@ -171,17 +159,12 @@ defmodule FastestMCP.ClientCallbackTaskTest do
 
   test "client advertises callback task list and cancel capabilities during initialize" do
     state = start_supervised!({Agent, fn -> %{} end})
-    bandit = start_callback_server!(state)
+    listener = start_callback_server!(state)
 
-    client =
-      connect_client!(bandit,
-        sampling_handler: fn _messages, _params -> sampling_result("draft") end,
-        elicitation_handler: fn _message, _params -> {:accept, %{"ok" => true}} end
-      )
-
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
-    end)
+    connect_client!(listener,
+      sampling_handler: fn _messages, _params -> sampling_result("draft") end,
+      elicitation_handler: fn _message, _params -> {:accept, %{"ok" => true}} end
+    )
 
     assert_receive {:fake_callback_server_post,
                     %{
@@ -198,17 +181,13 @@ defmodule FastestMCP.ClientCallbackTaskTest do
 
   test "client answers ping and roots/list and emits roots/list_changed on material updates" do
     state = start_supervised!({Agent, fn -> %{} end})
-    bandit = start_callback_server!(state)
+    listener = start_callback_server!(state)
 
     client =
-      connect_client!(bandit,
+      connect_client!(listener,
         session_stream: true,
         roots: [FastestMCP.Root.new("file:///workspace", name: "workspace")]
       )
-
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
-    end)
 
     assert_receive {:fake_callback_server_post,
                     %{
@@ -247,13 +226,13 @@ defmodule FastestMCP.ClientCallbackTaskTest do
                     }},
                    2_000
 
-    :ok = Client.set_roots(client, [FastestMCP.Root.new("file:///workspace-2")])
+    :ok = Client.set_roots!(client, [FastestMCP.Root.new("file:///workspace-2")])
 
     assert_receive {:fake_callback_server_post,
                     %{"method" => "notifications/roots/list_changed"}},
                    2_000
 
-    :ok = Client.set_roots(client, [FastestMCP.Root.new("file:///workspace-2")])
+    :ok = Client.set_roots!(client, [FastestMCP.Root.new("file:///workspace-2")])
 
     refute_receive {:fake_callback_server_post,
                     %{"method" => "notifications/roots/list_changed"}},
@@ -263,10 +242,10 @@ defmodule FastestMCP.ClientCallbackTaskTest do
   test "server callback request ids cannot be reused across methods or overwrite in-flight state" do
     parent = self()
     state = start_supervised!({Agent, fn -> %{} end})
-    bandit = start_callback_server!(state)
+    listener = start_callback_server!(state)
 
     client =
-      connect_client!(bandit,
+      connect_client!(listener,
         session_stream: true,
         sampling_handler: fn _messages, _params ->
           send(parent, {:reused_id_sampling_started, self()})
@@ -276,10 +255,6 @@ defmodule FastestMCP.ClientCallbackTaskTest do
           end
         end
       )
-
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
-    end)
 
     wait_for_post("initialize")
 
@@ -297,8 +272,8 @@ defmodule FastestMCP.ClientCallbackTaskTest do
 
     assert_receive {:reused_id_sampling_started, callback_pid}, 2_000
 
-    assert %{direction: :server_to_client, method: "sampling/createMessage"} =
-             :sys.get_state(client.pid).callback_requests["server-reused-id"]
+    assert %{method: "sampling/createMessage"} =
+             ClientProbe.callback_request(client, "server-reused-id")
 
     FakeCallbackServer.push(state, %{
       "jsonrpc" => "2.0",
@@ -314,7 +289,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
                     }},
                    2_000
 
-    assert :sys.get_state(client.pid).callback_requests["server-reused-id"].pid == callback_pid
+    assert ClientProbe.callback_request(client, "server-reused-id").pid == callback_pid
 
     send(callback_pid, :release)
 
@@ -332,17 +307,13 @@ defmodule FastestMCP.ClientCallbackTaskTest do
 
   test "server callback request-id history is bounded and terminates after the overload reply" do
     state = start_supervised!({Agent, fn -> %{} end})
-    bandit = start_callback_server!(state)
+    listener = start_callback_server!(state)
 
     client =
-      connect_client!(bandit,
+      connect_client!(listener,
         session_stream: true,
         max_callback_request_ids: 1
       )
-
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
-    end)
 
     wait_for_post("initialize")
 
@@ -383,23 +354,19 @@ defmodule FastestMCP.ClientCallbackTaskTest do
   test "HTTP task responses retain progress ownership until terminal status" do
     parent = self()
     state = start_supervised!({Agent, fn -> %{} end})
-    bandit = start_callback_server!(state)
+    listener = start_callback_server!(state)
 
     client =
-      connect_client!(bandit,
+      connect_client!(listener,
         session_stream: true,
         progress_handler: fn params -> send(parent, {:http_task_progress, params}) end,
         notification_handler: fn message -> send(parent, {:http_task_notification, message}) end
       )
 
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
-    end)
-
     wait_for_post("initialize")
 
     assert %FastestMCP.Client.Task{task_id: "http-progress-task"} =
-             Client.call_tool(client, "background", %{},
+             Client.call_tool_task!(client, "background", %{},
                task: true,
                progress_token: "http-retained-progress"
              )
@@ -424,7 +391,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
 
     error =
       assert_raise Error, fn ->
-        Client.request_async(client, "ping", %{
+        Client.request_async!(client, "ping", %{
           "_meta" => %{"progressToken" => "http-retained-progress"}
         })
       end
@@ -445,28 +412,23 @@ defmodule FastestMCP.ClientCallbackTaskTest do
                    2_000
 
     request =
-      Client.request_async(client, "ping", %{
+      Client.request_async!(client, "ping", %{
         "_meta" => %{"progressToken" => "http-retained-progress"}
       })
 
-    assert %{} = Client.await(request)
+    assert %{} = Client.Request.await!(request)
   end
 
   test "form elicitation applies property defaults while preserving explicit values" do
     state = start_supervised!({Agent, fn -> %{} end})
-    bandit = start_callback_server!(state)
+    listener = start_callback_server!(state)
 
-    client =
-      connect_client!(bandit,
-        session_stream: true,
-        elicitation_handler: fn _message, _params ->
-          {:accept, %{"environment" => "production"}}
-        end
-      )
-
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
-    end)
+    connect_client!(listener,
+      session_stream: true,
+      elicitation_handler: fn _message, _params ->
+        {:accept, %{"environment" => "production"}}
+      end
+    )
 
     wait_for_post("initialize")
 
@@ -502,10 +464,10 @@ defmodule FastestMCP.ClientCallbackTaskTest do
   test "URL elicitation requires consent and completion is delivered exactly once" do
     parent = self()
     state = start_supervised!({Agent, fn -> %{} end})
-    bandit = start_callback_server!(state)
+    listener = start_callback_server!(state)
 
     client =
-      connect_client!(bandit,
+      connect_client!(listener,
         session_stream: true,
         url_elicitation_handler: fn request, _context ->
           send(parent, {:url_elicitation, request})
@@ -515,10 +477,6 @@ defmodule FastestMCP.ClientCallbackTaskTest do
           send(parent, {:url_elicitation_complete, request.elicitation_id})
         end
       )
-
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
-    end)
 
     assert_receive {:fake_callback_server_post,
                     %{
@@ -575,7 +533,7 @@ defmodule FastestMCP.ClientCallbackTaskTest do
              })
 
     :ok =
-      Client.set_url_elicitation_handler(client, fn _request, _context ->
+      Client.set_handler!(client, :url_elicitation_handler, fn _request, _context ->
         {:accept, %{"must" => "not be returned"}}
       end)
 
@@ -594,32 +552,27 @@ defmodule FastestMCP.ClientCallbackTaskTest do
   test "callback context accepts advisory totals, enforces monotonic progress, and suppresses a cancelled response" do
     parent = self()
     state = start_supervised!({Agent, fn -> %{} end})
-    bandit = start_callback_server!(state)
+    listener = start_callback_server!(state)
 
-    client =
-      connect_client!(bandit,
-        session_stream: true,
-        sampling_tools: [{fn arguments -> arguments end, [name: "lookup"]}],
-        sampling_context: %{source: "test"},
-        sampling_handler: fn _messages, _params, context ->
-          :ok = CallbackContext.report_progress(context, 1, total: 2)
-          :ok = CallbackContext.report_progress(context, 1.5, total: 3)
-          :ok = CallbackContext.report_progress(context, 3)
+    connect_client!(listener,
+      session_stream: true,
+      sampling_tools: [{fn arguments -> arguments end, [name: "lookup"]}],
+      sampling_context: %{source: "test"},
+      sampling_handler: fn _messages, _params, context ->
+        :ok = CallbackContext.report_progress(context, 1, total: 2)
+        :ok = CallbackContext.report_progress(context, 1.5, total: 3)
+        :ok = CallbackContext.report_progress(context, 3)
 
-          try do
-            CallbackContext.report_progress(context, 2)
-          rescue
-            error in Error -> send(parent, {:callback_progress_error, error})
-          end
-
-          send(parent, {:callback_waiting, context, self()})
-          Process.sleep(:infinity)
+        try do
+          CallbackContext.report_progress(context, 2)
+        rescue
+          error in Error -> send(parent, {:callback_progress_error, error})
         end
-      )
 
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
-    end)
+        send(parent, {:callback_waiting, context, self()})
+        Process.sleep(:infinity)
+      end
+    )
 
     wait_for_post("initialize")
 
@@ -702,12 +655,8 @@ defmodule FastestMCP.ClientCallbackTaskTest do
 
   test "unsupported client callbacks use method-not-found without conflating missing data" do
     state = start_supervised!({Agent, fn -> %{} end})
-    bandit = start_callback_server!(state)
-    client = connect_client!(bandit, session_stream: true)
-
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
-    end)
+    listener = start_callback_server!(state)
+    connect_client!(listener, session_stream: true)
 
     wait_for_post("initialize")
 
@@ -733,19 +682,14 @@ defmodule FastestMCP.ClientCallbackTaskTest do
 
   test "unexpected synchronous sampling callback failures are masked" do
     state = start_supervised!({Agent, fn -> %{} end})
-    bandit = start_callback_server!(state)
+    listener = start_callback_server!(state)
 
-    client =
-      connect_client!(bandit,
-        session_stream: true,
-        sampling_handler: fn _messages, _params ->
-          raise "callback secret"
-        end
-      )
-
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
-    end)
+    connect_client!(listener,
+      session_stream: true,
+      sampling_handler: fn _messages, _params ->
+        raise "callback secret"
+      end
+    )
 
     wait_for_post("initialize")
 
@@ -773,22 +717,17 @@ defmodule FastestMCP.ClientCallbackTaskTest do
 
   test "explicit synchronous elicitation callback failures stay detailed" do
     state = start_supervised!({Agent, fn -> %{} end})
-    bandit = start_callback_server!(state)
+    listener = start_callback_server!(state)
 
-    client =
-      connect_client!(bandit,
-        session_stream: true,
-        elicitation_handler: fn _message, _params ->
-          raise Error,
-            code: :invalid_params,
-            message: "safe callback failure",
-            details: %{field: "name"}
-        end
-      )
-
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
-    end)
+    connect_client!(listener,
+      session_stream: true,
+      elicitation_handler: fn _message, _params ->
+        raise Error,
+          code: :invalid_params,
+          message: "safe callback failure",
+          details: %{field: "name"}
+      end
+    )
 
     wait_for_post("initialize")
 
@@ -821,21 +760,21 @@ defmodule FastestMCP.ClientCallbackTaskTest do
   test "client serves task-augmented sampling callbacks over tasks/get list result" do
     parent = self()
     state = start_supervised!({Agent, fn -> %{} end})
-    bandit = start_callback_server!(state)
+    listener = start_callback_server!(state)
 
-    client =
-      connect_client!(bandit,
-        session_stream: true,
-        sampling_handler: fn _messages, _params ->
-          Process.sleep(150)
-          send(parent, :sampling_handler_completed)
-          sampling_result("hello from client")
+    connect_client!(listener,
+      session_stream: true,
+      sampling_handler: fn _messages, _params ->
+        send(parent, {:sampling_handler_waiting, self()})
+
+        receive do
+          :release_sampling -> :ok
         end
-      )
 
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
-    end)
+        send(parent, :sampling_handler_completed)
+        sampling_result("hello from client")
+      end
+    )
 
     wait_for_post("initialize")
 
@@ -883,6 +822,8 @@ defmodule FastestMCP.ClientCallbackTaskTest do
 
     assert Enum.any?(tasks, &(&1["taskId"] == task_id and &1["status"] == "working"))
 
+    assert_receive {:sampling_handler_waiting, handler_pid}, 2_000
+    send(handler_pid, :release_sampling)
     assert_receive :sampling_handler_completed, 2_000
 
     assert_receive {:fake_callback_server_post,
@@ -914,23 +855,18 @@ defmodule FastestMCP.ClientCallbackTaskTest do
   test "client defers sampling callback task results until completion and includes related-task metadata" do
     parent = self()
     state = start_supervised!({Agent, fn -> %{} end})
-    bandit = start_callback_server!(state)
+    listener = start_callback_server!(state)
 
-    client =
-      connect_client!(bandit,
-        session_stream: true,
-        sampling_handler: fn _messages, _params ->
-          send(parent, {:sampling_handler_waiting, self()})
+    connect_client!(listener,
+      session_stream: true,
+      sampling_handler: fn _messages, _params ->
+        send(parent, {:sampling_handler_waiting, self()})
 
-          receive do
-            :release_sampling -> sampling_result("hello from client")
-          end
+        receive do
+          :release_sampling -> sampling_result("hello from client")
         end
-      )
-
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
-    end)
+      end
+    )
 
     wait_for_post("initialize")
 
@@ -991,21 +927,21 @@ defmodule FastestMCP.ClientCallbackTaskTest do
   test "client serves task-augmented elicitation callbacks over tasks/get list result" do
     parent = self()
     state = start_supervised!({Agent, fn -> %{} end})
-    bandit = start_callback_server!(state)
+    listener = start_callback_server!(state)
 
-    client =
-      connect_client!(bandit,
-        session_stream: true,
-        elicitation_handler: fn message, params ->
-          Process.sleep(150)
-          send(parent, {:elicitation_handler_completed, message, params["requestedSchema"]})
-          {:accept, %{"approved" => true}}
+    connect_client!(listener,
+      session_stream: true,
+      elicitation_handler: fn message, params ->
+        send(parent, {:elicitation_handler_waiting, self()})
+
+        receive do
+          :release_elicitation -> :ok
         end
-      )
 
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
-    end)
+        send(parent, {:elicitation_handler_completed, message, params["requestedSchema"]})
+        {:accept, %{"approved" => true}}
+      end
+    )
 
     wait_for_post("initialize")
 
@@ -1058,6 +994,9 @@ defmodule FastestMCP.ClientCallbackTaskTest do
 
     assert Enum.any?(tasks, &(&1["taskId"] == task_id and &1["status"] == "working"))
 
+    assert_receive {:elicitation_handler_waiting, handler_pid}, 2_000
+    send(handler_pid, :release_elicitation)
+
     assert_receive {:elicitation_handler_completed, "Deploy to production?",
                     %{
                       "type" => "object",
@@ -1091,23 +1030,18 @@ defmodule FastestMCP.ClientCallbackTaskTest do
   test "client defers elicitation callback task results until completion and includes related-task metadata" do
     parent = self()
     state = start_supervised!({Agent, fn -> %{} end})
-    bandit = start_callback_server!(state)
+    listener = start_callback_server!(state)
 
-    client =
-      connect_client!(bandit,
-        session_stream: true,
-        elicitation_handler: fn _message, _params ->
-          send(parent, {:elicitation_handler_waiting, self()})
+    connect_client!(listener,
+      session_stream: true,
+      elicitation_handler: fn _message, _params ->
+        send(parent, {:elicitation_handler_waiting, self()})
 
-          receive do
-            :release_elicitation -> {:accept, %{"approved" => true}}
-          end
+        receive do
+          :release_elicitation -> {:accept, %{"approved" => true}}
         end
-      )
-
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
-    end)
+      end
+    )
 
     wait_for_post("initialize")
 
@@ -1167,19 +1101,14 @@ defmodule FastestMCP.ClientCallbackTaskTest do
 
   test "unexpected callback task failures are masked across callback task surfaces" do
     state = start_supervised!({Agent, fn -> %{} end})
-    bandit = start_callback_server!(state)
+    listener = start_callback_server!(state)
 
-    client =
-      connect_client!(bandit,
-        session_stream: true,
-        sampling_handler: fn _messages, _params ->
-          raise "callback secret"
-        end
-      )
-
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
-    end)
+    connect_client!(listener,
+      session_stream: true,
+      sampling_handler: fn _messages, _params ->
+        raise "callback secret"
+      end
+    )
 
     wait_for_post("initialize")
 
@@ -1271,19 +1200,14 @@ defmodule FastestMCP.ClientCallbackTaskTest do
 
   test "explicit callback task failures stay detailed across callback task surfaces" do
     state = start_supervised!({Agent, fn -> %{} end})
-    bandit = start_callback_server!(state)
+    listener = start_callback_server!(state)
 
-    client =
-      connect_client!(bandit,
-        session_stream: true,
-        sampling_handler: fn _messages, _params ->
-          raise Error, code: :bad_request, message: "safe callback failure"
-        end
-      )
-
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
-    end)
+    connect_client!(listener,
+      session_stream: true,
+      sampling_handler: fn _messages, _params ->
+        raise Error, code: :bad_request, message: "safe callback failure"
+      end
+    )
 
     wait_for_post("initialize")
 
@@ -1336,25 +1260,20 @@ defmodule FastestMCP.ClientCallbackTaskTest do
   test "client can cancel a task-augmented sampling callback" do
     parent = self()
     state = start_supervised!({Agent, fn -> %{} end})
-    bandit = start_callback_server!(state)
+    listener = start_callback_server!(state)
 
-    client =
-      connect_client!(bandit,
-        session_stream: true,
-        sampling_handler: fn _messages, _params, context ->
-          send(parent, {:cancel_sampling_started, self(), context})
+    connect_client!(listener,
+      session_stream: true,
+      sampling_handler: fn _messages, _params, context ->
+        send(parent, {:cancel_sampling_started, self(), context})
 
-          receive do
-            :release -> sampling_result("released")
-          after
-            5_000 -> sampling_result("timed out")
-          end
+        receive do
+          :release -> sampling_result("released")
+        after
+          5_000 -> sampling_result("timed out")
         end
-      )
-
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
-    end)
+      end
+    )
 
     wait_for_post("initialize")
 
@@ -1403,23 +1322,18 @@ defmodule FastestMCP.ClientCallbackTaskTest do
   test "cancelling a callback task resolves pending tasks/result requests with task metadata" do
     parent = self()
     state = start_supervised!({Agent, fn -> %{} end})
-    bandit = start_callback_server!(state)
+    listener = start_callback_server!(state)
 
-    client =
-      connect_client!(bandit,
-        session_stream: true,
-        sampling_handler: fn _messages, _params ->
-          send(parent, {:cancel_waiting, self()})
+    connect_client!(listener,
+      session_stream: true,
+      sampling_handler: fn _messages, _params ->
+        send(parent, {:cancel_waiting, self()})
 
-          receive do
-            :release -> sampling_result("released")
-          end
+        receive do
+          :release -> sampling_result("released")
         end
-      )
-
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
-    end)
+      end
+    )
 
     wait_for_post("initialize")
 
@@ -1482,20 +1396,48 @@ defmodule FastestMCP.ClientCallbackTaskTest do
                    2_000
   end
 
-  defp start_callback_server!(state) do
-    start_supervised!(
-      {Bandit, plug: {FakeCallbackServer, state: state, test_pid: self()}, scheme: :http, port: 0}
-    )
+  test "a callback whose connection is gone reports cancelled" do
+    parent = self()
+    server_name = unique_name("callback-connection")
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("sampled", fn _arguments, context ->
+      Context.sample(context, "continue", timeout_ms: 2_000)
+      %{"ok" => true}
+    end)
+    |> start_server!()
+
+    client =
+      Client.connect!({:in_process, server_name},
+        protocol_version: "2025-11-25",
+        sampling_handler: fn _messages, _params, context ->
+          send(parent, {:callback_context, context})
+
+          %{
+            "role" => "assistant",
+            "model" => "callback-model",
+            "content" => %{"type" => "text", "text" => "ok"}
+          }
+        end
+      )
+
+    assert {:ok, _result} = Client.call_tool(client, "sampled", %{})
+    assert_receive {:callback_context, context}
+    # A context without a cancellation flag asks its connection.
+    asking = %CallbackContext{client: client, request_id: "gone", method: context.method}
+
+    refute CallbackContext.cancelled?(asking)
+    refute CallbackContext.cancelled?(context)
+    assert :ok = Client.disconnect(client)
+    assert CallbackContext.cancelled?(asking)
+    assert CallbackContext.cancelled?(context)
   end
 
-  defp connect_client!(bandit, opts) do
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+  defp start_callback_server!(state),
+    do: serve!({FakeCallbackServer, state: state, test_pid: self()})
 
-    Client.connect!(
-      "http://127.0.0.1:#{port}/mcp",
-      Keyword.put_new(opts, :protocol_version, "2025-11-25")
-    )
-  end
+  defp connect_client!(%{url: url}, opts),
+    do: connect!(url, Keyword.put_new(opts, :protocol_version, "2025-11-25"))
 
   defp wait_for_post(expected_method) do
     assert_receive {:fake_callback_server_post, %{"method" => ^expected_method}}, 2_000
@@ -1508,17 +1450,4 @@ defmodule FastestMCP.ClientCallbackTaskTest do
       "content" => %{"type" => "text", "text" => text}
     }
   end
-
-  defp assert_eventually(fun, attempts \\ 50)
-
-  defp assert_eventually(fun, attempts) when attempts > 0 do
-    if fun.() do
-      :ok
-    else
-      Process.sleep(20)
-      assert_eventually(fun, attempts - 1)
-    end
-  end
-
-  defp assert_eventually(fun, 0), do: assert(fun.())
 end

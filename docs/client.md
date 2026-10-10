@@ -1,916 +1,748 @@
 # Client
 
-`FastestMCP.Client` is a connected MCP client for streamable HTTP, stdio, and
-an Elixir-owned in-process server runtime. It keeps negotiated protocol state,
-auth, request tracking, callbacks, and remote task handles in one OTP process.
+`FastestMCP.Client` connects your Elixir application to an MCP server, over
+HTTP, over stdio, or in the same BEAM, and calls the server's tools, reads its
+resources, and renders its prompts. Use it to call MCP servers from your
+application, and to see your own server the way MCP clients see it.
 
-It is the right API when you need:
-
-- latest-first protocol negotiation with an exact-version override
-- remote task handles for task-augmented `tools/call`
-- legacy session-stream notifications and modern request listeners
-- sampling or elicitation callbacks
-- subscriptions, completions, and auth reuse on one connection
-
-## HTTP Connection
+Start the notes server from [Getting Started](getting-started.md) with
+`iex -S mix phx.server`, and paste this into its IEx session:
 
 ```elixir
-client =
-  FastestMCP.Client.connect!("http://127.0.0.1:4100/mcp",
-    client_info: %{"name" => "docs-client", "version" => "1.0.0"},
-    sampling_handler: fn messages, params ->
-      IO.inspect({:sampling, messages, params})
+endpoint = "http://localhost:4000/mcp"
+client = FastestMCP.Client.connect!(endpoint)
 
-      %{
-        "role" => "assistant",
-        "model" => "my-model",
-        "content" => %{"type" => "text", "text" => "sampled"}
-      }
-    end,
-    elicitation_handler: fn message, params ->
-      IO.inspect({:elicitation, message, params})
-      {:accept, %{"value" => "Alice"}}
-    end,
-    log_handler: &IO.inspect/1,
-    progress_handler: &IO.inspect/1,
-    notification_handler: &IO.inspect/1
-  )
+FastestMCP.Client.list_tools!(client).items |> Enum.map(& &1["name"])
+# => ["add_note", "search_notes"]
 
-%{items: tools} = FastestMCP.Client.list_tools(client)
-FastestMCP.Client.call_tool(client, "sum", %{"a" => 20, "b" => 22})
+result =
+  FastestMCP.Client.call_tool!(client, "add_note", %{
+    "title" => "Groceries",
+    "body" => "Buy oat milk"
+  })
+
+result.structured_content
+# => %{"body" => "Buy oat milk", "id" => "1", "title" => "Groceries"}
 ```
 
-The default `protocol_version: :auto` probes MCP `2026-07-28` through
-`server/discover`. It falls back to `2025-11-25` only on credible legacy
-evidence such as method-not-found; authentication and arbitrary network errors
-do not silently downgrade. Select `"2026-07-28"` or `"2025-11-25"` when a
-test or deployment requires one exact wire.
+`FastestMCP.Client.connect!/2` starts a client process, agrees on a protocol
+version with the server, and returns a `%FastestMCP.Client{}` that the other
+functions take. Results arrive as the server sent them: JSON, with string
+keys. The maps you pass, such as tool arguments, may use atom keys and atom
+values: the client sends them as JSON, so `%{mode: :fast}` reaches the server
+as `%{"mode" => "fast"}`. Every operation has two forms:
+`FastestMCP.Client.call_tool/4` returns `{:ok, value}` or `{:error, error}`,
+and `FastestMCP.Client.call_tool!/4` returns the value or raises the error.
 
-The modern profile carries protocol, client information, and capabilities on
-each request and does not create an MCP session. The legacy profile sends
-`initialize` without a client-chosen session id, retains the issued
-`MCP-Session-Id`, sends `notifications/initialized`, and adds the negotiated
-protocol and session headers to later requests.
+## Connecting
 
-The 0.2 client no longer accepts an initial `session_id:`. On `2025-11-25`, an
-HTTP session is always negotiated with the server and FastestMCP always returns
-a session id. The modern profile does not use this path at all.
+The first argument of `connect/2` says where the server is:
 
-If a later request carrying that session id receives HTTP `404`, the client
-performs a fresh `initialize` plus `notifications/initialized` handshake
-without the stale session header and installs the replacement session. It does
-not replay the failed request because it may be non-idempotent. That call raises
-its original error with `session_recovered: true` and
-`original_request_replayed: false` in the error details; the next request uses
-the replacement session.
+| Target | The server |
+| --- | --- |
+| `"http://localhost:4000/mcp"` | Serves Streamable HTTP at that URL. |
+| `{:stdio, executable, args}` | Is a program that the client starts and talks to over standard input and output. |
+| `{:in_process, server_name}` | Runs in the same BEAM, started by `FastestMCP.start_server/2` or as a server module. |
 
-`max_sse_event_bytes:` bounds every incrementally decoded JSON or SSE event and
-defaults to 1 MiB. Use a smaller positive value when the connected server has a
-tighter response contract.
+### Over HTTP
 
-`max_response_bytes:` bounds one complete MCP response across HTTP, SSE, stdio,
-and in-process transports and defaults to 16 MiB. The same ceiling applies when
-`tools/call` is transparently completed through `tasks/result`; an oversized
-response fails without retaining its payload. Set this on the client connection
-when the embedding host has a tighter durable-result limit.
+Pass the URL of the server's MCP endpoint, `http` or `https`. A URL without a
+path connects to `/mcp`. For servers that require credentials, add
+`access_token:` or let the client sign in with OAuth; see
+[Client Authentication](client-auth.md).
 
-Oversize errors include `details.terminal_response_observed`. It is `true` only
-when the client observed a complete response frame for the in-flight request;
-crossing the limit before the HTTP stream, SSE event, or stdio frame completed
-leaves it `false`. Effectful hosts should preserve that distinction instead of
-assuming an incomplete response is safe to replay.
+### Over stdio
 
-## OTP Supervision and Readiness
-
-Production clients can be ordinary supervised workers. `start_link/1` does not
-report success until automatic discovery or initialization has completed:
+The client starts the program, sends MCP messages to its standard input, and
+reads the replies from its standard output. From your project directory, this
+launches the stdio server from [Stdio](transports.md#stdio):
 
 ```elixir
+stdio_target =
+  {:stdio, System.find_executable("mix"),
+   ["run", "--no-compile", "--no-start", "-e", "MyApp.MCPServer.serve_stdio()"]}
+
+client = FastestMCP.Client.connect!(stdio_target)
+
+FastestMCP.Client.info!(client).protocol_version
+# => "2026-07-28"
+```
+
+The executable is a path: the client doesn't search the `PATH`, so look it up
+with `System.find_executable/1`. The program inherits your environment, and
+`env:` replaces it:
+
+```elixir
+stdio_target =
+  {:stdio, System.find_executable("mix"),
+   ["run", "--no-compile", "--no-start", "-e", "MyApp.MCPServer.serve_stdio()"]}
+
+client =
+  FastestMCP.Client.connect!(stdio_target,
+    env: %{
+      "PATH" => System.fetch_env!("PATH"),
+      "HOME" => System.fetch_env!("HOME"),
+      "NOTES_DATA_DIR" => "/srv/notes"
+    }
+  )
+```
+
+The program then sees only the variables you list, so include `PATH` and
+`HOME` when it needs them, as `mix` does. Disconnecting ends the program.
+[Stdio connections](#stdio-connections) covers restarts and process groups.
+
+### In the same BEAM
+
+A server running in your application, or in a test, takes its name as the
+target:
+
+```elixir
+FastestMCP.server("hello-local")
+|> FastestMCP.add_tool("hello", fn %{"name" => name}, _ctx -> "Hello, #{name}!" end,
+  input_schema: %{
+    "type" => "object",
+    "properties" => %{"name" => %{"type" => "string"}},
+    "required" => ["name"]
+  }
+)
+|> FastestMCP.start_server!()
+
+client = FastestMCP.Client.connect!({:in_process, "hello-local"})
+
+FastestMCP.Client.call_tool!(client, "hello", %{"name" => "Ada"}).content
+# => [%{"text" => "Hello, Ada!", "type" => "text"}]
+```
+
+An in-process connection encodes every message as JSON and runs it through the
+server's whole pipeline: authentication, middleware, and validation. It sees
+what a remote client sees, without a network, which makes it useful in tests.
+Its requests show the transport `:in_process` to handlers. It takes
+credentials as `auth_input:`, which the server's authenticator receives as you
+pass it, structs included (see [Client Authentication](client-auth.md)), and
+HTTP and stdio options, such as `access_token:` or `env:`, raise
+`ArgumentError`. When the server stops, the connection ends.
+
+Most examples below connect in process, so that you can paste them into IEx.
+Over HTTP or stdio, only the target changes.
+
+### Protocol versions
+
+`connect/2` asks the server for MCP `2026-07-28`, and uses `2025-11-25` when the
+server shows that it supports only the older version. To use one version only,
+pass `protocol_version:`:
+
+```elixir
+client = FastestMCP.Client.connect!({:in_process, "hello-local"}, protocol_version: "2025-11-25")
+
+FastestMCP.Client.info!(client).protocol_version
+# => "2025-11-25"
+```
+
+`FastestMCP.Client.info/1` returns a `FastestMCP.Client.Info` with the version
+the connection uses, the server's capabilities, and, on `2025-11-25` over HTTP,
+the session id. Most functions work the same on both versions; this guide notes
+where they differ. [Protocol Versions](protocol-versions.md) explains the
+versions, and [Protocol negotiation](#protocol-negotiation) the rules the
+client follows.
+
+### The client's lifetime
+
+`connect/2` links the client process to the process that calls it, so the
+client stops when that process exits. `FastestMCP.Client.disconnect/1` stops it
+earlier. Either way, the client closes its connection: it ends a stdio program,
+and the session of a `2025-11-25` HTTP connection. A client that should live as
+long as your application belongs in your supervision tree.
+
+`connect/2` checks its options before it starts a process, and raises
+`ArgumentError` for an unknown or invalid one, or one that the target's
+transport can't use, such as `env:` over HTTP. The message names the option,
+and never repeats a credential such as a token. Crash reports of the client's
+processes leave credentials out too.
+
+## Supervising a client
+
+In a Phoenix application, start the client with the application and call it by
+name:
+
+```elixir
+# In lib/my_app/application.ex
 children = [
-  {FastestMCP.Client,
-   target: "https://mcp.example.com/mcp",
-   name: MyApp.MCPClient,
-   protocol_version: :auto}
+  # ...the children Phoenix generated, such as {Phoenix.PubSub, name: MyApp.PubSub}
+  {FastestMCP.Client, target: "https://mcp.example.com/mcp", name: MyApp.MCPClient},
+  MyAppWeb.Endpoint
 ]
-
-:ok = FastestMCP.Client.await_ready(MyApp.MCPClient, 10_000)
-%{items: tools} = FastestMCP.Client.list_tools(MyApp.MCPClient)
 ```
 
-Every public client operation accepts either `%FastestMCP.Client{}` or a
-standard `GenServer.server()` reference, including local names, Registry names,
-and `{:global, term()}` names. The reference is resolved once per operation;
-request, callback, and remote-task handles retain that exact pid and never jump
-to a replacement connection after a supervisor restart.
-
-`ready?/1` checks negotiation, recovery, and transport usability, while
-`connected?/1` checks process liveness only. `await_ready/2` follows a named
-permanent child through a supervisor replacement until its monotonic deadline.
-Pid and struct references remain pinned. With `auto_initialize: false`, the
-child starts in `:new`; call `initialize/3` or `discover/2`, then await readiness.
-
-The default child id is `FastestMCP.Client`, so multiple unnamed clients need
-explicit `id:` values. The child is permanent with a 20-second shutdown budget.
-Calling `disconnect/1` on a permanent supervised child causes its supervisor to
-restart it; terminate or remove the child through the owning Supervisor when
-the shutdown should be permanent.
-
-On the legacy profile, use `session_stream: true` when you want:
-
-- `notifications/tasks/status`
-- resource update notifications
-- server log and progress notifications
-- server-to-client elicitation or sampling relay during `tasks/result`
-
-## Stdio Connection
-
 ```elixir
-client =
-  FastestMCP.Client.connect!(
-    {:stdio, "/path/to/server-command", ["--serve-mcp"]},
-    client_info: %{"name" => "stdio-client", "version" => "1.0.0"},
-    env: %{"MCP_DATA_DIR" => "/srv/mcp-data"}
-  )
+# In lib/my_app/research.ex
+def remote_tool_names do
+  MyApp.MCPClient
+  |> FastestMCP.Client.list_all_tools!()
+  |> Enum.map(& &1["name"])
+end
 ```
 
-The stdio connection has a concurrent reader and serialized writer. It can
-therefore receive server requests and notifications while another request is
-waiting. Legacy connections support roots, sampling, elicitation, task status,
-progress, logs, ping, and cancellation; modern connections use request-scoped
-interaction rounds and long-lived listeners.
+`FastestMCP.Client.start_link/1` takes the target as `target:` and the options
+of `connect/2`. It connects before it returns, so the children after the
+client can use it. Every function accepts the client struct, a pid, or a name,
+including `{:global, term}` and `{:via, module, term}` names; any other term
+raises `ArgumentError`.
 
-On `2026-07-28`, `max_in_flight:` bounds multiple concurrent requests and
-responses are correlated by JSON-RPC id even when they arrive in reverse
-order. A long-lived `subscriptions/listen` request consumes one slot. The
-legacy `2025-11-25` stdio profile deliberately enforces
-`max_in_flight: 1`.
+A call resolves the name once: its requests stay with that process, and never
+move to another. When the supervisor replaces the client, the name points to
+the new process, and `FastestMCP.Client.await_ready/2` waits until it is
+connected, as in `FastestMCP.Client.await_ready(MyApp.MCPClient, 10_000)`.
+`FastestMCP.Client.ready?/1` tells whether the client has connected and can
+send requests; `FastestMCP.Client.connected?/1` only whether its process is
+alive.
 
-Unexpected child exits on a ready modern connection use bounded restart by
-default (`max_attempts: 3`). Ordinary in-flight calls fail and are never
-replayed; active `subscriptions/listen` handles are reissued with fresh
-JSON-RPC ids after the child reopens. Configure or disable it explicitly:
+> #### A client that can't connect doesn't start {: .warning}
+>
+> When the server can't be reached, the client fails to start, and so does the
+> supervisor that starts it, which stops your application from booting. If the
+> server may be down when your application starts, give the client
+> `auto_initialize: false`: it starts without contacting the server, and
+> `FastestMCP.Client.discover/2` connects it when you first need it. A failed
+> `discover/2` can be retried.
+
+The child spec gives the client 20 seconds to close its connection when it
+stops, and takes two more options:
+
+- `id:`. The child's id is its `name:`, or `FastestMCP.Client` without one, so
+  give several unnamed clients an id each.
+- `restart:`, `:permanent` by default. A permanent client that you stop with
+  `disconnect/1` is started again by its supervisor; to stop it for good, use
+  `Supervisor.terminate_child/2`.
+
+The child spec keeps the values of credential options, such as
+`access_token:`, `headers:`, and `env:`, wrapped, so supervisor reports, which
+print its start arguments, leave them out. So does the child spec of a
+`FastestMCP.ClientGroup`.
+
+## Calling tools
+
+`FastestMCP.Client.call_tool/4` takes the tool's name and its arguments, and
+returns a `FastestMCP.Client.ToolResult`:
 
 ```elixir
-FastestMCP.Client.connect!(stdio_target,
-  stdio_restart: [max_attempts: 3, retry_ms: 1_000, max_retry_ms: 30_000]
+FastestMCP.server("notes-tools")
+|> FastestMCP.add_tool(
+  "get_note",
+  fn
+    %{"id" => "1"}, _ctx -> %{id: "1", title: "Release"}
+    %{"id" => id}, _ctx -> FastestMCP.Tools.Result.new("No note with id #{id}", is_error: true)
+  end,
+  input_schema: %{
+    "type" => "object",
+    "properties" => %{"id" => %{"type" => "string"}},
+    "required" => ["id"]
+  }
 )
+|> FastestMCP.start_server!()
 
-FastestMCP.Client.connect!(stdio_target, stdio_restart: false)
+client = FastestMCP.Client.connect!({:in_process, "notes-tools"})
+
+result = FastestMCP.Client.call_tool!(client, "get_note", %{"id" => "1"})
+result.structured_content
+# => %{"id" => "1", "title" => "Release"}
+
+{:ok, result} = FastestMCP.Client.call_tool(client, "get_note", %{"id" => "7"})
+{result.is_error, result.content}
+# => {true, [%{"text" => "No note with id 7", "type" => "text"}]}
 ```
 
-`stdio_restart: true` selects the bounded defaults. Legacy child exits and an
-explicit `FastestMCP.Client.disconnect/1` remain terminal.
+A `FastestMCP.Client.ToolResult` has these fields:
 
-Hosts that need descendant-safe lifecycle control may supply a process-group
-launcher. FastestMCP appends the original stdio executable and argv after the
-host-owned launcher arguments, assigns a monotonically increasing launch
-generation, and terminates the complete old process group before opening a
-replacement generation:
+| Field | Holds |
+| --- | --- |
+| `content` | The content blocks, such as `%{"type" => "text", "text" => "Hello"}`. |
+| `structured_content` | The structured result, or `nil` when the tool returned none. |
+| `structured_content_present?` | Whether the result has structured content, to tell a missing one from JSON `null`. |
+| `meta` | The result's `_meta` map. |
+| `is_error` | `true` when the tool reports that its work failed. |
+| `raw` | The result as the server sent it. |
+
+A result with `is_error: true` is still `{:ok, result}`: the tool answered, and
+its content says what went wrong. `{:error, error}` means the call itself
+failed; see [Errors](#errors).
+
+Before it sends a call, the client checks the arguments against the input
+schema that the server lists for the tool. A call of a tool that the server
+doesn't list fails with `:method_not_found`, and arguments that don't match
+fail with `:invalid_params`; neither reaches the server. The client also
+checks structured content against the tool's output schema.
+
+`call_tool/4` takes these options:
+
+- `timeout_ms:` sets how long the call may take, by default the connection's
+  `timeout_ms:`, 5 seconds unless you change it. Then the call returns a
+  `:timeout` error, and the client tells the server to cancel the request. A
+  tool that the server runs as a background task may take longer; see
+  [Deadlines](#deadlines).
+- `meta:` adds a map to the request as its `_meta`.
+- `progress_handler:` receives the tool's progress reports; see
+  [Progress](client-callbacks.md#progress).
+- `version:` calls one version of a FastestMCP tool; `read_resource/3` and
+  `render_prompt/4` take it too. See
+  [Versioning components](versioning-and-visibility.md#versioning-components).
+- `access_token:`, `headers:`, and `auth_input:` set credentials for this call
+  only; see [Client Authentication](client-auth.md).
+
+To cancel a call that is under way, see
+[Long-running calls](client-callbacks.md#long-running-calls); for a tool that
+the server runs as a background task, see
+[Remote tasks](client-callbacks.md#remote-tasks).
+
+## Resources, prompts, and completion
 
 ```elixir
-FastestMCP.Client.connect!(stdio_target,
-  stdio_process_group: [
-    launcher: "/absolute/path/to/process-group-launcher",
-    launcher_args: ["host", "owned", "identity", "arguments"]
-  ]
+FastestMCP.server("notes-reading")
+|> FastestMCP.add_resource_template("notes://{id}", fn %{"id" => id}, _ctx ->
+  %{id: id, title: "Release"}
+end)
+|> FastestMCP.add_prompt(
+  "summarize_notes",
+  fn %{"topic" => topic}, _ctx -> "Summarize my notes about #{topic}." end,
+  arguments: [%{name: "topic", required: true, completion: ["groceries", "reading", "release"]}]
 )
-```
+|> FastestMCP.start_server!()
 
-The launcher contract is strict: its own OS pid must become the process-group
-id before it execs the appended target. A failed or stale-generation shutdown
-never opens a replacement process. The library does not infer this guarantee
-from an arbitrary shell wrapper.
+client = FastestMCP.Client.connect!({:in_process, "notes-reading"})
 
-`FastestMCP.Client.disconnect_with_evidence/1` returns `:ok` only after the
-current transport proves cleanup. `disconnect/1` uses the same boundary. An
-unproven process-group shutdown returns `{:error, reason}` and retains the
-client's generation handle so the owning host can reconcile or try cleanup
-again instead of silently losing the descendant identity.
+FastestMCP.Client.list_resource_templates!(client).items |> Enum.map(& &1["uriTemplate"])
+# => ["notes://{id}"]
 
-When supervised, `FastestMCP.Client.child_spec/1` accepts
-`restart: :permanent | :transient | :temporary` (default `:permanent`). Hosts
-that persist their own server generation and recovery state should normally
-select `:temporary` and decide when to admit a fresh client themselves.
+%{"contents" => [content]} = FastestMCP.Client.read_resource!(client, "notes://1")
+content["text"]
+# => "{\"id\":\"1\",\"title\":\"Release\"}"
 
-When `env:` is omitted, the child inherits the caller environment for backward
-compatibility. When `env:` is supplied, it is a complete replacement: an empty
-map creates an empty child environment and a nonempty map exposes only those
-entries. Include `PATH` explicitly when the executable or its launcher needs
-it. FastestMCP does not send credentials in protocol metadata by default. The old non-standard
-`_meta.fastestmcp.auth` bridge is deprecated and is emitted only when
-`legacy_stdio_auth_metadata: true` is set for a controlled legacy peer. Prefer
-child environment or another host-owned stdio credential channel.
+FastestMCP.Client.render_prompt!(client, "summarize_notes", %{"topic" => "release"})["messages"]
+# => [%{"content" => %{"text" => "Summarize my notes about release.", "type" => "text"}, "role" => "user"}]
 
-## Connected In-Process Server
-
-When the client and an already-running FastestMCP server live in the same BEAM,
-connect by server name:
-
-```elixir
-{:ok, _server} =
-  FastestMCP.start_server(
-    FastestMCP.server("local-mcp")
-    |> FastestMCP.add_tool("echo", fn arguments, _context -> arguments end)
-  )
-
-client =
-  FastestMCP.Client.connect!({:in_process, "local-mcp"},
-    protocol_version: :auto,
-    auth_input: %{"token" => "application-owned-token"}
-  )
-```
-
-This is a connected transport, not a privileged direct-call shortcut. A
-supervised connection coordinator JSON-encodes and decodes every envelope and
-runs it through the existing JSON-RPC, stdio adapter, transport engine,
-serializer, authentication, and legacy session lifecycle. It supports modern
-discovery, legacy initialization, concurrent modern requests, callbacks,
-progress, cancellation, tasks, and long-lived subscriptions with the same
-Client APIs used by network transports.
-
-The public client session id remains `nil`, as it does for stdio; the server
-loop owns its internal transport session. Stopping the named server closes the
-connection and fails outstanding requests. In-process connections do not use
-stdio child restart or HTTP session recovery.
-
-Use `auth_input:` or `FastestMCP.Client.set_auth_input/2` for authentication.
-The effective current or per-call auth input is attached to each request for
-normal server authentication. HTTP and process-launch options are rejected:
-`oauth:`, `headers:`, `authorization:`, `access_token:`, `session_id:`,
-`session_stream:`, SSE options, `env:`, `legacy_stdio_auth_metadata:`, and
-`stdio_restart:`.
-The same restriction applies to `stdio_process_group:`.
-
-## Protected Servers
-
-```elixir
-client =
-  FastestMCP.Client.connect!("http://127.0.0.1:4100/mcp",
-    access_token: System.fetch_env!("MCP_TOKEN")
-  )
-
-FastestMCP.Client.call_tool(client, "whoami", %{})
-```
-
-Manual bearer tokens remain supported when `oauth:` is absent. For an MCP OAuth
-2.1 protected resource, configure the connected client instead:
-
-```elixir
-client =
-  FastestMCP.Client.connect!("https://mcp.example.com/mcp",
-    oauth: [
-      redirect_uri: "http://127.0.0.1:8765/callback",
-      registration: {:pre_registered, [client_id: "my-client"]},
-      authorization_handler: MyApp.MCPAuthorization
-    ]
-  )
-```
-
-`FastestMCP.Client.OAuth` discovers RFC 9728 protected-resource metadata,
-tries RFC 8414 and OpenID Connect discovery in the specified order, verifies
-PKCE S256 support, includes the RFC 8707 resource indicator, validates state
-and the redirect, rotates refresh tokens, and performs bounded scope step-up.
-Registration is always explicit: pre-registered credentials, an HTTPS Client
-ID Metadata Document, or dynamic registration when the authorization server
-advertises it.
-
-Authorization-server issuers and authorization, token, and registration
-endpoints are HTTPS-only, including loopback hosts. HTTP loopback is accepted
-only for a local MCP resource and a local redirect URI; a remote HTTPS resource
-cannot redirect protected-resource discovery to loopback HTTP.
-
-The host implements `FastestMCP.Client.OAuth.AuthorizationHandler` (or supplies
-an equivalent function) to show/open the authorization URL and return the final
-redirect. FastestMCP does not provide authorization UI or operate an
-authorization server. The default token store is process-local memory; hosts
-that need restart durability must provide an encrypted
-`FastestMCP.Client.OAuth.TokenStore`. Tokens are carried only in Authorization
-headers, never URLs, logs, or MCP metadata.
-
-If you need to connect first and authenticate later:
-
-```elixir
-client =
-  FastestMCP.Client.connect!("http://127.0.0.1:4100/mcp",
-    auto_initialize: false,
-    protocol_version: "2025-11-25"
-  )
-
-:ok = FastestMCP.Client.set_auth_input(client, headers: [{"x-trace-id", "trace-123"}])
-:ok = FastestMCP.Client.set_access_token(client, System.fetch_env!("MCP_TOKEN"))
-
-FastestMCP.Client.initialize(client)
-```
-
-For a manually started modern connection, select `"2026-07-28"` and call
-`FastestMCP.Client.discover/2` instead. Leaving `protocol_version: :auto` while
-disabling automatic startup also transfers the probe/fallback policy to the
-application.
-
-Per-request overrides are also supported:
-
-```elixir
-FastestMCP.Client.call_tool(client, "secure.echo", %{"message" => "hi"},
-  access_token: "request-specific-token",
-  headers: [{"x-request-id", "req-123"}]
+FastestMCP.Client.complete!(
+  client,
+  %{"type" => "ref/prompt", "name" => "summarize_notes"},
+  %{"name" => "topic", "value" => "re"}
 )
+# => %{"hasMore" => false, "total" => 2, "values" => ["reading", "release"]}
 ```
 
-## Core Operations
+- `FastestMCP.Client.list_resources/2` lists fixed resources and
+  `FastestMCP.Client.list_resource_templates/2` templates; read either kind
+  with `FastestMCP.Client.read_resource/3` and a concrete URI.
+- `read_resource/3` returns the result, a map whose `"contents"` holds each
+  content with its `"uri"`, `"mimeType"`, and `"text"` or `"blob"` (base64),
+  on both protocol versions.
+- `FastestMCP.Client.render_prompt/4` returns the result with its
+  `"messages"`.
+- `FastestMCP.Client.complete/4` asks for values of a prompt argument
+  (`"ref/prompt"` with the prompt's `"name"`) or a template parameter
+  (`"ref/resource"` with the template as `"uri"`). Pass the values of other
+  arguments as `context_arguments:`. The server must offer completions;
+  otherwise the call fails with `:method_not_found`.
+- References and arguments may use atom keys, as in
+  `%{type: "ref/prompt", name: "summarize_notes"}`; the client sends them as
+  JSON.
 
-The client mirrors the main MCP surfaces:
+To hear about changes to a resource, subscribe to it; see
+[Resource subscriptions](client-callbacks.md#resource-subscriptions).
 
-- `FastestMCP.Client.list_tools/2`
-- `FastestMCP.Client.list_all_tools/2`
-- `FastestMCP.Client.call_tool/4`
-- `FastestMCP.Client.call_tool_result/4`
-- `FastestMCP.Client.start_tool_result/4`
-- `FastestMCP.Client.await_tool_result/2`
-- `FastestMCP.Client.cancel_tool_result/2`
-- `FastestMCP.Client.call_tool_task/4`
-- `FastestMCP.Client.list_resources/2`
-- `FastestMCP.Client.list_all_resources/2`
-- `FastestMCP.Client.list_resource_templates/2`
-- `FastestMCP.Client.list_all_resource_templates/2`
-- `FastestMCP.Client.read_resource/3`
-- `FastestMCP.Client.list_prompts/2`
-- `FastestMCP.Client.list_all_prompts/2`
-- `FastestMCP.Client.render_prompt/4`
-- `FastestMCP.Client.complete/4`
+## Listing and paging
 
-`call_tool/4` keeps its compatibility projection, whose return shape depends on
-the result. New application code that needs a stable boundary can use
-`call_tool_result/4`:
+The list functions return one page: a map with the page's `items` and a
+`next_cursor`, which is `nil` on the last page. Pass the cursor back for the
+next page:
 
 ```elixir
-%FastestMCP.Client.ToolResult{
-  content: content,
-  structured_content: structured,
-  structured_content_present?: present?,
-  meta: meta,
-  is_error: is_error,
-  raw: raw
-} = FastestMCP.Client.call_tool_result(client, "report", %{"id" => 42})
+Enum.reduce(1..150, FastestMCP.server("many-tools"), fn i, server ->
+  FastestMCP.add_tool(server, "tool_#{i}", fn _args, _ctx -> i end)
+end)
+|> FastestMCP.start_server!()
+
+client = FastestMCP.Client.connect!({:in_process, "many-tools"})
+
+%{items: first_page, next_cursor: cursor} = FastestMCP.Client.list_tools!(client)
+length(first_page)
+# => 100
+
+%{items: rest, next_cursor: nil} = FastestMCP.Client.list_tools!(client, cursor: cursor)
+length(rest)
+# => 50
+
+FastestMCP.Client.list_all_tools!(client) |> length()
+# => 150
 ```
 
-The struct preserves validated content blocks, any modern JSON structured
-value, empty metadata, the tool-level error flag, and the complete validated
-wire result. `structured_content_present?` distinguishes an absent field from
-explicit JSON `null`. A tool result with `is_error: true` is still a normal
-result struct; protocol, transport, schema, MRTR, and task failures retain the
-existing exception contract. Explicit task-handle options belong to
-`call_tool_task/4`; a server-created modern task is transparently driven to its
-terminal tool result.
+- `FastestMCP.Client.list_tools/2`, `FastestMCP.Client.list_resources/2`,
+  `FastestMCP.Client.list_resource_templates/2`, and
+  `FastestMCP.Client.list_prompts/2` return pages. The server chooses the page
+  size; a FastestMCP server sends 100 items per page.
+- A cursor is opaque: pass it back unchanged, to the same list function.
+- `FastestMCP.Client.list_all_tools/2`, `FastestMCP.Client.list_all_resources/2`,
+  `FastestMCP.Client.list_all_resource_templates/2`, and
+  `FastestMCP.Client.list_all_prompts/2` follow every page and return a plain
+  list. They stop at 256 pages or 100,000 items, which `max_pages:` and
+  `max_items:` change, and then return an `:overloaded` error instead of a
+  partial list. A server that repeats a cursor gets an error too.
 
-Use a phase-covering tool-result handle when the caller may need to cancel while
-the peer is deciding whether `tools/call` will finish directly or become a
-server-owned task:
+[Listing from a client](pagination.md#listing-from-a-client) compares this
+with paging in process.
+
+## Errors
+
+A failed operation returns `{:error, error}`, and its `!` form raises the
+error. The error is a `FastestMCP.Error`, with a `code`, a `message`, and
+`details`:
 
 ```elixir
-request =
-  FastestMCP.Client.start_tool_result(
-    client,
-    "slow_report",
-    %{"id" => 42}
+FastestMCP.server("notes-errors")
+|> FastestMCP.add_tool("delete_note", fn _args, _ctx ->
+  raise FastestMCP.Error, code: :forbidden, message: "notes are read-only"
+end)
+|> FastestMCP.start_server!()
+
+client = FastestMCP.Client.connect!({:in_process, "notes-errors"})
+
+{:error, error} = FastestMCP.Client.call_tool(client, "delete_note")
+{error.code, error.message}
+# => {:forbidden, "notes are read-only"}
+
+{:error, error} = FastestMCP.Client.call_tool(client, "archive_note")
+{error.code, error.message}
+# => {:method_not_found, "server did not advertise tool \"archive_note\""}
+```
+
+The codes you are most likely to meet:
+
+| Code | When |
+| --- | --- |
+| The handler's code, such as `:forbidden` or `:not_found` | The server's handler raised `FastestMCP.Error`. |
+| `:internal_error` | The handler or the server's authenticator crashed, the server couldn't be reached (`details.reason` says why), or the connection ended. |
+| `:method_not_found` | The server doesn't list the tool, or doesn't support the request at all: `details.required_capability` names what it would need to offer. |
+| `:invalid_params` | The arguments don't match the tool's input schema, which the client checks before it sends the call; `details.violations` lists the problems. A FastestMCP server answers invalid arguments with the same code. |
+| `:unauthorized` | The server rejected the credentials, with `details.status` `401`, or an OAuth sign-in failed. |
+| `:forbidden` | The server refused the request, with `details.status` `403`: the credentials lack a scope, or the server's host check rejected the address. |
+| `:timeout` | The operation ran past its `timeout_ms:`, or the server, or a proxy in front of it, answered `504`. |
+| `:cancelled` | You cancelled the request. |
+| `:overloaded` | The client already has as many requests running as `max_in_flight:` allows (10 by default), a `list_all_*` function reached its limit, or the server answered `503`, as a FastestMCP server does while it isn't running; try again later. |
+
+Errors that come from the server keep the server's code and message, and
+`details.jsonrpc_code` holds the JSON-RPC error code; an HTTP error also has
+`details.status`. An HTTP response without a JSON-RPC error gets the code of
+its status (`:unauthorized` for `401`, `:forbidden` for `403`, `:not_found` for
+`404`, `:rate_limited` for `429`, `:bad_request` for other `4xx`, `:overloaded`
+for `503`, `:timeout` for `504`, and `:internal_error` for other `5xx`) and a
+message such as `"server/discover failed with HTTP 404 Not Found"`, or the
+message of a FastestMCP endpoint's error. A response that doesn't match the MCP schema fails with a
+`FastestMCP.Client.ProtocolError`, whose `violations` list what is wrong; so
+does a call of a tool whose advertised schema the client can't compile, with
+the tool's name in each violation. The response itself isn't kept, because it
+may hold credentials or user data.
+
+## Client groups
+
+`FastestMCP.ClientGroup` connects to several servers and offers their tools
+as one list. Each tool's name gets its server's alias as a prefix:
+
+```elixir
+FastestMCP.server("notes-group")
+|> FastestMCP.add_tool("search", fn _args, _ctx -> %{source: "notes"} end)
+|> FastestMCP.start_server!()
+
+FastestMCP.server("calendar-group")
+|> FastestMCP.add_tool("search", fn _args, _ctx -> %{source: "calendar"} end)
+|> FastestMCP.start_server!()
+
+group =
+  FastestMCP.ClientGroup.connect!(
+    clients: %{
+      "notes" => [target: {:in_process, "notes-group"}],
+      "calendar" => [target: {:in_process, "calendar-group"}]
+    }
   )
 
-# The same handle remains valid before and after a negotiated task transition.
-:ok = FastestMCP.Client.cancel_tool_result(request, "caller no longer needs it")
+FastestMCP.ClientGroup.list_tools!(group) |> Enum.map(& &1["name"])
+# => ["calendar_search", "notes_search"]
 
-# Or wait for the stable terminal result.
-result = FastestMCP.Client.await_tool_result(request, 30_000)
+FastestMCP.ClientGroup.call_tool!(group, "notes_search").structured_content
+# => %{"source" => "notes"}
 ```
 
-`call_tool_result/4` uses this same path and waits indefinitely. A
-`FastestMCP.Client.ToolResultRequest` is owned by the process that created it and
-must be awaited by that process. If the owner exits, or if `await_tool_result/2`
-times out, FastestMCP requests cancellation and does not leave the coordinator
-detached. An explicit cancellation request is asynchronous: it returns `:ok`
-after signalling the coordinator, while the subsequent await preserves the
-normal typed cancellation, transport, protocol, MRTR, and task error contract.
-
-On an ordinary request, cancellation sends `notifications/cancelled`. On a
-modern MCP `2026-07-28` connection where both peers negotiated the Tasks
-extension, the coordinator also covers the race in which the initial response
-publishes a remote task and cancellation must continue through `tasks/cancel`.
-Legacy connections and modern connections without negotiated Tasks cancel only
-the initial request; they never wait for a task transition that cannot occur.
-
-On a legacy `2025-11-25` connection, use
-`FastestMCP.Client.set_log_level/3` to send `logging/setLevel` after the server
-advertises logging. The method does not exist in `2026-07-28`. Modern logging
-is request-scoped instead:
+In an application, supervise the group and call it by name:
 
 ```elixir
-FastestMCP.Client.call_tool(client, "report", %{},
-  meta: %{"io.modelcontextprotocol/logLevel" => "info"}
-)
+# In lib/my_app/application.ex
+children = [
+  # ...your other children
+  {FastestMCP.ClientGroup,
+   name: MyApp.MCPGroup,
+   clients: %{
+     "notes" => [
+       target: "https://notes.example.com/mcp",
+       access_token: System.fetch_env!("NOTES_MCP_TOKEN")
+     ],
+     "calendar" => [target: "https://calendar.example.com/mcp", protocol_version: "2025-11-25"],
+     "local" => {:existing, MyApp.MCPClient}
+   }}
+]
 ```
 
-## Asynchronous Requests and Cancellation
+- Each member is an ordinary client, configured with the options of
+  `FastestMCP.Client.start_link/1`: its own credentials, protocol version, and
+  handlers. `{:existing, client}` adds a client that you started yourself; the
+  group never stops it.
+- A tool's name is `<alias>_<tool>`. When two names collide, listing fails
+  instead of hiding one of the tools.
+- `FastestMCP.ClientGroup.list_tools/2` fetches the tool list of every member
+  again and returns all tools, or an error if any member fails. Pass
+  `cache: :use` to reuse lists that are still fresh. It asks up to 8 members at
+  once, which the group's `max_concurrency:` option changes, and gives up after
+  10 seconds, which its own `timeout_ms:` option changes.
+- Every member must connect when the group starts. If a member fails later,
+  the tools of the others stay callable. When a member's client restarts, the
+  next `list_tools/2` binds the group to the new process; calls already
+  running stay with the old one.
+- `FastestMCP.ClientGroup.call_tool/4` and
+  `FastestMCP.ClientGroup.start_tool_result/4` call a group tool on its
+  member. For resources, prompts, and anything else, take the member with
+  `FastestMCP.ClientGroup.client/2`, then use `FastestMCP.Client`.
+- `FastestMCP.ClientGroup.protocol_versions/1` shows the version of each
+  member, and `FastestMCP.ClientGroup.resolve_tool/3` which member and tool a
+  name calls. `FastestMCP.ClientGroup.ready?/1` and
+  `FastestMCP.ClientGroup.await_ready/2` work as they do for a client.
+- A group of one member is fine when you only want its tools' names prefixed.
+- The functions take the group's name, or the handle that
+  `FastestMCP.ClientGroup.connect/1` returns. `FastestMCP.ClientGroup.start_link/1`
+  returns the pid of the group's supervisor instead;
+  `FastestMCP.ClientGroup.handle/1` turns it into a handle.
+- Stop a supervised group through its supervisor, and a group from
+  `connect/1` with `FastestMCP.ClientGroup.disconnect/1`.
 
-Use `start_tool_result/4` for cancellable terminal tool calls that may cross the
-ordinary-request-to-remote-task boundary. For raw MCP methods and applications
-that intentionally manage the protocol phases themselves, the lower-level
-tracked request engine remains available through
-`FastestMCP.Client.request_async/4`:
+## Details
+
+### Connection options
+
+`connect/2` and `start_link/1` take these options. Handlers, credentials, and
+OAuth have guides of their own.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `protocol_version:` | `:auto` | `"2026-07-28"`, `"2025-11-25"`, or `:auto`. |
+| `name:` | none | Registers the client process under a name. |
+| `auto_initialize:` | `true` | `false` starts the client without contacting the server; call `discover/2` or `initialize/3` yourself. |
+| `init_timeout_ms:` | `10_000` | How long connecting may take. An OAuth sign-in that is still under way then finishes first; see [OAuth](client-auth.md#oauth). |
+| `timeout_ms:` | `5_000` | The default `timeout_ms:` of each operation, and how long the client waits to send its own notifications and its answers to the server's requests. |
+| `max_in_flight:` | `10` | Requests running at once, or `:infinity`; an open `listen/3` request counts. With `protocol_version: "2025-11-25"`, a stdio or in-process connection allows only `1`. |
+| `max_response_bytes:` | 16 MiB | The largest response the client accepts. |
+| `max_sse_event_bytes:` | 1 MiB | The largest server-sent event the client accepts over HTTP. |
+| `client_info:` | `"FastestMCP.Client"` and the library's version | A map with the `"name"` and `"version"` that the client gives the server. |
+| `extensions:` | `%{}` | Protocol extensions to declare, such as `FastestMCP.Protocol.Extensions.tasks()`, with their settings. |
+| `schema_options:` | `[]` | Options for compiling the JSON Schemas the server sends; see `FastestMCP.Schema.compile/2`. |
+| `response_cache:` | `false` | See [Caching responses](#caching-responses). |
+| `session_stream:` | `false` | See [Sessions on 2025-11-25](#sessions-on-2025-11-25). |
+| `sse_reconnect:` | `true` | See [Sessions on 2025-11-25](#sessions-on-2025-11-25). |
+| `env:`, `stdio_restart:`, `stdio_process_group:` | | See [Stdio connections](#stdio-connections). |
+| `roots:`, the handlers, `sampling_tools:`, `sampling_context:`, `max_mrtr_rounds:`, `max_callback_request_ids:` | | See [Client Callbacks](client-callbacks.md). |
+| `access_token:`, `authorization:`, `headers:`, `auth_input:`, `oauth:`, `legacy_stdio_auth_metadata:` | | See [Client Authentication](client-auth.md). |
+
+Operations reject unknown options with `ArgumentError` too, and so do
+credentials that the connection's transport can't use.
+
+### Protocol negotiation
+
+With `protocol_version: :auto`, the client sends `server/discover` and falls
+back to `initialize` and `2025-11-25` only on evidence that the server doesn't
+know `server/discover`; authentication and network failures fail the
+connection instead.
+[How the client chooses a version](protocol-versions.md#how-the-client-chooses-a-version)
+lists the evidence. A server that rejects the version but lists `2026-07-28`
+among its supported versions gets one more `server/discover`.
+
+With `auto_initialize: false`, the client doesn't contact the server until you
+call `FastestMCP.Client.discover/2` or `FastestMCP.Client.initialize/3`; see
+[Connecting without negotiation](protocol-versions.md#connecting-without-negotiation).
+`discover/2` can be retried after a failure, and `initialize/3` after its
+request fails; once the server has answered `initialize`, a failure ends the
+negotiation for good, and you start a new client.
+
+### Deadlines
+
+An operation's `timeout_ms:`, by default the connection's `timeout_ms:` (5
+seconds unless you change it), covers all of its requests: `list_all_tools/2`,
+for instance, fetches every page within it. A
+`FastestMCP.Client.listen/3` request stays open until you cancel it, and the
+functions of remote tasks wait 60 seconds by default (see
+[Remote tasks](client-callbacks.md#remote-tasks)). `call_tool/4` and
+`FastestMCP.Client.start_tool_result/4` have two limits:
+
+- Listing the tools, sending the call, and answering the server's questions
+  in a [multi-round-trip request](sampling-and-elicitation.md#multi-round-trip-requests)
+  happen within `timeout_ms:`.
+- When the server runs the call as a background task, the client waits for
+  the task until the call's deadline: `timeout_ms:` from the start of the
+  call when you pass it, and otherwise `task_timeout_ms:`, 60 seconds by
+  default.
+
+`init_timeout_ms:` bounds connecting, 10 seconds by default, except for an
+OAuth sign-in that is under way when it runs out.
+
+### The tool list behind call_tool
+
+`call_tool/4` checks arguments against the tool list, which the client
+fetches with every page and keeps. `list_all_tools/2` returns the same list.
+The client fetches it again when the server sends
+`notifications/tools/list_changed`, and when its credentials or session
+change. On `2026-07-28`, the server's `ttlMs` says how long the list stays
+fresh: `list_all_tools/2` fetches it again once it is older, while
+`call_tool/4` keeps using it for the tools it lists and fetches it again only
+for a tool it lacks. A FastestMCP server sends a `ttlMs` of one minute for its
+lists, as it announces their changes. A call with credentials of its own
+fetches a list of its own.
+
+### Sessions on 2025-11-25
+
+Over HTTP, a `2025-11-25` connection has a session, and some server messages
+travel on a separate event stream of that session: resource updates, list
+changes, task status notifications, and URL elicitation completions. Messages
+about a request, such as its progress, arrive with the request's response.
+Open the session's stream with `session_stream: true`. When a stream breaks,
+the client reconnects with the last event id it saw, and the server sends the
+events it missed; the same applies to the broken response stream of a request.
+`sse_reconnect:` bounds the attempts:
 
 ```elixir
-request =
-  FastestMCP.Client.request_async(
-    client,
-    "tools/call",
-    %{"name" => "slow_report", "arguments" => %{"id" => 42}}
+endpoint = "http://localhost:4000/mcp"
+
+client =
+  FastestMCP.Client.connect!(endpoint,
+    protocol_version: "2025-11-25",
+    session_stream: true,
+    sse_reconnect: [max_attempts: 3, default_retry_ms: 1_000, min_retry_ms: 0, max_retry_ms: 30_000]
   )
 
-result = FastestMCP.Client.Request.await(request, 10_000)
+FastestMCP.Client.info!(client).session_stream_open?
+# => true
 ```
 
-Cancel a low-level request explicitly with
-`FastestMCP.Client.Request.cancel/2`. An explicit
-cancel, an await timeout, or termination of the owning caller sends
-`notifications/cancelled` for an active ordinary request and ignores a late
-response. Task-augmented operations use `FastestMCP.Client.Task.cancel/2`,
-which sends `tasks/cancel`; these two low-level handles are not interchangeable.
-The phase-covering `ToolResultRequest` described above is the supported bridge
-when one terminal tool call may move between them.
+The client tries `max_attempts` times in a row. It waits as long as the
+server's `retry:` field says, or `default_retry_ms` when the server sends none;
+`min_retry_ms` and `max_retry_ms`, at most 60 seconds, bound that default.
+`sse_reconnect: false` turns reconnecting off.
+`FastestMCP.Client.open_session_stream/1` and
+`FastestMCP.Client.close_session_stream/1` open and close the stream later.
+Stdio and in-process connections deliver every message over the connection
+itself.
 
-Closing a modern HTTP request's SSE response also cancels the corresponding
-server worker. Closing a legacy session GET does not cancel detached work;
-cancel its request or task explicitly.
+When a request gets `404` because the server no longer knows the session, the
+client opens a new session, with `initialize` and `notifications/initialized`.
+It doesn't send the failed request again, because the request may have had an
+effect: that call returns its error with `details.session_recovered: true` and
+`details.original_request_replayed: false`, and the next call uses the new
+session. A session stream that gets `404` recovers the same way, once.
 
-Responses are validated as complete JSON-RPC envelopes and then against the
-original method's bundled MCP schema. Invalid initialization aborts the
-connection. Invalid ordinary results surface as
-`%FastestMCP.Client.ProtocolError{kind, method, request_id, errors}` through the
-existing client error contract; the peer payload itself is not retained.
+Closing the session's stream doesn't cancel requests that are running; cancel
+them as [Long-running calls](client-callbacks.md#long-running-calls) shows.
+On `2025-11-25`, the client answers the server's `ping` requests, and
+`FastestMCP.Client.ping/2` pings the server; `2026-07-28` has no `ping`.
+[Client Callbacks](client-callbacks.md#details) describes the questions that a
+server asks while a task's result is pending, and the tasks that a server asks
+the client to run.
 
-Connected list helpers return a stable page-map shape:
+### Stdio connections
+
+A stdio connection runs requests concurrently, up to `max_in_flight:`, and
+matches responses to requests by their JSON-RPC id. With
+`protocol_version: "2025-11-25"`, it runs one request at a time. A program
+that exits before the client has connected makes `connect/2` return an
+`:internal_error` whose message and `details.status` give its exit status,
+such as `"stdio server exited with status 1"`; what it printed to standard
+error appears on your application's standard error.
+
+When the program of a `2026-07-28` connection exits, the client starts it
+again. Requests that were running fail and aren't sent again; open
+[subscriptions](client-callbacks.md#resource-subscriptions) are. The client
+tries `max_attempts` times in a row, waiting `retry_ms`, then twice as long
+each time, up to `max_retry_ms`:
 
 ```elixir
-%{items: tools, next_cursor: next_cursor} =
-  FastestMCP.Client.list_tools(client)
+stdio_target =
+  {:stdio, System.find_executable("mix"),
+   ["run", "--no-compile", "--no-start", "-e", "MyApp.MCPServer.serve_stdio()"]}
 
-%{items: prompts, next_cursor: nil} =
-  FastestMCP.Client.list_prompts(client)
+client =
+  FastestMCP.Client.connect!(stdio_target,
+    stdio_restart: [max_attempts: 3, retry_ms: 1_000, max_retry_ms: 30_000]
+  )
 ```
 
-Use the corresponding `list_all_*` helper when the caller needs the complete
-catalog. The shared paginator preserves server order and empty-string cursors,
-rejects cursor cycles, and defaults to at most 256 pages and 100,000 items.
-Override those bounds with `max_pages:` and `max_items:`. A failure returns no
-partial list.
+`stdio_restart: true` uses these values, and `stdio_restart: false` turns
+restarts off. On `2025-11-25`, the program's exit ends the connection, and the
+client stops.
 
-## Modern Response Cache
+To end a program, the client closes its standard input, then signals it with
+`TERM` and then `KILL` when it doesn't exit within a second of each step.
+`disconnect/1` returns `:ok` once the program is gone, and otherwise an error
+whose `details.reason` says why, keeping the client so that you can try again.
 
-Modern complete discovery, list, and resource-read results may include a
-positive `ttlMs`. The connected client can retain their normalized values in
-its existing GenServer:
+A program that starts programs of its own can leave them running. To end them
+together, start it through a launcher: a program that makes itself the leader
+of a new process group, then executes the command it receives in its own
+process. Pass `stdio_process_group: [launcher: path, launcher_args: args]`,
+with the absolute path of the launcher. The client runs the launcher with
+`launcher_args`, followed by the executable and arguments of the target, and
+signals the whole process group when it ends the program. The client relies on
+the launcher to keep that contract, which a shell script doesn't.
+
+A host that tracks its stdio servers itself can supervise the client with
+`restart: :temporary` and decide when to start a new one.
+
+### Response limits
+
+`max_response_bytes:` (16 MiB) bounds one response, and `max_sse_event_bytes:`
+(1 MiB) one server-sent event. A larger response fails with a `:bad_request`
+error that never holds the payload. Over HTTP, only that request fails; over
+stdio and in process, the connection ends. `details.terminal_response_observed`
+is `true` when the client received the whole response before it rejected it,
+and `false` when it stopped reading early; don't assume that a request whose
+response was cut off had no effect.
+
+### Caching responses
+
+On `2026-07-28`, a server may say how long a result stays valid, with a
+`ttlMs` field. `response_cache:` keeps such results in the client and answers
+repeated requests from them:
 
 ```elixir
+endpoint = "http://localhost:4000/mcp"
+
 client =
   FastestMCP.Client.connect!(endpoint,
     response_cache: [max_entries: 128, max_item_size: 1_000_000]
   )
 
-FastestMCP.Client.list_tools(client, cache: :use)
-FastestMCP.Client.list_tools(client, cache: :refresh)
-FastestMCP.Client.list_tools(client, cache: :bypass)
+FastestMCP.Client.list_tools!(client, cache: :refresh).items |> Enum.map(& &1["name"])
+# => ["add_note", "search_notes"]
 ```
 
-The cache is disabled by default; `response_cache: true` uses the limits shown
-above. It applies only to `server/discover`, the four component list methods,
-and `resources/read` on a selected `2026-07-28` connection. Cursor pages,
-MRTR continuations, asynchronous requests, progress-bearing requests, and
-requests with scoped callbacks bypass it. Request-scoped credentials also
-bypass it rather than entering a cache key. Authentication, roots, connection
-recovery, server identity, and relevant catalog notifications partition or
-invalidate cached values.
-
-## Remote Task Handles
-
-When a server returns a task, the Elixir client wraps it in
-`%FastestMCP.Client.Task{}`. An ordinary modern `call_tool/4` transparently
-drives a server-created task to its final tool result. Use `call_tool_task/4`
-when the caller needs the handle itself; `task: :handle` is equivalent and
-`task: true` remains a compatibility alias.
-
-Tool example:
-
-```elixir
-alias FastestMCP.Client.Task, as: RemoteTask
-
-task =
-  FastestMCP.Client.call_tool_task(
-    client,
-    "slow_report",
-    %{"id" => 42}
-  )
-
-RemoteTask.status(task)
-RemoteTask.fetch(task)
-RemoteTask.wait(task)
-RemoteTask.result(task)
-RemoteTask.cancel(task)
-```
-
-By default, `RemoteTask.wait/2` returns when the task leaves active work states.
-That includes terminal states such as `"completed"` and `"failed"`, and also
-interactive states such as `"input_required"`. Pass `status:` or `statuses:`
-when you need to wait for a specific state:
-
-```elixir
-RemoteTask.wait(task, status: "completed")
-RemoteTask.wait(task, statuses: ["completed", "failed"])
-```
-
-On modern connections, the negotiated Tasks v2 extension is server-directed:
-`tasks/get` inlines terminal results, `RemoteTask.update/3` sends outstanding
-`inputResponses`, and cancellation uses `tasks/cancel`. On legacy connections,
-Tasks v1 augments `tools/call` and keeps separate `tasks/list` and
-`tasks/result` methods. FastestMCP does not translate between the two wires.
-Prompt and resource tasks remain available through the local in-process Elixir
-API when the application owns both the runtime and task.
-
-Descriptor discovery, the initial RPC, and synchronous MRTR use `timeout_ms`.
-Once a modern task is returned, its independent `task_timeout_ms` defaults to
-60 seconds. The client polls with a bounded adaptive delay and wakes early when
-an active modern subscription delivers a task notification. `RemoteTask.wait/2`
-remains observational: it may return `"input_required"` without invoking
-interaction callbacks, while `RemoteTask.result/2` drives those callbacks and
-sends the resulting `tasks/update`.
-
-## Task Listing
-
-`FastestMCP.Client.list_tasks/2` follows the same page-map shape:
-
-```elixir
-%{items: tasks, next_cursor: next_cursor} =
-  FastestMCP.Client.list_tasks(client)
-
-Enum.each(tasks, fn task ->
-  IO.inspect({task["taskId"], task["status"]})
-end)
-```
-
-The server enforces version-appropriate ownership and auth scoping, so task
-operations expose only tasks visible to the current connection identity.
-Continue with `cursor:` only on the legacy Tasks v1 list method;
-the MCP server owns the wire page size and ignores legacy `pageSize` hints.
-
-## Task Status Notifications
-
-On legacy connections, an open session stream carries
-`notifications/tasks/status`. On modern connections, request task updates with
-a `subscriptions/listen` filter and receive `notifications/tasks`:
-
-```elixir
-listener =
-  FastestMCP.Client.listen(client, %{"taskIds" => [task.task_id]},
-    on_notification: &IO.inspect/1
-  )
-```
-
-Register per-task callbacks:
-
-```elixir
-RemoteTask.on_status_change(task, fn status ->
-  IO.inspect({status["taskId"], status["status"]})
-end)
-```
-
-Or inspect the raw session notification feed:
-
-```elixir
-client =
-  FastestMCP.Client.connect!("http://127.0.0.1:4100/mcp",
-    protocol_version: "2025-11-25",
-    session_stream: true,
-    notification_handler: fn
-      %{"method" => "notifications/tasks/status", "params" => params} ->
-        IO.inspect({:task_status, params})
-
-      message ->
-        IO.inspect({:notification, message})
-    end
-  )
-```
-
-Tracked task handles update their cached status from those notifications and
-fall back to `tasks/get` polling when needed.
-
-## Legacy Elicitation and Sampling Relay
-
-On `2025-11-25`, remote task resolution uses the standard `tasks/result` path.
-That matters for interactive tasks: `tasks/result` can block, the server can call
-`elicitation/create` or `sampling/createMessage` back into the client, and the
-same request resumes after the handler replies.
-
-```elixir
-task = FastestMCP.Client.call_tool(client, "ask_name", %{}, task: true)
-
-result =
-  FastestMCP.Client.Task.result(task)
-
-IO.inspect(result)
-```
-
-If the connected client has an elicitation handler:
-
-```elixir
-client =
-  FastestMCP.Client.connect!("http://127.0.0.1:4100/mcp",
-    protocol_version: "2025-11-25",
-    session_stream: false,
-    elicitation_handler: fn "What is your name?", _params ->
-      {:accept, "Alice"}
-    end
-  )
-```
-
-then `RemoteTask.result(task)` can trigger that callback, open the session
-stream on demand, and return the resumed result after the relay finishes.
-Scalar elicitation handlers may return the raw scalar value or
-`%{"value" => value}`.
-
-To opt into sampling tool calls, pass the executable tool definitions through
-`sampling_tools:` together with a sampling handler. FastestMCP advertises
-`sampling.tools` only when this list is non-empty. `sampling_context:` similarly
-opts the client into the sampling context capability.
-
-```elixir
-client =
-  FastestMCP.Client.connect!("http://127.0.0.1:4100/mcp",
-    protocol_version: "2025-11-25",
-    sampling_handler: &MyApp.Model.sample/2,
-    sampling_tools: FastestMCP.prepare_sampling_tools(MyApp.MCPServer),
-    sampling_context: %{tenant: "docs"},
-    max_sse_event_bytes: 1_048_576
-  )
-```
-
-Modern `2026-07-28` interactions use input-required MRTR results instead. The
-client invokes the same configured roots, sampling, and elicitation handlers,
-then retries with a fresh request id and the latest opaque request state.
-One monotonic deadline covers the request legs and callbacks. The default
-limit is eight interaction rounds; configure it at connection time with
-`max_mrtr_rounds:` or override it with a positive per-call value.
-
-The non-standard `tasks/sendInput` wire method and its connected-client helper
-were removed in 0.2. Interactive remote tasks use the standard `tasks/result`
-relay on the legacy profile. The local
-`FastestMCP.send_task_input/5` API remains available for in-process Elixir
-workflows.
-
-## Legacy Client-Owned Callback Tasks
-
-On `2025-11-25`, if the server calls the client for sampling or elicitation and
-marks the request as task-capable, the Elixir client supports that task runtime
-too.
-
-That means:
-
-- the client returns a `CreateTaskResult` immediately
-- the installed callback handler runs in a supervised worker
-- the server can then use `tasks/get`, `tasks/list`, `tasks/result`, and
-  `tasks/cancel` against the client-owned task on the same connection
-- the client emits `notifications/tasks/status` back to the server as the
-  callback task changes state
-
-The client only advertises these callback-task capabilities when the matching
-handler is installed:
-
-```elixir
-client =
-  FastestMCP.Client.connect!("http://127.0.0.1:4100/mcp",
-    protocol_version: "2025-11-25",
-    session_stream: true,
-    sampling_handler: fn _messages, _params ->
-      %{
-        "role" => "assistant",
-        "model" => "my-model",
-        "content" => %{"type" => "text", "text" => "draft"}
-      }
-    end,
-    elicitation_handler: fn _message, _params -> {:accept, %{"ok" => true}} end
-  )
-```
-
-With that configuration, initialization capabilities include the task callback
-request surface:
-
-```elixir
-%{
-  "tasks" => %{
-    "list" => %{},
-    "cancel" => %{},
-    "requests" => %{
-      "sampling" => %{"createMessage" => %{}},
-      "elicitation" => %{"create" => %{}}
-    }
-  }
-} = FastestMCP.Client.initialize_result(client)["capabilities"]
-```
-
-If a handler is not installed, that callback-task capability is not advertised.
-
-When the server later calls `tasks/result` for one of those client-owned
-callback tasks, the client does not return an intermediate `"not completed"`
-error. It holds that `tasks/result` request open until the callback reaches a
-terminal state, then posts the final response with
-`_meta["io.modelcontextprotocol/related-task"]`.
-
-Task-augmented sampling example:
-
-```elixir
-client =
-  FastestMCP.Client.connect!("http://127.0.0.1:4100/mcp",
-    protocol_version: "2025-11-25",
-    session_stream: true,
-    sampling_handler: fn _messages, _params ->
-      Process.sleep(150)
-
-      %{
-        "role" => "assistant",
-        "model" => "my-model",
-        "content" => %{"type" => "text", "text" => "draft summary"}
-      }
-    end
-  )
-
-# Server flow on the same connection:
-# 1. sampling/createMessage arrives with params.task = %{}
-# 2. client returns CreateTaskResult immediately
-# 3. server calls tasks/result with that taskId
-# 4. client waits for the sampling handler to finish
-# 5. final tasks/result payload includes related-task metadata
-```
-
-Task-augmented elicitation example:
-
-```elixir
-client =
-  FastestMCP.Client.connect!("http://127.0.0.1:4100/mcp",
-    protocol_version: "2025-11-25",
-    session_stream: true,
-    elicitation_handler: fn "Deploy to production?", _params ->
-      Process.sleep(150)
-      {:accept, %{"approved" => true}}
-    end
-  )
-
-# The server can poll with tasks/get or tasks/list, or wait directly on
-# tasks/result. The client resolves that request only after the elicitation
-# handler accepts, declines, cancels, or fails.
-```
-
-## Result Caching
-
-Remote task handles cache terminal state and final results once they have been
-observed or fetched. In practice this gives you:
-
-- repeated `RemoteTask.result/1` calls without another round trip
-- cached terminal status after completion or cancellation
-- resilience when the session stream closes after the terminal result was
-  already cached
-
-## Resource Subscriptions
-
-Modern clients open one `subscriptions/listen` request with the notifications
-they want. Notifications carrying its subscription id are also routed to its
-request-local handler:
-
-```elixir
-listener =
-  FastestMCP.Client.listen(
-    client,
-    %{"resourceSubscriptions" => ["config://release"]},
-    on_notification: &MyApp.MCPNotifications.handle/1
-  )
-
-FastestMCP.Client.Request.cancel(listener, "listener no longer needed")
-```
-
-Legacy clients use session-scoped resource subscribe/unsubscribe methods and
-an HTTP session stream or the stdio output sink:
-
-```elixir
-%{} = FastestMCP.Client.subscribe_resource(client, "config://release")
-
-%{} = FastestMCP.Client.unsubscribe_resource(client, "config://release")
-```
-
-Both profiles receive `notifications/resources/updated`; the generic
-notification handler observes them as well. Resource templates are discovery
-and read routes, so subscribe to concrete expanded URIs.
-
-## Client Roots
-
-Configure only absolute `file://` roots and pass `roots:` when connecting (an
-empty list enables the capability without exposing a root yet). Legacy peers
-can call `roots/list`; the client emits legacy
-`notifications/roots/list_changed` only when the normalized list changes.
-Modern MRTR rounds reuse the same configured roots handler, but do not create a
-session or emit the legacy list-changed notification:
-
-```elixir
-client =
-  FastestMCP.Client.connect!("http://127.0.0.1:4100/mcp",
-    roots: []
-  )
-
-:ok =
-  FastestMCP.Client.set_roots(client, [
-    %{uri: "file:///workspace/app", name: "Application"}
-  ])
-```
-
-On `2025-11-25`, the connected client also answers server `ping` requests
-automatically. Core `2026-07-28` has no `ping` method.
-
-## Legacy Session Stream Control (`2025-11-25`)
-
-If a legacy HTTP connection starts without `session_stream: true`, you can
-manage the stream explicitly:
-
-```elixir
-:ok = FastestMCP.Client.open_session_stream(client)
-FastestMCP.Client.session_stream_open?(client)
-:ok = FastestMCP.Client.close_session_stream(client)
-```
-
-This is useful when initialization should stay plain HTTP first and the event
-stream should only open later.
-
-An open session stream reconnects after a network disconnect or clean stream
-end. When the server supplied SSE event ids, the reconnect is a GET carrying
-`Last-Event-ID`; retained decoder state suppresses duplicate ids. Server
-`retry:` values are clamped and reconnect attempts are bounded:
-
-```elixir
-client =
-  FastestMCP.Client.connect!("http://127.0.0.1:4100/mcp",
-    protocol_version: "2025-11-25",
-    session_stream: true,
-    sse_reconnect: [
-      max_attempts: 3,
-      default_retry_ms: 1_000,
-      min_retry_ms: 0,
-      max_retry_ms: 30_000
-    ]
-  )
-```
-
-Set `sse_reconnect: false` to disable transport reconnects. When a standalone
-session GET carrying `MCP-Session-Id` receives `404`, the client still performs
-one fresh initialize handshake and opens the replacement stream without the
-old event id. If that replacement GET is also missing, or receives another
-terminal HTTP response, the stream stops instead of entering a recovery loop.
-Disconnecting the stream still does not cancel an in-flight MCP request.
-
-## Callback Handlers
-
-Install or replace handlers at runtime with:
-
-- `FastestMCP.Client.set_sampling_handler/2`
-- `FastestMCP.Client.set_elicitation_handler/2`
-- `FastestMCP.Client.set_url_elicitation_handler/2`
-- `FastestMCP.Client.set_elicitation_complete_handler/2`
-- `FastestMCP.Client.set_log_handler/2`
-- `FastestMCP.Client.set_progress_handler/2`
-- `FastestMCP.Client.set_notification_handler/2`
-
-The generic notification handler is where resource updates, list-change
-notifications, and other version-appropriate notifications arrive.
-
-Existing callback arities remain valid. Sampling and form-elicitation handlers
-may accept a trailing `%FastestMCP.Client.CallbackContext{}` containing the
-request id, method, progress token, configured sampling tools/context, task id,
-and cancellation state. Callback workers are supervised; peer cancellation
-terminates the matching worker and suppresses a late response. Callback output
-is validated before it is written to the wire, and invalid application output
-becomes JSON-RPC internal error `-32603`.
-
-The client retains server-issued callback request ids for the lifetime of the
-connection (the legacy session, where applicable) so a duplicate cannot replace
-active or completed callback state. This
-history is capped by `max_callback_request_ids:` (default `100_000`). Reaching
-the cap returns one correlated overload error and closes the client connection;
-increase the cap for legacy peers expected to issue more callbacks per session.
-
-URL elicitation has a separate handler and is advertised only when that handler
-is configured. It receives `%FastestMCP.Client.URLElicitation{}` and must gather
-host consent before returning `:accept`, `:decline`, or `:cancel`. FastestMCP
-validates the URL, never fetches or opens it, forbids response content, and
-tracks the opaque elicitation id until a matching
-`notifications/elicitation/complete`. Displaying the full target URL, opening
-it securely, and providing manual retry/cancel controls are host UI
-responsibilities.
-
-## Why This Shape
-
-The client is connection-first on purpose. It models one negotiated MCP
-connection, not a bag of unrelated request helpers. A modern connection is
-sessionless and carries metadata per request; a legacy connection owns one
-initialized session. That keeps task relay, callback routing, auth reuse,
-subscriptions, and task-result caching aligned with the selected protocol.
+- It applies to `server/discover`, the four list functions, and
+  `read_resource/3`, for results with a positive `ttlMs`. A FastestMCP server
+  sends one minute for its lists, and `0` for discovery and reads.
+- `response_cache: true` uses the limits above: 128 results, of at most 1 MB
+  each.
+- A request takes `cache: :use` (the default), `:refresh` to ask the server
+  and store the new result, or `:bypass` to ask without storing.
+- Pages after the first, multi-round-trip retries, requests with a progress
+  handler, and requests with credentials of their own are never cached.
+- The cache is emptied when the credentials, the roots, the session, or the
+  server change, and when the server reports changed lists or resources.
+
+## See also
+
+- [Client Callbacks](client-callbacks.md): handlers for the server's
+  requests, logs, progress, long-running calls, tasks, and subscriptions
+- [Client Authentication](client-auth.md): tokens and OAuth
+- [Transports](transports.md): the server side of HTTP and stdio
+- [Protocol Versions](protocol-versions.md): `2026-07-28` and `2025-11-25`
+- [Testing with a connected client](testing.md#testing-with-a-connected-client):
+  testing your server the way clients see it
+- [Pagination](pagination.md): paging in process and from a client

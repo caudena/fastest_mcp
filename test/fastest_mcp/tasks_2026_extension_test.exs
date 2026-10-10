@@ -1,5 +1,5 @@
 defmodule FastestMCP.Tasks2026ExtensionTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Client
   alias FastestMCP.Client.Task, as: RemoteTask
@@ -8,7 +8,7 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
   alias FastestMCP.Error
   alias FastestMCP.InputRequiredResult
   alias FastestMCP.Protocol.Extensions
-  alias FastestMCP.Schema
+  alias FastestMCP.Protocol.Schema, as: ProtocolSchema
   alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
   alias FastestMCP.Transport.Engine
   alias FastestMCP.Transport.JSONRPC
@@ -30,14 +30,14 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
       }
     }
 
-    assert Schema.protocol_supported?(
+    assert ProtocolSchema.supported?(
              @modern_version,
              :server_to_client,
              :notification,
              "notifications/tasks"
            )
 
-    refute Schema.protocol_supported?(
+    refute ProtocolSchema.supported?(
              @modern_version,
              :client_to_server,
              :notification,
@@ -45,7 +45,7 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
            )
 
     assert {:ok, ^notification} =
-             Schema.validate_protocol(
+             ProtocolSchema.validate(
                @modern_version,
                :server_to_client,
                :notification,
@@ -56,7 +56,7 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
 
   test "HTTP and stdio reject task subscription filters without the Tasks capability" do
     server_name = unique_name("tasks-subscription-capability")
-    start_server!(server_name, FastestMCP.server(server_name, extensions: tasks_extensions()))
+    start_server!(FastestMCP.server(server_name, extensions: tasks_extensions()))
 
     params = %{"notifications" => %{"taskIds" => ["task-1"]}}
 
@@ -81,7 +81,7 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
     allowed_request =
       modern_request("subscriptions/listen", params, tasks_capabilities())
 
-    assert {:ok, subscriber, ^allowed_request} =
+    assert {:ok, subscriber} =
              Engine.start_subscription(server_name, allowed_request)
 
     assert_receive {:fastest_mcp_subscription_notification,
@@ -93,14 +93,12 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
   test "modern response validation ignores legacy task augmentation unless the result is a task" do
     server_name = unique_name("tasks-legacy-augmentation")
 
-    server =
-      FastestMCP.server(server_name, extensions: tasks_extensions())
-      |> FastestMCP.add_tool("sync", fn _arguments, _context -> "synchronous" end)
-      |> FastestMCP.add_tool("async", fn _arguments, _context -> "asynchronous" end,
-        task: [mode: :required]
-      )
-
-    start_server!(server_name, server)
+    FastestMCP.server(server_name, extensions: tasks_extensions())
+    |> FastestMCP.add_tool("sync", fn _arguments, _context -> "synchronous" end)
+    |> FastestMCP.add_tool("async", fn _arguments, _context -> "asynchronous" end,
+      task: [mode: :required]
+    )
+    |> start_server!()
 
     sync_request =
       modern_request("tools/call", %{
@@ -129,16 +127,14 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
   test "modern Tasks augmentation is restricted to tools/call" do
     server_name = unique_name("tasks-tools-only")
 
-    server =
-      FastestMCP.server(server_name, extensions: tasks_extensions())
-      |> FastestMCP.add_prompt("draft", fn _arguments, _context -> "prompt body" end,
-        task: [mode: :required]
-      )
-      |> FastestMCP.add_resource("memo://status", fn _arguments, _context -> "ready" end,
-        task: [mode: :required]
-      )
-
-    start_server!(server_name, server)
+    FastestMCP.server(server_name, extensions: tasks_extensions())
+    |> FastestMCP.add_prompt("draft", fn _arguments, _context -> "prompt body" end,
+      task: [mode: :required]
+    )
+    |> FastestMCP.add_resource("memo://status", fn _arguments, _context -> "ready" end,
+      task: [mode: :required]
+    )
+    |> start_server!()
 
     prompt_result =
       Engine.dispatch!(
@@ -165,11 +161,9 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
   test "Tasks is an explicit server extension and does not change legacy task capabilities" do
     disabled = unique_name("tasks-disabled")
 
-    disabled_server =
-      FastestMCP.server(disabled)
-      |> FastestMCP.add_tool("echo", fn arguments, _context -> arguments end, task: true)
-
-    start_server!(disabled, disabled_server)
+    FastestMCP.server(disabled)
+    |> FastestMCP.add_tool("echo", fn arguments, _context -> arguments end, task: true)
+    |> start_server!()
 
     disabled_discovery = Engine.dispatch!(disabled, modern_request("server/discover", %{}))
     refute get_in(disabled_discovery, ["capabilities", "extensions", Extensions.tasks()])
@@ -194,16 +188,14 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
 
     assert disabled_error.code == :method_not_found
 
-    legacy_initialize = FastestMCP.initialize(disabled, %{}, transport: :in_process)
+    legacy_initialize = FastestMCP.initialize!(disabled, %{}, transport: :in_process)
     assert get_in(legacy_initialize, ["capabilities", "tasks", "requests", "tools", "call"])
 
     enabled = unique_name("tasks-enabled")
 
-    enabled_server =
-      FastestMCP.server(enabled, extensions: tasks_extensions())
-      |> FastestMCP.add_tool("echo", fn arguments, _context -> arguments end, task: true)
-
-    start_server!(enabled, enabled_server)
+    FastestMCP.server(enabled, extensions: tasks_extensions())
+    |> FastestMCP.add_tool("echo", fn arguments, _context -> arguments end, task: true)
+    |> start_server!()
 
     assert %{} =
              get_in(
@@ -227,13 +219,11 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
   test "required Tasks tools return -32021 when the client omits the extension" do
     server_name = unique_name("tasks-required")
 
-    server =
-      FastestMCP.server(server_name, extensions: tasks_extensions())
-      |> FastestMCP.add_tool("required", fn _arguments, _context -> %{ok: true} end,
-        task: [mode: :required, poll_interval_ms: 10]
-      )
-
-    start_server!(server_name, server)
+    FastestMCP.server(server_name, extensions: tasks_extensions())
+    |> FastestMCP.add_tool("required", fn _arguments, _context -> %{ok: true} end,
+      task: [mode: :required, poll_interval_ms: 10]
+    )
+    |> start_server!()
 
     error =
       assert_raise Error, fn ->
@@ -260,6 +250,32 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
 
     assert lifecycle_error.code == :missing_required_client_capability
     assert lifecycle_error.details.jsonrpc_code == -32_021
+  end
+
+  test "a tool that requires a task fails on 2026-07-28 when the server lacks the Tasks extension" do
+    parent = self()
+    server_name = unique_name("tasks-required-no-extension")
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("required", fn _arguments, _context -> send(parent, :ran) end,
+      task: [mode: :required]
+    )
+    |> start_server!()
+
+    error =
+      assert_raise Error, fn ->
+        Engine.dispatch!(
+          server_name,
+          modern_request("tools/call", %{"name" => "required", "arguments" => %{}}, %{
+            "extensions" => tasks_extensions()
+          })
+        )
+      end
+
+    assert error.code == :method_not_found
+    assert error.message =~ "requires background task execution"
+    assert error.message =~ Extensions.tasks()
+    refute_received :ran
   end
 
   test "tasks/get, tasks/update, and tasks/cancel implement the modern lifecycle" do
@@ -299,12 +315,15 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
       |> FastestMCP.add_tool(
         "tool_error",
         fn _arguments, _context ->
-          %{isError: true, content: [%{type: "text", text: "tool rejected input"}]}
+          FastestMCP.Tools.Result.from(%{
+            isError: true,
+            content: [%{type: "text", text: "tool rejected input"}]
+          })
         end,
         task: [mode: :optional, poll_interval_ms: 10]
       )
 
-    start_server!(server_name, server)
+    start_server!(server)
 
     %{"taskId" => ask_id} =
       Engine.dispatch!(
@@ -398,33 +417,35 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
       |> FastestMCP.add_tool(
         "reject",
         fn _arguments, _context ->
-          %{isError: true, content: [%{type: "text", text: "rejected"}]}
+          FastestMCP.Tools.Result.from(%{
+            isError: true,
+            content: [%{type: "text", text: "rejected"}]
+          })
         end,
         task: [mode: :optional, poll_interval_ms: 10]
       )
       |> FastestMCP.add_tool(
         "large",
         fn _arguments, _context ->
-          %{
+          FastestMCP.Tools.Result.from(%{
             content: [%{type: "text", text: String.duplicate("x", 32_768)}]
-          }
+          })
         end,
         task: [mode: :required, poll_interval_ms: 10]
       )
 
-    start_server!(server_name, server)
-    bandit = start_http_transport!(server_name)
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+    start_server!(server)
+    %{url: url} = start_http!(server_name, allowed_hosts: ["127.0.0.1", "localhost"])
 
     client =
-      Client.connect!("http://127.0.0.1:#{port}/mcp",
+      connect!(url,
         protocol_version: @modern_version,
         extensions: tasks_extensions(),
         client_info: @client_info
       )
 
     bounded_client =
-      Client.connect!("http://127.0.0.1:#{port}/mcp",
+      connect!(url,
         protocol_version: @modern_version,
         extensions: tasks_extensions(),
         client_info: @client_info,
@@ -432,20 +453,14 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
       )
 
     direct_client =
-      Client.connect!({:in_process, server_name},
+      connect!({:in_process, server_name},
         protocol_version: @modern_version,
         client_info: @client_info
       )
 
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
-      if Client.connected?(bounded_client), do: Client.disconnect(bounded_client)
-      if Client.connected?(direct_client), do: Client.disconnect(direct_client)
-    end)
-
     call =
       Task.async(fn ->
-        Client.call_tool(client, "echo", %{"value" => "modern"},
+        Client.call_tool!(client, "echo", %{"value" => "modern"},
           task: false,
           task_timeout_ms: 2_000
         )
@@ -453,12 +468,12 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
 
     assert_receive {:task_worker, worker}, 1_000
     send(worker, :release)
-    assert %{"value" => "modern"} = Task.await(call, 3_000)
-    refute Client.session_stream_open?(client)
+    assert %{structured_content: %{"value" => "modern"}} = Task.await(call, 3_000)
+    refute Client.info!(client).session_stream_open?
 
     stable_call =
       Task.async(fn ->
-        Client.call_tool_result(client, "echo", %{"value" => "stable"}, task_timeout_ms: 2_000)
+        Client.call_tool!(client, "echo", %{"value" => "stable"}, task_timeout_ms: 2_000)
       end)
 
     assert_receive {:task_worker, stable_worker}, 1_000
@@ -471,28 +486,28 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
            } = Task.await(stable_call, 3_000)
 
     cancellable =
-      Client.start_tool_result(client, "echo", %{"value" => "cancelled"}, task_timeout_ms: 2_000)
+      Client.start_tool_result!(client, "echo", %{"value" => "cancelled"}, task_timeout_ms: 2_000)
 
     assert_receive {:task_worker, cancellable_worker}, 1_000
-    assert :ok = Client.cancel_tool_result(cancellable, "test cancellation")
+    assert :ok = Client.ToolResultRequest.cancel!(cancellable, "test cancellation")
 
     cancellation =
-      assert_raise Error, fn -> Client.await_tool_result(cancellable, 2_000) end
+      assert_raise Error, fn -> Client.ToolResultRequest.await!(cancellable, 2_000) end
 
     assert cancellation.code == :cancelled
     monitor = Process.monitor(cancellable_worker)
     assert_receive {:DOWN, ^monitor, :process, ^cancellable_worker, _reason}, 1_000
 
     direct =
-      Client.start_tool_result(direct_client, "echo", %{"value" => "cancelled-direct"},
+      Client.start_tool_result!(direct_client, "echo", %{"value" => "cancelled-direct"},
         task_timeout_ms: 2_000
       )
 
     assert_receive {:task_worker, direct_worker}, 1_000
-    assert :ok = Client.cancel_tool_result(direct, "test direct cancellation")
+    assert :ok = Client.ToolResultRequest.cancel!(direct, "test direct cancellation")
 
     direct_cancellation =
-      assert_raise Error, fn -> Client.await_tool_result(direct, 2_000) end
+      assert_raise Error, fn -> Client.ToolResultRequest.await!(direct, 2_000) end
 
     assert direct_cancellation.code == :cancelled
     direct_monitor = Process.monitor(direct_worker)
@@ -501,11 +516,11 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
     assert %ToolResult{
              content: [%{"type" => "text", "text" => "rejected"}],
              is_error: true
-           } = Client.call_tool_result(client, "reject", %{}, task_timeout_ms: 2_000)
+           } = Client.call_tool!(client, "reject", %{}, task_timeout_ms: 2_000)
 
     oversized =
       assert_raise Error, fn ->
-        Client.call_tool_result(bounded_client, "large", %{}, task_timeout_ms: 2_000)
+        Client.call_tool!(bounded_client, "large", %{}, task_timeout_ms: 2_000)
       end
 
     assert oversized.code == :bad_request
@@ -516,12 +531,12 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
     assert oversized.details.terminal_response_observed == false
 
     assert %RemoteTask{task_id: task_id} =
-             task = Client.call_tool_task(client, "echo", %{"value" => "handle"})
+             task = Client.call_tool_task!(client, "echo", %{"value" => "handle"})
 
     assert_receive {:task_worker, handle_worker}, 1_000
 
     listener =
-      Client.listen(client, %{"taskIds" => [task_id]},
+      Client.listen!(client, %{"taskIds" => [task_id]},
         on_notification: fn message -> send(parent, {:task_notification, message}) end
       )
 
@@ -529,7 +544,7 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
                     %{"method" => "notifications/subscriptions/acknowledged"}},
                    1_000
 
-    result_waiter = Task.async(fn -> RemoteTask.result(task, timeout_ms: 2_000) end)
+    result_waiter = Task.async(fn -> RemoteTask.result!(task, timeout_ms: 2_000) end)
     send(handle_worker, :release)
 
     assert_receive {:task_notification,
@@ -539,21 +554,21 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
                     }},
                    1_000
 
-    assert %{"value" => "handle"} = Task.await(result_waiter, 3_000)
-    assert %{"taskId" => ^task_id, "status" => "completed"} = RemoteTask.status(task)
-    assert :ok = Client.cancel(listener, "test complete")
+    assert %{structured_content: %{"value" => "handle"}} = Task.await(result_waiter, 3_000)
+    assert %{"taskId" => ^task_id, "status" => "completed"} = RemoteTask.status!(task)
+    assert :ok = Client.Request.cancel!(listener, "test complete")
 
     assert %RemoteTask{} =
              compatibility_task =
-             Client.call_tool(client, "echo", %{"value" => "compatibility"}, task: true)
+             Client.call_tool_task!(client, "echo", %{"value" => "compatibility"}, task: true)
 
     assert_receive {:task_worker, compatibility_worker}, 1_000
     send(compatibility_worker, :release)
 
-    assert %{"value" => "compatibility"} =
-             RemoteTask.result(compatibility_task, timeout_ms: 2_000)
+    assert %{structured_content: %{"value" => "compatibility"}} =
+             RemoteTask.result!(compatibility_task, timeout_ms: 2_000)
 
-    refute Client.session_stream_open?(client)
+    refute Client.info!(client).session_stream_open?
   end
 
   test "transparent modern tasks fulfill input-required callbacks with task context" do
@@ -584,12 +599,11 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
         task: [mode: :optional, poll_interval_ms: 10]
       )
 
-    start_server!(server_name, server)
-    bandit = start_http_transport!(server_name)
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+    start_server!(server)
+    %{url: url} = start_http!(server_name, allowed_hosts: ["127.0.0.1", "localhost"])
 
     client =
-      Client.connect!("http://127.0.0.1:#{port}/mcp",
+      connect!(url,
         protocol_version: @modern_version,
         extensions: tasks_extensions(),
         client_info: @client_info,
@@ -599,14 +613,191 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
         end
       )
 
-    on_exit(fn -> if Client.connected?(client), do: Client.disconnect(client) end)
-
-    assert %{"answer" => %{"action" => "accept", "content" => %{"answer" => "yes"}}} =
-             Client.call_tool(client, "ask", %{}, task_timeout_ms: 2_000)
+    assert %{
+             structured_content: %{
+               "answer" => %{"action" => "accept", "content" => %{"answer" => "yes"}}
+             }
+           } =
+             Client.call_tool!(client, "ask", %{}, task_timeout_ms: 2_000)
 
     assert_receive {:task_callback_context, task_id}, 1_000
     assert is_binary(task_id)
-    refute Client.session_stream_open?(client)
+    refute Client.info!(client).session_stream_open?
+  end
+
+  defmodule RecordingPlug do
+    @moduledoc false
+    # Reports every MCP POST to the test before the HTTP app handles it, and
+    # holds a request for the `hold:` method until the test releases it.
+
+    def init(opts), do: opts
+
+    def call(%Plug.Conn{method: "POST"} = conn, opts) do
+      {:ok, body, conn} = Plug.Conn.read_body(conn)
+      payload = JSON.decode!(body)
+      send(opts[:test_pid], {:mcp_request, payload})
+
+      with hold when is_binary(hold) <- opts[:hold], %{"method" => ^hold} <- payload do
+        send(opts[:test_pid], {:held, self()})
+        receive do: (:release -> :ok)
+      end
+
+      FastestMCP.Transport.HTTPApp.call(%{conn | body_params: payload}, app(opts))
+    end
+
+    def call(conn, opts), do: FastestMCP.Transport.HTTPApp.call(conn, app(opts))
+
+    defp app(opts) do
+      FastestMCP.Transport.HTTPApp.init(
+        server_name: opts[:server_name],
+        path: "/mcp",
+        allowed_hosts: ["127.0.0.1", "localhost"]
+      )
+    end
+  end
+
+  test "task results and waits forward per-call metadata to tasks/get" do
+    parent = self()
+    server_name = unique_name("tasks-client-meta")
+
+    FastestMCP.server(server_name, extensions: tasks_extensions())
+    |> FastestMCP.add_tool(
+      "slow",
+      fn _arguments, _context ->
+        send(parent, {:slow_started, self()})
+
+        receive do
+          :release -> %{"done" => true}
+        end
+      end,
+      task: [mode: :optional, poll_interval_ms: 10]
+    )
+    |> start_server!()
+
+    %{url: url} = serve!({RecordingPlug, test_pid: self(), server_name: server_name})
+
+    client =
+      connect!(url,
+        protocol_version: @modern_version,
+        extensions: tasks_extensions(),
+        client_info: @client_info
+      )
+
+    result =
+      Task.async(fn ->
+        Client.call_tool!(client, "slow", %{},
+          meta: %{"example.com/marker" => "result"},
+          task_timeout_ms: 2_000
+        )
+      end)
+
+    # The call polls with its metadata while the tool is still running.
+    assert_polled_with_marker("result")
+    release_slow_tool()
+    assert %ToolResult{structured_content: %{"done" => true}} = Task.await(result)
+
+    task = Client.call_tool_task!(client, "slow", %{})
+
+    waited =
+      Task.async(fn ->
+        RemoteTask.wait!(task, meta: %{"example.com/marker" => "wait"}, timeout_ms: 2_000)
+      end)
+
+    assert_polled_with_marker("wait")
+    release_slow_tool()
+    assert %{"status" => "completed"} = Task.await(waited)
+  end
+
+  # Two polls of a working task, so the client keeps waiting between them.
+  defp assert_polled_with_marker(marker) do
+    for _poll <- 1..2 do
+      assert_receive {:mcp_request,
+                      %{
+                        "method" => "tasks/get",
+                        "params" => %{"_meta" => %{"example.com/marker" => ^marker}}
+                      }},
+                     1_000
+    end
+  end
+
+  defp release_slow_tool do
+    assert_receive {:slow_started, tool}, 1_000
+    send(tool, :release)
+  end
+
+  defmodule NonPositivePollIntervalPlug do
+    @moduledoc false
+    # Serves the HTTP app with every task status's pollIntervalMs set to 0,
+    # which the Tasks schema (a number) admits.
+
+    def init(opts), do: opts
+
+    def call(conn, opts) do
+      app =
+        FastestMCP.Transport.HTTPApp.init(
+          server_name: opts[:server_name],
+          path: "/mcp",
+          allowed_hosts: ["127.0.0.1", "localhost"]
+        )
+
+      conn
+      |> Plug.Conn.register_before_send(&rewrite(&1, opts[:test_pid]))
+      |> FastestMCP.Transport.HTTPApp.call(app)
+    end
+
+    defp rewrite(%Plug.Conn{resp_body: body} = conn, test_pid) when not is_nil(body) do
+      case JSON.decode(IO.iodata_to_binary(body)) do
+        {:ok, %{"result" => %{"pollIntervalMs" => _interval}} = payload} ->
+          send(test_pid, :poll_interval_rewritten)
+          %{conn | resp_body: JSON.encode!(put_in(payload, ["result", "pollIntervalMs"], 0))}
+
+        _other ->
+          conn
+      end
+    end
+
+    defp rewrite(conn, _test_pid), do: conn
+  end
+
+  test "a non-positive task pollIntervalMs falls back to the default interval" do
+    parent = self()
+    server_name = unique_name("tasks-client-poll-interval")
+
+    FastestMCP.server(server_name, extensions: tasks_extensions())
+    |> FastestMCP.add_tool(
+      "slow",
+      fn _arguments, _context ->
+        send(parent, {:slow_started, self()})
+
+        receive do
+          :release -> %{"done" => true}
+        end
+      end,
+      task: [mode: :optional, poll_interval_ms: 10]
+    )
+    |> start_server!()
+
+    %{url: url} =
+      serve!({NonPositivePollIntervalPlug, test_pid: self(), server_name: server_name})
+
+    client =
+      connect!(url,
+        protocol_version: @modern_version,
+        extensions: tasks_extensions(),
+        client_info: @client_info
+      )
+
+    result = Task.async(fn -> Client.call_tool(client, "slow", %{}, task_timeout_ms: 2_000) end)
+    # The client sees a working task whose zero interval it must not use.
+    assert_receive :poll_interval_rewritten, 1_000
+    release_slow_tool()
+    assert {:ok, %ToolResult{structured_content: %{"done" => true}}} = Task.await(result)
+
+    task = Client.call_tool_task!(client, "slow", %{})
+    waited = Task.async(fn -> RemoteTask.wait(task, timeout_ms: 2_000) end)
+    release_slow_tool()
+    assert {:ok, %{"status" => "completed"}} = Task.await(waited)
+    assert_receive :poll_interval_rewritten, 1_000
   end
 
   test "transparent task timeout leaves the remote task running" do
@@ -627,23 +818,20 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
         task: [mode: :optional, poll_interval_ms: 10]
       )
 
-    start_server!(server_name, server)
-    bandit = start_http_transport!(server_name)
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+    start_server!(server)
+    %{url: url} = start_http!(server_name, allowed_hosts: ["127.0.0.1", "localhost"])
 
     client =
-      Client.connect!("http://127.0.0.1:#{port}/mcp",
+      connect!(url,
         protocol_version: @modern_version,
         extensions: tasks_extensions(),
         client_info: @client_info
       )
 
-    on_exit(fn -> if Client.connected?(client), do: Client.disconnect(client) end)
-
     call =
       Task.async(fn ->
         try do
-          Client.call_tool(client, "block", %{}, task_timeout_ms: 50)
+          Client.call_tool!(client, "block", %{}, task_timeout_ms: 500)
         rescue
           error in Error -> {:error, error}
         end
@@ -652,8 +840,150 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
     assert_receive {:blocking_task_worker, worker}, 1_000
     assert {:error, %Error{code: :timeout}} = Task.await(call, 2_000)
     assert Process.alive?(worker)
-    refute Client.session_stream_open?(client)
+    refute Client.info!(client).session_stream_open?
     send(worker, :release)
+  end
+
+  test "a terminal call cancels the remote task it drives when its caller exits" do
+    server_name = blocking_task_server!()
+    client = recording_client!(server_name)
+    caller = spawn(fn -> Client.call_tool(client, "block", %{}, task_timeout_ms: 10_000) end)
+
+    assert_receive {:blocking_task_worker, worker}, 1_000
+    # The caller drives the task once it polls it.
+    assert_receive {:mcp_request, %{"method" => "tasks/get", "params" => %{"taskId" => task_id}}},
+                   1_000
+
+    monitor = Process.monitor(worker)
+    Process.exit(caller, :kill)
+
+    assert_receive {:mcp_request,
+                    %{"method" => "tasks/cancel", "params" => %{"taskId" => ^task_id}}},
+                   1_000
+
+    assert_receive {:DOWN, ^monitor, :process, ^worker, _reason}, 1_000
+    assert %{"status" => "cancelled"} = wait_for_status(server_name, task_id, "cancelled")
+  end
+
+  test "a terminal call whose caller exits mid-request cancels the task the request creates" do
+    server_name = blocking_task_server!()
+    client = recording_client!(server_name, hold: "tools/call")
+    caller = spawn(fn -> Client.call_tool(client, "block", %{}, task_timeout_ms: 10_000) end)
+
+    assert_receive {:held, plug}, 1_000
+    monitor = Process.monitor(caller)
+    Process.exit(caller, :kill)
+    assert_receive {:DOWN, ^monitor, :process, ^caller, :killed}
+    send(plug, :release)
+
+    assert_receive {:blocking_task_worker, worker}, 1_000
+    monitor = Process.monitor(worker)
+
+    assert_receive {:mcp_request,
+                    %{"method" => "tasks/cancel", "params" => %{"taskId" => task_id}}},
+                   1_000
+
+    assert_receive {:DOWN, ^monitor, :process, ^worker, _reason}, 1_000
+    assert %{"status" => "cancelled"} = wait_for_status(server_name, task_id, "cancelled")
+  end
+
+  test "an explicit task handle outlives the caller that created it" do
+    parent = self()
+    server_name = blocking_task_server!()
+    client = recording_client!(server_name)
+    caller = spawn(fn -> send(parent, {:handle, Client.call_tool_task(client, "block")}) end)
+
+    assert_receive {:handle, {:ok, %RemoteTask{task_id: task_id}}}, 1_000
+    assert_receive {:blocking_task_worker, worker}, 1_000
+    monitor = Process.monitor(caller)
+    assert_receive {:DOWN, ^monitor, :process, ^caller, _reason}
+    refute_receive {:mcp_request, %{"method" => "tasks/cancel"}}, 200
+    send(worker, :release)
+    assert %{"status" => "completed"} = wait_for_status(server_name, task_id, "completed")
+  end
+
+  test "call_tool_task/4 fails before calling unless both sides declare the Tasks extension" do
+    parent = self()
+
+    for {server_extensions, client_extensions} <- [
+          {tasks_extensions(), %{}},
+          {%{}, tasks_extensions()}
+        ] do
+      server_name = unique_name("tasks-handle-missing")
+
+      FastestMCP.server(server_name, extensions: server_extensions)
+      |> FastestMCP.add_tool("work", fn _arguments, _context -> send(parent, :ran) end,
+        task: true
+      )
+      |> start_server!()
+
+      client =
+        connect!({:in_process, server_name},
+          protocol_version: @modern_version,
+          extensions: client_extensions
+        )
+
+      assert {:error, %Error{code: :bad_request, message: message}} =
+               Client.call_tool_task(client, "work")
+
+      assert message =~ Extensions.tasks()
+      refute_receive :ran, 100
+    end
+  end
+
+  test "Task.result/2 right after Task.update/3 does not answer the old questions again" do
+    parent = self()
+    server_name = unique_name("tasks-update-result")
+
+    FastestMCP.server(server_name, extensions: tasks_extensions())
+    |> FastestMCP.add_tool(
+      "ask",
+      fn _arguments, context ->
+        case Context.input_responses(context) do
+          responses when map_size(responses) == 0 ->
+            InputRequiredResult.new(%{
+              "answer" => %{
+                "method" => "elicitation/create",
+                "params" => %{
+                  "message" => "Answer",
+                  "requestedSchema" => %{
+                    "type" => "object",
+                    "properties" => %{"answer" => %{"type" => "string"}}
+                  }
+                }
+              }
+            })
+
+          %{"answer" => answer} ->
+            answer
+        end
+      end,
+      task: [mode: :optional, poll_interval_ms: 10]
+    )
+    |> start_server!()
+
+    client =
+      connect!({:in_process, server_name},
+        protocol_version: @modern_version,
+        extensions: tasks_extensions(),
+        elicitation_handler: fn _message, _params ->
+          send(parent, :handler_answered)
+          {:accept, %{"answer" => "from the handler"}}
+        end
+      )
+
+    task = Client.call_tool_task!(client, "ask")
+    status = RemoteTask.wait!(task, status: "input_required")
+    [key] = Map.keys(status["inputRequests"])
+
+    RemoteTask.update!(task, %{
+      key => %{"action" => "accept", "content" => %{"answer" => "from update"}}
+    })
+
+    assert %{"action" => "accept", "content" => %{"answer" => "from update"}} =
+             RemoteTask.result!(task).structured_content
+
+    refute_received :handler_answered
   end
 
   test "modern task response descriptors accept discriminators and result metadata" do
@@ -674,7 +1004,7 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
     }
 
     assert {:ok, ^response} =
-             Schema.validate_protocol(
+             ProtocolSchema.validate(
                @modern_version,
                :server_to_client,
                :task_response,
@@ -682,7 +1012,7 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
                response
              )
 
-    refute Schema.protocol_supported?(
+    refute ProtocolSchema.supported?(
              "2025-11-25",
              :client_to_server,
              :request,
@@ -690,21 +1020,11 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
            )
   end
 
-  defp wait_for_status(server_name, task_id, status, attempts \\ 100)
-
-  defp wait_for_status(server_name, task_id, status, attempts) when attempts > 0 do
-    task = task_request(server_name, "tasks/get", %{"taskId" => task_id})
-
-    if task["status"] == status do
-      task
-    else
-      Process.sleep(10)
-      wait_for_status(server_name, task_id, status, attempts - 1)
-    end
-  end
-
-  defp wait_for_status(_server_name, task_id, status, 0) do
-    flunk("task #{task_id} did not reach #{status}")
+  defp wait_for_status(server_name, task_id, status) do
+    assert_eventually(fn ->
+      task = task_request(server_name, "tasks/get", %{"taskId" => task_id})
+      task["status"] == status && task
+    end)
   end
 
   defp task_request(server_name, method, params) do
@@ -737,22 +1057,37 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
     }
   end
 
-  defp start_server!(server_name, server) do
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
-  end
+  # A modern server whose task-capable "block" tool runs until released.
+  defp blocking_task_server! do
+    parent = self()
+    server_name = unique_name("tasks-client-owner")
 
-  defp start_http_transport!(server_name) do
-    start_supervised!(
-      {Bandit,
-       plug:
-         {FastestMCP.Transport.HTTPApp,
-          server_name: server_name, path: "/mcp", allowed_hosts: ["127.0.0.1", "localhost"]},
-       scheme: :http,
-       port: 0}
+    FastestMCP.server(server_name, extensions: tasks_extensions())
+    |> FastestMCP.add_tool(
+      "block",
+      fn _arguments, _context ->
+        send(parent, {:blocking_task_worker, self()})
+        receive do: (:release -> %{released: true})
+      end,
+      task: [mode: :optional, poll_interval_ms: 10]
     )
+    |> start_server!()
+
+    server_name
   end
 
-  defp unique_name(prefix),
-    do: prefix <> "-" <> Integer.to_string(System.unique_integer([:positive]))
+  # A modern HTTP client whose requests the test observes through RecordingPlug.
+  defp recording_client!(server_name, plug_opts \\ []) do
+    %{url: url} =
+      serve!({RecordingPlug, [test_pid: self(), server_name: server_name] ++ plug_opts})
+
+    client =
+      connect!(url,
+        protocol_version: @modern_version,
+        extensions: tasks_extensions(),
+        client_info: @client_info
+      )
+
+    client
+  end
 end

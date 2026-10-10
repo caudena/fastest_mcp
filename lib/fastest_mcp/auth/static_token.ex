@@ -12,6 +12,16 @@ defmodule FastestMCP.Auth.StaticToken do
           principal: %{"sub" => "service-a"}
         }
       }
+
+  A token configuration is a map or keyword list with the atom keys
+  `:client_id`, `:principal`, `:scopes`, `:capabilities`, `:audiences` (or
+  `:audience`), `:auth`, and `:expires_at`. Pass the tokens, and optionally
+  `:required_scopes`, as the authenticator options:
+
+      FastestMCP.add_auth(server, FastestMCP.Auth.StaticToken,
+        tokens: tokens,
+        required_scopes: ["tools:call"]
+      )
   """
 
   @behaviour FastestMCP.Auth
@@ -19,7 +29,11 @@ defmodule FastestMCP.Auth.StaticToken do
   alias FastestMCP.Auth.Result
   alias FastestMCP.Error
 
-  @doc "Authenticates the incoming input and returns an updated context or an error."
+  @doc """
+  Authenticates the bearer token of `input`: `{:ok, %FastestMCP.Auth.Result{}}`,
+  or `{:error, %FastestMCP.Error{}}` with code `:unauthorized` for a missing,
+  unknown, or expired token and `:forbidden` when it lacks a required scope.
+  """
   def authenticate(input, _context, opts) do
     tokens = normalize_tokens(Map.get(opts, :tokens, %{}))
     required_scopes = normalize_list(Map.get(opts, :required_scopes, []))
@@ -40,10 +54,10 @@ defmodule FastestMCP.Auth.StaticToken do
   end
 
   defp authenticate_token(token, token_config, required_scopes) do
-    if expired?(fetch_field(token_config, :expires_at)) do
+    if expired?(token_config[:expires_at]) do
       {:error, %Error{code: :unauthorized, message: "token expired"}}
     else
-      scopes = normalize_list(fetch_field(token_config, :scopes, []))
+      scopes = normalize_list(Map.get(token_config, :scopes, []))
       missing_scopes = required_scopes -- scopes
 
       if missing_scopes == [] do
@@ -51,7 +65,7 @@ defmodule FastestMCP.Auth.StaticToken do
          %Result{
            principal: principal_for(token_config),
            auth: auth_for(token, token_config, scopes),
-           capabilities: normalize_list(fetch_field(token_config, :capabilities, scopes)),
+           capabilities: normalize_list(Map.get(token_config, :capabilities, scopes)),
            audiences: verified_audiences(token_config),
            scopes: scopes
          }}
@@ -67,32 +81,25 @@ defmodule FastestMCP.Auth.StaticToken do
   end
 
   defp principal_for(token_config) do
-    case fetch_field(token_config, :principal) do
-      nil ->
-        client_id = fetch_field(token_config, :client_id)
-        if client_id, do: %{"client_id" => client_id}, else: nil
-
-      principal ->
-        principal
+    case token_config[:principal] do
+      nil -> if client_id = token_config[:client_id], do: %{"client_id" => client_id}
+      principal -> principal
     end
   end
 
   defp auth_for(token, token_config, scopes) do
-    base_auth =
-      token_config
-      |> fetch_field(:auth, %{})
-      |> Map.new()
-
-    base_auth
+    token_config
+    |> Map.get(:auth, %{})
+    |> Map.new()
     |> Map.put_new(:provider, :static_token)
     |> Map.put_new(:token, token)
-    |> maybe_put_new(:client_id, fetch_field(token_config, :client_id))
+    |> maybe_put_new(:client_id, token_config[:client_id])
     |> Map.put_new(:scopes, scopes)
   end
 
   defp verified_audiences(token_config) do
     token_config
-    |> fetch_field(:audiences, fetch_field(token_config, :audience, []))
+    |> Map.get(:audiences, Map.get(token_config, :audience, []))
     |> normalize_list()
   end
 
@@ -126,8 +133,4 @@ defmodule FastestMCP.Auth.StaticToken do
 
   defp maybe_put_new(map, _key, nil), do: map
   defp maybe_put_new(map, key, value), do: Map.put_new(map, key, value)
-
-  defp fetch_field(map, key, default \\ nil) do
-    Map.get(map, key, Map.get(map, Atom.to_string(key), default))
-  end
 end

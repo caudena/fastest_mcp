@@ -1,10 +1,10 @@
 defmodule FastestMCP.Client.ToolResult do
   @moduledoc """
-  Stable, protocol-faithful result returned by `FastestMCP.Client.call_tool_result/4`.
+  Complete validated result returned by `FastestMCP.Client.call_tool/4`.
 
-  Unlike the compatibility projection returned by `FastestMCP.Client.call_tool/4`,
-  this struct preserves the complete validated wire result and distinguishes an
-  absent `structuredContent` field from an explicitly returned JSON `null`.
+  `raw` preserves all wire fields, metadata, and content blocks. The presence
+  flag distinguishes missing `structuredContent` from explicit JSON null.
+  `is_error` describes a completed MCP tool response, not a transport failure.
   """
 
   @enforce_keys [:raw]

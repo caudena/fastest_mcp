@@ -1,10 +1,9 @@
 defmodule FastestMCP.MiddlewareTimingLoggingTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   import ExUnit.CaptureLog
 
   alias FastestMCP.Middleware
-  alias FastestMCP.Middleware.DetailedTiming
   alias FastestMCP.Middleware.Logging
   alias FastestMCP.Middleware.Timing
   alias FastestMCP.Operation
@@ -15,16 +14,15 @@ defmodule FastestMCP.MiddlewareTimingLoggingTest do
 
     success_log =
       capture_log(fn ->
-        assert :ok == Timing.call(timing, operation, fn _operation -> :ok end)
+        assert {:ok, %Operation{result: :ok}} = Timing.call(timing, operation, &reply(&1, :ok))
       end)
 
     assert success_log =~ "Request tools/call completed in"
 
     failure_log =
       capture_log(fn ->
-        assert_raise RuntimeError, fn ->
-          Timing.call(timing, operation, fn _operation -> raise "boom" end)
-        end
+        assert {:error, %FastestMCP.Error{}} =
+                 Middleware.run([timing], operation, fn _operation -> raise "boom" end)
       end)
 
     assert failure_log =~ "Request tools/call failed after"
@@ -36,13 +34,11 @@ defmodule FastestMCP.MiddlewareTimingLoggingTest do
 
     log =
       capture_log(fn ->
-        assert :ok ==
-                 DetailedTiming.call(
+        assert {:ok, %Operation{result: :ok}} =
+                 Timing.call(
                    detailed,
                    %Operation{method: "tools/call", target: "echo"},
-                   fn _operation ->
-                     :ok
-                   end
+                   &reply(&1, :ok)
                  )
       end)
 
@@ -50,24 +46,18 @@ defmodule FastestMCP.MiddlewareTimingLoggingTest do
   end
 
   test "plain logging middleware logs selected methods only" do
-    logger = Middleware.logging(methods: ["tools/call"])
+    test_pid = self()
+    logger = Middleware.logging(methods: ["tools/call"], log_fn: &send(test_pid, {:log, &1, &2}))
 
-    log =
-      capture_log(fn ->
-        assert :ok ==
-                 Logging.call(logger, %Operation{method: "tools/call"}, fn _operation ->
-                   :ok
-                 end)
+    assert {:ok, %Operation{result: :ok}} =
+             Logging.call(logger, %Operation{method: "tools/call"}, &reply(&1, :ok))
 
-        assert :ok ==
-                 Logging.call(logger, %Operation{method: "resources/read"}, fn _operation ->
-                   :ok
-                 end)
-      end)
+    assert {:ok, %Operation{result: :ok}} =
+             Logging.call(logger, %Operation{method: "resources/read"}, &reply(&1, :ok))
 
-    assert log =~ "event=request_start method=tools/call source=server"
-    assert log =~ "event=request_success method=tools/call source=server"
-    refute log =~ "resources/read"
+    assert_received {:log, :info, "event=request_start method=tools/call source=server"}
+    assert_received {:log, :info, "event=request_success method=tools/call source=server" <> _}
+    refute_received {:log, _level, _message}
   end
 
   test "logging middleware can include payloads and lengths" do
@@ -153,15 +143,15 @@ defmodule FastestMCP.MiddlewareTimingLoggingTest do
       |> FastestMCP.add_tool("ok", fn arguments, _ctx -> arguments end)
       |> FastestMCP.add_tool("fail", fn _arguments, _ctx -> raise "nope" end)
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    start_server!(server)
 
     log =
       capture_log(fn ->
         assert %{"message" => "hi"} ==
-                 FastestMCP.call_tool(server_name, "ok", %{"message" => "hi"})
+                 FastestMCP.call_tool!(server_name, "ok", %{"message" => "hi"})
 
         assert_raise FastestMCP.Error, fn ->
-          FastestMCP.call_tool(server_name, "fail", %{})
+          FastestMCP.call_tool!(server_name, "fail", %{})
         end
       end)
 
@@ -174,21 +164,19 @@ defmodule FastestMCP.MiddlewareTimingLoggingTest do
   test "detailed timing integration logs multiple operation types" do
     server_name = "detailed-timing-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_middleware(Middleware.detailed_timing())
-      |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
-      |> FastestMCP.add_resource("config://app", fn _arguments, _ctx -> %{theme: "sunrise"} end)
-      |> FastestMCP.add_prompt("greet", fn _arguments, _ctx -> "Hello" end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_middleware(Middleware.detailed_timing())
+    |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+    |> FastestMCP.add_resource("config://app", fn _arguments, _ctx -> %{theme: "sunrise"} end)
+    |> FastestMCP.add_prompt("greet", fn _arguments, _ctx -> "Hello" end)
+    |> start_server!()
 
     log =
       capture_log(fn ->
-        _ = FastestMCP.call_tool(server_name, "echo", %{"message" => "hi"})
-        _ = FastestMCP.read_resource(server_name, "config://app")
-        _ = FastestMCP.render_prompt(server_name, "greet", %{})
-        _ = FastestMCP.list_tools(server_name)
+        _ = FastestMCP.call_tool!(server_name, "echo", %{"message" => "hi"})
+        _ = FastestMCP.read_resource!(server_name, "config://app")
+        _ = FastestMCP.render_prompt!(server_name, "greet", %{})
+        _ = FastestMCP.list_tools!(server_name)
       end)
 
     assert log =~ "Tool 'echo' completed in"
@@ -196,4 +184,19 @@ defmodule FastestMCP.MiddlewareTimingLoggingTest do
     assert log =~ "Prompt 'greet' completed in"
     assert log =~ "List tools completed in"
   end
+
+  test "dispatch uses an updated immutable middleware configuration" do
+    parent = self()
+    configured = Middleware.timing(log_fn: fn _, message -> send(parent, {:old, message}) end)
+    updated = %{configured | log_fn: fn _, message -> send(parent, {:new, message}) end}
+    operation = %Operation{method: "tools/list"}
+
+    assert {:ok, %Operation{result: :result}} =
+             Middleware.run([updated], operation, &reply(&1, :result))
+
+    assert_receive {:new, _}
+    refute_receive {:old, _}
+  end
+
+  defp reply(operation, result), do: {:ok, %{operation | result: result}}
 end

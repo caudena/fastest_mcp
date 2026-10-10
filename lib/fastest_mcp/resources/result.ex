@@ -17,26 +17,50 @@ defmodule FastestMCP.Resources.Result do
     * list of `FastestMCP.Resources.Content`
   """
 
+  import FastestMCP.Util, only: [optional_map!: 2, string_keys: 1]
+
   alias FastestMCP.Resources.Content
 
-  defstruct contents: [], meta: nil
+  defstruct contents: [], meta: nil, extra: %{}
 
   @type t :: %__MODULE__{
           contents: [Content.t()],
-          meta: map() | nil
+          meta: map() | nil,
+          extra: map()
         }
 
   @doc "Builds a normalized resource result."
   def new(contents, opts \\ []) do
     %__MODULE__{
       contents: normalize_contents(contents),
-      meta: normalize_optional_map(Keyword.get(opts, :meta))
+      meta: optional_map!(Keyword.get(opts, :meta), "resource result meta")
     }
   end
 
   @doc "Normalizes result-like values into `%FastestMCP.Resources.Result{}`."
   def from(%__MODULE__{} = result), do: result
+
+  # Application code gives envelopes with atom or string keys.
+  def from(%{} = value) do
+    case string_keys(value) do
+      %{"contents" => contents} = envelope ->
+        %__MODULE__{contents: contents, meta: Map.get(envelope, "_meta", envelope["meta"])}
+
+      _contents ->
+        new(value)
+    end
+  end
+
   def from(contents), do: new(contents)
+
+  @doc "Builds an explicit envelope from a validated MCP resource result."
+  def from_raw(%{} = raw) do
+    %__MODULE__{
+      contents: Map.fetch!(raw, "contents"),
+      meta: Map.get(raw, "_meta"),
+      extra: Map.delete(raw, "contents")
+    }
+  end
 
   defp normalize_contents(contents) when is_binary(contents), do: [Content.new(contents)]
 
@@ -60,12 +84,5 @@ defmodule FastestMCP.Resources.Result do
   defp normalize_contents(other) do
     raise ArgumentError,
           "contents must be a string, binary, or list[FastestMCP.Resources.Content], got #{inspect(other)}"
-  end
-
-  defp normalize_optional_map(nil), do: nil
-  defp normalize_optional_map(map) when is_map(map), do: Map.new(map)
-
-  defp normalize_optional_map(other) do
-    raise ArgumentError, "resource result meta must be a map, got #{inspect(other)}"
   end
 end

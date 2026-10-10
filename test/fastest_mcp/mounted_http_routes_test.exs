@@ -1,5 +1,5 @@
 defmodule FastestMCP.MountedHTTPRoutesTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   import Plug.Conn
   import Plug.Test
@@ -20,20 +20,17 @@ defmodule FastestMCP.MountedHTTPRoutesTest do
       end)
       |> FastestMCP.mount(leaf, namespace: "leaf")
 
-    parent =
-      FastestMCP.server(parent_name)
-      |> FastestMCP.mount(child, namespace: "child")
-
-    assert {:ok, _pid} = FastestMCP.start_server(parent)
-    on_exit(fn -> FastestMCP.stop_server(parent_name) end)
+    FastestMCP.server(parent_name)
+    |> FastestMCP.mount(child, namespace: "child")
+    |> start_server!()
 
     app =
       FastestMCP.http_app(parent_name,
         allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]
       )
 
-    ready = conn(:get, "/readyz") |> app.()
-    leaf_ready = conn(:get, "/leaf-health") |> app.()
+    ready = conn(:get, "/readyz") |> Plug.run([app])
+    leaf_ready = conn(:get, "/leaf-health") |> Plug.run([app])
 
     assert ready.status == 200
     assert leaf_ready.status == 200

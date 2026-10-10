@@ -1,6 +1,8 @@
 defmodule FastestMCP.Client.StdioProcess do
   @moduledoc false
 
+  alias FastestMCP.Deadline
+
   defmodule Handle do
     @moduledoc false
 
@@ -91,10 +93,9 @@ defmodule FastestMCP.Client.StdioProcess do
       await_exit(target, term_timeout_ms, poll_interval_ms) ->
         {:ok, :term}
 
-      signal(target, "-KILL") != :ok ->
-        if target_alive?(target), do: {:error, :process_still_alive}, else: {:ok, :kill}
-
-      await_exit(target, kill_timeout_ms, poll_interval_ms) ->
+      # A member forked while the group is being signalled escapes that
+      # signal, so KILL is repeated until the group is gone.
+      await_exit(target, kill_timeout_ms, poll_interval_ms, "-KILL") ->
         {:ok, :kill}
 
       true ->
@@ -102,7 +103,6 @@ defmodule FastestMCP.Client.StdioProcess do
     end
   end
 
-  @doc false
   def os_pid(port) when is_port(port) do
     case Port.info(port, :os_pid) do
       {:os_pid, pid} when is_integer(pid) and pid > 0 -> pid
@@ -110,7 +110,6 @@ defmodule FastestMCP.Client.StdioProcess do
     end
   end
 
-  @doc false
   def alive?(pid) when is_integer(pid) and pid > 0 do
     case kill_command() do
       nil ->
@@ -126,31 +125,28 @@ defmodule FastestMCP.Client.StdioProcess do
     _error -> false
   end
 
-  @doc false
   def alive?(%Handle{} = handle), do: target_alive?(signal_target(handle))
 
   def alive?(_pid), do: false
 
-  @doc false
   def signal_supported?, do: match?({:unix, _name}, :os.type()) and not is_nil(kill_command())
 
-  defp await_exit(target, timeout_ms, poll_interval_ms) do
-    deadline = System.monotonic_time(:millisecond) + timeout_ms
-    do_await_exit(target, deadline, poll_interval_ms)
-  end
+  defp await_exit(target, timeout_ms, poll_interval_ms, resend \\ nil),
+    do: do_await_exit(target, Deadline.new(timeout_ms), poll_interval_ms, resend)
 
-  defp do_await_exit(target, deadline, poll_interval_ms) do
+  defp do_await_exit(target, deadline, poll_interval_ms, resend) do
+    if resend, do: signal(target, resend)
+
     cond do
       not target_alive?(target) ->
         true
 
-      System.monotonic_time(:millisecond) >= deadline ->
+      Deadline.remaining(deadline) == 0 ->
         false
 
       true ->
-        remaining_ms = deadline - System.monotonic_time(:millisecond)
-        Process.sleep(min(poll_interval_ms, max(remaining_ms, 0)))
-        do_await_exit(target, deadline, poll_interval_ms)
+        Process.sleep(min(poll_interval_ms, Deadline.remaining(deadline)))
+        do_await_exit(target, deadline, poll_interval_ms, resend)
     end
   end
 

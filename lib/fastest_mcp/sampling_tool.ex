@@ -1,14 +1,7 @@
 defmodule FastestMCP.SamplingTool do
-  @moduledoc """
-  A lightweight tool definition for `sampling/createMessage`.
+  @moduledoc false
 
-  This module keeps one focused piece of FastestMCP behavior in a dedicated
-  place so builders, runtimes, transports, and providers can share the same
-  rules without duplicating logic.
-
-  Unless you are extending FastestMCP itself, you will usually meet this
-  module indirectly through higher-level APIs rather than calling it first.
-  """
+  import FastestMCP.Util, only: [maybe_put: 3]
 
   alias FastestMCP.Components.Tool
   alias FastestMCP.Context
@@ -17,7 +10,6 @@ defmodule FastestMCP.SamplingTool do
 
   defstruct [:name, :description, :parameters, :runner]
 
-  @doc "Builds a new value for this module from the supplied options."
   def new(name, runner, opts \\ []) when is_function(runner) do
     %__MODULE__{
       name: to_string(name),
@@ -27,7 +19,6 @@ defmodule FastestMCP.SamplingTool do
     }
   end
 
-  @doc "Builds a sampling tool from a function."
   def from_function(fun, opts \\ []) when is_function(fun) and is_list(opts) do
     name = Keyword.get_lazy(opts, :name, fn -> infer_function_name(fun) end)
     explicit_parameters? = Keyword.has_key?(opts, :parameters)
@@ -42,7 +33,6 @@ defmodule FastestMCP.SamplingTool do
     )
   end
 
-  @doc "Builds a sampling tool from a runtime tool component."
   def from_tool(%Tool{} = tool, opts \\ []) do
     server_name = Keyword.get(opts, :server_name, tool.server_name)
 
@@ -55,7 +45,7 @@ defmodule FastestMCP.SamplingTool do
       description: tool.description,
       parameters: normalize_schema(tool.input_schema || empty_schema()),
       runner: fn arguments ->
-        FastestMCP.call_tool(
+        FastestMCP.call_tool!(
           server_name,
           tool.name,
           arguments || %{},
@@ -65,32 +55,22 @@ defmodule FastestMCP.SamplingTool do
     }
   end
 
-  @doc "Builds a sampling tool from metadata and a runner."
   def from_metadata(%{name: name} = metadata, opts \\ []) do
-    server_name =
-      Keyword.get_lazy(opts, :server_name, fn ->
-        Map.get(metadata, :server_name, Map.get(metadata, "server_name"))
-      end)
+    server_name = Keyword.get_lazy(opts, :server_name, fn -> Map.get(metadata, :server_name) end)
 
     if is_nil(server_name) do
       raise ArgumentError, "sampling tool metadata conversion requires :server_name"
     end
 
-    description = Map.get(metadata, :description, Map.get(metadata, "description"))
-
-    schema =
-      Map.get(
-        metadata,
-        :input_schema,
-        Map.get(metadata, "input_schema", empty_schema())
-      )
+    description = Map.get(metadata, :description)
+    schema = Map.get(metadata, :input_schema, empty_schema())
 
     %__MODULE__{
       name: to_string(name),
       description: description,
       parameters: normalize_schema(schema),
       runner: fn arguments ->
-        FastestMCP.call_tool(
+        FastestMCP.call_tool!(
           server_name,
           name,
           arguments || %{},
@@ -100,12 +80,10 @@ defmodule FastestMCP.SamplingTool do
     }
   end
 
-  @doc "Runs the main entrypoint for this module."
   def run(%__MODULE__{runner: runner}, arguments \\ nil) do
     runner.(normalize_arguments(arguments))
   end
 
-  @doc "Returns the serialized tool definition."
   def definition(%__MODULE__{} = tool) do
     %{
       "name" => tool.name,
@@ -184,9 +162,6 @@ defmodule FastestMCP.SamplingTool do
     _compiled = Schema.compile!(schema)
     schema
   end
-
-  defp maybe_put(map, _key, nil), do: map
-  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
   defp normalize_arguments(nil), do: %{}
   defp normalize_arguments(arguments) when is_map(arguments), do: arguments

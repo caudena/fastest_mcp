@@ -1,5 +1,7 @@
 defmodule FastestMCP.ClientSessionRecoveryTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
+
+  alias FastestMCP.Test.ClientProbe
 
   import Plug.Conn
 
@@ -43,6 +45,14 @@ defmodule FastestMCP.ClientSessionRecoveryTest do
             end)
 
           send(test_pid, {:initialize_request, initialize_count, session_id})
+
+          if initialize_count > 1 and Agent.get(state, & &1.mode) == :blocked_recovery do
+            send(test_pid, {:recovery_blocked, self()})
+
+            receive do
+              :release_recovery -> :ok
+            end
+          end
 
           response = %{
             "jsonrpc" => "2.0",
@@ -231,31 +241,31 @@ defmodule FastestMCP.ClientSessionRecoveryTest do
   test "a 404 session miss reinitializes without replaying the original request" do
     {client, state} = start_client(:recovery)
 
-    assert Client.session_id(client) == "recovery-session-1"
+    assert Client.info!(client).session_id == "recovery-session-1"
 
     error =
       assert_raise Error, fn ->
-        Client.call_tool(client, "charge_card_1", %{"amount" => 10})
+        Client.call_tool!(client, "charge_card_1", %{"amount" => 10})
       end
 
-    assert error.code == :bad_request
+    assert error.code == :not_found
     assert error.details.session_recovered
     refute error.details.original_request_replayed
 
     assert_receive {:initialize_request, 1, nil}, 1_000
     assert_receive {:initialize_request, 2, nil}, 1_000
 
-    assert Client.session_id(client) == "recovery-session-2"
+    assert %Client.Info{
+             session_id: "recovery-session-2",
+             initialize_result: %{"serverInfo" => %{"name" => "recovery-server-2"}}
+           } = Client.info!(client)
 
-    assert get_in(Client.initialize_result(client), ["serverInfo", "name"]) ==
-             "recovery-server-2"
+    assert ClientProbe.server_identity(client)["name"] == "recovery-server-2"
 
-    assert :sys.get_state(client.pid).server_identity["name"] == "recovery-server-2"
+    assert %{structured_content: %{"charged" => true}} =
+             Client.call_tool!(client, "charge_card_2", %{"amount" => 20})
 
-    assert %{"charged" => true} =
-             Client.call_tool(client, "charge_card_2", %{"amount" => 20})
-
-    assert %{} = Client.ping(client)
+    assert %{} = Client.ping!(client)
 
     snapshot = Agent.get(state, & &1)
     assert snapshot.initialize_count == 2
@@ -274,7 +284,7 @@ defmodule FastestMCP.ClientSessionRecoveryTest do
         sse_reconnect: [max_attempts: 1, min_retry_ms: 0, max_retry_ms: 10]
       )
 
-    assert :ok = Client.open_session_stream(client)
+    assert :ok = Client.open_session_stream!(client)
 
     assert_receive {:session_stream_request, 1, nil}, 1_000
     assert_receive {:stream_message, "one"}, 1_000
@@ -283,7 +293,7 @@ defmodule FastestMCP.ClientSessionRecoveryTest do
     refute_receive {:stream_message, "duplicate"}, 100
 
     wait_for_session_stream_to_close(client)
-    Process.sleep(25)
+    refute_receive {:session_stream_request, 3, _last_event_id}, 25
 
     snapshot = Agent.get(state, & &1)
     assert snapshot.stream_connections == 2
@@ -296,7 +306,7 @@ defmodule FastestMCP.ClientSessionRecoveryTest do
         sse_reconnect: [max_attempts: 5, min_retry_ms: 0, max_retry_ms: 0]
       )
 
-    assert :ok = Client.open_session_stream(client)
+    assert :ok = Client.open_session_stream!(client)
 
     assert_receive {:stream_message, "before-delete"}, 1_000
     assert_receive {:session_stream_request, 2, "deleted-event-1"}, 1_000
@@ -304,7 +314,7 @@ defmodule FastestMCP.ClientSessionRecoveryTest do
     assert_receive {:session_stream_request, 3, nil}, 1_000
 
     wait_for_session_stream_to_close(client)
-    Process.sleep(25)
+    refute_receive {:session_stream_request, 4, _last_event_id}, 25
 
     snapshot = Agent.get(state, & &1)
     assert snapshot.initialize_count == 2
@@ -320,17 +330,17 @@ defmodule FastestMCP.ClientSessionRecoveryTest do
   test "a standalone session GET 404 recovers once and opens the replacement stream" do
     {client, state} = start_client(:get_recovery, sse_reconnect: false)
 
-    assert :ok = Client.open_session_stream(client)
+    assert :ok = Client.open_session_stream!(client)
 
     assert_receive {:session_stream_request, 1, nil}, 1_000
     assert_receive {:initialize_request, 2, nil}, 1_000
     assert_receive {:session_stream_request, 2, nil}, 1_000
     assert_receive {:stream_message, "after-recovery"}, 1_000
 
-    assert Client.session_id(client) == "recovery-session-2"
-
-    assert get_in(Client.initialize_result(client), ["serverInfo", "name"]) ==
-             "recovery-server-2"
+    assert %Client.Info{
+             session_id: "recovery-session-2",
+             initialize_result: %{"serverInfo" => %{"name" => "recovery-server-2"}}
+           } = Client.info!(client)
 
     wait_for_session_stream_to_close(client)
 
@@ -347,7 +357,7 @@ defmodule FastestMCP.ClientSessionRecoveryTest do
 
     error =
       assert_raise Error, fn ->
-        Client.open_session_stream(client)
+        Client.open_session_stream!(client)
       end
 
     assert error.code == :bad_request
@@ -356,20 +366,54 @@ defmodule FastestMCP.ClientSessionRecoveryTest do
     assert Agent.get(state, & &1).stream_connections == 1
   end
 
+  test "requests that expire while recovery is blocked are never dispatched later" do
+    {client, state} = start_client(:blocked_recovery)
+    params = %{"name" => "charge_card_1", "arguments" => %{"amount" => 1}}
+    trigger = Task.async(fn -> Client.request(client, "tools/call", params) end)
+    assert_receive {:recovery_blocked, recovery_handler}, 1_000
+    parent = self()
+
+    waiting =
+      for mode <- [:sync, :async] do
+        Task.async(fn ->
+          result =
+            case mode do
+              :sync -> Client.request(client, "tools/call", params, timeout_ms: 10)
+              :async -> Client.request_async(client, "tools/call", params, timeout_ms: 10)
+            end
+
+          send(parent, {:expired_request, mode, result})
+          # Keep the owner alive so only the deadline can discard this request.
+          receive do
+            :finish -> :ok
+          end
+        end)
+      end
+
+    for mode <- [:sync, :async] do
+      assert_receive {:expired_request, ^mode, {:error, %Error{code: :timeout}}}, 2_000
+    end
+
+    send(recovery_handler, :release_recovery)
+    assert {:error, %Error{}} = Task.await(trigger, 2_000)
+    assert {:ok, %{}} = Client.ping(client)
+    assert Agent.get(state, & &1.tool_call_count) == 1
+
+    Enum.each(waiting, fn task ->
+      send(task.pid, :finish)
+      assert :ok = Task.await(task)
+    end)
+  end
+
   defp start_client(mode, opts \\ []) do
     state = start_supervised!({Agent, fn -> %{mode: mode} end})
 
-    bandit =
-      start_supervised!(
-        {Bandit, plug: {RecoveryPlug, state: state, test_pid: self()}, scheme: :http, port: 0}
-      )
-
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+    %{url: url} = serve!({RecoveryPlug, state: state, test_pid: self()})
     parent = self()
 
     client =
-      Client.connect!(
-        "http://127.0.0.1:#{port}/mcp",
+      connect!(
+        url,
         Keyword.merge(
           [
             protocol_version: "2025-11-25",
@@ -385,24 +429,12 @@ defmodule FastestMCP.ClientSessionRecoveryTest do
         )
       )
 
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
-    end)
-
     {client, state}
   end
 
-  defp wait_for_session_stream_to_close(client, attempts \\ 100)
-
-  defp wait_for_session_stream_to_close(_client, 0),
-    do: flunk("session stream did not stop")
-
-  defp wait_for_session_stream_to_close(client, attempts) do
-    if Client.session_stream_open?(client) or :sys.get_state(client.pid).session_stream do
-      Process.sleep(10)
-      wait_for_session_stream_to_close(client, attempts - 1)
-    else
-      :ok
-    end
+  defp wait_for_session_stream_to_close(client) do
+    assert_eventually(fn ->
+      not Client.info!(client).session_stream_open? and is_nil(ClientProbe.session_stream(client))
+    end)
   end
 end

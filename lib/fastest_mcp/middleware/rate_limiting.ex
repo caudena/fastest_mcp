@@ -1,142 +1,93 @@
 defmodule FastestMCP.Middleware.RateLimiting do
-  @moduledoc """
-  Token-bucket rate limiting middleware for sustained traffic plus bursts.
-
-  Middleware modules in FastestMCP are configured as explicit structs that
-  carry options plus a ready-to-run `middleware` function. That keeps runtime
-  assembly cheap while making the configured value easy to inspect in tests.
-
-  Most applications reach this module through `FastestMCP.Middleware` helper
-  functions or by adding the configured struct directly with
-  `FastestMCP.Server.add_middleware/2`.
-  """
+  @moduledoc false
+  # A token bucket for sustained traffic plus bursts (`new/1`), or a sliding
+  # window for precise request caps (`sliding_window/1`).
 
   alias FastestMCP.Error
   alias FastestMCP.Middleware
-  alias FastestMCP.Operation
-  alias FastestMCP.Registry
+  alias FastestMCP.Middleware.RateLimiting.SlidingWindow
+  alias FastestMCP.Middleware.RateLimiting.TokenBucket
+  @behaviour FastestMCP.Middleware
 
-  defstruct [
-    :get_client_id,
-    :instance_id,
-    :runtime_id,
-    :middleware,
-    :state,
-    max_requests_per_second: 10.0,
-    burst_capacity: 20,
-    max_clients: 10_000,
-    global_limit: false
-  ]
+  alias FastestMCP.Operation
+
+  defstruct [:get_client_id, :runtime, :limiter, max_clients: 10_000, global_limit: false]
 
   @type t :: %__MODULE__{
           get_client_id: (Operation.t() -> String.t()) | nil,
-          instance_id: reference(),
-          runtime_id: reference() | nil,
-          middleware: (Operation.t(), (Operation.t() -> any()) -> any()),
-          state: pid() | nil,
-          max_requests_per_second: float(),
-          burst_capacity: pos_integer(),
+          runtime: pid() | nil,
+          limiter: struct(),
           max_clients: pos_integer(),
           global_limit: boolean()
         }
 
-  @doc "Builds a new value for this module from the supplied options."
   def new(opts \\ []) do
-    max_requests_per_second = Keyword.get(opts, :max_requests_per_second, 10.0)
-
-    burst_capacity =
-      Keyword.get(opts, :burst_capacity, max(1, trunc(max_requests_per_second * 2)))
-
-    global_limit = Keyword.get(opts, :global_limit, false)
+    rate = Keyword.get(opts, :max_requests_per_second, 10.0)
+    burst = Keyword.get(opts, :burst_capacity, max(1, trunc(rate * 2)))
     max_clients = Keyword.get(opts, :max_clients, 10_000)
 
-    validate!(max_requests_per_second, burst_capacity, max_clients)
+    unless rate > 0 and positive_integers?([burst, max_clients]) do
+      raise ArgumentError,
+            "max_requests_per_second must be positive and burst_capacity and max_clients must be positive integers, got: #{inspect(rate)} / #{inspect(burst)} / #{inspect(max_clients)}"
+    end
 
-    middleware = %__MODULE__{
-      get_client_id: Keyword.get(opts, :get_client_id),
-      instance_id: make_ref(),
-      runtime_id: nil,
-      state: nil,
-      max_requests_per_second: max_requests_per_second,
-      burst_capacity: burst_capacity,
-      max_clients: max_clients,
-      global_limit: global_limit
-    }
-
-    bind_middleware(middleware)
+    build(
+      opts,
+      TokenBucket.new(burst, rate),
+      max_clients,
+      Keyword.get(opts, :global_limit, false)
+    )
   end
 
-  @doc "Runs the middleware around the next operation."
+  def sliding_window(opts) do
+    max_requests = Keyword.fetch!(opts, :max_requests)
+    window_minutes = Keyword.get(opts, :window_minutes, 1)
+    max_clients = Keyword.get(opts, :max_clients, 10_000)
+
+    unless positive_integers?([max_requests, window_minutes, max_clients]) do
+      raise ArgumentError,
+            "max_requests, window_minutes, and max_clients must be positive integers, got: #{inspect(max_requests)} / #{inspect(window_minutes)} / #{inspect(max_clients)}"
+    end
+
+    build(opts, SlidingWindow.new(max_requests, window_minutes * 60_000_000), max_clients, false)
+  end
+
+  @impl FastestMCP.Middleware
+  def call(%__MODULE__{runtime: nil} = middleware, _operation, _next),
+    do: Middleware.not_running(middleware)
+
   def call(%__MODULE__{} = middleware, %Operation{} = operation, next)
       when is_function(next, 1) do
-    middleware = ensure_runtime(middleware)
     client_id = client_identifier(middleware, operation)
 
-    case __MODULE__.State.consume(middleware.state, client_id) do
+    case GenServer.call(middleware.runtime, {:acquire, client_id}) do
       :ok ->
         next.(operation)
 
-      {:error, :overloaded} ->
-        raise Error,
-          code: :overloaded,
-          message: "rate limiter client capacity exceeded",
-          details: %{max_clients: middleware.max_clients}
+      :overloaded ->
+        {:error,
+         %Error{
+           code: :overloaded,
+           message: overloaded_message(middleware.limiter),
+           details: %{max_clients: middleware.max_clients}
+         }}
 
-      {:error, retry_after_seconds} ->
-        raise Error,
-          code: :rate_limited,
-          message: rate_limit_message(middleware, client_id),
-          details: %{client_id: client_id, retry_after_seconds: retry_after_seconds}
+      {:wait, microseconds} ->
+        {:error,
+         %Error{
+           code: :rate_limited,
+           message: rate_limited_message(middleware, client_id),
+           details: %{
+             client_id: client_id,
+             retry_after_seconds: max(ceil(microseconds / 1_000_000), 1)
+           }
+         }}
     end
   end
 
-  @doc "Releases resources owned by this module."
-  def close(%__MODULE__{} = middleware), do: deactivate_runtime(middleware)
+  @impl FastestMCP.Middleware
+  def child_spec(%__MODULE__{} = middleware), do: {__MODULE__.State, middleware}
 
-  @doc false
-  def activate_runtime(%__MODULE__{} = middleware) do
-    if middleware.runtime_id, do: deactivate_runtime(middleware)
-
-    runtime_id = make_ref()
-
-    {:ok, state} =
-      __MODULE__.State.start_link(
-        burst_capacity: middleware.burst_capacity,
-        refill_rate: middleware.max_requests_per_second,
-        max_clients: middleware.max_clients
-      )
-
-    runtime =
-      middleware
-      |> Map.put(:runtime_id, runtime_id)
-      |> Map.put(:state, state)
-      |> bind_middleware()
-
-    :ok = Registry.register_middleware_runtime(middleware.instance_id, runtime_id, %{pid: state})
-    runtime
-  end
-
-  @doc false
-  def deactivate_runtime(%__MODULE__{} = middleware) do
-    middleware
-    |> runtime_middlewares()
-    |> Enum.each(fn %{runtime_id: runtime_id, state: pid} ->
-      Registry.unregister_middleware_runtime(runtime_id)
-      Middleware.shutdown_runtime_pid(pid)
-    end)
-
-    :ok
-  end
-
-  @doc false
-  def state_pid(%__MODULE__{} = middleware) do
-    case runtime_middleware(middleware) do
-      %__MODULE__{state: state} -> state
-      nil -> nil
-    end
-  end
-
-  @doc "Derives the client identifier used by the limiter."
   def client_identifier(%__MODULE__{global_limit: true}, _operation), do: "global"
   def client_identifier(%__MODULE__{get_client_id: nil}, _operation), do: "global"
 
@@ -147,154 +98,81 @@ defmodule FastestMCP.Middleware.RateLimiting do
     end
   end
 
-  defp rate_limit_message(%__MODULE__{global_limit: true}, _client_id),
+  defp build(opts, limiter, max_clients, global_limit) do
+    %__MODULE__{
+      get_client_id: Keyword.get(opts, :get_client_id),
+      limiter: limiter,
+      max_clients: max_clients,
+      global_limit: global_limit
+    }
+  end
+
+  defp positive_integers?(values), do: Enum.all?(values, &(is_integer(&1) and &1 > 0))
+
+  defp overloaded_message(%TokenBucket{}), do: "rate limiter client capacity exceeded"
+
+  defp overloaded_message(%SlidingWindow{}),
+    do: "sliding-window rate limiter client capacity exceeded"
+
+  defp rate_limited_message(%__MODULE__{global_limit: true}, _client_id),
     do: "global rate limit exceeded"
 
-  defp rate_limit_message(_middleware, client_id),
+  defp rate_limited_message(%__MODULE__{limiter: %TokenBucket{}}, client_id),
     do: "rate limit exceeded for client: #{client_id}"
 
-  defp ensure_runtime(%__MODULE__{} = middleware) do
-    runtime_middleware(middleware) || activate_runtime(middleware)
-  end
-
-  defp runtime_middleware(%__MODULE__{} = middleware) do
-    case runtime_middlewares(middleware) do
-      [runtime] -> runtime
-      _other -> nil
-    end
-  end
-
-  defp runtime_middlewares(%__MODULE__{runtime_id: runtime_id} = middleware)
-       when is_reference(runtime_id) do
-    case Registry.lookup_middleware_runtime(runtime_id) do
-      {:ok, runtime} -> [hydrate_runtime(middleware, runtime)]
-      {:error, :not_found} -> []
-    end
-  end
-
-  defp runtime_middlewares(%__MODULE__{} = middleware) do
-    middleware.instance_id
-    |> Registry.list_middleware_runtimes()
-    |> Enum.map(&hydrate_runtime(middleware, &1))
-  end
-
-  defp hydrate_runtime(%__MODULE__{} = middleware, %{runtime_id: runtime_id, pid: pid}) do
-    middleware
-    |> Map.put(:runtime_id, runtime_id)
-    |> Map.put(:state, pid)
-    |> bind_middleware()
-  end
-
-  defp bind_middleware(%__MODULE__{} = middleware) do
-    %{middleware | middleware: fn operation, next -> call(middleware, operation, next) end}
-  end
-
-  defp validate!(max_requests_per_second, burst_capacity, max_clients)
-       when is_number(max_requests_per_second) and max_requests_per_second > 0 and
-              is_integer(burst_capacity) and burst_capacity > 0 and is_integer(max_clients) and
-              max_clients > 0 do
-    :ok
-  end
-
-  defp validate!(max_requests_per_second, burst_capacity, max_clients) do
-    raise ArgumentError,
-          "max_requests_per_second must be positive and burst_capacity and max_clients must be positive integers, got: #{inspect(max_requests_per_second)} / #{inspect(burst_capacity)} / #{inspect(max_clients)}"
-  end
+  defp rate_limited_message(%__MODULE__{limiter: %SlidingWindow{} = window}, client_id),
+    do:
+      "rate limit exceeded: #{window.limit} requests per #{div(window.interval, 60_000_000)} minutes for client: #{client_id}"
 
   defmodule State do
-    @moduledoc """
-    Token-bucket state process backing the fixed-window rate limiter.
-    """
+    @moduledoc false
+    # One limiter per client, each starting as a copy of the configured one.
 
     use GenServer
 
-    @doc "Starts the limiter state process."
-    def start_link(opts) do
-      GenServer.start_link(__MODULE__, opts)
-    end
-
-    @doc "Consumes one request slot for the given client id."
-    def consume(pid, client_id) do
-      GenServer.call(pid, {:consume, client_id})
-    end
+    def start_link(middleware), do: GenServer.start_link(__MODULE__, middleware)
 
     @impl true
-    @doc "Initializes the limiter state."
-    def init(opts) do
-      {:ok,
-       %{
-         capacity: Keyword.fetch!(opts, :burst_capacity),
-         refill_rate: Keyword.fetch!(opts, :refill_rate),
-         max_clients: Keyword.get(opts, :max_clients, 10_000),
-         buckets: %{}
-       }}
-    end
+    def init(middleware),
+      do: {:ok, %{limiter: middleware.limiter, max_clients: middleware.max_clients, clients: %{}}}
 
     @impl true
-    @doc "Processes token-consumption requests for the token-bucket limiter process."
-    def handle_call({:consume, client_id}, _from, state) do
+    def handle_call({:acquire, client_id}, _from, state) do
       now = System.monotonic_time(:microsecond)
-      {bucket, state} = fetch_bucket(state, client_id, now)
 
-      case bucket do
-        :overloaded ->
-          {:reply, {:error, :overloaded}, state}
-
-        bucket ->
-          bucket = refill(bucket, state.capacity, state.refill_rate, now)
-
-          if bucket.tokens >= 1.0 do
-            updated = %{bucket | tokens: bucket.tokens - 1.0}
-            {:reply, :ok, put_in(state.buckets[client_id], updated)}
-          else
-            retry_after = retry_after_seconds(bucket, state.refill_rate)
-            {:reply, {:error, retry_after}, put_in(state.buckets[client_id], bucket)}
-          end
-      end
-    end
-
-    defp fetch_bucket(state, client_id, now) do
-      case Map.fetch(state.buckets, client_id) do
-        {:ok, bucket} ->
-          {bucket, state}
+      case Map.fetch(state.clients, client_id) do
+        {:ok, limiter} ->
+          acquire(state, client_id, limiter, now)
 
         :error ->
-          buckets = make_room(state, now)
-          state = %{state | buckets: buckets}
+          state = make_room(state, now)
 
-          if map_size(buckets) < state.max_clients do
-            {new_bucket(state.capacity, now), state}
-          else
-            {:overloaded, state}
-          end
+          if map_size(state.clients) < state.max_clients,
+            do: acquire(state, client_id, state.limiter, now),
+            else: {:reply, :overloaded, state}
       end
     end
 
-    defp make_room(%{buckets: buckets, max_clients: max_clients}, _now)
-         when map_size(buckets) < max_clients,
-         do: buckets
+    defp acquire(state, client_id, %module{} = limiter, now) do
+      {reply, limiter} =
+        case module.acquire(limiter, now) do
+          {:ok, limiter} -> {:ok, limiter}
+          {:error, wait, limiter} -> {{:wait, wait}, limiter}
+        end
+
+      {:reply, reply, put_in(state.clients[client_id], limiter)}
+    end
+
+    # At capacity, forgets the clients whose limiter is back to its initial state.
+    defp make_room(%{clients: clients, max_clients: max_clients} = state, _now)
+         when map_size(clients) < max_clients,
+         do: state
 
     defp make_room(state, now) do
-      Map.reject(state.buckets, fn {_client_id, bucket} ->
-        semantically_expired?(bucket, state.capacity, state.refill_rate, now)
-      end)
-    end
+      clients =
+        Map.reject(state.clients, fn {_id, %module{} = limiter} -> module.idle?(limiter, now) end)
 
-    defp semantically_expired?(bucket, capacity, refill_rate, now) do
-      refill(bucket, capacity, refill_rate, now).tokens >= capacity
-    end
-
-    defp new_bucket(capacity, now), do: %{tokens: capacity * 1.0, last_refill: now}
-
-    defp refill(bucket, capacity, refill_rate, now) do
-      elapsed_seconds = max(now - bucket.last_refill, 0) / 1_000_000
-      tokens = min(capacity * 1.0, bucket.tokens + elapsed_seconds * refill_rate)
-      %{bucket | tokens: tokens, last_refill: now}
-    end
-
-    defp retry_after_seconds(bucket, refill_rate) do
-      needed = max(1.0 - bucket.tokens, 0.0)
-      max(Float.ceil(needed / refill_rate), 1) |> trunc()
+      %{state | clients: clients}
     end
   end
 end

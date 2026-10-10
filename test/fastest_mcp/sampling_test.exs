@@ -1,5 +1,5 @@
 defmodule FastestMCP.SamplingTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Client
   alias FastestMCP.Context
@@ -44,26 +44,14 @@ defmodule FastestMCP.SamplingTest do
         %{text: response.text, raw: response.raw}
       end)
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
-    bandit =
-      start_supervised!(
-        {Bandit,
-         plug:
-           {FastestMCP.Transport.HTTPApp,
-            server_name: server_name,
-            path: "/mcp",
-            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
-         scheme: :http,
-         port: 0}
-      )
-
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+    %{url: url} =
+      start_http!(server_name, allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"])
 
     client =
-      Client.connect!(
-        "http://127.0.0.1:#{port}/mcp",
+      connect!(
+        url,
         protocol_version: "2025-11-25",
         sampling_handler: fn messages, params ->
           send(test_pid, {:sampling_seen, messages, params})
@@ -71,18 +59,16 @@ defmodule FastestMCP.SamplingTest do
         end
       )
 
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
-    end)
-
     assert %{
-             "text" => "summary",
-             "raw" => %{
-               "role" => "assistant",
-               "model" => "test-model",
-               "content" => [%{"type" => "text", "text" => "summary"}]
+             structured_content: %{
+               "text" => "summary",
+               "raw" => %{
+                 "role" => "assistant",
+                 "model" => "test-model",
+                 "content" => [%{"type" => "text", "text" => "summary"}]
+               }
              }
-           } = Client.call_tool(client, "summarize", %{})
+           } = Client.call_tool!(client, "summarize", %{})
 
     assert_receive {:sampling_seen, messages, params}, 1_000
 
@@ -113,26 +99,14 @@ defmodule FastestMCP.SamplingTest do
         %{text: response.text}
       end)
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
-    bandit =
-      start_supervised!(
-        {Bandit,
-         plug:
-           {FastestMCP.Transport.HTTPApp,
-            server_name: server_name,
-            path: "/mcp",
-            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
-         scheme: :http,
-         port: 0}
-      )
-
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+    %{url: url} =
+      start_http!(server_name, allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"])
 
     client =
-      Client.connect!(
-        "http://127.0.0.1:#{port}/mcp",
+      connect!(
+        url,
         protocol_version: "2025-11-25",
         sampling_handler: fn messages, params ->
           send(test_pid, {:sampling_messages_seen, messages, params})
@@ -140,17 +114,38 @@ defmodule FastestMCP.SamplingTest do
         end
       )
 
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
-    end)
-
-    assert %{"text" => "ok"} = Client.call_tool(client, "chat", %{})
+    assert %{structured_content: %{"text" => "ok"}} = Client.call_tool!(client, "chat", %{})
 
     assert_receive {:sampling_messages_seen, messages, params}, 1_000
     assert [%{"role" => "user", "content" => %{"type" => "text", "text" => "hello"}}] = messages
     assert params["systemPrompt"] == "Be terse"
     refute Map.has_key?(params, "tools")
     refute Map.has_key?(params, "toolChoice")
+  end
+
+  test "Context.sample/3 accepts atom-keyed messages, as Sampling.run!/3 does" do
+    test_pid = self()
+    server_name = "sampling-atom-messages-" <> unique_id()
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("chat", fn _arguments, ctx ->
+      sampled = Context.sample(ctx, [%{role: :user, content: %{type: "text", text: "hello"}}])
+      %{text: sampled["content"]["text"]}
+    end)
+    |> start_server!()
+
+    client =
+      connect_client!(server_name,
+        sampling_handler: fn messages, _params ->
+          send(test_pid, {:sampled, messages})
+          sampling_result(%{"type" => "text", "text" => "hi"})
+        end
+      )
+
+    assert Client.call_tool!(client, "chat", %{}).structured_content == %{"text" => "hi"}
+
+    assert_receive {:sampled,
+                    [%{"role" => "user", "content" => %{"type" => "text", "text" => "hello"}}]}
   end
 
   test "run! sends tools and toolChoice and continues with tool_result blocks" do
@@ -198,8 +193,7 @@ defmodule FastestMCP.SamplingTest do
         ).text
       end)
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
     client =
       connect_client!(server_name,
@@ -233,7 +227,8 @@ defmodule FastestMCP.SamplingTest do
         end
       )
 
-    assert Client.call_tool(client, "orchestrate", %{}) == "done"
+    assert %{content: [%{"type" => "text", "text" => "done"}]} =
+             Client.call_tool!(client, "orchestrate", %{})
 
     assert_receive {:sampling_tool_capabilities, capabilities}, 1_000
     assert get_in(capabilities, ["sampling", "tools"]) == %{}
@@ -267,6 +262,56 @@ defmodule FastestMCP.SamplingTest do
     assert error_text =~ "tool exploded"
   end
 
+  test "run! takes {name, function, options} tools as they are, without preparing them" do
+    test_pid = self()
+    server_name = "sampling-tuple-tools-" <> unique_id()
+
+    double =
+      {"double", fn %{"value" => value} -> %{"doubled" => value * 2} end,
+       description: "Double a number",
+       parameters: %{
+         "type" => "object",
+         "properties" => %{"value" => %{"type" => "integer"}},
+         "required" => ["value"]
+       }}
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("orchestrate", fn _arguments, ctx ->
+      Sampling.run!(ctx, "Double 4", tools: [double]).text
+    end)
+    |> start_server!()
+
+    client =
+      connect_client!(server_name,
+        sampling_tools: [double],
+        sampling_handler: fn messages, params ->
+          case message_blocks(messages, "tool_result") do
+            [] ->
+              send(test_pid, {:sampling_tools, params["tools"]})
+
+              sampling_result([
+                %{
+                  "type" => "tool_use",
+                  "id" => "d-1",
+                  "name" => "double",
+                  "input" => %{"value" => 4}
+                }
+              ])
+
+            [result] ->
+              sampling_result([
+                %{"type" => "text", "text" => inspect(result["structuredContent"])}
+              ])
+          end
+        end
+      )
+
+    assert %{content: [%{"type" => "text", "text" => ~s(%{"doubled" => 8})}]} =
+             Client.call_tool!(client, "orchestrate", %{})
+
+    assert_receive {:sampling_tools, [%{"name" => "double", "description" => "Double a number"}]}
+  end
+
   test "tool-enabled sampling requires the negotiated sampling.tools capability" do
     test_pid = self()
     server_name = "sampling-tools-capability-" <> unique_id()
@@ -277,17 +322,14 @@ defmodule FastestMCP.SamplingTest do
         parameters: %{"type" => "object", "properties" => %{}}
       )
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("validate", fn _arguments, ctx ->
-        case Sampling.run(ctx, "use a tool", tools: [known]) do
-          {:ok, _response} -> %{"unexpected" => true}
-          {:error, error} -> %{"code" => to_string(error.code), "message" => error.message}
-        end
-      end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("validate", fn _arguments, ctx ->
+      case Sampling.run(ctx, "use a tool", tools: [known]) do
+        {:ok, _response} -> %{"unexpected" => true}
+        {:error, error} -> %{"code" => to_string(error.code), "message" => error.message}
+      end
+    end)
+    |> start_server!()
 
     client =
       connect_client!(server_name,
@@ -298,9 +340,11 @@ defmodule FastestMCP.SamplingTest do
       )
 
     assert %{
-             "code" => "bad_request",
-             "message" => "connected client did not declare sampling.tools support"
-           } = Client.call_tool(client, "validate", %{})
+             structured_content: %{
+               "code" => "bad_request",
+               "message" => "connected client did not declare sampling.tools support"
+             }
+           } = Client.call_tool!(client, "validate", %{})
 
     refute_receive :unexpected_sampling_request
   end
@@ -309,17 +353,14 @@ defmodule FastestMCP.SamplingTest do
     test_pid = self()
     server_name = "sampling-context-capability-" <> unique_id()
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("sample", fn _arguments, ctx ->
-        case Sampling.run(ctx, "use context", include_context: :this_server) do
-          {:ok, response} -> %{"text" => response.text}
-          {:error, error} -> %{"code" => to_string(error.code), "message" => error.message}
-        end
-      end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("sample", fn _arguments, ctx ->
+      case Sampling.run(ctx, "use context", include_context: :this_server) do
+        {:ok, response} -> %{"text" => response.text}
+        {:error, error} -> %{"code" => to_string(error.code), "message" => error.message}
+      end
+    end)
+    |> start_server!()
 
     unsupported =
       connect_client!(server_name,
@@ -327,11 +368,13 @@ defmodule FastestMCP.SamplingTest do
       )
 
     assert %{
-             "code" => "bad_request",
-             "message" => "connected client did not declare sampling.context support"
-           } = Client.call_tool(unsupported, "sample", %{})
+             structured_content: %{
+               "code" => "bad_request",
+               "message" => "connected client did not declare sampling.context support"
+             }
+           } = Client.call_tool!(unsupported, "sample", %{})
 
-    Client.disconnect(unsupported)
+    Client.disconnect!(unsupported)
 
     supported =
       connect_client!(server_name,
@@ -342,7 +385,7 @@ defmodule FastestMCP.SamplingTest do
         end
       )
 
-    assert %{"text" => "ok"} = Client.call_tool(supported, "sample", %{})
+    assert %{structured_content: %{"text" => "ok"}} = Client.call_tool!(supported, "sample", %{})
     assert_receive {:sampling_context_params, %{"includeContext" => "thisServer"}}, 1_000
   end
 
@@ -368,8 +411,7 @@ defmodule FastestMCP.SamplingTest do
         end
       end)
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
     client =
       connect_client!(server_name,
@@ -418,30 +460,38 @@ defmodule FastestMCP.SamplingTest do
       )
 
     assert %{
-             "code" => "peer_error",
-             "message" => "sampling result tool_use requires a non-empty id"
-           } = Client.call_tool(client, "validate", %{"case" => "missing_id"})
+             structured_content: %{
+               "code" => "peer_error",
+               "message" => "sampling result tool_use requires a non-empty id"
+             }
+           } = Client.call_tool!(client, "validate", %{"case" => "missing_id"})
 
     assert %{
-             "code" => "peer_error",
-             "message" => "sampling handler returned tool input outside inputSchema"
-           } = Client.call_tool(client, "validate", %{"case" => "bad_input"})
+             structured_content: %{
+               "code" => "peer_error",
+               "message" => "sampling handler returned tool input outside inputSchema"
+             }
+           } = Client.call_tool!(client, "validate", %{"case" => "bad_input"})
 
     assert %{
-             "code" => "peer_error",
-             "message" => "client callback returned an invalid sampling/createMessage result"
-           } = Client.call_tool(client, "validate", %{"case" => "bad_meta"})
+             structured_content: %{
+               "code" => "peer_error",
+               "message" => "client callback returned an invalid sampling/createMessage result"
+             }
+           } = Client.call_tool!(client, "validate", %{"case" => "bad_meta"})
 
-    assert %{"code" => "peer_error", "message" => message} =
-             Client.call_tool(client, "validate", %{"case" => "duplicate"})
+    assert %{structured_content: %{"code" => "peer_error", "message" => message}} =
+             Client.call_tool!(client, "validate", %{"case" => "duplicate"})
 
     assert message =~ "duplicate sampling tool_use id"
 
     assert %{
-             "code" => "peer_error",
-             "message" => "sampling handler selected an unknown tool"
+             structured_content: %{
+               "code" => "peer_error",
+               "message" => "sampling handler selected an unknown tool"
+             }
            } =
-             Client.call_tool(client, "validate", %{"case" => "unknown"})
+             Client.call_tool!(client, "validate", %{"case" => "unknown"})
 
     refute_receive :unexpected_tool_execution
   end
@@ -460,17 +510,14 @@ defmodule FastestMCP.SamplingTest do
         parameters: %{"type" => "object", "properties" => %{}}
       )
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("validate", fn _arguments, ctx ->
-        case Sampling.run(ctx, "reuse an id", tools: [known]) do
-          {:ok, _response} -> %{"unexpected" => true}
-          {:error, error} -> %{"code" => to_string(error.code), "message" => error.message}
-        end
-      end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("validate", fn _arguments, ctx ->
+      case Sampling.run(ctx, "reuse an id", tools: [known]) do
+        {:ok, _response} -> %{"unexpected" => true}
+        {:error, error} -> %{"code" => to_string(error.code), "message" => error.message}
+      end
+    end)
+    |> start_server!()
 
     client =
       connect_client!(server_name,
@@ -482,8 +529,8 @@ defmodule FastestMCP.SamplingTest do
         end
       )
 
-    assert %{"code" => "bad_request", "message" => message} =
-             Client.call_tool(client, "validate", %{})
+    assert %{structured_content: %{"code" => "bad_request", "message" => message}} =
+             Client.call_tool!(client, "validate", %{})
 
     assert message =~ "duplicate sampling tool_use id"
     assert_receive :sampling_tool_executed, 1_000
@@ -504,17 +551,14 @@ defmodule FastestMCP.SamplingTest do
         parameters: %{"type" => "object", "properties" => %{}}
       )
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("loop", fn _arguments, ctx ->
-        case Sampling.run(ctx, "keep going", tools: [repeat]) do
-          {:ok, _response} -> %{"unexpected" => true}
-          {:error, error} -> %{"code" => to_string(error.code), "message" => error.message}
-        end
-      end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("loop", fn _arguments, ctx ->
+      case Sampling.run(ctx, "keep going", tools: [repeat]) do
+        {:ok, _response} -> %{"unexpected" => true}
+        {:error, error} -> %{"code" => to_string(error.code), "message" => error.message}
+      end
+    end)
+    |> start_server!()
 
     client =
       connect_client!(server_name,
@@ -534,8 +578,13 @@ defmodule FastestMCP.SamplingTest do
         end
       )
 
-    assert %{"code" => "bad_request", "message" => "sampling exceeded max_tool_rounds"} =
-             Client.call_tool(client, "loop", %{})
+    assert %{
+             structured_content: %{
+               "code" => "bad_request",
+               "message" => "sampling exceeded max_tool_rounds"
+             }
+           } =
+             Client.call_tool!(client, "loop", %{})
 
     for round <- 0..8 do
       assert_receive {:sampling_round, ^round}, 1_000
@@ -585,43 +634,25 @@ defmodule FastestMCP.SamplingTest do
         end
       end)
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(server)
 
-    assert :error = FastestMCP.call_tool(server_name, "probe", %{})
+    assert :error = FastestMCP.call_tool!(server_name, "probe", %{})
 
-    assert_receive {:sampling_error,
-                    %FastestMCP.Error{
-                      code: :method_not_found,
-                      message: "connected client did not declare sampling support"
-                    }},
+    assert_receive {:sampling_error, %FastestMCP.Error{code: :internal_error, message: message}},
                    1_000
+
+    assert message =~ "the request has no client to ask for sampling"
   end
 
   defp connect_client!(server_name, opts) do
-    bandit =
-      start_supervised!(
-        {Bandit,
-         plug:
-           {FastestMCP.Transport.HTTPApp,
-            server_name: server_name,
-            path: "/mcp",
-            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
-         scheme: :http,
-         port: 0}
-      )
-
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+    %{url: url} =
+      start_http!(server_name, allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"])
 
     client =
-      Client.connect!(
-        "http://127.0.0.1:#{port}/mcp",
+      connect!(
+        url,
         Keyword.put_new(opts, :protocol_version, "2025-11-25")
       )
-
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
-    end)
 
     client
   end

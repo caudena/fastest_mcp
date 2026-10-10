@@ -1,30 +1,19 @@
 defmodule FastestMCP.Middleware.ErrorHandling do
-  @moduledoc """
-  Stateful middleware that logs failures, tracks counts, and normalizes common exceptions.
-
-  Middleware modules in FastestMCP are configured as explicit structs that
-  carry options plus a ready-to-run `middleware` function. That keeps runtime
-  assembly cheap while making the configured value easy to inspect in tests.
-
-  Most applications reach this module through `FastestMCP.Middleware` helper
-  functions or by adding the configured struct directly with
-  `FastestMCP.Server.add_middleware/2`.
-  """
+  @moduledoc false
 
   require Logger
 
   alias FastestMCP.Error
   alias FastestMCP.Middleware
+  @behaviour FastestMCP.Middleware
+
   alias FastestMCP.Operation
-  alias FastestMCP.Registry
 
   defstruct [
     :error_callback,
     :instance_id,
-    :runtime_id,
+    :runtime,
     :logger,
-    :middleware,
-    :stats,
     include_traceback: false,
     transform_errors: true
   ]
@@ -34,141 +23,91 @@ defmodule FastestMCP.Middleware.ErrorHandling do
   @type t :: %__MODULE__{
           error_callback: callback() | nil,
           instance_id: reference(),
-          runtime_id: reference() | nil,
+          runtime: :ets.tid() | nil,
           logger: (Logger.level(), String.t() -> any()),
-          middleware: (Operation.t(), (Operation.t() -> any()) -> any()),
-          stats: pid() | nil,
           include_traceback: boolean(),
           transform_errors: boolean()
         }
 
-  @doc "Builds a new value for this module from the supplied options."
   def new(opts \\ []) do
-    logger = opts |> Keyword.get(:logger, &Logger.log/2) |> normalize_logger()
-
-    middleware = %__MODULE__{
+    %__MODULE__{
       error_callback: Keyword.get(opts, :error_callback),
       instance_id: make_ref(),
-      runtime_id: nil,
-      logger: logger,
-      stats: nil,
+      logger: opts |> Keyword.get(:logger, &Logger.log/2) |> normalize_logger(),
       include_traceback: Keyword.get(opts, :include_traceback, false),
       transform_errors: Keyword.get(opts, :transform_errors, true)
     }
-
-    bind_middleware(middleware)
   end
 
-  @doc "Runs the middleware around the next operation."
+  # Every error is logged and counted, by the exception it wraps when it has
+  # one (see `FastestMCP.Error`). An exception that middleware or an extension
+  # method raised becomes a clearer error; a handler's crash already names its
+  # component and stays as it is.
+  @impl FastestMCP.Middleware
+  def call(%__MODULE__{runtime: nil} = middleware, _operation, _next),
+    do: Middleware.not_running(middleware)
+
   def call(%__MODULE__{} = middleware, %Operation{} = operation, next)
       when is_function(next, 1) do
-    middleware = ensure_runtime(middleware)
+    with {:error, %Error{} = error} <- next.(operation) do
+      {exception, stacktrace} = error.cause || {error, []}
+      log_error(middleware, exception, operation, stacktrace)
+      exception = if error.code == :component_crash, do: error, else: exception
 
-    try do
-      next.(operation)
-    rescue
-      error ->
-        stacktrace = __STACKTRACE__
-        log_error(middleware, error, operation, stacktrace)
-
-        case transform_error(middleware, error, operation) do
-          ^error -> reraise error, stacktrace
-          transformed -> reraise transformed, stacktrace
-        end
+      case transform_error(middleware, exception, operation) do
+        %Error{} = transformed -> {:error, transformed}
+        _untransformed -> {:error, error}
+      end
     end
   end
 
-  @doc "Returns the collected error statistics."
-  def get_error_stats(%__MODULE__{} = middleware) do
-    middleware
-    |> runtime_middlewares()
-    |> Enum.reduce(%{}, fn %{stats: runtime_stats}, stats ->
-      Agent.get(runtime_stats, fn current ->
-        Map.merge(stats, current, fn _key, left, right -> left + right end)
-      end)
-    end)
+  # The state is a public table of error counts, owned by an Agent.
+  @impl FastestMCP.Middleware
+  def child_spec(%__MODULE__{instance_id: instance_id}) do
+    {Agent,
+     fn ->
+       table = :ets.new(__MODULE__, [:public, write_concurrency: true])
+       Middleware.register_runtime(instance_id, table)
+     end}
   end
 
-  @doc "Releases resources owned by this module."
-  def close(%__MODULE__{} = middleware), do: deactivate_runtime(middleware)
+  @impl FastestMCP.Middleware
+  def attach(%__MODULE__{} = middleware, pid),
+    do: %{middleware | runtime: Agent.get(pid, & &1)}
 
-  @doc false
-  def activate_runtime(%__MODULE__{} = middleware) do
-    if middleware.runtime_id, do: deactivate_runtime(middleware)
-
-    runtime_id = make_ref()
-    {:ok, stats} = Agent.start(fn -> %{} end)
-
-    runtime =
-      middleware
-      |> Map.put(:runtime_id, runtime_id)
-      |> Map.put(:stats, stats)
-      |> bind_middleware()
-
-    :ok = Registry.register_middleware_runtime(middleware.instance_id, runtime_id, %{pid: stats})
-    runtime
+  def error_counts(%__MODULE__{} = middleware) do
+    for table <- Middleware.runtimes(middleware),
+        {error_key, count} <- :ets.tab2list(table),
+        reduce: %{} do
+      stats -> Map.update(stats, error_key, count, &(&1 + count))
+    end
   end
 
-  @doc false
-  def deactivate_runtime(%__MODULE__{} = middleware) do
-    middleware
-    |> runtime_middlewares()
-    |> Enum.each(fn %{runtime_id: runtime_id, stats: pid} ->
-      Registry.unregister_middleware_runtime(runtime_id)
-      Middleware.shutdown_runtime_pid(pid)
-    end)
-
-    :ok
-  end
-
-  @doc "Transforms an exception or runtime error into a normalized error."
   def transform_error(_middleware, error, operation)
   def transform_error(%__MODULE__{transform_errors: false}, error, _operation), do: error
   def transform_error(_middleware, %Error{} = error, _operation), do: error
 
-  def transform_error(_middleware, %ArgumentError{} = error, _operation) do
-    invalid_params_error(error)
-  end
+  def transform_error(_middleware, %module{} = error, _operation)
+      when module in [ArgumentError, BadArityError, FunctionClauseError],
+      do: %{Error.from_exception(error, "invalid params") | code: :invalid_params}
 
-  def transform_error(_middleware, %BadArityError{} = error, _operation) do
-    invalid_params_error(error)
-  end
+  def transform_error(_middleware, %File.Error{reason: :enoent} = error, operation),
+    do: not_found_error(error, operation)
 
-  def transform_error(_middleware, %FunctionClauseError{} = error, _operation) do
-    invalid_params_error(error)
-  end
-
-  def transform_error(_middleware, %File.Error{reason: :enoent} = error, operation) do
-    not_found_error(error, operation)
-  end
-
-  def transform_error(_middleware, %KeyError{} = error, operation) do
-    not_found_error(error, operation)
-  end
+  def transform_error(_middleware, %KeyError{} = error, operation),
+    do: not_found_error(error, operation)
 
   def transform_error(_middleware, %File.Error{reason: reason} = error, _operation)
       when reason in [:eacces, :eperm] do
-    %Error{
-      code: :permission_denied,
-      message: "permission denied: #{Exception.message(error)}",
-      details: %{kind: inspect(error.__struct__)}
-    }
+    %{Error.from_exception(error, "permission denied") | code: :permission_denied}
   end
 
-  def transform_error(_middleware, error, _operation) do
-    %Error{
-      code: :internal_error,
-      message: "internal error: #{Exception.message(error)}",
-      details: %{kind: inspect(error.__struct__)}
-    }
-  end
+  def transform_error(_middleware, error, _operation),
+    do: Error.from_exception(error, "internal error")
 
   defp log_error(%__MODULE__{} = middleware, error, operation, stacktrace) do
     error_key = "#{exception_name(error)}:#{operation.method || "unknown"}"
-
-    Agent.update(middleware.stats, fn counts ->
-      Map.update(counts, error_key, 1, &(&1 + 1))
-    end)
+    :ets.update_counter(middleware.runtime, error_key, 1, {error_key, 0})
 
     message = log_message(middleware, error, operation, stacktrace)
     middleware.logger.(error_log_level(error), message)
@@ -186,19 +125,14 @@ defmodule FastestMCP.Middleware.ErrorHandling do
     end
   end
 
-  defp log_message(_middleware, %Error{} = error, operation, _stacktrace) do
-    "Error in #{operation.method || "unknown"}: #{exception_name(error)}: #{Exception.message(error)}"
-  end
-
-  defp log_message(%__MODULE__{include_traceback: true}, error, operation, stacktrace) do
-    base =
+  defp log_message(middleware, error, operation, stacktrace) do
+    message =
       "Error in #{operation.method || "unknown"}: #{exception_name(error)}: #{Exception.message(error)}"
 
-    base <> "\n" <> Exception.format(:error, error, stacktrace)
-  end
-
-  defp log_message(_middleware, error, operation, _stacktrace) do
-    "Error in #{operation.method || "unknown"}: #{exception_name(error)}: #{Exception.message(error)}"
+    # Normalized errors are logged without traceback noise.
+    if middleware.include_traceback and not is_struct(error, Error),
+      do: message <> "\n" <> Exception.format(:error, error, stacktrace),
+      else: message
   end
 
   defp error_log_level(%Error{log_level: level}) when is_atom(level), do: level
@@ -209,68 +143,14 @@ defmodule FastestMCP.Middleware.ErrorHandling do
   defp normalize_logger(logger) when is_function(logger, 1),
     do: fn _level, message -> logger.(message) end
 
-  defp invalid_params_error(error) do
-    %Error{
-      code: :invalid_params,
-      message: "invalid params: #{Exception.message(error)}",
-      details: %{kind: inspect(error.__struct__)}
-    }
-  end
-
   defp not_found_error(error, %Operation{method: method}) do
-    message =
-      if String.starts_with?(to_string(method), "resources/") do
-        "resource not found: #{Exception.message(error)}"
-      else
-        "not found: #{Exception.message(error)}"
-      end
+    prefix =
+      if String.starts_with?(to_string(method), "resources/"),
+        do: "resource not found",
+        else: "not found"
 
-    %Error{
-      code: :not_found,
-      message: message,
-      details: %{kind: inspect(error.__struct__)}
-    }
+    %{Error.from_exception(error, prefix) | code: :not_found}
   end
 
-  defp exception_name(%module{}) do
-    module
-    |> inspect()
-    |> String.trim_leading("Elixir.")
-  end
-
-  defp ensure_runtime(%__MODULE__{} = middleware) do
-    runtime_middleware(middleware) || activate_runtime(middleware)
-  end
-
-  defp runtime_middleware(%__MODULE__{} = middleware) do
-    case runtime_middlewares(middleware) do
-      [runtime] -> runtime
-      _other -> nil
-    end
-  end
-
-  defp runtime_middlewares(%__MODULE__{runtime_id: runtime_id} = middleware)
-       when is_reference(runtime_id) do
-    case Registry.lookup_middleware_runtime(runtime_id) do
-      {:ok, runtime} -> [hydrate_runtime(middleware, runtime)]
-      {:error, :not_found} -> []
-    end
-  end
-
-  defp runtime_middlewares(%__MODULE__{} = middleware) do
-    middleware.instance_id
-    |> Registry.list_middleware_runtimes()
-    |> Enum.map(&hydrate_runtime(middleware, &1))
-  end
-
-  defp hydrate_runtime(%__MODULE__{} = middleware, %{runtime_id: runtime_id, pid: pid}) do
-    middleware
-    |> Map.put(:runtime_id, runtime_id)
-    |> Map.put(:stats, pid)
-    |> bind_middleware()
-  end
-
-  defp bind_middleware(%__MODULE__{} = middleware) do
-    %{middleware | middleware: fn operation, next -> call(middleware, operation, next) end}
-  end
+  defp exception_name(%module{}), do: inspect(module)
 end

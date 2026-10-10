@@ -1,11 +1,39 @@
 defmodule FastestMCP.SkillProviderTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.PathSafety
   alias FastestMCP.Providers.Skill
   alias FastestMCP.Providers.Skills.Common
   alias FastestMCP.Transport.Engine
   alias FastestMCP.Transport.Request
+
+  test "frontmatter preserves YAML strings, nesting, delimiters, and body bytes" do
+    assert {%{}, "body"} = Common.parse_frontmatter("---\n---\nbody")
+
+    text =
+      "---\r\ndescription: >\r\n  first line\r\n  second line\r\nmetadata:\r\n  version: 1.10\r\n  enabled: yes\r\n  empty:\r\n  tags: [one, two]\r\nquoted: \"---\"\r\n---\r\n\r\nBody"
+
+    assert {metadata, "\r\nBody"} = Common.parse_frontmatter(text)
+    assert metadata["description"] == "first line second line\n"
+
+    assert metadata["metadata"] == %{
+             "version" => "1.10",
+             "enabled" => "yes",
+             "empty" => "",
+             "tags" => ["one", "two"]
+           }
+
+    assert metadata["quoted"] == "---"
+
+    assert {%{"description" => "first\nsecond\n"}, ""} =
+             Common.parse_frontmatter("---\ndescription: |\n  first\n  second\n---")
+
+    assert {%{"description" => "unquoted: colon"}, "body"} =
+             Common.parse_frontmatter("---\ndescription: unquoted: colon\n---\nbody")
+
+    assert {%{}, "---not frontmatter\nbody"} =
+             Common.parse_frontmatter("---not frontmatter\nbody")
+  end
 
   test "parse_frontmatter handles basic maps and lists" do
     content = """
@@ -45,17 +73,14 @@ defmodule FastestMCP.SkillProviderTest do
     File.write!(Path.join(skill_dir, "scripts/helper.py"), "print('helper')")
 
     provider = Skill.new(skill_dir)
-    server_name = unique_server_name("skill-provider")
+    server_name = unique_name("skill-provider")
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_provider(provider)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_provider(provider)
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
-
-    resources = FastestMCP.list_resources(server_name)
-    templates = FastestMCP.list_resource_templates(server_name)
+    resources = FastestMCP.list_resources!(server_name)
+    templates = FastestMCP.list_resource_templates!(server_name)
 
     assert length(resources) == 2
 
@@ -96,22 +121,22 @@ defmodule FastestMCP.SkillProviderTest do
            }
 
     assert String.contains?(
-             FastestMCP.read_resource(server_name, "skill://my-skill/SKILL.md"),
+             FastestMCP.read_resource!(server_name, "skill://my-skill/SKILL.md"),
              "# My Skill"
            )
 
     assert String.contains?(
-             FastestMCP.read_resource(server_name, "skill://my-skill/reference.md"),
+             FastestMCP.read_resource!(server_name, "skill://my-skill/reference.md"),
              "# Reference"
            )
 
     assert String.contains?(
-             FastestMCP.read_resource(server_name, "skill://my-skill/scripts/helper.py"),
+             FastestMCP.read_resource!(server_name, "skill://my-skill/scripts/helper.py"),
              "helper"
            )
 
     manifest =
-      JSON.decode!(FastestMCP.read_resource(server_name, "skill://my-skill/_manifest"))
+      JSON.decode!(FastestMCP.read_resource!(server_name, "skill://my-skill/_manifest"))
 
     paths = MapSet.new(Enum.map(manifest["files"], & &1["path"]))
 
@@ -131,27 +156,24 @@ defmodule FastestMCP.SkillProviderTest do
     File.ln_s!(secret_file, Path.join(skill_dir, "leak.txt"))
 
     provider = Skill.new(skill_dir, supporting_files: :resources)
-    server_name = unique_server_name("skill-provider-resources")
+    server_name = unique_name("skill-provider-resources")
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_provider(provider)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_provider(provider)
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
-
-    resources = FastestMCP.list_resources(server_name)
+    resources = FastestMCP.list_resources!(server_name)
 
     assert length(resources) == 3
     assert Enum.any?(resources, &(&1.uri == "skill://resource-mode-skill/reference.md"))
     refute Enum.any?(resources, &(&1.uri == "skill://resource-mode-skill/leak.txt"))
-    assert [] == FastestMCP.list_resource_templates(server_name)
+    assert [] == FastestMCP.list_resource_templates!(server_name)
 
     assert "# Reference" ==
-             FastestMCP.read_resource(server_name, "skill://resource-mode-skill/reference.md")
+             FastestMCP.read_resource!(server_name, "skill://resource-mode-skill/reference.md")
 
     assert_raise FastestMCP.Error, fn ->
-      FastestMCP.read_resource(server_name, "skill://resource-mode-skill/../../../secret.txt")
+      FastestMCP.read_resource!(server_name, "skill://resource-mode-skill/../../../secret.txt")
     end
   end
 
@@ -202,16 +224,13 @@ defmodule FastestMCP.SkillProviderTest do
       FastestMCP.server("child-skill-server")
       |> FastestMCP.add_provider(Skill.new(skill_dir))
 
-    parent_name = unique_server_name("mounted-skill-parent")
+    parent_name = unique_name("mounted-skill-parent")
 
-    parent =
-      FastestMCP.server(parent_name)
-      |> FastestMCP.mount(child, namespace: "skills")
+    FastestMCP.server(parent_name)
+    |> FastestMCP.mount(child, namespace: "skills")
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(parent)
-    on_exit(fn -> FastestMCP.stop_server(parent_name) end)
-
-    resources = FastestMCP.list_resources(parent_name)
+    resources = FastestMCP.list_resources!(parent_name)
     main = Enum.find(resources, &(&1.uri == "skill://skills/mounted-skill/SKILL.md"))
 
     assert main.meta["fastestmcp"]["skill"] == %{
@@ -220,7 +239,7 @@ defmodule FastestMCP.SkillProviderTest do
            }
 
     assert "# Mounted Skill" ==
-             FastestMCP.read_resource(parent_name, "skill://skills/mounted-skill/SKILL.md")
+             FastestMCP.read_resource!(parent_name, "skill://skills/mounted-skill/SKILL.md")
   end
 
   defp create_skill_dir(name) do
@@ -233,9 +252,5 @@ defmodule FastestMCP.SkillProviderTest do
     File.mkdir_p!(skill_dir)
     on_exit(fn -> File.rm_rf(root) end)
     skill_dir
-  end
-
-  defp unique_server_name(prefix) do
-    prefix <> "-" <> Integer.to_string(System.unique_integer([:positive]))
   end
 end

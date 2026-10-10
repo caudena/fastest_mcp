@@ -1,18 +1,17 @@
 defmodule FastestMCP.Providers.OpenAPI do
-  @moduledoc """
-  OpenAPI-backed dynamic tool provider.
+  @moduledoc false
 
-  The public API stays Plug/BEAM-friendly:
+  use FastestMCP.Provider
 
-  - pass an OpenAPI spec map
-  - optionally pass a `:requester` callback for tests or custom HTTP transport
-  - otherwise the provider uses `FastestMCP.HTTP.request/3`
-  """
+  import FastestMCP.Util, only: [maybe_put: 3, stringify_keys: 1]
 
   alias FastestMCP.ComponentCompiler
   alias FastestMCP.Error
   alias FastestMCP.HTTP
   alias FastestMCP.MIME
+  alias FastestMCP.Schema
+  alias FastestMCP.Providers.OpenAPI.RequestPlan
+  alias FastestMCP.Providers.OpenAPI.Schema, as: OpenAPISchema
   @http_methods ~w(get post put patch delete)a
   @parameter_locations %{
     "path" => :path,
@@ -27,6 +26,8 @@ defmodule FastestMCP.Providers.OpenAPI do
     cookie: ~w(form)
   }
 
+  # `headers:` may hold credentials, which inspect output leaves out.
+  @derive {Inspect, except: [:headers]}
   defstruct [
     :name,
     :spec,
@@ -34,10 +35,10 @@ defmodule FastestMCP.Providers.OpenAPI do
     :requester,
     timeout_ms: 5_000,
     schema_options: [],
+    headers: [],
     tools: []
   ]
 
-  @doc "Builds a new value for this module from the supplied options."
   def new(opts) when is_list(opts) do
     schema_options = normalize_schema_options!(Keyword.get(opts, :schema_options, []))
 
@@ -45,7 +46,6 @@ defmodule FastestMCP.Providers.OpenAPI do
       opts
       |> Keyword.fetch!(:openapi_spec)
       |> stringify_keys()
-      |> resolve_refs()
 
     requester = Keyword.get(opts, :requester)
     base_url = Keyword.get(opts, :base_url) || first_server_url(spec)
@@ -66,16 +66,17 @@ defmodule FastestMCP.Providers.OpenAPI do
       base_url: base_url && String.trim_trailing(to_string(base_url), "/"),
       requester: requester,
       timeout_ms: Keyword.get(opts, :timeout_ms, 5_000),
-      schema_options: schema_options
+      schema_options: schema_options,
+      headers: normalize_headers!(Keyword.get(opts, :headers, []))
     }
 
     %{provider | tools: build_tools(provider)}
   end
 
-  @doc "Returns the provider type label."
+  @impl FastestMCP.Provider
   def provider_type(%__MODULE__{}), do: "OpenAPIProvider"
 
-  @doc "Lists the components exposed by this module."
+  @impl FastestMCP.Provider
   def list_components(%__MODULE__{} = provider, :tool, _operation), do: provider.tools
   def list_components(%__MODULE__{}, _component_type, _operation), do: []
 
@@ -83,6 +84,7 @@ defmodule FastestMCP.Providers.OpenAPI do
     provider.spec
     |> Map.get("paths", %{})
     |> Enum.flat_map(fn {path, path_item} ->
+      path_item = OpenAPISchema.reference!(path_item, provider.spec)
       path_parameters = normalized_parameters(Map.get(path_item, "parameters", []), provider.spec)
 
       Enum.flat_map(@http_methods, fn method ->
@@ -95,36 +97,59 @@ defmodule FastestMCP.Providers.OpenAPI do
   end
 
   defp build_tool(provider, method, path, operation, path_parameters) do
-    operation = stringify_keys(operation)
-    {body_schema, body_content_type, body_required?} = request_body_schema(operation)
+    operation = OpenAPISchema.reference!(operation, provider.spec)
+
+    {body_schema, body_content_type, body_required?, encoding} =
+      request_body_schema(operation, provider.spec)
+
+    body_view = OpenAPISchema.view(body_schema, provider.spec)
+
+    body_validator =
+      if is_nil(body_schema),
+        do: nil,
+        else:
+          Schema.compile!(
+            standalone_schema(body_schema, provider.spec, provider.schema_options),
+            provider.schema_options
+          )
 
     parameter_bindings =
-      build_parameter_bindings(path_parameters, operation, body_schema, body_required?)
+      build_parameter_bindings(
+        path_parameters,
+        operation,
+        body_view,
+        body_required?,
+        provider
+      )
 
-    input_schema = parameter_bindings |> build_input_schema() |> standalone_schema(provider.spec)
+    input_schema = build_input_schema(parameter_bindings)
 
     {output_schema, wrap_output?} =
       operation
-      |> response_schema()
-      |> prepare_output_schema(provider.spec)
+      |> response_schema(provider.spec)
+      |> prepare_output_schema(provider.spec, provider.schema_options)
+
+    plan =
+      RequestPlan.new(
+        method: method,
+        path: path,
+        base_url: provider.base_url,
+        requester: provider.requester,
+        timeout_ms: provider.timeout_ms,
+        headers: provider.headers,
+        bindings: parameter_bindings,
+        initial_body: initial_request_body(body_view, body_required?),
+        body_content_type: body_content_type,
+        body_required?: body_required?,
+        body_validator: body_validator,
+        encoding: encoding,
+        wrap_output?: wrap_output?
+      )
 
     ComponentCompiler.compile(
       :tool,
-      provider.name,
       operation_name(method, path, operation),
-      fn arguments, _context ->
-        execute_operation(
-          provider,
-          method,
-          path,
-          parameter_bindings,
-          arguments || %{},
-          body_schema,
-          body_content_type,
-          body_required?,
-          wrap_output?
-        )
-      end,
+      fn arguments, context -> execute_operation(plan, arguments || %{}, context) end,
       description: operation_description(operation),
       input_schema: input_schema,
       output_schema: output_schema,
@@ -132,21 +157,11 @@ defmodule FastestMCP.Providers.OpenAPI do
     )
   end
 
-  defp execute_operation(
-         provider,
-         method,
-         path,
-         bindings,
-         arguments,
-         body_schema,
-         body_content_type,
-         body_required?,
-         wrap_output?
-       ) do
+  defp execute_operation(%RequestPlan{} = plan, arguments, context) do
     args = stringify_keys(arguments)
 
     path =
-      Enum.reduce(bindings, path, fn
+      Enum.reduce(plan.bindings.path, plan.path, fn
         %{location: :path, source_name: source_name} = binding, current_path ->
           value = fetch_binding_value!(binding, args)
           encoded = encode_path_value(binding, value)
@@ -157,41 +172,40 @@ defmodule FastestMCP.Providers.OpenAPI do
       end)
 
     query =
-      bindings
-      |> Enum.filter(&(&1.location == :query))
+      plan.bindings.query
       |> Enum.flat_map(&query_pairs(&1, args))
 
     headers =
-      bindings
-      |> Enum.filter(&(&1.location == :header))
-      |> Enum.flat_map(&header_pairs(&1, args))
-      |> add_cookie_header(bindings, args)
+      plan.headers
+      |> Enum.flat_map(&configured_header(&1, context))
+      |> Kernel.++(Enum.flat_map(plan.bindings.header, &header_pairs(&1, args)))
+      |> add_cookie_header(plan.bindings.cookie, args)
 
     body =
-      bindings
-      |> Enum.filter(&(&1.location == :body))
-      |> Enum.reduce(initial_request_body(body_schema, body_required?), fn binding, body ->
+      plan.bindings.body
+      |> Enum.reduce(plan.initial_body, fn binding, body ->
         case fetch_binding_value(binding, args) do
           {:ok, value} -> put_body_value(body, binding.body_path, value)
           :error -> body
         end
       end)
 
-    url = build_url(provider.base_url, path)
+    url = build_url(plan.base_url, path)
+    validate_body!(body, plan.body_validator, plan.body_required?)
 
     request_opts =
       []
-      |> Keyword.put(:timeout_ms, provider.timeout_ms)
-      |> maybe_put(:requester, provider.requester)
+      |> Keyword.put(:timeout_ms, plan.timeout_ms)
+      |> maybe_put(:requester, plan.requester)
       |> maybe_put(:headers, headers)
       |> maybe_put(:query, query)
-      |> put_request_body(body, body_content_type)
+      |> put_request_body(body, plan.body_content_type, plan.encoding)
 
-    case HTTP.request(method, url, request_opts) do
+    case HTTP.request(plan.method, url, request_opts) do
       {:ok, status, response_headers, response_body} when status in 200..299 ->
         response_headers
         |> normalize_response(response_body)
-        |> maybe_wrap_output(wrap_output?)
+        |> maybe_wrap_output(plan.wrap_output?)
 
       {:ok, status, response_headers, response_body} ->
         raise Error,
@@ -226,18 +240,28 @@ defmodule FastestMCP.Providers.OpenAPI do
     |> maybe_put_map("required", required |> Enum.reverse() |> Enum.uniq())
   end
 
-  defp build_parameter_bindings(path_parameters, operation, body_schema, body_required?) do
-    operation_parameters = normalized_parameters(Map.get(operation, "parameters", []), %{})
-    parameters = merge_parameters(path_parameters, operation_parameters)
+  defp build_parameter_bindings(path_parameters, operation, body_schema, body_required?, provider) do
+    %{spec: spec, schema_options: options} = provider
+    operation_parameters = normalized_parameters(Map.get(operation, "parameters", []), spec)
+    configured = MapSet.new(provider.headers, fn {name, _value} -> String.downcase(name) end)
+
+    # A header that the provider sends itself is no argument.
+    parameters =
+      path_parameters
+      |> merge_parameters(operation_parameters)
+      |> Enum.reject(&(&1["in"] == "header" and String.downcase(&1["name"]) in configured))
 
     body_bindings =
       body_schema
       |> build_body_bindings(body_required?)
+      |> Enum.map(fn binding ->
+        %{binding | schema: standalone_schema(binding.schema, spec, options)}
+      end)
       |> Enum.map(fn binding -> Map.put(binding, :priority, 0) end)
 
     parameter_bindings =
       parameters
-      |> Enum.map(&parameter_binding/1)
+      |> Enum.map(&parameter_binding(&1, spec, options))
       |> Enum.map(&Map.put(&1, :priority, 1))
 
     (body_bindings ++ parameter_bindings)
@@ -252,20 +276,28 @@ defmodule FastestMCP.Providers.OpenAPI do
          %{"type" => "object", "properties" => properties} = schema,
          body_required?
        ) do
-    required = MapSet.new(Map.get(schema, "required", []))
+    if OpenAPISchema.plain_object?(schema) do
+      required = MapSet.new(Map.get(schema, "required", []))
 
-    Enum.map(properties, fn {name, property_schema} ->
-      %{
-        location: :body,
-        source_name: name,
-        schema: property_schema,
-        required: body_required? and MapSet.member?(required, name),
-        body_path: [name]
-      }
-    end)
+      Enum.map(properties, fn {name, property_schema} ->
+        %{
+          location: :body,
+          source_name: name,
+          schema: property_schema,
+          required: body_required? and MapSet.member?(required, name),
+          body_path: [name]
+        }
+      end)
+    else
+      whole_body_binding(schema, body_required?)
+    end
   end
 
   defp build_body_bindings(schema, body_required?) do
+    whole_body_binding(schema, body_required?)
+  end
+
+  defp whole_body_binding(schema, body_required?) do
     [
       %{
         location: :body,
@@ -277,7 +309,7 @@ defmodule FastestMCP.Providers.OpenAPI do
     ]
   end
 
-  defp parameter_binding(parameter) do
+  defp parameter_binding(parameter, spec, options) do
     location = parameter_location!(parameter["in"])
     style = parameter["style"] || default_parameter_style(location)
     validate_parameter_style!(location, style)
@@ -288,8 +320,9 @@ defmodule FastestMCP.Providers.OpenAPI do
       schema:
         parameter
         |> Map.get("schema", %{"type" => "string"})
-        |> normalize_openapi_schema()
-        |> maybe_put_map("description", parameter["description"]),
+        |> standalone_schema(spec, options)
+        |> maybe_put_map("description", parameter["description"])
+        |> parameter_examples(parameter),
       required: location == :path or !!parameter["required"],
       style: style,
       explode: Map.get(parameter, "explode", default_explode(style))
@@ -376,44 +409,53 @@ defmodule FastestMCP.Providers.OpenAPI do
     |> Enum.map(&resolve_parameter(&1, spec))
   end
 
-  defp resolve_parameter(%{"$ref" => "#/components/parameters/" <> name} = parameter, spec) do
-    referenced =
-      spec
-      |> get_in(["components", "parameters", name])
-      |> stringify_keys()
-      |> resolve_refs(spec)
+  defp resolve_parameter(parameter, spec), do: OpenAPISchema.reference!(parameter, spec)
 
-    Map.merge(referenced || %{}, Map.delete(parameter, "$ref"))
-  end
-
-  defp resolve_parameter(parameter, spec) do
-    parameter |> stringify_keys() |> resolve_refs(spec)
-  end
-
-  defp request_body_schema(operation) do
-    operation
-    |> Map.get("requestBody")
-    |> case do
+  defp request_body_schema(operation, spec) do
+    case Map.get(operation, "requestBody") do
       nil ->
-        {nil, nil, false}
+        {nil, nil, false, %{}}
 
-      request_body ->
-        request_body = resolve_refs(request_body)
-        {schema, content_type} = schema_for_request_body_content(request_body["content"] || %{})
+      body ->
+        body = OpenAPISchema.reference!(body, spec)
 
-        {schema, content_type, request_body["required"] == true}
+        case select_request_body_media(body["content"] || %{}) do
+          {content_type, media} ->
+            schema = Map.get(media, "schema", %{"type" => "string"})
+            {schema, content_type, body["required"] == true, Map.get(media, "encoding", %{})}
+
+          nil ->
+            raise ArgumentError, "OpenAPI request body has no supported media type"
+        end
     end
   end
 
-  defp initial_request_body(
-         %{"type" => "object", "properties" => _properties},
-         true
-       ),
-       do: %{}
+  defp initial_request_body(schema, true) do
+    if OpenAPISchema.plain_object?(schema), do: %{}, else: :no_body
+  end
 
-  defp initial_request_body(_body_schema, _body_required?), do: :no_body
+  defp initial_request_body(_schema, _required?), do: :no_body
 
-  defp response_schema(operation) do
+  defp validate_body!(:no_body, _validator, false), do: :ok
+  defp validate_body!(:no_body, nil, _required), do: :ok
+
+  defp validate_body!(:no_body, _validator, true),
+    do: raise(Error, code: :invalid_params, message: "OpenAPI request body is required")
+
+  defp validate_body!(body, validator, _required) do
+    case Schema.validate(validator, body) do
+      {:ok, _} ->
+        :ok
+
+      {:error, error} ->
+        raise Error,
+          code: :invalid_params,
+          message: "invalid OpenAPI request body",
+          details: %{violations: error.violations}
+    end
+  end
+
+  defp response_schema(operation, spec) do
     responses = Map.get(operation, "responses", %{})
 
     Enum.find_value(["200", "201", "202", "204"], fn status ->
@@ -423,7 +465,7 @@ defmodule FastestMCP.Providers.OpenAPI do
 
         response ->
           response
-          |> resolve_refs()
+          |> OpenAPISchema.reference!(spec)
           |> Map.get("content", %{})
           |> schema_for_json_content()
       end
@@ -433,38 +475,23 @@ defmodule FastestMCP.Providers.OpenAPI do
   # MCP tool output schemas and structuredContent are object-rooted. Preserve
   # object OpenAPI responses directly and give scalar/array responses an
   # explicit, advertised object representation.
-  defp prepare_output_schema(nil, _spec), do: {nil, false}
+  defp prepare_output_schema(nil, _spec, _options), do: {nil, false}
 
-  defp prepare_output_schema(%{"type" => "object"} = schema, spec) do
-    {standalone_schema(schema, spec), false}
-  end
+  defp prepare_output_schema(schema, spec, options) do
+    view = OpenAPISchema.view(schema, spec)
 
-  defp prepare_output_schema(schema, spec) do
-    wrapped = %{
-      "type" => "object",
-      "properties" => %{"result" => schema},
-      "required" => ["result"]
-    }
+    if match?(%{"type" => "object"}, view) do
+      {standalone_schema(view, spec, options), false}
+    else
+      wrapped = %{
+        "type" => "object",
+        "properties" => %{"result" => standalone_schema(schema, spec, options)},
+        "required" => ["result"]
+      }
 
-    {standalone_schema(wrapped, spec), true}
-  end
-
-  defp schema_for_request_body_content(content) when is_map(content) do
-    case select_request_body_media(content) do
-      {content_type, media} ->
-        schema =
-          media
-          |> Map.get("schema")
-          |> normalize_openapi_schema()
-
-        {schema, content_type}
-
-      nil ->
-        {nil, nil}
+      {wrapped, true}
     end
   end
-
-  defp schema_for_request_body_content(_content), do: {nil, nil}
 
   defp schema_for_json_content(content) when is_map(content) do
     content
@@ -472,7 +499,6 @@ defmodule FastestMCP.Providers.OpenAPI do
       if json_media_type?(content_type) do
         media
         |> Map.get("schema")
-        |> normalize_openapi_schema()
       end
     end)
   end
@@ -484,10 +510,11 @@ defmodule FastestMCP.Providers.OpenAPI do
       [
         &json_media_type?/1,
         &(&1 == "application/x-www-form-urlencoded"),
-        &(&1 == "multipart/form-data")
+        &(&1 == "multipart/form-data"),
+        &MIME.valid?/1
       ],
       fn predicate ->
-        Enum.find_value(content, fn {content_type, media} ->
+        Enum.find_value(Enum.sort(content), fn {content_type, media} ->
           normalized = normalize_media_type(content_type)
           if predicate.(normalized), do: {content_type, media}
         end)
@@ -501,6 +528,8 @@ defmodule FastestMCP.Providers.OpenAPI do
 
   defp normalize_media_type(content_type), do: MIME.normalize(content_type)
 
+  # Tool names take letters, digits, `_`, `-`, and `.`; an operationId such
+  # as `repos/list-for-org` becomes `repos_list-for-org`.
   defp operation_name(method, path, operation) do
     case operation["operationId"] do
       nil ->
@@ -510,7 +539,7 @@ defmodule FastestMCP.Providers.OpenAPI do
         |> String.trim("_")
 
       value ->
-        to_string(value)
+        value |> to_string() |> String.replace(~r/[^A-Za-z0-9_.-]+/, "_")
     end
   end
 
@@ -527,6 +556,19 @@ defmodule FastestMCP.Providers.OpenAPI do
         encode_query_value(binding.source_name, value, binding.style, binding.explode)
         |> Enum.map(fn {key, item} -> {key, to_string(item)} end)
     end
+  end
+
+  # A configured header's value is a string, or a function of no arguments or
+  # of the handler context that returns one; `nil` leaves the header out.
+  defp configured_header({name, value}, context) do
+    value =
+      cond do
+        is_function(value, 0) -> value.()
+        is_function(value, 1) -> value.(context)
+        true -> value
+      end
+
+    if is_nil(value), do: [], else: [{name, to_string(value)}]
   end
 
   defp header_pairs(binding, args) do
@@ -565,9 +607,9 @@ defmodule FastestMCP.Providers.OpenAPI do
     end)
   end
 
-  defp put_request_body(opts, :no_body, _content_type), do: opts
+  defp put_request_body(opts, :no_body, _content_type, _encoding), do: opts
 
-  defp put_request_body(opts, body, content_type) do
+  defp put_request_body(opts, body, content_type, encoding) do
     cond do
       is_nil(content_type) or json_media_type?(content_type) ->
         opts
@@ -581,13 +623,16 @@ defmodule FastestMCP.Providers.OpenAPI do
 
       normalize_media_type(content_type) == "multipart/form-data" ->
         opts
-        |> Keyword.put(:multipart, body)
+        |> Keyword.put(:multipart, multipart_fields(body, encoding))
+        |> Keyword.put(:content_type, content_type)
+
+      is_binary(body) ->
+        opts
+        |> Keyword.put(:body, body)
         |> Keyword.put(:content_type, content_type)
 
       true ->
-        opts
-        |> Keyword.put(:body, JSON.encode!(body))
-        |> Keyword.put(:content_type, content_type)
+        raise Error, code: :invalid_params, message: "raw OpenAPI request bodies must be strings"
     end
   end
 
@@ -784,9 +829,6 @@ defmodule FastestMCP.Providers.OpenAPI do
   defp maybe_put_map(value, _key, _value) when not is_map(value), do: value
   defp maybe_put_map(map, key, value), do: Map.put(map, key, value)
 
-  defp maybe_put(keyword, _key, nil), do: keyword
-  defp maybe_put(keyword, key, value), do: Keyword.put(keyword, key, value)
-
   defp first_server_url(spec) do
     spec
     |> get_in(["servers"])
@@ -807,189 +849,70 @@ defmodule FastestMCP.Providers.OpenAPI do
     end)
   end
 
-  defp normalize_openapi_schema(nil), do: nil
-  defp normalize_openapi_schema(schema) when is_boolean(schema), do: schema
+  defp standalone_schema(schema, spec, options), do: OpenAPISchema.prepare(schema, spec, options)
 
-  defp normalize_openapi_schema(schema) when is_list(schema) do
-    Enum.map(schema, &normalize_openapi_schema/1)
-  end
+  defp parameter_examples(schema, parameter) do
+    cond do
+      Map.has_key?(parameter, "example") ->
+        schema |> Map.delete("examples") |> Map.put("examples", [parameter["example"]])
 
-  defp normalize_openapi_schema(schema) when is_map(schema) do
-    schema
-    |> Enum.into(%{}, fn {key, value} -> {key, normalize_openapi_schema(value)} end)
-    |> apply_nullable()
-  end
+      is_map(parameter["examples"]) ->
+        examples =
+          parameter["examples"]
+          |> Enum.sort()
+          |> Enum.flat_map(fn
+            {_, %{"value" => value}} -> [value]
+            _ -> []
+          end)
 
-  defp normalize_openapi_schema(value), do: value
+        Map.put(schema, "examples", examples)
 
-  defp apply_nullable(%{"nullable" => true} = schema) do
-    schema
-    |> Map.delete("nullable")
-    |> add_null_type()
-  end
-
-  defp apply_nullable(%{} = schema), do: Map.delete(schema, "nullable")
-
-  defp add_null_type(%{"type" => type} = schema) when is_binary(type) do
-    Map.put(schema, "type", Enum.uniq([type, "null"]))
-  end
-
-  defp add_null_type(%{"type" => types} = schema) when is_list(types) do
-    Map.put(schema, "type", Enum.uniq(types ++ ["null"]))
-  end
-
-  defp add_null_type(%{"oneOf" => schemas} = schema) when is_list(schemas) do
-    Map.put(schema, "oneOf", schemas ++ [%{"type" => "null"}])
-  end
-
-  defp add_null_type(%{"anyOf" => schemas} = schema) when is_list(schemas) do
-    Map.put(schema, "anyOf", schemas ++ [%{"type" => "null"}])
-  end
-
-  defp add_null_type(%{} = schema) do
-    %{"anyOf" => [schema, %{"type" => "null"}]}
-  end
-
-  defp resolve_refs(value), do: resolve_refs(value, stringify_keys(value), %{})
-
-  defp resolve_refs(value, spec), do: resolve_refs(value, spec, %{})
-
-  defp resolve_refs(value, spec, visited) when is_map(value) do
-    case Map.get(value, "$ref") do
-      ref when is_binary(ref) ->
-        resolve_ref_value(ref, value, spec, visited)
-
-      _other ->
-        Enum.into(value, %{}, fn {key, child} -> {key, resolve_refs(child, spec, visited)} end)
-    end
-  end
-
-  defp resolve_refs(value, spec, visited) when is_list(value) do
-    Enum.map(value, &resolve_refs(&1, spec, visited))
-  end
-
-  defp resolve_refs(value, _spec, _visited), do: value
-
-  defp resolve_ref_value(ref, value, spec, visited) do
-    case ref do
-      "#/components/schemas/" <> name ->
-        merge_ref(ref, get_in(spec, ["components", "schemas", name]), value, spec, visited)
-
-      "#/components/parameters/" <> name ->
-        merge_ref(ref, get_in(spec, ["components", "parameters", name]), value, spec, visited)
-
-      _other ->
-        Enum.into(value, %{}, fn {key, child} -> {key, resolve_refs(child, spec, visited)} end)
-    end
-  end
-
-  defp merge_ref(ref, referenced, value, spec, visited) do
-    if Map.has_key?(visited, ref) do
-      value
-    else
-      do_merge_ref(ref, referenced, value, spec, Map.put(visited, ref, true))
-    end
-  end
-
-  defp do_merge_ref(_ref, nil, value, _spec, _visited) do
-    value
-  end
-
-  defp do_merge_ref(_ref, referenced, value, spec, visited) do
-    referenced
-    |> stringify_keys()
-    |> resolve_refs(spec, visited)
-    |> Map.merge(Map.delete(value, "$ref"))
-  end
-
-  # Schemas extracted from an OpenAPI document must remain valid standalone
-  # JSON Schemas. Inlining deliberately stops at cycles, so move any remaining
-  # component references into a local $defs closure rather than advertising
-  # dangling #/components/... pointers.
-  defp standalone_schema(nil, _spec), do: nil
-  defp standalone_schema(schema, _spec) when is_boolean(schema), do: schema
-
-  defp standalone_schema(schema, spec) when is_map(schema) do
-    {schema, referenced_names} = rewrite_component_schema_refs(schema, MapSet.new())
-    definitions = collect_component_definitions(referenced_names, spec, %{})
-
-    case definitions do
-      definitions when map_size(definitions) == 0 ->
+      true ->
         schema
-
-      definitions ->
-        Map.update(schema, "$defs", definitions, &Map.merge(&1, definitions))
     end
   end
 
-  defp rewrite_component_schema_refs(value, names) when is_map(value) do
-    Enum.reduce(value, {%{}, names}, fn
-      {"$ref", "#/components/schemas/" <> pointer}, {result, names} ->
-        name = decode_json_pointer_segment(pointer)
-        ref = "#/$defs/" <> encode_json_pointer_segment(name)
-        {Map.put(result, "$ref", ref), MapSet.put(names, name)}
+  defp multipart_fields(body, encoding) when is_map(body) do
+    body
+    |> Enum.sort()
+    |> Enum.flat_map(fn {name, value} ->
+      settings = Map.get(encoding, name, %{})
 
-      {key, child}, {result, names} ->
-        {child, names} = rewrite_component_schema_refs(child, names)
-        {Map.put(result, key, child), names}
+      default? =
+        Map.get(settings, "style", "form") == "form" and
+          Map.get(settings, "explode", true) == true and
+          Map.get(settings, "contentType", "text/plain") == "text/plain" and
+          Enum.all?(Map.keys(settings), &(&1 in ["style", "explode", "contentType"]))
+
+      if default? and is_list(value) and value != [] and Enum.all?(value, &is_binary/1) do
+        Enum.map(value, &{name, &1})
+      else
+        [{name, value}]
+      end
     end)
   end
 
-  defp rewrite_component_schema_refs(value, names) when is_list(value) do
-    Enum.map_reduce(value, names, &rewrite_component_schema_refs/2)
+  defp multipart_fields(body, _encoding), do: body
+
+  defp normalize_headers!(headers) when is_map(headers) or is_list(headers) do
+    Enum.map(headers, fn
+      {name, value}
+      when (is_binary(name) or is_atom(name)) and
+             (is_binary(value) or is_function(value, 0) or is_function(value, 1)) ->
+        {to_string(name), value}
+
+      _other ->
+        invalid_headers!(headers)
+    end)
   end
 
-  defp rewrite_component_schema_refs(value, names), do: {value, names}
+  defp normalize_headers!(headers), do: invalid_headers!(headers)
 
-  defp collect_component_definitions(names, spec, definitions) do
-    case Enum.find(names, &(not Map.has_key?(definitions, &1))) do
-      nil ->
-        definitions
-
-      name ->
-        case get_in(spec, ["components", "schemas", name]) do
-          nil ->
-            # The rewritten reference stays unresolved so the shared schema
-            # compiler fails closed instead of weakening validation.
-            collect_component_definitions(MapSet.delete(names, name), spec, definitions)
-
-          definition ->
-            {definition, discovered_names} =
-              definition
-              |> stringify_keys()
-              |> rewrite_component_schema_refs(MapSet.new())
-
-            names
-            |> MapSet.delete(name)
-            |> MapSet.union(discovered_names)
-            |> collect_component_definitions(spec, Map.put(definitions, name, definition))
-        end
-    end
+  defp invalid_headers!(headers) do
+    raise ArgumentError,
+          "headers must be a map or a list of {name, value} pairs, where a value is a string " <>
+            "or a function of no arguments or of the handler context, got: #{inspect(headers)}"
   end
-
-  defp decode_json_pointer_segment(segment) do
-    segment
-    |> String.replace("~1", "/")
-    |> String.replace("~0", "~")
-  end
-
-  defp encode_json_pointer_segment(segment) do
-    segment
-    |> String.replace("~", "~0")
-    |> String.replace("/", "~1")
-  end
-
-  defp stringify_keys(%_{} = struct), do: stringify_keys(Map.from_struct(struct))
-
-  defp stringify_keys(value) when is_map(value) do
-    Enum.into(value, %{}, fn {key, child} -> {to_string(key), stringify_keys(child)} end)
-  end
-
-  defp stringify_keys(value) when is_list(value) do
-    Enum.map(value, &stringify_keys/1)
-  end
-
-  defp stringify_keys(value), do: value
 
   defp normalize_schema_options!(options) when is_list(options) do
     if Keyword.keyword?(options) do

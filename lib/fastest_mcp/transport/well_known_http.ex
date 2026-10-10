@@ -7,17 +7,37 @@ defmodule FastestMCP.Transport.WellKnownHTTP do
   the path-derived root route when Phoenix forwards the MCP app under `/mcp`;
   that forward cannot receive `/.well-known/...` requests. A direct Plug mount
   may still provide the value explicitly. Unconfigured routes return `404`.
+
+  It takes `:server_name`, `:allowed_hosts`, `:base_url`, and `:cors`, as
+  `FastestMCP.Transport.HTTPApp` does, `:protected_resource`, and for its
+  listener child spec `:port`, `:scheme`, and `:bandit_options`. Any other
+  option raises `ArgumentError`.
   """
 
   import Plug.Conn
 
   alias FastestMCP.Auth.ProtectedResource
   alias FastestMCP.Error
-  alias FastestMCP.ServerRuntime
   alias FastestMCP.Transport.HTTPCommon
 
-  @doc "Builds a child specification for supervising this module."
+  @option_keys [
+    :server_name,
+    :allowed_hosts,
+    :base_url,
+    :cors,
+    :protected_resource,
+    :port,
+    :scheme,
+    :bandit_options
+  ]
+
+  @doc """
+  Returns a child spec that starts a Bandit listener serving this plug for
+  `:server_name`, on `:port` (default 4001) of the loopback interface unless
+  `:bandit_options` say otherwise.
+  """
   def child_spec(opts) do
+    opts = validate_options!(opts)
     server_name = Keyword.fetch!(opts, :server_name)
     port = Keyword.get(opts, :port, 4_001)
 
@@ -37,30 +57,40 @@ defmodule FastestMCP.Transport.WellKnownHTTP do
     }
   end
 
-  @doc "Initializes the state used by this module before it starts processing work."
+  @doc "Plug callback: validates the options, raising `ArgumentError` for invalid ones."
   def init(opts) when is_list(opts) do
-    opts = HTTPCommon.normalize_dns_rebinding_options!(opts)
+    opts = validate_options!(opts)
     protected_resource = normalize_protected_resource(Keyword.get(opts, :protected_resource))
 
     %{opts: opts, protected_resource: protected_resource}
   end
 
-  @doc "Runs the main entrypoint for this module."
+  @doc "Plug callback: serves the protected resource metadata routes."
   def call(conn, %{opts: opts, protected_resource: configured_resource}) do
-    protected_resource = configured_resource || runtime_protected_resource(opts)
+    conn = HTTPCommon.put_cors_headers(conn, opts)
 
     with :ok <- HTTPCommon.validate_dns_rebinding(conn, opts),
-         :ok <- HTTPCommon.reject_query_access_token(conn) do
+         :ok <- HTTPCommon.reject_query_access_token(conn),
+         nil <- HTTPCommon.answer_cors_preflight(conn),
+         {:ok, protected_resource} <- protected_resource(configured_resource, opts) do
       case dispatch(conn, opts, protected_resource) do
         {:handled, handled_conn} -> handled_conn
         :pass -> render_not_found(conn, opts)
       end
     else
+      %Plug.Conn{} = preflight -> preflight
       {:error, %Error{} = error} -> render_error(conn, opts, error)
     end
   end
 
   def call(conn, opts) when is_list(opts), do: call(conn, init(opts))
+
+  @doc false
+  def validate_options!(opts) when is_list(opts) do
+    opts
+    |> HTTPCommon.normalize_options!()
+    |> HTTPCommon.validate_keys!(@option_keys)
+  end
 
   @doc false
   def dispatch(conn, opts, %ProtectedResource{} = protected_resource) do
@@ -102,18 +132,33 @@ defmodule FastestMCP.Transport.WellKnownHTTP do
     )
   end
 
-  defp runtime_protected_resource(opts) do
-    with server_name when not is_nil(server_name) <- Keyword.get(opts, :server_name),
-         {:ok, %{server: %{protected_resource: %ProtectedResource{} = protected_resource}}} <-
-           ServerRuntime.fetch(server_name) do
-      protected_resource
-    else
-      _other -> nil
+  # The configured metadata, or the running server's, if it has any. A server
+  # that isn't running gets the 503 of the MCP route.
+  defp protected_resource(%ProtectedResource{} = configured, _opts), do: {:ok, configured}
+
+  defp protected_resource(nil, opts) do
+    case Keyword.get(opts, :server_name) do
+      nil ->
+        {:ok, nil}
+
+      server_name ->
+        with {:ok, runtime} <- HTTPCommon.fetch_running(server_name) do
+          {:ok, protected_resource_of(runtime.server)}
+        end
     end
   end
 
-  defp matches_resource_origin?(conn, opts, protected_resource) do
-    case HTTPCommon.mcp_resource_uri(conn, opts) do
+  defp protected_resource_of(%{protected_resource: %ProtectedResource{} = resource}),
+    do: resource
+
+  defp protected_resource_of(_server), do: nil
+
+  # The metadata is served on the origin (scheme, host, and port) of the
+  # resource; its path names the resource.
+  defp matches_resource_origin?(conn, opts, %ProtectedResource{} = protected_resource) do
+    path = URI.parse(protected_resource.resource).path
+
+    case HTTPCommon.resource_uri(conn, opts, path) do
       {:ok, resource_uri} -> ProtectedResource.matches_resource?(protected_resource, resource_uri)
       {:error, _reason} -> false
     end

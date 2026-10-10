@@ -32,18 +32,22 @@ defmodule FastestMCP.Tools.Result do
   ```
   """
 
+  import FastestMCP.Util, only: [maybe_put: 3, optional_map!: 2, string_keys: 1]
+
   defstruct content: nil,
             structured_content: nil,
             structured_content_present?: false,
             meta: nil,
-            is_error: nil
+            is_error: nil,
+            extra: %{}
 
   @type t :: %__MODULE__{
           content: any(),
           structured_content: any(),
           structured_content_present?: boolean(),
           meta: map() | nil,
-          is_error: boolean() | nil
+          is_error: boolean() | nil,
+          extra: map()
         }
 
   @doc "Builds a normalized tool result."
@@ -64,7 +68,7 @@ defmodule FastestMCP.Tools.Result do
       content: if(is_nil(content), do: structured_content, else: content),
       structured_content: structured_content,
       structured_content_present?: structured_content_present?,
-      meta: normalize_optional_map(Keyword.get(opts, :meta)),
+      meta: optional_map!(Keyword.get(opts, :meta), "tool result meta"),
       is_error: normalize_optional_boolean(Keyword.get(opts, :is_error))
     }
   end
@@ -72,44 +76,40 @@ defmodule FastestMCP.Tools.Result do
   @doc "Normalizes result-like values into `%FastestMCP.Tools.Result{}`."
   def from(%__MODULE__{} = result), do: result
 
+  # Application code gives envelopes with atom or string keys, in Elixir or
+  # MCP spelling.
   def from(%{} = value) do
-    structured_content_keys = [
-      :structured_content,
-      "structured_content",
-      :structuredContent,
-      "structuredContent"
-    ]
+    value = string_keys(value)
 
-    structured_content_key = Enum.find(structured_content_keys, &Map.has_key?(value, &1))
-
-    structured_content_opts =
-      if structured_content_key do
-        [structured_content: Map.get(value, structured_content_key)]
-      else
-        []
+    structured_content =
+      case Enum.find(["structured_content", "structuredContent"], &Map.has_key?(value, &1)) do
+        nil -> []
+        key -> [structured_content: value[key]]
       end
 
     new(
-      Map.get(value, :content, Map.get(value, "content")),
-      structured_content_opts ++
+      value["content"],
+      structured_content ++
         [
-          meta:
-            Map.get(
-              value,
-              :_meta,
-              Map.get(value, "_meta", Map.get(value, :meta, Map.get(value, "meta")))
-            ),
-          is_error:
-            Map.get(
-              value,
-              :is_error,
-              Map.get(value, "is_error", Map.get(value, :isError, Map.get(value, "isError")))
-            )
+          meta: Map.get(value, "_meta", value["meta"]),
+          is_error: Map.get(value, "is_error", value["isError"])
         ]
     )
   end
 
   def from(value), do: new(value)
+
+  @doc "Builds an explicit envelope from a validated, string-keyed MCP result."
+  def from_raw(%{} = raw) do
+    %__MODULE__{
+      content: Map.get(raw, "content", []),
+      structured_content: Map.get(raw, "structuredContent"),
+      structured_content_present?: Map.has_key?(raw, "structuredContent"),
+      meta: Map.get(raw, "_meta"),
+      is_error: Map.get(raw, "isError"),
+      extra: Map.drop(raw, ["content", "structuredContent", "isError"])
+    }
+  end
 
   @doc "Converts the helper struct into the normalized tool-result map used by the runtime."
   def to_map(%__MODULE__{} = result) do
@@ -118,13 +118,6 @@ defmodule FastestMCP.Tools.Result do
     |> maybe_put_structured_content(result)
     |> maybe_put(:meta, result.meta)
     |> maybe_put(:isError, result.is_error)
-  end
-
-  defp normalize_optional_map(nil), do: nil
-  defp normalize_optional_map(map) when is_map(map), do: Map.new(map)
-
-  defp normalize_optional_map(other) do
-    raise ArgumentError, "tool result meta must be a map, got #{inspect(other)}"
   end
 
   defp normalize_structured_content(nil), do: nil
@@ -136,9 +129,6 @@ defmodule FastestMCP.Tools.Result do
   defp normalize_optional_boolean(other) do
     raise ArgumentError, "tool result is_error must be a boolean, got #{inspect(other)}"
   end
-
-  defp maybe_put(map, _key, nil), do: map
-  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
   defp maybe_put_structured_content(map, %{structured_content_present?: true} = result),
     do: Map.put(map, :structuredContent, result.structured_content)

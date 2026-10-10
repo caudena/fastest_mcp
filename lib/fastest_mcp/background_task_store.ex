@@ -1,22 +1,13 @@
 defmodule FastestMCP.BackgroundTaskStore do
-  @moduledoc """
-  Tracks background-task execution, waiters, interaction relay, and notifications.
-
-  The storage split is intentional:
-
-      BackgroundTaskStore
-      -> runs task orchestration
-      -> owns waiters, monitors, and client-bridge relay
-      -> delegates persistence, expiry, and pagination to TaskBackend
-
-  That lets FastestMCP stay single-node OTP-first today without hard-coding the
-  storage model into the public API.
-  """
+  @moduledoc false
+  # Runs the background tasks of one server: task workers, waiters, client
+  # interactions, and notifications. Task records live in a `FastestMCP.TaskBackend`.
 
   use GenServer
+  import FastestMCP.Util, only: [maybe_put: 3]
+  import FastestMCP.Protocol.Version
 
   alias FastestMCP.BackgroundTask
-  alias FastestMCP.BackgroundTaskSupervisor
   alias FastestMCP.Component
   alias FastestMCP.Context
   alias FastestMCP.Elicitation
@@ -25,1159 +16,847 @@ defmodule FastestMCP.BackgroundTaskStore do
   alias FastestMCP.InputRequiredResult
   alias FastestMCP.Operation
   alias FastestMCP.Session
-  alias FastestMCP.TaskBackend.Memory, as: MemoryTaskBackend
-  alias FastestMCP.TaskId
+  alias FastestMCP.TaskBackend.Memory
   alias FastestMCP.TaskOwner
+  alias FastestMCP.TaskRecord
   alias FastestMCP.TaskWire
 
   @default_ttl_ms 60_000
-  @startup_reconciliation_page_size 500
 
-  @doc "Starts the process owned by this module."
-  def start_link(opts \\ []) do
-    GenServer.start_link(__MODULE__, opts, server_options(opts))
+  def start_link(opts), do: GenServer.start_link(__MODULE__, opts, Keyword.take(opts, [:name]))
+
+  def submit(store, component, %Operation{} = operation, executor) when is_function(executor, 1),
+    do: GenServer.call(store, {:submit, component, operation, executor})
+
+  def fetch(store, task_id, opts \\ []),
+    do: GenServer.call(store, {:fetch, to_string(task_id), opts})
+
+  # A legacy `tasks/result` request (`:request_metadata` with its session
+  # stream) also relays the task's pending client interaction.
+  def await(store, task_id, timeout \\ 5_000, opts \\ [])
+      when timeout == :infinity or (is_integer(timeout) and timeout >= 0),
+      do: GenServer.call(store, {:await, to_string(task_id), opts, timeout}, :infinity)
+
+  # Waits for the client's answer to `request`: a form elicitation from
+  # `FastestMCP.Elicitation.request/3` (`:elicitation`), or any other client
+  # request as `%{"method" => method, "params" => params}` (`:request`).
+  def interact(store, task_id, kind, request, timeout_ms)
+      when kind in [:elicitation, :request] and is_integer(timeout_ms) and timeout_ms >= 0 do
+    GenServer.call(
+      store,
+      {:interact, to_string(task_id), kind, request, timeout_ms},
+      timeout_ms + 100
+    )
   end
 
-  @doc "Submits a new background task for execution."
-  def submit(store, supervisor, component, %Operation{} = operation, executor, opts \\ [])
-      when (is_pid(store) or is_atom(store)) and (is_pid(supervisor) or is_atom(supervisor)) and
-             is_function(executor, 1) do
-    GenServer.call(store, {:submit, supervisor, component, operation, executor, opts})
-  end
+  def send_input(store, task_id, action, content, opts \\ []),
+    do: GenServer.call(store, {:send_input, to_string(task_id), action, content, opts})
 
-  @doc "Fetches the latest state managed by this module."
-  def fetch(store, task_id, opts \\ []) when is_pid(store) or is_atom(store) do
-    GenServer.call(store, {:fetch, to_string(task_id), opts})
-  end
+  def update(store, task_id, input_responses, opts \\ []) when is_map(input_responses),
+    do: GenServer.call(store, {:update, to_string(task_id), input_responses, opts})
 
-  @doc "Waits for completion and refreshes the current task state."
-  def await(store, task_id, timeout \\ 5_000, opts \\ []) when is_pid(store) or is_atom(store) do
-    _ = call_timeout(timeout)
-    GenServer.call(store, {:await, to_string(task_id), opts, timeout}, :infinity)
-  end
+  # Newest first.
+  def list(store, opts \\ []), do: GenServer.call(store, {:list, opts})
 
-  @doc "Returns the final task result, blocking until the task reaches a terminal status."
-  def result(store, task_id, opts \\ []) when is_pid(store) or is_atom(store) do
-    timeout = Keyword.get(opts, :timeout, 60_000)
-    _ = call_timeout(timeout)
-    GenServer.call(store, {:result, to_string(task_id), opts, timeout}, :infinity)
-  end
+  def cancel(store, task_id, opts \\ []),
+    do: GenServer.call(store, {:cancel, to_string(task_id), opts})
 
-  @doc "Requests interactive input for a background task."
-  def elicit(store, task_id, request, timeout \\ 60_000) when is_pid(store) or is_atom(store) do
-    GenServer.call(store, {:elicit, to_string(task_id), request}, call_timeout(timeout))
-  end
-
-  @doc "Requests client-side sampling for a background task."
-  def sample(store, task_id, params, timeout \\ 60_000) when is_pid(store) or is_atom(store) do
-    GenServer.call(store, {:sample, to_string(task_id), params, timeout}, call_timeout(timeout))
-  end
-
-  @doc "Sends interactive input back to a waiting background task."
-  def send_input(store, task_id, action, content, opts \\ [])
-      when is_pid(store) or is_atom(store) do
-    GenServer.call(store, {:send_input, to_string(task_id), action, content, opts})
-  end
-
-  @doc "Applies responses to input requests currently outstanding for a task."
-  def update(store, task_id, input_responses, opts \\ [])
-      when (is_pid(store) or is_atom(store)) and is_map(input_responses) do
-    GenServer.call(store, {:update, to_string(task_id), input_responses, opts})
-  end
-
-  @doc "Lists the values owned by this module."
-  def list(store, opts \\ []) when is_pid(store) or is_atom(store) do
-    GenServer.call(store, {:list, opts})
-  end
-
-  @doc "Cancels the identified background task."
-  def cancel(store, task_id, opts \\ []) when is_pid(store) or is_atom(store) do
-    GenServer.call(store, {:cancel, to_string(task_id), opts})
-  end
-
-  @doc "Records a progress update."
-  def report_progress(store, task_id, progress) when is_pid(store) or is_atom(store) do
-    GenServer.cast(store, {:progress, to_string(task_id), Map.new(progress)})
-  end
+  def report_progress(store, task_id, progress),
+    do: GenServer.cast(store, {:progress, to_string(task_id), Map.new(progress)})
 
   @impl true
   def init(opts) do
-    case task_backend_from_opts(opts) do
-      {:ok, backend} ->
-        state = %{
-          server_name: Keyword.fetch!(opts, :server_name),
-          event_bus: Keyword.get(opts, :event_bus, EventBus),
-          relay_task_supervisor: Keyword.get(opts, :relay_task_supervisor),
-          backend: backend,
-          mask_error_details: Keyword.get(opts, :mask_error_details, false),
-          task_monitors: %{},
-          waiter_monitors: %{},
-          waiters: %{},
-          result_waiters: %{},
-          interaction_waiters: %{},
-          relay_requests: %{},
-          session_task_activity: %{}
-        }
+    {backend, backend_opts} = Keyword.get(opts, :task_backend, {Memory, []})
 
-        with {:ok, _expired_ids} <-
-               backend(state).expire_tasks(store(state), System.system_time(:millisecond)),
-             :ok <- reconcile_runtime_tasks(state) do
-          {:ok, state}
-        else
-          {:error, reason} -> {:stop, {:task_backend_startup_failed, reason}}
-        end
+    state = %{
+      server_name: Keyword.fetch!(opts, :server_name),
+      event_bus: Keyword.get(opts, :event_bus, %EventBus{}),
+      supervisor: whereis(Keyword.get(opts, :task_supervisor)),
+      relay_supervisor: whereis(Keyword.get(opts, :relay_task_supervisor)),
+      mask_error_details: Keyword.get(opts, :mask_error_details, false),
+      backend: backend,
+      backend_state: nil,
+      # task id => %{pid, ref, session_id}: running workers and held sessions
+      running: %{},
+      # task id => [%{from, ref, timer, bridge}]: callers awaiting the outcome
+      waiters: %{},
+      # task id => the client interaction a task waits for
+      interactions: %{}
+    }
 
-      {:error, reason} ->
-        {:stop, {:task_backend_startup_failed, reason}}
+    with {:ok, backend_state} <- backend.init(backend_opts),
+         {:ok, state} <- reconcile(%{state | backend_state: backend_state}) do
+      {:ok, state}
+    else
+      {:error, reason} -> {:stop, {:task_backend_startup_failed, reason}}
     end
   end
 
   @impl true
-  def handle_call({:submit, supervisor, component, operation, executor, _opts}, _from, state) do
-    with_expired_tasks(state, fn state ->
-      task_id = TaskId.generate()
-      task_config = Map.get(component, :task)
-      poll_interval_ms = Map.get(task_config, :poll_interval_ms, 5_000)
-      submitted_at = System.system_time(:millisecond)
-      ttl_ms = operation.task_ttl_ms || @default_ttl_ms
+  def handle_call({:submit, component, operation, executor}, _from, state) do
+    task_id = "task-" <> Base.url_encode64(:crypto.strong_rand_bytes(16), padding: false)
+    submit_context = operation.context
+    poll_interval_ms = component.task.poll_interval_ms
 
-      background_context =
-        Context.for_background_task(
-          operation.context,
-          task_id,
-          task_store: self(),
-          poll_interval_ms: poll_interval_ms
-        )
+    context =
+      Context.for_background_task(submit_context, task_id,
+        task_store: self(),
+        poll_interval_ms: poll_interval_ms
+      )
 
-      background_operation = %{
-        operation
-        | context: background_context,
-          transport: background_context.transport,
-          task_request: false
-      }
+    operation = %{operation | context: context, transport: context.transport, task_request: false}
+    now = now()
 
-      store = self()
-      start_token = make_ref()
+    task = %TaskRecord{
+      id: task_id,
+      component_type: operation.component_type,
+      target: operation.target,
+      component_descriptor: component_descriptor(component),
+      session_id: context.session_id,
+      request_id: context.request_id,
+      origin_request_id: Context.origin_request_id(context),
+      transport: context.transport,
+      protocol_version: context.negotiated_protocol_version,
+      owner_fingerprint: TaskOwner.from_context(context),
+      poll_interval_ms: poll_interval_ms,
+      ttl_ms: operation.task_ttl_ms || @default_ttl_ms,
+      submitted_at: now,
+      updated_at: now
+    }
 
-      case BackgroundTaskSupervisor.start_task(supervisor, task_id, fn ->
-             receive do
-               {:run_background_task, ^start_token} ->
-                 run_task(store, task_id, executor, background_operation)
-             end
-           end) do
-        {:ok, pid} ->
-          monitor_ref = Process.monitor(pid)
+    store = self()
 
-          task = %{
-            id: task_id,
-            component_type: operation.component_type,
-            target: operation.target,
-            component_descriptor: component_descriptor(component),
-            status: :working,
-            session_id: background_context.session_id,
-            request_id: background_context.request_id,
-            origin_request_id: Context.origin_request_id(background_context),
-            transport: background_context.transport,
-            protocol_version: background_context.negotiated_protocol_version,
-            owner_fingerprint: TaskOwner.from_context(operation.context),
-            client_capabilities: operation.context.client_capabilities,
-            poll_interval_ms: poll_interval_ms,
-            ttl_ms: ttl_ms,
-            submitted_at: submitted_at,
-            updated_at: submitted_at,
-            completed_at: nil,
-            expires_at: nil,
-            progress: nil,
-            result: nil,
-            error: nil,
-            failure_message: nil,
-            terminal_outcome: nil,
-            elicitation: nil,
-            input_requests: %{},
-            answered_input_request_ids: MapSet.new(),
-            interaction_status_message: nil,
-            pid: pid,
-            monitor_ref: monitor_ref
-          }
+    # The worker runs once its record is stored.
+    case Task.Supervisor.start_child(state.supervisor, fn ->
+           receive do
+             :run -> run(store, task_id, executor, operation)
+           end
+         end) do
+      {:ok, pid} ->
+        ref = Process.monitor(pid, tag: {:worker_down, task_id})
 
-          case put_task(state, task) do
-            :ok ->
-              send(pid, {:run_background_task, start_token})
+        case put_task(state, task) do
+          {:ok, state} ->
+            send(pid, :run)
+            worker = %{pid: pid, ref: ref, session_id: hold_session(state, task, submit_context)}
+            emit(state, task, "Task submitted")
+            {:reply, {:ok, handle(operation, task)}, put_in(state.running[task_id], worker)}
 
-              handle = %BackgroundTask{
-                server_name: operation.server_name,
-                task_id: task_id,
-                owner_fingerprint: task.owner_fingerprint,
-                component_type: operation.component_type,
-                target: operation.target,
-                poll_interval_ms: poll_interval_ms,
-                ttl_ms: ttl_ms,
-                submitted_at: submitted_at
-              }
+          {:error, reason, state} ->
+            Process.demonitor(ref, [:flush])
+            Process.exit(pid, :kill)
+            rollback(state, task_id, reason)
+        end
 
-              next_state =
-                %{
-                  state
-                  | task_monitors:
-                      put_task_monitor(state.task_monitors, task_id, pid, monitor_ref)
-                }
-                |> hold_session_for_task(task, operation.context)
+      {:error, :max_children} ->
+        {:reply, {:error, :overloaded}, state}
 
-              emit_status_notification(next_state, task, "working", "Task submitted")
-
-              {:reply, {:ok, handle}, next_state}
-
-            {:error, reason} ->
-              Process.demonitor(monitor_ref, [:flush])
-              Process.exit(pid, :kill)
-
-              {:reply, {:error, rollback_failed_submission(state, task_id, reason)}, state}
-          end
-
-        {:error, :overloaded} ->
-          {:reply, {:error, :overloaded}, state}
-
-        {:error, reason} ->
-          {:reply, {:error, reason}, state}
-      end
-    end)
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
   end
 
-  def handle_call({:fetch, task_id, opts}, _from, state) do
-    with_expired_tasks(state, fn state ->
-      case fetch_task(state, task_id, opts) do
-        {:ok, task} ->
-          {:reply, {:ok, public_task(task)}, state}
-
-        {:error, :not_found} ->
-          {:reply, {:error, :not_found}, state}
-
-        {:error, reason} ->
-          {:reply, {:error, reason}, fail_task_orchestration(state, task_id, reason)}
-      end
-    end)
-  end
+  def handle_call({:fetch, task_id, opts}, _from, state),
+    do: state |> with_task(task_id, opts, &{:ok, &1, state}) |> reply()
 
   def handle_call({:await, task_id, opts, timeout}, from, state) do
-    with_expired_tasks(state, fn state ->
-      case fetch_task(state, task_id, opts) do
-        {:ok, %{status: status} = task} when status in [:completed, :failed, :cancelled] ->
-          {:reply, await_reply(task), state}
-
-        {:ok, _task} ->
-          {:noreply, add_waiter(state, :waiters, task_id, from, timeout)}
-
-        {:error, :not_found} ->
-          {:reply, {:error, :not_found}, state}
-
-        {:error, reason} ->
-          {:reply, {:error, reason}, fail_task_orchestration(state, task_id, reason)}
+    state
+    |> with_task(task_id, opts, fn task ->
+      if TaskRecord.terminal?(task) do
+        {status, value} = TaskRecord.outcome(task)
+        {status, value, state}
+      else
+        {:noreply, state |> add_waiter(task_id, from, timeout, opts) |> start_relay(task_id)}
       end
     end)
+    |> reply()
   end
 
-  def handle_call({:result, task_id, opts, timeout}, from, state) do
-    with_expired_tasks(state, fn state ->
-      case fetch_task(state, task_id, opts) do
-        {:ok, %{status: status} = task} when status in [:completed, :failed, :cancelled] ->
-          {:reply, await_reply(task), state}
+  def handle_call({:interact, task_id, kind, request, timeout_ms}, from, state) do
+    state
+    |> with_task(task_id, [], fn task ->
+      if Map.has_key?(state.interactions, task_id) do
+        {:error, bad_request("background task is already waiting for input"), state}
+      else
+        interaction = interaction(kind, request, from, task_id, timeout_ms)
 
-        {:ok, task} ->
-          next_state =
-            add_waiter(state, :result_waiters, task_id, from, timeout, %{
-              bridge: bridge_from_opts(opts)
-            })
+        task =
+          TaskRecord.input_required(
+            task,
+            %{
+              interaction.request_id => %{
+                "method" => interaction.method,
+                "params" => interaction.params
+              }
+            },
+            interaction.elicitation,
+            now()
+          )
 
-          {:noreply, maybe_start_interaction_relay(next_state, task)}
+        with {:ok, state} <- put_task(state, task) do
+          emit(state, task, interaction.message)
 
-        {:error, :not_found} ->
-          {:reply, {:error, :not_found}, state}
-
-        {:error, reason} ->
-          {:reply, {:error, reason}, fail_task_orchestration(state, task_id, reason)}
+          {:noreply,
+           state |> put_in([:interactions, task_id], interaction) |> start_relay(task_id)}
+        end
       end
     end)
-  end
-
-  def handle_call({:elicit, task_id, request}, from, state) do
-    with_expired_tasks(state, fn state ->
-      case fetch_task(state, task_id, []) do
-        {:ok, task} ->
-          case ensure_not_waiting_for_interaction(state, task_id) do
-            :ok ->
-              updated_task =
-                task
-                |> Map.put(:status, :input_required)
-                |> Map.put(:updated_at, System.system_time(:millisecond))
-                |> Map.put(:elicitation, %{
-                  request_id: request.request_id,
-                  message: request.message,
-                  requested_schema: request.requested_schema
-                })
-                |> Map.put(:input_requests, %{
-                  request.request_id => %{
-                    "method" => "elicitation/create",
-                    "params" => %{
-                      "message" => request.message,
-                      "requestedSchema" => request.requested_schema
-                    }
-                  }
-                })
-
-              case put_task(state, updated_task) do
-                :ok ->
-                  next_state =
-                    add_interaction_waiter(
-                      state,
-                      task_id,
-                      from,
-                      request.timeout_ms,
-                      request.request_id,
-                      %{
-                        type: :elicitation,
-                        request: request,
-                        relay_request_id: nil,
-                        relay_waiter_ref: nil,
-                        relay_method: "elicitation/create",
-                        relay_params: %{
-                          "message" => request.message,
-                          "requestedSchema" => request.requested_schema
-                        }
-                      }
-                    )
-
-                  emit_status_notification(
-                    next_state,
-                    updated_task,
-                    "input_required",
-                    request.message
-                  )
-
-                  {:noreply, maybe_start_interaction_relay(next_state, updated_task)}
-
-                {:error, reason} ->
-                  {:reply, {:error, reason}, fail_task_orchestration(state, task_id, reason)}
-              end
-
-            {:error, %Error{} = error} ->
-              {:reply, {:error, error}, state}
-          end
-
-        {:error, :not_found} ->
-          {:reply, {:error, :not_found}, state}
-
-        {:error, reason} ->
-          {:reply, {:error, reason}, fail_task_orchestration(state, task_id, reason)}
-      end
-    end)
-  end
-
-  def handle_call({:sample, task_id, params, timeout_ms}, from, state) do
-    with_expired_tasks(state, fn state ->
-      request_id = "sampling-" <> Integer.to_string(System.unique_integer([:positive]))
-
-      case fetch_task(state, task_id, []) do
-        {:ok, task} ->
-          case ensure_not_waiting_for_interaction(state, task_id) do
-            :ok ->
-              updated_task =
-                task
-                |> Map.put(:status, :input_required)
-                |> Map.put(:updated_at, System.system_time(:millisecond))
-                |> Map.put(:interaction_status_message, "Waiting for client sampling")
-                |> Map.put(:input_requests, %{
-                  request_id => %{"method" => "sampling/createMessage", "params" => params}
-                })
-
-              case put_task(state, updated_task) do
-                :ok ->
-                  next_state =
-                    add_interaction_waiter(state, task_id, from, timeout_ms, request_id, %{
-                      type: :sampling,
-                      request: params,
-                      relay_request_id: nil,
-                      relay_waiter_ref: nil,
-                      relay_method: "sampling/createMessage",
-                      relay_params: params
-                    })
-
-                  emit_status_notification(
-                    next_state,
-                    updated_task,
-                    "input_required",
-                    "Waiting for client sampling"
-                  )
-
-                  {:noreply, maybe_start_interaction_relay(next_state, updated_task)}
-
-                {:error, reason} ->
-                  {:reply, {:error, reason}, fail_task_orchestration(state, task_id, reason)}
-              end
-
-            {:error, %Error{} = error} ->
-              {:reply, {:error, error}, state}
-          end
-
-        {:error, :not_found} ->
-          {:reply, {:error, :not_found}, state}
-
-        {:error, reason} ->
-          {:reply, {:error, reason}, fail_task_orchestration(state, task_id, reason)}
-      end
-    end)
+    |> reply()
   end
 
   def handle_call({:send_input, task_id, action, content, opts}, _from, state) do
-    with_expired_tasks(state, fn state ->
-      case fetch_task(state, task_id, opts) do
-        {:ok, task} ->
-          with {:ok, waiter} <- fetch_interaction_waiter(state, task_id),
-               :ok <- ensure_elicitation_waiter(waiter),
-               :ok <- validate_request_id(opts, waiter),
-               {:ok, elicitation_result} <- Elicitation.resolve(waiter.request, action, content) do
-            case resolve_interaction(state, task, task_id, {:ok, elicitation_result}) do
-              {:ok, next_state, resumed_task} ->
-                emit_status_notification(next_state, resumed_task, "working", nil)
-                {:reply, {:ok, public_task(resumed_task)}, next_state}
+    state
+    |> with_task(task_id, opts, fn task ->
+      request_id = opts[:request_id] && to_string(opts[:request_id])
 
-              {:error, reason, next_state} ->
-                {:reply, {:error, reason}, next_state}
-            end
-          else
-            {:error, :not_waiting} ->
-              {:reply,
-               {:error,
-                %Error{
-                  code: :bad_request,
-                  message: "background task is not waiting for input"
-                }}, state}
+      case state.interactions[task_id] do
+        %{kind: :elicitation} = interaction when request_id in [nil, interaction.request_id] ->
+          answer(state, task, interaction, %{"action" => action, "content" => content})
 
-            {:error, %Error{} = error} ->
-              {:reply, {:error, error}, state}
-          end
+        %{kind: :elicitation} ->
+          error = bad_request("elicitation request_id does not match the pending request")
+          {:error, %{error | details: %{request_id: request_id}}, state}
 
-        {:error, :not_found} ->
-          {:reply, {:error, :not_found}, state}
+        _other when task.input_requests == %{} ->
+          {:error, bad_request("background task is not waiting for input"), state}
 
-        {:error, reason} ->
-          {:reply, {:error, reason}, fail_task_orchestration(state, task_id, reason)}
+        _other ->
+          methods = task.input_requests |> Map.values() |> Enum.map(& &1["method"]) |> Enum.uniq()
+
+          error =
+            bad_request(
+              "background task waits for #{Enum.join(methods, ", ")}, which " <>
+                "send_task_input/5 cannot answer; answer it with FastestMCP.update_task/4"
+            )
+
+          {:error, %{error | details: %{input_requests: Map.keys(task.input_requests)}}, state}
       end
     end)
+    |> reply()
   end
 
   def handle_call({:update, task_id, input_responses, opts}, _from, state) do
-    with_expired_tasks(state, fn state ->
-      case fetch_task(state, task_id, opts) do
-        {:ok, task} ->
-          apply_task_input_responses(state, task, task_id, input_responses)
+    state
+    |> with_task(task_id, opts, fn task ->
+      responses =
+        input_responses
+        |> Map.new(fn {key, value} -> {to_string(key), value} end)
+        |> Map.take(Map.keys(task.input_requests))
 
-        {:error, :not_found} ->
-          {:reply, {:error, :not_found}, state}
+      interaction = state.interactions[task_id]
+      worker = state.running[task_id]
 
-        {:error, reason} ->
-          {:reply, {:error, reason}, fail_task_orchestration(state, task_id, reason)}
+      cond do
+        responses == %{} ->
+          {:ok, task, state}
+
+        interaction ->
+          case Map.fetch(responses, interaction.request_id) do
+            {:ok, response} -> answer(state, task, interaction, response)
+            :error -> {:ok, task, state}
+          end
+
+        # A handler that returned an `InputRequiredResult` waits for the answers.
+        worker && Process.alive?(worker.pid) ->
+          task = TaskRecord.resume(task, Map.keys(responses), now())
+
+          with {:ok, state} <- put_task(state, task) do
+            send(worker.pid, {:resume, responses})
+            emit(state, task)
+            {:ok, task, state}
+          end
+
+        true ->
+          {:error, Error.internal("background task cannot resume its outstanding input requests"),
+           state}
       end
     end)
+    |> reply()
   end
 
   def handle_call({:list, opts}, _from, state) do
-    with_expired_tasks(state, fn state ->
-      case backend(state).list_tasks(store(state), opts) do
-        {:ok, %{tasks: tasks, next_cursor: next_cursor}} ->
-          {:reply, {:ok, %{tasks: Enum.map(tasks, &public_task/1), next_cursor: next_cursor}},
-           state}
+    case state.backend.list_tasks(state.backend_state) do
+      {:ok, tasks} ->
+        now = now()
 
-        {:error, %Error{code: :bad_request} = error} ->
-          {:reply, {:error, error}, state}
+        tasks =
+          tasks
+          |> Enum.filter(&(TaskRecord.visible?(&1, opts) and not TaskRecord.expired?(&1, now)))
+          |> Enum.sort_by(&{-&1.submitted_at, &1.id})
 
-        {:error, reason} ->
-          {:reply, {:error, reason}, fail_all_task_orchestration(state, reason)}
-      end
-    end)
+        {:reply, {:ok, tasks}, state}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, fail_all(state, reason)}
+    end
   end
 
   def handle_call({:cancel, task_id, opts}, _from, state) do
-    with_expired_tasks(state, fn state ->
-      case fetch_task(state, task_id, opts) do
-        {:ok, %{status: status}} when status in [:completed, :failed, :cancelled] ->
-          error =
-            %Error{
-              code: :bad_request,
-              message: "background task is already in a terminal status",
-              details: %{status: status}
-            }
-
-          {:reply, {:error, error}, state}
-
-        {:ok, task} ->
-          now = System.system_time(:millisecond)
-
-          cancelled =
-            task
-            |> Map.put(:status, :cancelled)
-            |> Map.put(:error, %Error{code: :cancelled, message: "background task was cancelled"})
-            |> Map.put(:failure_message, "Task cancelled")
-            |> Map.put(:terminal_outcome, :cancelled)
-            |> Map.put(:updated_at, now)
-            |> Map.put(:completed_at, now)
-            |> Map.put(:expires_at, now + task.ttl_ms)
-            |> Map.put(:pid, nil)
-            |> Map.put(:monitor_ref, nil)
-            |> Map.put(:elicitation, nil)
-            |> Map.put(:input_requests, %{})
-            |> Map.put(:interaction_status_message, nil)
-
-          case put_task(state, cancelled) do
-            :ok ->
-              state = drop_interaction_waiter(state, task_id, {:ok, %Elicitation.Cancelled{}})
-              if task.monitor_ref, do: Process.demonitor(task.monitor_ref, [:flush])
-              if task.pid && Process.alive?(task.pid), do: Process.exit(task.pid, :kill)
-
-              next_state =
-                state
-                |> reply_waiters(task_id, await_reply(cancelled))
-                |> Map.update!(:task_monitors, &drop_task_monitor(&1, task.monitor_ref))
-
-              emit_status_notification(next_state, cancelled, "cancelled", "Task cancelled")
-
-              {:reply, {:ok, public_task(cancelled)}, release_session_task(next_state, task_id)}
-
-            {:error, reason} ->
-              {:reply, {:error, reason}, fail_task_orchestration(state, task_id, reason)}
-          end
-
-        {:error, :not_found} ->
-          {:reply, {:error, :not_found}, state}
-
-        {:error, reason} ->
-          {:reply, {:error, reason}, fail_task_orchestration(state, task_id, reason)}
+    state
+    |> with_task(task_id, opts, fn task ->
+      if TaskRecord.terminal?(task) do
+        {:error,
+         %{
+           bad_request("background task is already in a terminal status")
+           | details: %{status: task.status}
+         }, state}
+      else
+        finish(state, TaskRecord.cancel(task, now()), true)
       end
     end)
+    |> reply()
   end
 
   @impl true
   def handle_cast({:progress, task_id, progress}, state) do
-    case fetch_task(state, task_id, []) do
-      {:ok, %{status: status}} when status in [:completed, :failed, :cancelled] ->
-        {:noreply, state}
+    state
+    |> with_active_task(task_id, fn task ->
+      task = TaskRecord.progress(task, progress, now())
 
-      {:ok, task} ->
-        updated_task =
-          task
-          |> Map.put(:progress, progress)
-          |> Map.put(:updated_at, System.system_time(:millisecond))
+      with {:ok, state} <- put_task(state, task) do
+        if is_binary(progress[:message]) and progress[:message] != "",
+          do: emit(state, task, progress[:message])
 
-        case put_task(state, updated_task) do
-          :ok ->
-            case progress[:message] || progress["message"] do
-              status_message when is_binary(status_message) and status_message != "" ->
-                emit_status_notification(state, updated_task, "working", status_message)
-
-              _other ->
-                :ok
-            end
-
-            {:noreply, state}
-
-          {:error, reason} ->
-            {:noreply, fail_task_orchestration(state, task_id, reason)}
-        end
-
-      {:error, :not_found} ->
-        {:noreply, state}
-
-      {:error, reason} ->
-        {:noreply, fail_task_orchestration(state, task_id, reason)}
-    end
+        {:ok, task, state}
+      end
+    end)
+    |> noreply()
   end
 
   @impl true
-  def handle_info({:task_result, task_id, component_type, {:ok, result}}, state) do
-    {status, terminal_outcome, failure_message} =
-      classify_successful_result(state, task_id, component_type, result)
+  def handle_info({:task_result, task_id, result}, state) do
+    state
+    |> with_active_task(task_id, fn task ->
+      task =
+        case result do
+          {:ok, value} -> TaskRecord.complete(task, value, now())
+          {:error, %Error{} = error} -> TaskRecord.fail(task, error, now())
+        end
 
-    {:noreply,
-     complete_task(state, task_id, status, result, nil, terminal_outcome, failure_message)}
+      finish(state, task)
+    end)
+    |> noreply()
   end
 
   def handle_info({:task_input_required, task_id, %InputRequiredResult{} = result}, state) do
-    case fetch_task(state, task_id, []) do
-      {:ok, %{status: status}} when status in [:completed, :failed, :cancelled] ->
-        {:noreply, state}
+    state
+    |> with_active_task(task_id, fn task ->
+      case TaskRecord.reused_input_request_ids(task, result.input_requests) do
+        [] ->
+          task = TaskRecord.input_required(task, result.input_requests, nil, now())
 
-      {:ok, task} ->
-        input_requests = result.input_requests || %{}
+          with {:ok, state} <- put_task(state, task) do
+            emit(state, task, "Waiting for task input")
+            {:ok, task, state}
+          end
 
-        case validate_new_input_request_ids(task, input_requests) do
-          :ok ->
-            updated_task =
-              task
-              |> Map.put(:status, :input_required)
-              |> Map.put(:updated_at, System.system_time(:millisecond))
-              |> Map.put(:input_requests, input_requests)
-              |> Map.put(:interaction_status_message, "Waiting for task input")
-
-            case put_task(state, updated_task) do
-              :ok ->
-                emit_status_notification(
-                  state,
-                  updated_task,
-                  "input_required",
-                  "Waiting for task input"
-                )
-
-                {:noreply, state}
-
-              {:error, reason} ->
-                {:noreply, fail_task_orchestration(state, task_id, reason)}
-            end
-
-          {:error, %Error{} = error} ->
-            {:noreply,
-             complete_task(state, task_id, :failed, nil, error, :request_error, error.message)}
-        end
-
-      {:error, :not_found} ->
-        {:noreply, state}
-
-      {:error, reason} ->
-        {:noreply, fail_task_orchestration(state, task_id, reason)}
-    end
-  end
-
-  def handle_info({:task_result, task_id, _component_type, {:error, %Error{} = error}}, state) do
-    {:noreply, complete_task(state, task_id, :failed, nil, error, :request_error, error.message)}
-  end
-
-  def handle_info({:waiter_timeout, collection, task_id, ref}, state)
-      when collection in [:waiters, :result_waiters] do
-    error =
-      %Error{
-        code: :timeout,
-        message: "timed out waiting for background task #{inspect(task_id)}"
-      }
-
-    next_state = remove_waiter(state, collection, task_id, ref, {:error, error})
-    {:noreply, maybe_reset_interaction_relay(next_state, collection, task_id, ref)}
-  end
-
-  def handle_info({:interaction_timeout, task_id, request_id, waiter_ref}, state) do
-    case Map.get(state.interaction_waiters, task_id) do
-      %{request_id: ^request_id, ref: ^waiter_ref, type: :elicitation} ->
-        case fetch_task(state, task_id, []) do
-          {:ok, task} ->
-            case resolve_interaction(state, task, task_id, {:ok, %Elicitation.Cancelled{}}) do
-              {:ok, next_state, resumed_task} ->
-                emit_status_notification(next_state, resumed_task, "working", nil)
-                {:noreply, next_state}
-
-              {:error, _reason, next_state} ->
-                {:noreply, next_state}
-            end
-
-          {:error, reason} ->
-            {:noreply, fail_task_orchestration(state, task_id, reason)}
-        end
-
-      %{request_id: ^request_id, ref: ^waiter_ref, type: :sampling} ->
-        error =
-          %Error{
-            code: :timeout,
-            message: "sampling/createMessage timed out",
-            details: %{timeout_ms: interaction_timeout(state, task_id)}
+        reused ->
+          error = %Error{
+            code: :invalid_params,
+            message: "background task reused an input request identifier",
+            details: %{request_ids: reused}
           }
 
-        case fetch_task(state, task_id, []) do
-          {:ok, task} ->
-            case resolve_interaction(state, task, task_id, {:error, error}) do
-              {:ok, next_state, resumed_task} ->
-                emit_status_notification(next_state, resumed_task, "working", nil)
-                {:noreply, next_state}
+          finish(state, TaskRecord.fail(task, error, now()))
+      end
+    end)
+    |> noreply()
+  end
 
-              {:error, _reason, next_state} ->
-                {:noreply, next_state}
-            end
+  def handle_info({:waiter_timeout, task_id, ref}, state) do
+    error = %Error{
+      code: :timeout,
+      message: "timed out waiting for background task #{inspect(task_id)}"
+    }
 
-          {:error, reason} ->
-            {:noreply, fail_task_orchestration(state, task_id, reason)}
-        end
+    {:noreply,
+     state |> remove_waiter(task_id, ref, {:error, error}) |> restart_relay(task_id, ref)}
+  end
+
+  def handle_info({{:waiter_down, task_id}, ref, :process, _pid, _reason}, state),
+    do: {:noreply, state |> remove_waiter(task_id, ref, nil) |> restart_relay(task_id, ref)}
+
+  # An unanswered elicitation is cancelled; any other request fails.
+  def handle_info({:interaction_timeout, task_id, ref}, state) do
+    case state.interactions[task_id] do
+      %{ref: ^ref, kind: :elicitation} = interaction ->
+        answered(state, task_id, interaction, {:ok, %Elicitation.Cancelled{}})
+
+      %{ref: ^ref} = interaction ->
+        error = %{
+          Error.timeout(interaction.method)
+          | details: %{timeout_ms: interaction.timeout_ms}
+        }
+
+        answered(state, task_id, interaction, {:error, error})
 
       _other ->
         {:noreply, state}
     end
   end
 
-  def handle_info({relay_request_id, response}, state) when is_reference(relay_request_id) do
-    case pop_relay_request(state, relay_request_id, terminate?: false) do
-      {nil, _relay_requests} ->
-        {:noreply, state}
+  def handle_info({{:worker_down, task_id}, _ref, :process, _pid, reason}, state) do
+    state
+    |> stop_worker(task_id, false)
+    |> with_active_task(task_id, fn task ->
+      error = %Error{
+        code: :component_crash,
+        message: "background task #{inspect(task_id)} exited: #{Exception.format_exit(reason)}",
+        exposure: exposure(task)
+      }
 
-      {%{task_id: task_id}, state} ->
-        case {Map.get(state.interaction_waiters, task_id), fetch_task(state, task_id, [])} do
-          {%{relay_request_id: ^relay_request_id, type: :elicitation} = waiter, {:ok, task}} ->
-            resolved =
-              case response do
-                {:ok, params} ->
-                  Elicitation.resolve(
-                    waiter.request,
-                    Map.get(params, "action"),
-                    Map.get(params, "content")
-                  )
+      finish(state, TaskRecord.fail(task, error, now()))
+    end)
+    |> noreply()
+  end
 
-                {:error, %Error{} = error} ->
-                  {:error, error}
-              end
-
-            finish_interaction_resolution(state, task, task_id, resolved)
-
-          {%{relay_request_id: ^relay_request_id, type: :sampling}, {:ok, task}} ->
-            resolved =
-              case response do
-                {:ok, result} -> {:ok, result}
-                {:error, %Error{} = error} -> {:error, error}
-              end
-
-            finish_interaction_resolution(state, task, task_id, resolved)
-
-          {_waiter, {:error, reason}} ->
-            {:noreply, fail_task_orchestration(state, task_id, reason)}
-
-          _other ->
-            {:noreply, state}
-        end
+  # Reads skip an expired task until its timer deletes it; a record the
+  # backend cannot delete stays hidden.
+  def handle_info({:expire, task_id}, state) do
+    case delete_task(state, task_id) do
+      {:ok, state} -> {:noreply, state}
+      {:error, _reason} -> {:noreply, state}
     end
   end
 
-  def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
-    case Map.fetch(state.relay_requests, ref) do
-      {:ok, %{task_id: task_id}} ->
-        {_relay, state} = pop_relay_request(state, ref, demonitor?: false, terminate?: false)
-        relay_error = relay_error({:worker_exit, reason})
-
-        case {Map.get(state.interaction_waiters, task_id), fetch_task(state, task_id, [])} do
-          {%{relay_request_id: ^ref}, {:ok, task}} ->
-            finish_interaction_resolution(state, task, task_id, {:error, relay_error})
-
-          {_waiter, {:error, fetch_reason}} ->
-            {:noreply, fail_task_orchestration(state, task_id, fetch_reason)}
-
-          _other ->
-            {:noreply, state}
-        end
-
-      :error ->
-        case Map.pop(state.task_monitors, ref) do
-          {nil, _task_monitors} ->
-            handle_waiter_down(ref, state)
-
-          {{task_id, _task_pid}, task_monitors} ->
-            state = %{state | task_monitors: task_monitors}
-
-            case fetch_task(state, task_id, []) do
-              {:ok, %{status: status}} when status in [:completed, :failed, :cancelled] ->
-                {:noreply, release_session_task(state, task_id)}
-
-              {:ok, task} ->
-                error =
-                  %Error{
-                    code: :component_crash,
-                    message:
-                      "background task #{inspect(task_id)} exited: #{Exception.format_exit(reason)}",
-                    exposure: %{
-                      mask_error_details: true,
-                      component_type: task.component_type,
-                      identifier: task.target
-                    }
-                  }
-
-                state = drop_interaction_waiter(state, task_id, {:error, error})
-
-                {:noreply,
-                 complete_task(
-                   state,
-                   task_id,
-                   :failed,
-                   nil,
-                   error,
-                   :request_error,
-                   error.message
-                 )}
-
-              {:error, fetch_reason} ->
-                {:noreply, fail_task_orchestration(state, task_id, fetch_reason)}
-            end
-        end
-    end
+  # Relays run under `Task.Supervisor.async_nolink/2`.
+  def handle_info({ref, response}, state) when is_reference(ref) do
+    Process.demonitor(ref, [:flush])
+    relay_done(state, ref, response)
   end
 
-  defp run_task(store, task_id, executor, %Operation{} = operation) do
+  def handle_info({:DOWN, ref, :process, _pid, reason}, state),
+    do: relay_done(state, ref, {:error, relay_error({:worker_exit, reason})})
+
+  defp run(store, task_id, executor, %Operation{context: context} = operation) do
     started_at = System.monotonic_time()
-
-    Context.emit(
-      operation.context,
-      [:task, :start],
-      %{system_time: System.system_time()},
-      task_metadata(operation.context)
-    )
-
-    result =
-      Context.with_request(operation.context, fn ->
-        try do
-          {:ok, executor.(operation)}
-        rescue
-          error in Error ->
-            {:error, error}
-
-          error ->
-            {:error,
-             %Error{
-               code: :internal_error,
-               message: "background task failed: #{Exception.message(error)}",
-               details: %{kind: inspect(error.__struct__)},
-               exposure: task_error_exposure(operation)
-             }}
-        catch
-          :exit, reason ->
-            {:error,
-             %Error{
-               code: :component_crash,
-               message: "background task exited: #{Exception.format_exit(reason)}",
-               exposure: task_error_exposure(operation)
-             }}
-
-          kind, reason ->
-            {:error,
-             %Error{
-               code: :component_crash,
-               message: "background task failed with #{kind}: #{inspect(reason)}",
-               exposure: task_error_exposure(operation)
-             }}
-        end
-      end)
+    metadata = telemetry_metadata(context)
+    Context.emit(context, [:task, :start], %{system_time: System.system_time()}, metadata)
+    result = Context.with_request(context, fn -> execute(executor, operation) end)
+    duration = %{duration: System.monotonic_time() - started_at}
 
     case result do
       {:ok, _value} ->
-        Context.emit(
-          operation.context,
-          [:task, :stop],
-          %{duration: System.monotonic_time() - started_at},
-          task_metadata(operation.context)
-        )
+        Context.emit(context, [:task, :stop], duration, metadata)
 
-      {:error, %Error{} = error} ->
+      {:error, error} ->
         Context.emit(
-          operation.context,
+          context,
           [:task, :exception],
-          %{duration: System.monotonic_time() - started_at},
-          Map.merge(task_metadata(operation.context), %{
-            code: error.code,
-            error: Exception.message(error)
-          })
+          duration,
+          Map.merge(metadata, %{code: error.code, error: Exception.message(error)})
         )
     end
 
     case result do
-      {:ok, %InputRequiredResult{input_requests: requests} = input_required}
-      when is_map(requests) and map_size(requests) > 0 ->
-        case InputRequiredResult.validate_client_capabilities(
-               input_required,
-               operation.context.client_capabilities
-             ) do
-          :ok ->
-            send(store, {:task_input_required, task_id, input_required})
+      {:ok, %InputRequiredResult{} = input_required} ->
+        await_input(store, task_id, executor, operation, input_required)
 
-            receive do
-              {:resume_background_task, input_responses} when is_map(input_responses) ->
-                context = %{
-                  operation.context
-                  | input_responses:
-                      Map.merge(operation.context.input_responses, input_responses),
-                    request_state: input_required.request_state
-                }
+      result ->
+        send(store, {:task_result, task_id, result})
+    end
+  end
 
-                run_task(store, task_id, executor, %{operation | context: context})
-            end
+  # A handler that needs input returns an `InputRequiredResult`; it runs again
+  # with the answers, which it waits for up to the result's timeout. A
+  # 2025-11-25 client has no way to answer one.
+  defp await_input(store, task_id, executor, operation, %InputRequiredResult{} = input_required) do
+    with :ok <- answerable(operation),
+         true <- is_map(input_required.input_requests) and input_required.input_requests != %{},
+         :ok <-
+           InputRequiredResult.validate_client_capabilities(
+             input_required,
+             operation.context.client_capabilities
+           ) do
+      send(store, {:task_input_required, task_id, input_required})
 
-          {:error, %Error{} = error} ->
-            send(store, {:task_result, task_id, operation.component_type, {:error, error}})
-            :ok
-        end
+      receive do
+        {:resume, responses} ->
+          context = %{
+            operation.context
+            | input_responses: Map.merge(operation.context.input_responses, responses),
+              request_state: input_required.request_state
+          }
 
-      {:ok, %InputRequiredResult{}} ->
+          run(store, task_id, executor, %{operation | context: context})
+      after
+        input_required.timeout_ms ->
+          error = %{
+            Error.timeout("background task input")
+            | details: %{timeout_ms: input_required.timeout_ms}
+          }
+
+          send(store, {:task_result, task_id, {:error, error}})
+      end
+    else
+      false ->
         error = %Error{
           code: :invalid_params,
           message: "background task input_required result must include inputRequests"
         }
 
-        send(store, {:task_result, task_id, operation.component_type, {:error, error}})
-        :ok
+        send(store, {:task_result, task_id, {:error, error}})
 
-      _terminal ->
-        send(store, {:task_result, task_id, operation.component_type, result})
-        :ok
+      {:error, %Error{} = error} ->
+        send(store, {:task_result, task_id, {:error, error}})
     end
   end
 
-  defp complete_task(state, task_id, status, result, error, terminal_outcome, failure_message) do
-    case fetch_task(state, task_id, []) do
-      {:ok, %{status: terminal_status}}
-      when terminal_status in [:completed, :failed, :cancelled] ->
-        state
-
-      {:ok, task} ->
-        completed_at = System.system_time(:millisecond)
-
-        updated_task =
-          task
-          |> Map.put(:status, status)
-          |> Map.put(:result, result)
-          |> Map.put(:error, error)
-          |> Map.put(:failure_message, failure_message)
-          |> Map.put(:terminal_outcome, terminal_outcome)
-          |> Map.put(:completed_at, completed_at)
-          |> Map.put(:updated_at, completed_at)
-          |> Map.put(:expires_at, completed_at + task.ttl_ms)
-          |> Map.put(:pid, nil)
-          |> Map.put(:monitor_ref, nil)
-          |> Map.put(:elicitation, nil)
-          |> Map.put(:input_requests, %{})
-          |> Map.put(:interaction_status_message, nil)
-
-        case put_task(state, updated_task) do
-          :ok ->
-            if task.monitor_ref, do: Process.demonitor(task.monitor_ref, [:flush])
-
-            next_state =
-              state
-              |> drop_interaction_waiter(task_id, await_reply(updated_task))
-              |> reply_waiters(task_id, await_reply(updated_task))
-              |> Map.update!(:task_monitors, &drop_task_monitor(&1, task.monitor_ref))
-
-            emit_status_notification(next_state, updated_task, nil, nil)
-            release_session_task(next_state, task_id)
-
-          {:error, reason} ->
-            fail_task_orchestration(state, task_id, reason)
-        end
-
-      {:error, :not_found} ->
-        release_session_task(state, task_id)
-
-      {:error, reason} ->
-        fail_task_orchestration(state, task_id, reason)
-    end
-  end
-
-  defp await_reply(%{status: :completed, result: result}), do: {:ok, result}
-
-  defp await_reply(%{status: :failed, terminal_outcome: :tool_error_result, result: result}),
-    do: {:ok, result}
-
-  defp await_reply(%{status: :failed, error: %Error{} = error}), do: {:error, error}
-
-  defp await_reply(%{status: :cancelled}) do
-    {:error, %Error{code: :cancelled, message: "background task was cancelled"}}
-  end
-
-  defp public_task(task) do
-    %{
-      id: task.id,
-      status: task.status,
-      component_type: task.component_type,
-      target: task.target,
-      component_descriptor: Map.get(task, :component_descriptor),
-      session_id: task.session_id,
-      request_id: task.request_id,
-      origin_request_id: task.origin_request_id,
-      transport: task.transport,
-      protocol_version: Map.get(task, :protocol_version),
-      poll_interval_ms: task.poll_interval_ms,
-      ttl_ms: task.ttl_ms,
-      submitted_at: task.submitted_at,
-      updated_at: task.updated_at,
-      completed_at: task.completed_at,
-      elicitation: Map.get(task, :elicitation),
-      input_requests: Map.get(task, :input_requests, %{}),
-      progress: task.progress,
-      result: task.result,
-      error: task.error,
-      failure_message: Map.get(task, :failure_message),
-      terminal_outcome: Map.get(task, :terminal_outcome)
-    }
-  end
-
-  defp fetch_task(state, task_id, opts) do
-    backend(state).fetch_task(store(state), task_id, opts)
-  end
-
-  defp classify_successful_result(state, task_id, :tool, result) do
-    modern? =
-      case fetch_task(state, task_id, []) do
-        {:ok, task} -> Map.get(task, :protocol_version) == "2026-07-28"
-        _other -> false
-      end
-
-    if tool_error_result?(result) do
-      if modern?,
-        do: {:completed, :tool_error_result, tool_error_message(result)},
-        else: {:failed, :tool_error_result, tool_error_message(result)}
+  defp answerable(%Operation{invocation: :protocol, context: context}) do
+    if is_legacy(context.negotiated_protocol_version) do
+      {:error,
+       Error.internal(
+         "a background task's InputRequiredResult is not valid under #{legacy()}: " <>
+           "ask with FastestMCP.Context.elicit/4 or FastestMCP.Context.sample/3 instead"
+       )}
     else
-      {:completed, :success_result, nil}
+      :ok
     end
   end
 
-  defp classify_successful_result(_state, _task_id, _component_type, _result),
-    do: {:completed, :success_result, nil}
+  defp answerable(_operation), do: :ok
 
-  defp component_descriptor(component) do
-    %{}
-    |> Map.put(:identifier, Component.identifier(component))
-    |> Map.put(:version, Component.version(component))
-    |> maybe_put(:output_schema, Map.get(component, :output_schema))
-    |> maybe_put(:mime_type, Map.get(component, :mime_type))
+  defp execute(executor, operation) do
+    {:ok, executor.(operation)}
+  rescue
+    error in Error ->
+      {:error, error}
+
+    error ->
+      {:error,
+       %{Error.from_exception(error, "background task failed") | exposure: exposure(operation)}}
+  catch
+    kind, reason ->
+      message =
+        if kind == :exit,
+          do: "background task exited: #{Exception.format_exit(reason)}",
+          else: "background task failed with #{kind}: #{inspect(reason)}"
+
+      {:error, %Error{code: :component_crash, message: message, exposure: exposure(operation)}}
   end
 
-  defp tool_error_result?(%{} = result) do
-    Map.get(result, :isError, Map.get(result, "isError", Map.get(result, :is_error, false))) ==
-      true
-  end
+  # Masked errors of a task name its component.
+  defp exposure(%{component_type: component_type, target: target}),
+    do: %{mask_error_details: true, component_type: component_type, identifier: target}
 
-  defp tool_error_result?(_result), do: false
-
-  defp tool_error_message(%{} = result) do
-    result
-    |> Map.get(:content, Map.get(result, "content"))
-    |> tool_error_content_message()
-  end
-
-  defp tool_error_content_message([first | _rest]), do: tool_error_content_message(first)
-  defp tool_error_content_message(%{text: text}) when is_binary(text) and text != "", do: text
-  defp tool_error_content_message(%{"text" => text}) when is_binary(text) and text != "", do: text
-  defp tool_error_content_message(text) when is_binary(text) and text != "", do: text
-
-  defp tool_error_content_message(other) when not is_nil(other) do
-    inspect(other)
-  end
-
-  defp tool_error_content_message(_other), do: "Tool task failed"
-
-  defp put_task(state, task) do
-    backend(state).put_task(store(state), task)
-  end
-
-  defp expire_tasks(state) do
-    case backend(state).expire_tasks(store(state), System.system_time(:millisecond)) do
-      {:ok, expired_ids} ->
-        next_state =
-          Enum.reduce(expired_ids, state, fn task_id, acc ->
-            acc
-            |> reply_waiters(task_id, {:error, :not_found})
-            |> drop_interaction_waiter(task_id, {:error, :not_found})
-            |> drop_task_monitor_for(task_id)
-            |> drop_relay_requests_for(task_id)
-            |> release_session_task(task_id)
-          end)
-
-        {:ok, next_state}
-
-      {:error, reason} ->
-        {:error, reason, fail_all_task_orchestration(state, reason)}
+  # Runs `fun` with the visible task `task_id`. Every function here returns
+  # `{:ok | :error, value, state}`, or `{:noreply, state}` for a caller that
+  # waits; a task whose record cannot be read fails its pending work.
+  defp with_task(state, task_id, opts, fun) do
+    case fetch_task(state, task_id, opts) do
+      {:ok, task} -> fun.(task)
+      {:error, :not_found} -> {:error, :not_found, state}
+      {:error, reason} -> {:error, reason, fail_task(state, task_id, reason)}
     end
   end
 
-  defp with_expired_tasks(state, fun) when is_function(fun, 1) do
-    case expire_tasks(state) do
-      {:ok, next_state} -> fun.(next_state)
-      {:error, reason, next_state} -> {:reply, {:error, reason}, next_state}
-    end
-  end
-
-  defp rollback_failed_submission(state, task_id, put_reason) do
-    case backend(state).delete_task(store(state), task_id) do
-      :ok -> put_reason
-      {:error, delete_reason} -> {:task_backend_rollback_failed, put_reason, delete_reason}
-    end
-  end
-
-  defp reconcile_runtime_tasks(state), do: reconcile_runtime_tasks(state, nil, %{})
-
-  defp reconcile_runtime_tasks(state, cursor, seen_cursors) do
-    opts = [page_size: @startup_reconciliation_page_size, cursor: cursor]
-
-    case backend(state).list_tasks(store(state), opts) do
-      {:ok, %{tasks: tasks, next_cursor: next_cursor}} ->
-        with :ok <- reconcile_runtime_task_page(state, tasks),
-             :ok <- validate_reconciliation_cursor(next_cursor, seen_cursors) do
-          if is_nil(next_cursor) do
-            :ok
-          else
-            reconcile_runtime_tasks(state, next_cursor, Map.put(seen_cursors, next_cursor, true))
-          end
-        end
-
-      {:error, reason} ->
-        {:error, reason}
-
-      other ->
-        {:error, {:invalid_list_tasks_result, other}}
-    end
-  end
-
-  defp reconcile_runtime_task_page(state, tasks) when is_list(tasks) do
-    Enum.reduce_while(tasks, :ok, fn task, :ok ->
-      if runtime_active_status?(Map.get(task, :status)) do
-        now = System.system_time(:millisecond)
-        ttl_ms = Map.get(task, :ttl_ms) || @default_ttl_ms
-
-        failed_task =
-          task
-          |> Map.put(:status, :failed)
-          |> Map.put(:error, %Error{
-            code: :runtime_restarted,
-            message: "background task was interrupted because the runtime restarted"
-          })
-          |> Map.put(:failure_message, "Runtime restarted")
-          |> Map.put(:terminal_outcome, :request_error)
-          |> Map.put(:updated_at, now)
-          |> Map.put(:completed_at, now)
-          |> Map.put(:expires_at, now + ttl_ms)
-          |> Map.put(:pid, nil)
-          |> Map.put(:monitor_ref, nil)
-          |> Map.put(:elicitation, nil)
-          |> Map.put(:interaction_status_message, nil)
-
-        case put_task(state, failed_task) do
-          :ok -> {:cont, :ok}
-          {:error, reason} -> {:halt, {:error, reason}}
-        end
-      else
-        {:cont, :ok}
-      end
+  # Worker reports apply to running tasks only.
+  defp with_active_task(state, task_id, fun) do
+    with_task(state, task_id, [], fn task ->
+      if TaskRecord.terminal?(task), do: {:ok, task, state}, else: fun.(task)
     end)
   end
 
-  defp reconcile_runtime_task_page(_state, tasks),
-    do: {:error, {:invalid_task_page, tasks}}
+  defp reply({:noreply, state}), do: {:noreply, state}
+  defp reply({status, value, state}), do: {:reply, {status, value}, state}
 
-  defp runtime_active_status?(status),
-    do: status in [:working, :input_required, "working", "input_required"]
+  defp noreply({_status, _value, state}), do: {:noreply, state}
 
-  defp validate_reconciliation_cursor(nil, _seen_cursors), do: :ok
+  # Stores a task that reached a terminal status and settles its worker,
+  # session, interaction, and waiters.
+  defp finish(state, task, kill_worker? \\ false) do
+    with {:ok, state} <- put_task(state, task) do
+      outcome = TaskRecord.outcome(task)
 
-  defp validate_reconciliation_cursor(cursor, seen_cursors) do
-    if Map.has_key?(seen_cursors, cursor),
-      do: {:error, {:repeated_task_cursor, cursor}},
-      else: :ok
+      state =
+        state
+        |> stop_worker(task.id, kill_worker?)
+        |> drop_interaction(task.id, outcome)
+        |> reply_waiters(task.id, outcome)
+
+      schedule_expiry(task, task.completed_at)
+      emit(state, task)
+      {:ok, task, state}
+    end
   end
 
-  defp emit_status_notification(state, task, status_override, status_message_override) do
+  # The pending work of a task whose record cannot be read or written fails.
+  defp fail_task(state, task_id, reason) do
+    state
+    |> stop_worker(task_id, true)
+    |> drop_interaction(task_id, {:error, reason})
+    |> reply_waiters(task_id, {:error, reason})
+  end
+
+  defp fail_all(state, reason) do
+    [state.running, state.waiters, state.interactions]
+    |> Enum.flat_map(&Map.keys/1)
+    |> Enum.uniq()
+    |> Enum.reduce(state, &fail_task(&2, &1, reason))
+  end
+
+  defp stop_worker(state, task_id, kill?) do
+    {worker, state} = pop_in(state, [:running, task_id])
+
+    if worker do
+      Process.demonitor(worker.ref, [:flush])
+      if kill?, do: Process.exit(worker.pid, :kill)
+
+      if worker.session_id,
+        do: Session.receiver_task_finished(state.server_name, worker.session_id, task_id)
+    end
+
+    state
+  end
+
+  # The session that submitted a task stays open until the task finishes.
+  defp hold_session(state, task, context) do
+    request_id = metadata(context, :jsonrpc_request_id) || context.request_id
+
+    with session_id when is_binary(session_id) and session_id != "" <- task.session_id,
+         true <- is_binary(request_id) or is_integer(request_id),
+         started when started in [:ok, {:error, :already_started}] <-
+           Session.receiver_task_started(
+             state.server_name,
+             session_id,
+             task.id,
+             request_id,
+             metadata(context, :progress_token)
+           ) do
+      session_id
+    else
+      _not_held -> nil
+    end
+  end
+
+  defp metadata(context, key),
+    do: Map.get(context.request_metadata, key, context.request_metadata[Atom.to_string(key)])
+
+  defp add_waiter(state, task_id, {pid, _tag} = from, timeout, opts) do
+    ref = Process.monitor(pid, tag: {:waiter_down, task_id})
+
+    timer =
+      if timeout != :infinity,
+        do: Process.send_after(self(), {:waiter_timeout, task_id, ref}, timeout)
+
+    waiter = %{from: from, ref: ref, timer: timer, bridge: bridge(opts)}
+
+    update_in(
+      state.waiters,
+      &Map.update(&1, task_id, [waiter], fn waiters -> [waiter | waiters] end)
+    )
+  end
+
+  defp reply_waiters(state, task_id, reply) do
+    {waiters, all} = Map.pop(state.waiters, task_id, [])
+    Enum.each(waiters, &settle_waiter(&1, reply))
+    %{state | waiters: all}
+  end
+
+  defp remove_waiter(state, task_id, ref, reply) do
+    {removed, kept} = state.waiters |> Map.get(task_id, []) |> Enum.split_with(&(&1.ref == ref))
+    Enum.each(removed, &settle_waiter(&1, reply))
+
+    if kept == [],
+      do: %{state | waiters: Map.delete(state.waiters, task_id)},
+      else: put_in(state.waiters[task_id], kept)
+  end
+
+  defp settle_waiter(waiter, reply) do
+    Process.demonitor(waiter.ref, [:flush])
+    if waiter.timer, do: Process.cancel_timer(waiter.timer)
+    if reply, do: GenServer.reply(waiter.from, reply)
+  end
+
+  # A legacy `tasks/result` request carries the session and stream through
+  # which the store relays the task's pending interaction.
+  defp bridge(opts) do
+    metadata = opts[:request_metadata] || %{}
+
+    if is_reference(metadata[:session_sink_ref]) and not is_nil(opts[:session_id]) do
+      %{
+        session_id: to_string(opts[:session_id]),
+        sink_ref: metadata[:session_sink_ref],
+        origin_request_id: metadata[:jsonrpc_request_id]
+      }
+    end
+  end
+
+  defp interaction(kind, request, from, task_id, timeout_ms) do
+    ref = make_ref()
+
+    kind
+    |> interaction_request(request)
+    |> Map.merge(%{
+      kind: kind,
+      from: from,
+      ref: ref,
+      timeout_ms: timeout_ms,
+      timer: Process.send_after(self(), {:interaction_timeout, task_id, ref}, timeout_ms),
+      relay: nil
+    })
+  end
+
+  defp interaction_request(:elicitation, request) do
+    %{
+      request: request,
+      request_id: request.request_id,
+      method: "elicitation/create",
+      params: %{"message" => request.message, "requestedSchema" => request.requested_schema},
+      message: request.message,
+      elicitation: Map.take(request, [:request_id, :message, :requested_schema])
+    }
+  end
+
+  defp interaction_request(:request, %{"method" => method, "params" => params}) do
+    %{
+      request: nil,
+      request_id: request_key(method) <> Integer.to_string(System.unique_integer([:positive])),
+      method: method,
+      params: params,
+      message: interaction_message(method, params),
+      elicitation: nil
+    }
+  end
+
+  defp request_key("sampling/createMessage"), do: "sampling-"
+  defp request_key("elicitation/create"), do: "elicit-"
+  defp request_key("roots/list"), do: "roots-"
+  defp request_key(_method), do: "request-"
+
+  defp interaction_message("sampling/createMessage", _params), do: "Waiting for client sampling"
+  defp interaction_message("elicitation/create", %{"message" => message}), do: message
+  defp interaction_message("roots/list", _params), do: "Waiting for client roots"
+  defp interaction_message(method, _params), do: "Waiting for the client to answer #{method}"
+
+  # Answers the pending interaction of a task with a client response.
+  defp answer(state, task, interaction, response) do
+    case resolve(interaction, response) do
+      {:ok, _value} = reply -> resume(state, task, interaction, reply)
+      {:error, error} -> {:error, error, state}
+    end
+  end
+
+  defp resolve(%{kind: :elicitation, request: request}, %{} = response),
+    do: Elicitation.resolve(request, response["action"], response["content"])
+
+  defp resolve(%{kind: :request}, %{} = response), do: {:ok, Map.delete(response, "resultType")}
+
+  defp resolve(_interaction, _response),
+    do: {:error, %Error{code: :invalid_params, message: "invalid task input response"}}
+
+  # Ends the interaction a task waits for: its caller gets `reply` and the
+  # task works again.
+  defp resume(state, task, interaction, reply) do
+    task = TaskRecord.resume(task, [interaction.request_id], now())
+
+    with {:ok, state} <- put_task(state, task) do
+      state = drop_interaction(state, task.id, reply)
+      emit(state, task)
+      {:ok, task, state}
+    end
+  end
+
+  defp answered(state, task_id, interaction, reply),
+    do: state |> with_task(task_id, [], &resume(state, &1, interaction, reply)) |> noreply()
+
+  defp drop_interaction(state, task_id, reply) do
+    case Map.pop(state.interactions, task_id) do
+      {nil, _interactions} ->
+        state
+
+      {interaction, interactions} ->
+        Process.cancel_timer(interaction.timer)
+        if interaction.relay, do: stop_relay(interaction.relay)
+        GenServer.reply(interaction.from, reply)
+        %{state | interactions: interactions}
+    end
+  end
+
+  # Relays the pending interaction of a task to the client through the stream
+  # of a waiting `tasks/result` request.
+  defp start_relay(state, task_id) do
+    with %{relay: nil} = interaction <- state.interactions[task_id],
+         %{bridge: bridge, ref: waiter_ref} <-
+           Enum.find(Map.get(state.waiters, task_id, []), & &1.bridge) do
+      params =
+        TaskWire.attach_related_task_meta(interaction.params, task_id, %{
+          "status" => "input_required",
+          "statusMessage" => interaction.message
+        })
+
+      relay =
+        try do
+          %{ref: ref, pid: pid} =
+            Task.Supervisor.async_nolink(state.relay_supervisor, fn ->
+              relay_request(state.server_name, bridge, interaction, params, task_id)
+            end)
+
+          %{ref: ref, pid: pid, waiter: waiter_ref}
+        catch
+          :exit, reason ->
+            ref = make_ref()
+            send(self(), {ref, {:error, relay_error({:relay_start_failed, reason})}})
+            %{ref: ref, pid: nil, waiter: waiter_ref}
+        end
+
+      put_in(state.interactions[task_id].relay, relay)
+    else
+      _no_relay -> state
+    end
+  end
+
+  defp relay_request(server_name, bridge, interaction, params, task_id) do
+    case Session.request_peer(server_name, bridge.session_id, interaction.method, params,
+           sink_ref: bridge.sink_ref,
+           origin_request_id: bridge.origin_request_id,
+           protocol_related_task_id: task_id,
+           timeout_ms: interaction.timeout_ms
+         ) do
+      {:ok, %{} = result} -> {:ok, result}
+      {:error, %Error{} = error} -> {:error, error}
+      {:error, reason} -> {:error, relay_error(reason)}
+      other -> {:error, relay_error({:invalid_response, other})}
+    end
+  end
+
+  defp relay_done(state, ref, response) do
+    case Enum.find(state.interactions, &match?({_task_id, %{relay: %{ref: ^ref}}}, &1)) do
+      {task_id, interaction} ->
+        reply = with {:ok, result} <- response, do: resolve(interaction, result)
+        answered(put_in(state.interactions[task_id].relay, nil), task_id, interaction, reply)
+
+      nil ->
+        {:noreply, state}
+    end
+  end
+
+  # A relay ends with the `tasks/result` request it answers through; another
+  # waiting request may take it over.
+  defp restart_relay(state, task_id, waiter_ref) do
+    case state.interactions[task_id] do
+      %{relay: %{waiter: ^waiter_ref} = relay} ->
+        stop_relay(relay)
+        state |> put_in([:interactions, task_id, :relay], nil) |> start_relay(task_id)
+
+      _other ->
+        state
+    end
+  end
+
+  defp stop_relay(relay) do
+    Process.demonitor(relay.ref, [:flush])
+    if relay.pid, do: Process.exit(relay.pid, :shutdown)
+  end
+
+  defp relay_error(reason),
+    do: Error.internal("client interaction relay failed", %{reason: inspect(reason)})
+
+  defp emit(state, task, message \\ nil) do
     notification =
-      TaskWire.status_notification(
-        task,
-        status_override,
-        status_message_override,
+      TaskWire.status_notification(task, message,
         mask_error_details: state.mask_error_details,
-        protocol_version: Map.get(task, :protocol_version, "2025-11-25")
+        protocol_version: task.protocol_version
       )
 
     EventBus.emit(
@@ -1189,712 +868,110 @@ defmodule FastestMCP.BackgroundTaskStore do
     )
   end
 
-  defp add_waiter(state, collection, task_id, from, timeout, extra \\ %{}) do
-    ref = make_ref()
-    monitor_ref = Process.monitor(elem(from, 0))
-    timer_ref = schedule_waiter_timeout(collection, task_id, ref, timeout)
-
-    waiter =
-      Map.merge(extra, %{
-        ref: ref,
-        from: from,
-        monitor_ref: monitor_ref,
-        timer_ref: timer_ref
-      })
-
-    state
-    |> Map.update!(
-      collection,
-      &Map.update(&1, task_id, [waiter], fn waiters -> [waiter | waiters] end)
-    )
-    |> Map.update!(:waiter_monitors, &Map.put(&1, monitor_ref, {collection, task_id, ref}))
-  end
-
-  defp add_interaction_waiter(state, task_id, from, timeout, request_id, extra) do
-    ref = make_ref()
-    monitor_ref = Process.monitor(elem(from, 0))
-
-    timer_ref =
-      Process.send_after(
-        self(),
-        {:interaction_timeout, task_id, request_id, ref},
-        timeout
-      )
-
-    waiter =
-      Map.merge(extra, %{
-        ref: ref,
-        from: from,
-        monitor_ref: monitor_ref,
-        timer_ref: timer_ref,
-        request_id: request_id,
-        timeout_ms: timeout
-      })
-
-    state
-    |> Map.update!(:interaction_waiters, &Map.put(&1, task_id, waiter))
-    |> Map.update!(:waiter_monitors, fn monitors ->
-      Map.put(monitors, monitor_ref, {:interaction_waiters, task_id, ref})
-    end)
-  end
-
-  defp schedule_waiter_timeout(_collection, _task_id, _ref, :infinity), do: nil
-
-  defp schedule_waiter_timeout(collection, task_id, ref, timeout) do
-    Process.send_after(self(), {:waiter_timeout, collection, task_id, ref}, timeout)
-  end
-
-  defp reply_waiters(state, task_id, reply) do
-    state
-    |> reply_waiter_collection(:waiters, task_id, reply)
-    |> reply_waiter_collection(:result_waiters, task_id, reply)
-  end
-
-  defp reply_waiter_collection(state, collection, task_id, reply) do
-    {waiters, collection_state} = Map.pop(Map.fetch!(state, collection), task_id, [])
-
-    Enum.reduce(waiters, Map.put(state, collection, collection_state), fn waiter, acc ->
-      GenServer.reply(waiter.from, reply)
-      cleanup_waiter_tracking(acc, waiter)
-    end)
-  end
-
-  defp remove_waiter(state, collection, task_id, ref, reply, monitor_already_down? \\ false) do
-    waiters = state |> Map.fetch!(collection) |> Map.get(task_id, [])
-    {removed, retained} = Enum.split_with(waiters, &(&1.ref == ref))
-
-    collection_state =
-      if retained == [] do
-        state |> Map.fetch!(collection) |> Map.delete(task_id)
-      else
-        state |> Map.fetch!(collection) |> Map.put(task_id, retained)
-      end
-
-    Enum.reduce(removed, Map.put(state, collection, collection_state), fn waiter, acc ->
-      if reply, do: GenServer.reply(waiter.from, reply)
-      cleanup_waiter_tracking(acc, waiter, monitor_already_down?)
-    end)
-  end
-
-  defp cleanup_waiter_tracking(state, waiter, monitor_already_down? \\ false) do
-    if waiter.timer_ref, do: Process.cancel_timer(waiter.timer_ref, async: false, info: false)
-
-    if waiter.monitor_ref && not monitor_already_down? do
-      Process.demonitor(waiter.monitor_ref, [:flush])
-    end
-
-    Map.update!(state, :waiter_monitors, &Map.delete(&1, waiter.monitor_ref))
-  end
-
-  defp handle_waiter_down(monitor_ref, state) do
-    case Map.pop(state.waiter_monitors, monitor_ref) do
-      {nil, _waiter_monitors} ->
-        {:noreply, state}
-
-      {{:interaction_waiters, task_id, waiter_ref}, waiter_monitors} ->
-        state = %{state | waiter_monitors: waiter_monitors}
-
-        case Map.get(state.interaction_waiters, task_id) do
-          %{ref: ^waiter_ref} = waiter ->
-            interaction_waiters = Map.delete(state.interaction_waiters, task_id)
-
-            {:noreply,
-             cleanup_interaction_waiter(
-               state,
-               waiter,
-               interaction_waiters,
-               true
-             )}
-
-          _other ->
-            {:noreply, state}
-        end
-
-      {{collection, task_id, waiter_ref}, waiter_monitors} ->
-        state = %{state | waiter_monitors: waiter_monitors}
-        state = remove_waiter(state, collection, task_id, waiter_ref, nil, true)
-        {:noreply, maybe_reset_interaction_relay(state, collection, task_id, waiter_ref)}
-    end
-  end
-
-  defp maybe_reset_interaction_relay(state, :result_waiters, task_id, waiter_ref) do
-    case Map.get(state.interaction_waiters, task_id) do
-      %{relay_waiter_ref: ^waiter_ref, relay_request_id: relay_request_id} ->
-        state =
-          state
-          |> maybe_drop_relay_request(relay_request_id)
-          |> put_in([:interaction_waiters, task_id, :relay_request_id], nil)
-          |> put_in([:interaction_waiters, task_id, :relay_waiter_ref], nil)
-
-        case fetch_task(state, task_id, []) do
-          {:ok, task} -> maybe_start_interaction_relay(state, task)
-          {:error, reason} -> fail_task_orchestration(state, task_id, reason)
-        end
-
-      _other ->
-        state
-    end
-  end
-
-  defp maybe_reset_interaction_relay(state, _collection, _task_id, _waiter_ref), do: state
-
-  defp ensure_not_waiting_for_interaction(state, task_id) do
-    if Map.has_key?(state.interaction_waiters, task_id) do
-      {:error,
-       %Error{
-         code: :bad_request,
-         message: "background task is already waiting for input"
-       }}
-    else
-      :ok
-    end
-  end
-
-  defp fetch_interaction_waiter(state, task_id) do
-    case Map.fetch(state.interaction_waiters, task_id) do
-      {:ok, waiter} -> {:ok, waiter}
-      :error -> {:error, :not_waiting}
-    end
-  end
-
-  defp apply_task_input_responses(state, task, task_id, input_responses) do
-    outstanding = Map.get(task, :input_requests, %{})
-
-    matching =
-      input_responses
-      |> Map.new(fn {key, value} -> {to_string(key), value} end)
-      |> Map.take(Map.keys(outstanding))
-
-    cond do
-      map_size(matching) == 0 ->
-        {:reply, {:ok, public_task(task)}, state}
-
-      Map.has_key?(state.interaction_waiters, task_id) ->
-        apply_interaction_waiter_responses(state, task, task_id, matching)
-
-      is_pid(task.pid) and Process.alive?(task.pid) ->
-        resumed_task =
-          task
-          |> mark_answered_input_requests(Map.keys(matching))
-          |> Map.put(:status, :working)
-          |> Map.put(:updated_at, System.system_time(:millisecond))
-          |> Map.put(:input_requests, Map.drop(outstanding, Map.keys(matching)))
-          |> Map.put(:interaction_status_message, nil)
-
-        case put_task(state, resumed_task) do
-          :ok ->
-            send(task.pid, {:resume_background_task, matching})
-            emit_status_notification(state, resumed_task, "working", nil)
-            {:reply, {:ok, public_task(resumed_task)}, state}
-
-          {:error, reason} ->
-            {:reply, {:error, reason}, fail_task_orchestration(state, task_id, reason)}
-        end
-
-      true ->
-        {:reply,
-         {:error,
-          %Error{
-            code: :internal_error,
-            message: "background task cannot resume its outstanding input requests"
-          }}, state}
-    end
-  end
-
-  defp apply_interaction_waiter_responses(state, task, task_id, matching) do
-    case fetch_interaction_waiter(state, task_id) do
-      {:ok, waiter} ->
-        case Map.fetch(matching, waiter.request_id) do
-          :error ->
-            {:reply, {:ok, public_task(task)}, state}
-
-          {:ok, response} ->
-            case resolve_task_input_response(waiter, response) do
-              {:ok, resolved} ->
-                task = mark_answered_input_requests(task, [waiter.request_id])
-
-                case resolve_interaction(state, task, task_id, {:ok, resolved}) do
-                  {:ok, next_state, resumed_task} ->
-                    emit_status_notification(next_state, resumed_task, "working", nil)
-                    {:reply, {:ok, public_task(resumed_task)}, next_state}
-
-                  {:error, reason, next_state} ->
-                    {:reply, {:error, reason}, next_state}
-                end
-
-              {:error, %Error{} = error} ->
-                {:reply, {:error, error}, state}
-            end
-        end
-
-      {:error, _reason} = error ->
-        error
-    end
-  end
-
-  defp resolve_task_input_response(%{type: :elicitation, request: request}, response)
-       when is_map(response) do
-    Elicitation.resolve(request, Map.get(response, "action"), Map.get(response, "content"))
-  end
-
-  defp resolve_task_input_response(%{type: :sampling}, response) when is_map(response),
-    do: {:ok, response}
-
-  defp resolve_task_input_response(_waiter, _response) do
-    {:error, %Error{code: :invalid_params, message: "invalid task input response"}}
-  end
-
-  defp mark_answered_input_requests(task, request_ids) do
-    answered = Map.get(task, :answered_input_request_ids, MapSet.new())
-
-    Map.put(
-      task,
-      :answered_input_request_ids,
-      Enum.reduce(request_ids, answered, &MapSet.put(&2, &1))
-    )
-  end
-
-  defp validate_new_input_request_ids(task, input_requests) do
-    answered = Map.get(task, :answered_input_request_ids, MapSet.new())
-    reused = Enum.filter(Map.keys(input_requests), &MapSet.member?(answered, &1))
-
-    if reused == [] do
-      :ok
-    else
-      {:error,
-       %Error{
-         code: :invalid_params,
-         message: "background task reused an input request identifier",
-         details: %{request_ids: reused}
-       }}
-    end
-  end
-
-  defp ensure_elicitation_waiter(%{type: :elicitation}), do: :ok
-
-  defp ensure_elicitation_waiter(_waiter) do
-    {:error,
-     %Error{
-       code: :bad_request,
-       message: "background task is not waiting for input"
-     }}
-  end
-
-  defp validate_request_id(opts, waiter) do
-    case opts[:request_id] do
-      nil ->
-        :ok
-
-      request_id ->
-        request_id = to_string(request_id)
-
-        if request_id == waiter.request_id do
-          :ok
-        else
-          {:error,
-           %Error{
-             code: :bad_request,
-             message: "elicitation request_id does not match the pending request",
-             details: %{request_id: request_id}
-           }}
-        end
-    end
-  end
-
-  defp resolve_interaction(state, task, task_id, reply) do
-    case Map.pop(state.interaction_waiters, task_id) do
-      {nil, _waiters} ->
-        {:error, :not_waiting, state}
-
-      {waiter, interaction_waiters} ->
-        resumed_task =
-          task
-          |> Map.put(:status, :working)
-          |> Map.put(:updated_at, System.system_time(:millisecond))
-          |> Map.put(:elicitation, nil)
-          |> Map.put(:input_requests, %{})
-          |> Map.put(:interaction_status_message, nil)
-
-        case put_task(state, resumed_task) do
-          :ok ->
-            next_state = cleanup_interaction_waiter(state, waiter, interaction_waiters)
-            GenServer.reply(waiter.from, reply)
-            {:ok, next_state, resumed_task}
-
-          {:error, reason} ->
-            {:error, reason, fail_task_orchestration(state, task_id, reason)}
-        end
-    end
-  end
-
-  defp finish_interaction_resolution(state, task, task_id, resolved) do
-    case resolve_interaction(state, task, task_id, resolved) do
-      {:ok, next_state, resumed_task} ->
-        emit_status_notification(next_state, resumed_task, "working", nil)
-        {:noreply, next_state}
-
-      {:error, _reason, next_state} ->
-        {:noreply, next_state}
-    end
-  end
-
-  defp drop_interaction_waiter(state, task_id, reply) do
-    case Map.pop(state.interaction_waiters, task_id) do
-      {nil, _waiters} ->
-        state
-
-      {waiter, interaction_waiters} ->
-        if reply, do: GenServer.reply(waiter.from, reply)
-        cleanup_interaction_waiter(state, waiter, interaction_waiters)
-    end
-  end
-
-  defp cleanup_interaction_waiter(
-         state,
-         %{relay_request_id: relay_request_id} = waiter,
-         interaction_waiters,
-         monitor_already_down? \\ false
-       ) do
-    state
-    |> Map.put(:interaction_waiters, interaction_waiters)
-    |> maybe_drop_relay_request(relay_request_id)
-    |> cleanup_waiter_tracking(waiter, monitor_already_down?)
-  end
-
-  defp maybe_start_interaction_relay(state, %{id: task_id} = task) do
-    case {Map.get(state.interaction_waiters, task_id), first_bridge_waiter(state, task_id)} do
-      {%{relay_request_id: nil} = waiter, %{bridge: bridge, ref: bridge_waiter_ref}}
-      when is_map(bridge) and is_binary(bridge.session_id) ->
-        params =
-          TaskWire.attach_related_task_meta(waiter.relay_params, task_id, %{
-            status: "input_required",
-            statusMessage: TaskWire.task(task).statusMessage,
-            elicitation: Map.get(TaskWire.task(task), :elicitation)
-          })
-
-        case start_relay_request(state, waiter.relay_method, params, bridge, task_id) do
-          {:ok, relay_request_id, relay, state} ->
-            state
-            |> put_in([:interaction_waiters, task_id, :relay_request_id], relay_request_id)
-            |> put_in([:interaction_waiters, task_id, :relay_waiter_ref], bridge_waiter_ref)
-            |> put_in([:relay_requests, relay_request_id], relay)
-
-          {:error, reason, state} ->
-            relay_request_id = make_ref()
-
-            send(self(), {relay_request_id, {:error, relay_error(reason)}})
-
-            state
-            |> put_in([:interaction_waiters, task_id, :relay_request_id], relay_request_id)
-            |> put_in([:interaction_waiters, task_id, :relay_waiter_ref], bridge_waiter_ref)
-            |> put_in([:relay_requests, relay_request_id], %{
-              task_id: task_id,
-              worker_pid: nil
-            })
-        end
-
-      _other ->
-        state
-    end
-  end
-
-  defp first_bridge_waiter(state, task_id) do
-    state.result_waiters
-    |> Map.get(task_id, [])
-    |> Enum.find(fn
-      %{bridge: %{session_id: session_id, sink_ref: sink_ref}}
-      when is_binary(session_id) and is_reference(sink_ref) ->
-        true
-
-      _other ->
-        false
-    end)
-  end
-
-  defp bridge_from_opts(opts) do
-    metadata = opts[:request_metadata] || %{}
-
-    %{
-      sink_ref: Map.get(metadata, :session_sink_ref, Map.get(metadata, "session_sink_ref")),
-      origin_request_id:
-        Map.get(metadata, :jsonrpc_request_id, Map.get(metadata, "jsonrpc_request_id")),
-      session_id: opts[:session_id] && to_string(opts[:session_id])
+  defp handle(operation, task) do
+    %BackgroundTask{
+      server_name: operation.server_name,
+      task_id: task.id,
+      owner_fingerprint: task.owner_fingerprint,
+      component_type: task.component_type,
+      target: task.target,
+      poll_interval_ms: task.poll_interval_ms,
+      ttl_ms: task.ttl_ms,
+      submitted_at: task.submitted_at
     }
   end
 
-  defp start_relay_request(state, method, params, bridge, task_id) do
-    case state.relay_task_supervisor do
-      supervisor when is_pid(supervisor) ->
-        try do
-          task =
-            Task.Supervisor.async_nolink(supervisor, fn ->
-              state.server_name
-              |> Session.request_peer(bridge.session_id, method, params,
-                sink_ref: bridge.sink_ref,
-                origin_request_id: bridge.origin_request_id,
-                protocol_related_task_id: task_id,
-                timeout_ms: interaction_timeout(state, task_id)
-              )
-              |> normalize_relay_response()
-            end)
-
-          {:ok, task.ref, %{task_id: task_id, worker_pid: task.pid}, state}
-        catch
-          :exit, reason -> {:error, {:relay_start_failed, reason}, state}
-        end
-
-      _other ->
-        {:error, :relay_task_supervisor_unavailable, state}
-    end
+  defp component_descriptor(component) do
+    %{identifier: Component.identifier(component), version: Component.version(component)}
+    |> maybe_put(:output_schema, Map.get(component, :output_schema))
+    |> maybe_put(:mime_type, Map.get(component, :mime_type))
   end
 
-  defp normalize_relay_response({:ok, %{} = result}), do: {:ok, result}
-  defp normalize_relay_response({:error, %Error{} = error}), do: {:error, error}
-  defp normalize_relay_response({:error, reason}), do: {:error, relay_error(reason)}
-  defp normalize_relay_response(other), do: {:error, relay_error({:invalid_response, other})}
-
-  defp relay_error(reason) do
-    %Error{
-      code: :internal_error,
-      message: "client interaction relay failed",
-      details: %{reason: inspect(reason)}
-    }
-  end
-
-  defp interaction_timeout(state, task_id) do
-    state.interaction_waiters
-    |> Map.get(task_id, %{})
-    |> Map.get(:timeout_ms, 60_000)
-  end
-
-  defp maybe_drop_relay_request(state, nil), do: state
-
-  defp maybe_drop_relay_request(state, relay_request_id) do
-    {_relay, state} = pop_relay_request(state, relay_request_id)
-    state
-  end
-
-  defp pop_relay_request(state, relay_request_id, opts \\ []) do
-    case Map.pop(state.relay_requests, relay_request_id) do
-      {nil, relay_requests} ->
-        {nil, %{state | relay_requests: relay_requests}}
-
-      {relay, relay_requests} ->
-        if Keyword.get(opts, :demonitor?, true), do: Process.demonitor(relay_request_id, [:flush])
-
-        if Keyword.get(opts, :terminate?, true) and is_pid(relay.worker_pid) and
-             Process.alive?(relay.worker_pid) do
-          Process.exit(relay.worker_pid, :shutdown)
-        end
-
-        {relay, %{state | relay_requests: relay_requests}}
-    end
-  end
-
-  defp drop_task_monitor_for(state, task_id) do
-    monitor =
-      Enum.find_value(state.task_monitors, fn
-        {monitor_ref, {^task_id, pid}} -> {monitor_ref, pid}
-        _other -> nil
-      end)
-
-    monitor_ref = if monitor, do: elem(monitor, 0)
-    if monitor_ref, do: Process.demonitor(monitor_ref, [:flush])
-    %{state | task_monitors: drop_task_monitor(state.task_monitors, monitor_ref)}
-  end
-
-  defp fail_task_orchestration(state, task_id, reason) do
-    state
-    |> abort_task_monitor_for(task_id)
-    |> reply_waiters(task_id, {:error, reason})
-    |> drop_interaction_waiter(task_id, {:error, reason})
-    |> drop_waiter_monitors_for(task_id)
-    |> drop_relay_requests_for(task_id)
-    |> release_session_task(task_id)
-  end
-
-  defp fail_all_task_orchestration(state, reason) do
-    state
-    |> orchestration_task_ids()
-    |> Enum.reduce(state, fn task_id, acc ->
-      fail_task_orchestration(acc, task_id, reason)
-    end)
-  end
-
-  defp orchestration_task_ids(state) do
-    monitor_task_ids = Enum.map(state.task_monitors, fn {_ref, {task_id, _pid}} -> task_id end)
-
-    waiter_monitor_task_ids =
-      Enum.map(state.waiter_monitors, fn {_ref, {_collection, task_id, _waiter_ref}} ->
-        task_id
-      end)
-
-    [
-      Map.keys(state.waiters),
-      Map.keys(state.result_waiters),
-      Map.keys(state.interaction_waiters),
-      Map.keys(state.session_task_activity),
-      monitor_task_ids,
-      waiter_monitor_task_ids,
-      Enum.map(state.relay_requests, fn {_ref, relay} -> relay.task_id end)
-    ]
-    |> List.flatten()
-    |> Enum.uniq()
-  end
-
-  defp drop_waiter_monitors_for(state, task_id) do
-    waiter_monitors =
-      Enum.reduce(state.waiter_monitors, %{}, fn
-        {monitor_ref, {_collection, ^task_id, _waiter_ref}}, acc ->
-          Process.demonitor(monitor_ref, [:flush])
-          acc
-
-        {monitor_ref, tracking}, acc ->
-          Map.put(acc, monitor_ref, tracking)
-      end)
-
-    %{state | waiter_monitors: waiter_monitors}
-  end
-
-  defp abort_task_monitor_for(state, task_id) do
-    monitor =
-      Enum.find_value(state.task_monitors, fn
-        {monitor_ref, {^task_id, pid}} -> {monitor_ref, pid}
-        _other -> nil
-      end)
-
-    case monitor do
-      {monitor_ref, pid} ->
-        Process.demonitor(monitor_ref, [:flush])
-        if is_pid(pid) and Process.alive?(pid), do: Process.exit(pid, :kill)
-        %{state | task_monitors: drop_task_monitor(state.task_monitors, monitor_ref)}
-
-      nil ->
-        state
-    end
-  end
-
-  defp drop_relay_requests_for(state, task_id) do
-    state.relay_requests
-    |> Enum.reduce(state, fn
-      {relay_request_id, %{task_id: ^task_id}}, acc ->
-        maybe_drop_relay_request(acc, relay_request_id)
-
-      {_relay_request_id, _relay}, acc ->
-        acc
-    end)
-  end
-
-  defp hold_session_for_task(state, task, context) do
-    session_id = task.session_id
-    request_id = protocol_request_id(context)
-    progress_token = request_metadata_value(context, :progress_token)
-
-    if is_binary(session_id) and session_id != "" and
-         (is_binary(request_id) or is_integer(request_id)) do
-      activity = %{
-        session_id: session_id,
-        request_id: request_id,
-        progress_token: progress_token
-      }
-
-      case Session.receiver_task_started(
-             state.server_name,
-             session_id,
-             task.id,
-             request_id,
-             progress_token
-           ) do
-        :ok ->
-          %{
-            state
-            | session_task_activity: Map.put(state.session_task_activity, task.id, activity)
-          }
-
-        {:error, :already_started} ->
-          %{
-            state
-            | session_task_activity: Map.put(state.session_task_activity, task.id, activity)
-          }
-
-        _session_unavailable ->
-          state
-      end
-    else
-      state
-    end
-  end
-
-  defp release_session_task(state, task_id) do
-    case Map.pop(state.session_task_activity, task_id) do
-      {nil, activity} ->
-        %{state | session_task_activity: activity}
-
-      {%{session_id: session_id}, activity} ->
-        _ = Session.receiver_task_finished(state.server_name, session_id, task_id)
-        %{state | session_task_activity: activity}
-    end
-  end
-
-  defp protocol_request_id(context) do
-    request_metadata_value(context, :jsonrpc_request_id) || context.request_id
-  end
-
-  defp request_metadata_value(context, key) do
-    Map.get(
-      context.request_metadata,
-      key,
-      Map.get(context.request_metadata, Atom.to_string(key))
-    )
-  end
-
-  defp task_metadata(context) do
+  defp telemetry_metadata(context) do
     context
     |> Context.base_metadata()
     |> Map.put(:origin_request_id, Context.origin_request_id(context))
     |> Map.put(:task_id, Context.task_id(context))
   end
 
-  defp backend(%{backend: %{module: module}}), do: module
-  defp store(%{backend: %{store: store}}), do: store
+  defp schedule_expiry(task, now),
+    do: Process.send_after(self(), {:expire, task.id}, max(task.expires_at - now, 0))
 
-  defp task_backend_from_opts(opts) do
-    case Keyword.get(opts, :backend) do
-      nil ->
-        case MemoryTaskBackend.start_link([]) do
-          {:ok, store} -> {:ok, %{module: MemoryTaskBackend, store: store}}
-          {:error, reason} -> {:error, reason}
-        end
+  defp bad_request(message), do: %Error{code: :bad_request, message: message}
 
-      backend ->
-        {:ok, backend}
+  defp now, do: System.system_time(:millisecond)
+
+  defp whereis(name), do: GenServer.whereis(name) || name
+
+  # Backend access. A write that fails fails the task's pending work.
+
+  defp fetch_task(state, task_id, opts) do
+    with {:ok, task} <- state.backend.fetch_task(state.backend_state, task_id) do
+      if TaskRecord.visible?(task, opts) and not TaskRecord.expired?(task, now()),
+        do: {:ok, task},
+        else: {:error, :not_found}
     end
   end
 
-  defp maybe_put(map, _key, nil), do: map
-  defp maybe_put(map, key, value), do: Map.put(map, key, value)
-
-  defp task_error_exposure(operation) do
-    %{
-      mask_error_details: true,
-      component_type: operation.component_type,
-      identifier: operation.target
-    }
+  defp put_task(state, task) do
+    case state.backend.put_task(state.backend_state, task) do
+      {:ok, backend_state} -> {:ok, %{state | backend_state: backend_state}}
+      {:error, reason} -> {:error, reason, fail_task(state, task.id, reason)}
+    end
   end
 
-  defp call_timeout(:infinity), do: :infinity
-  defp call_timeout(timeout) when is_integer(timeout) and timeout >= 0, do: timeout + 100
+  defp delete_task(state, task_id) do
+    with {:ok, backend_state} <- state.backend.delete_task(state.backend_state, task_id),
+         do: {:ok, %{state | backend_state: backend_state}}
+  end
 
-  defp put_task_monitor(task_monitors, task_id, pid, monitor_ref),
-    do: Map.put(task_monitors, monitor_ref, {task_id, pid})
+  # A failed submission may have been written in part.
+  defp rollback(state, task_id, reason) do
+    case delete_task(state, task_id) do
+      {:ok, state} ->
+        {:reply, {:error, reason}, state}
 
-  defp drop_task_monitor(task_monitors, nil), do: task_monitors
-  defp drop_task_monitor(task_monitors, monitor_ref), do: Map.delete(task_monitors, monitor_ref)
+      {:error, delete_reason} ->
+        {:reply, {:error, {:task_backend_rollback_failed, reason, delete_reason}}, state}
+    end
+  end
 
-  defp server_options(opts) do
-    case Keyword.get(opts, :name) do
-      nil -> Keyword.delete(opts, :name)
-      _name -> opts
+  # Tasks a previous runtime left active cannot resume: they fail. Finished
+  # tasks expire on their timers.
+  defp reconcile(state) do
+    now = now()
+
+    with {:ok, tasks} <- state.backend.list_tasks(state.backend_state) do
+      Enum.reduce_while(tasks, {:ok, state}, fn task, {:ok, state} ->
+        case reconcile(state, task, now) do
+          {:ok, state} -> {:cont, {:ok, state}}
+          {:error, reason} -> {:halt, {:error, reason}}
+        end
+      end)
+    end
+  end
+
+  defp reconcile(state, task, now) do
+    cond do
+      TaskRecord.expired?(task, now) ->
+        delete_task(state, task.id)
+
+      TaskRecord.terminal?(task) ->
+        schedule_expiry(task, now)
+        {:ok, state}
+
+      true ->
+        error = %Error{
+          code: :runtime_restarted,
+          message: "background task was interrupted because the runtime restarted"
+        }
+
+        task = TaskRecord.fail(task, error, now, "Runtime restarted")
+
+        with {:ok, backend_state} <- state.backend.put_task(state.backend_state, task) do
+          schedule_expiry(task, now)
+          {:ok, %{state | backend_state: backend_state}}
+        end
     end
   end
 end

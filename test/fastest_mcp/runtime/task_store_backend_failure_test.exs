@@ -1,138 +1,88 @@
 defmodule FastestMCP.Runtime.TaskStoreBackendFailureTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.BackgroundTaskStore
-  alias FastestMCP.BackgroundTaskSupervisor
   alias FastestMCP.Components.Tool
   alias FastestMCP.Context
   alias FastestMCP.Elicitation
   alias FastestMCP.EventBus
   alias FastestMCP.Operation
   alias FastestMCP.RuntimeQuota
+  alias FastestMCP.ServerRuntime
   alias FastestMCP.Session
   alias FastestMCP.SessionStateStore.Memory, as: SessionStateStore
   alias FastestMCP.TaskConfig
 
   defmodule FailureBackend do
-    use Agent
-
+    # Its state is an Agent the test starts, so tests can inject failures.
     @behaviour FastestMCP.TaskBackend
 
-    @impl true
-    def start_link(_opts) do
-      Agent.start_link(fn -> %{tasks: %{}, failures: %{}, calls: []} end)
-    end
+    def fail(agent, callback, reason),
+      do: Agent.update(agent, &put_in(&1, [:failures, callback], reason))
 
-    def fail(store, callback, reason) do
-      Agent.update(store, &put_in(&1, [:failures, callback], reason))
-    end
+    def fail_after_write(agent, :put_task, reason),
+      do: Agent.update(agent, &put_in(&1, [:failures, :put_task], {:after_write, reason}))
 
-    def fail_after_write(store, :put_task, reason) do
-      Agent.update(store, &put_in(&1, [:failures, :put_task], {:after_write, reason}))
-    end
-
-    def tasks(store), do: Agent.get(store, & &1.tasks)
-    def calls(store), do: Agent.get(store, &Enum.reverse(&1.calls))
+    def tasks(agent), do: Agent.get(agent, & &1.tasks)
+    def calls(agent), do: Agent.get(agent, &Enum.reverse(&1.calls))
 
     @impl true
-    def put_task(store, task) do
-      Agent.get_and_update(store, fn state ->
-        state = record_call(state, :put_task)
+    def init(agent: agent), do: {:ok, agent}
 
-        case state.failures[:put_task] do
-          {:after_write, reason} ->
-            {{:error, reason}, put_in(state, [:tasks, task.id], task)}
-
-          reason when not is_nil(reason) ->
-            {{:error, reason}, state}
-
-          nil ->
-            {:ok, put_in(state, [:tasks, task.id], task)}
-        end
+    @impl true
+    def put_task(agent, task) do
+      call(agent, :put_task, fn
+        state, {:after_write, reason} -> {{:error, reason}, put_in(state.tasks[task.id], task)}
+        state, nil -> {{:ok, agent}, put_in(state.tasks[task.id], task)}
+        state, reason -> {{:error, reason}, state}
       end)
     end
 
     @impl true
-    def fetch_task(store, task_id, _opts) do
-      Agent.get_and_update(store, fn state ->
-        state = record_call(state, :fetch_task)
-
-        reply =
-          case state.failures[:fetch_task] do
-            reason when not is_nil(reason) ->
-              {:error, reason}
-
-            nil ->
-              case Map.fetch(state.tasks, task_id) do
-                {:ok, task} -> {:ok, task}
-                :error -> {:error, :not_found}
-              end
-          end
-
-        {reply, state}
+    def fetch_task(agent, task_id) do
+      call(agent, :fetch_task, fn
+        state, nil -> {Map.fetch(state.tasks, task_id) |> found(), state}
+        state, reason -> {{:error, reason}, state}
       end)
     end
 
     @impl true
-    def delete_task(store, task_id) do
-      Agent.get_and_update(store, fn state ->
-        state = record_call(state, :delete_task)
-
-        case state.failures[:delete_task] do
-          reason when not is_nil(reason) ->
-            {{:error, reason}, state}
-
-          nil ->
-            {:ok, update_in(state.tasks, &Map.delete(&1, task_id))}
-        end
+    def delete_task(agent, task_id) do
+      call(agent, :delete_task, fn
+        state, nil -> {{:ok, agent}, update_in(state.tasks, &Map.delete(&1, task_id))}
+        state, reason -> {{:error, reason}, state}
       end)
     end
 
     @impl true
-    def list_tasks(store, _opts) do
-      Agent.get_and_update(store, fn state ->
-        state = record_call(state, :list_tasks)
-
-        reply =
-          case state.failures[:list_tasks] do
-            reason when not is_nil(reason) ->
-              {:error, reason}
-
-            nil ->
-              {:ok, %{tasks: Map.values(state.tasks), next_cursor: nil}}
-          end
-
-        {reply, state}
+    def list_tasks(agent) do
+      call(agent, :list_tasks, fn
+        state, nil -> {{:ok, Map.values(state.tasks)}, state}
+        state, reason -> {{:error, reason}, state}
       end)
     end
 
-    @impl true
-    def expire_tasks(store, _now_ms) do
-      Agent.get_and_update(store, fn state ->
-        state = record_call(state, :expire_tasks)
-
-        reply =
-          case state.failures[:expire_tasks] do
-            reason when not is_nil(reason) -> {:error, reason}
-            nil -> {:ok, []}
-          end
-
-        {reply, state}
+    defp call(agent, callback, fun) do
+      Agent.get_and_update(agent, fn state ->
+        fun.(update_in(state.calls, &[callback | &1]), state.failures[callback])
       end)
     end
 
-    defp record_call(state, callback), do: update_in(state.calls, &[callback | &1])
+    defp found(:error), do: {:error, :not_found}
+    defp found(ok), do: ok
   end
 
   setup do
     server_name = "backend-failure-#{System.unique_integer([:positive])}"
     session_id = "backend-failure-session"
-    backend = start_supervised!(FailureBackend)
-    event_bus = start_supervised!(EventBus)
-    task_supervisor = start_supervised!(BackgroundTaskSupervisor)
-    relay_task_supervisor = start_supervised!(Task.Supervisor)
+    backend = start_supervised!({Agent, fn -> %{tasks: %{}, failures: %{}, calls: []} end})
+    event_bus = %EventBus{}
+    task_supervisor = start_supervised!(Task.Supervisor, id: :task_supervisor)
+    relay_task_supervisor = start_supervised!(Task.Supervisor, id: :relay_task_supervisor)
     session_state_store = start_supervised!(SessionStateStore)
-    runtime_quota = start_supervised!(RuntimeQuota)
+
+    runtime_quota =
+      RuntimeQuota.new(pending_requests: 10, active_requests: 10, sse_replay_bytes: 1_000_000)
 
     session =
       start_supervised!(
@@ -148,12 +98,9 @@ defmodule FastestMCP.Runtime.TaskStoreBackendFailureTest do
       )
 
     :ok =
-      Session.begin_initialization(
-        server_name,
-        session_id,
-        "2025-11-25",
-        %{"elicitation" => %{"form" => %{}}},
-        %{"name" => "backend failure test", "version" => "1"}
+      Session.begin_initialization(server_name, session_id,
+        client_capabilities: %{"elicitation" => %{"form" => %{}}},
+        client_info: %{"name" => "backend failure test", "version" => "1"}
       )
 
     :ok = Session.mark_initialized(server_name, session_id)
@@ -163,7 +110,8 @@ defmodule FastestMCP.Runtime.TaskStoreBackendFailureTest do
         {BackgroundTaskStore,
          server_name: server_name,
          event_bus: event_bus,
-         backend: %{module: FailureBackend, store: backend},
+         task_backend: {FailureBackend, agent: backend},
+         task_supervisor: task_supervisor,
          relay_task_supervisor: relay_task_supervisor}
       )
 
@@ -209,12 +157,18 @@ defmodule FastestMCP.Runtime.TaskStoreBackendFailureTest do
     assert_failure_cleanup(context.store, task, :list_failed)
   end
 
-  test "expire_tasks failures fail the triggering call and release all orchestration", context do
-    task = task_with_waiters(context)
-    FailureBackend.fail(context.backend, :expire_tasks, :expire_failed)
+  test "a finished task expires on its timer and stays hidden when it cannot be deleted",
+       context do
+    FailureBackend.fail(context.backend, :delete_task, :delete_failed)
 
-    assert {:error, :expire_failed} = BackgroundTaskStore.fetch(context.store, task.task_id)
-    assert_failure_cleanup(context.store, task, :expire_failed)
+    assert {:ok, handle} = submit_task(context, fn _operation -> :done end, 500)
+    assert {:ok, :done} = BackgroundTaskStore.await(context.store, handle.task_id, 1_000)
+
+    assert_eventually(fn -> :delete_task in FailureBackend.calls(context.backend) end, 5_000)
+    assert {:error, :not_found} = BackgroundTaskStore.fetch(context.store, handle.task_id)
+    assert {:ok, []} = BackgroundTaskStore.list(context.store)
+    assert Map.has_key?(FailureBackend.tasks(context.backend), handle.task_id)
+    assert_clean_state(context.store)
   end
 
   test "put_task failures reject a submission before its executor runs", context do
@@ -229,9 +183,7 @@ defmodule FastestMCP.Runtime.TaskStoreBackendFailureTest do
 
     refute_receive :rejected_executor_started, 100
 
-    assert_eventually(fn ->
-      DynamicSupervisor.count_children(context.task_supervisor).active == 0
-    end)
+    assert_eventually(fn -> Task.Supervisor.children(context.task_supervisor) == [] end)
 
     assert_clean_state(context.store)
   end
@@ -253,9 +205,7 @@ defmodule FastestMCP.Runtime.TaskStoreBackendFailureTest do
     assert [_task_id] = Map.keys(FailureBackend.tasks(context.backend))
     assert :delete_task in FailureBackend.calls(context.backend)
 
-    assert_eventually(fn ->
-      DynamicSupervisor.count_children(context.task_supervisor).active == 0
-    end)
+    assert_eventually(fn -> Task.Supervisor.children(context.task_supervisor) == [] end)
 
     assert_clean_state(context.store)
 
@@ -283,12 +233,14 @@ defmodule FastestMCP.Runtime.TaskStoreBackendFailureTest do
 
     interaction_pid =
       spawn(fn ->
-        reply = BackgroundTaskStore.elicit(context.store, task_id, request, 10_000)
+        reply =
+          BackgroundTaskStore.interact(context.store, task_id, :elicitation, request, 10_000)
+
         send(parent, {:interaction_reply, reply})
       end)
 
     assert_eventually(fn ->
-      Map.has_key?(:sys.get_state(context.store).interaction_waiters, task_id)
+      Map.has_key?(:sys.get_state(context.store).interactions, task_id)
     end)
 
     assert {:ok, sink} =
@@ -302,8 +254,7 @@ defmodule FastestMCP.Runtime.TaskStoreBackendFailureTest do
     result_pid =
       spawn(fn ->
         reply =
-          BackgroundTaskStore.result(context.store, task_id,
-            timeout: 10_000,
+          BackgroundTaskStore.await(context.store, task_id, 10_000,
             session_id: context.session_id,
             request_metadata: %{
               session_sink_ref: sink_ref,
@@ -320,7 +271,7 @@ defmodule FastestMCP.Runtime.TaskStoreBackendFailureTest do
                       "id" => wire_request_id,
                       "method" => "elicitation/create"
                     }},
-                   1_000
+                   5_000
 
     assert is_binary(wire_request_id)
 
@@ -330,51 +281,44 @@ defmodule FastestMCP.Runtime.TaskStoreBackendFailureTest do
         send(parent, {:await_reply, reply})
       end)
 
-    assert_eventually(fn ->
-      state = :sys.get_state(context.store)
+    assert_eventually(
+      fn ->
+        state = :sys.get_state(context.store)
 
-      map_size(state.task_monitors) == 1 and
-        map_size(state.waiter_monitors) == 3 and
-        length(Map.get(state.waiters, task_id, [])) == 1 and
-        length(Map.get(state.result_waiters, task_id, [])) == 1 and
-        Map.has_key?(state.interaction_waiters, task_id) and
-        map_size(state.relay_requests) == 1 and
-        Enum.all?(state.relay_requests, fn
-          {relay_id, %{task_id: ^task_id, worker_pid: worker_pid}} ->
-            is_reference(relay_id) and is_pid(worker_pid)
-
-          _other ->
-            false
-        end)
-    end)
+        Map.has_key?(state.running, task_id) and
+          length(Map.get(state.waiters, task_id, [])) == 2 and
+          match?(%{relay: %{pid: pid}} when is_pid(pid), state.interactions[task_id])
+      end,
+      5_000
+    )
 
     state = :sys.get_state(context.store)
-    [{_relay_id, relay}] = Map.to_list(state.relay_requests)
 
-    timer_refs =
-      [
-        get_in(state, [:waiters, task_id, Access.at(0), :timer_ref]),
-        get_in(state, [:result_waiters, task_id, Access.at(0), :timer_ref]),
-        get_in(state, [:interaction_waiters, task_id, :timer_ref])
-      ]
+    timer_refs = [
+      state.interactions[task_id].timer | Enum.map(state.waiters[task_id], & &1.timer)
+    ]
 
     %{
       task_id: task_id,
       worker_pid: worker_pid,
-      relay_worker_pid: relay.worker_pid,
+      relay_worker_pid: state.interactions[task_id].relay.pid,
       session_pid: context.session,
       caller_pids: [interaction_pid, result_pid, await_pid],
       timer_refs: timer_refs
     }
   end
 
-  defp submit_task(context, executor) do
-    {:ok, request_context} =
-      Context.build(context.server_name,
+  defp submit_task(context, executor, ttl_ms \\ nil) do
+    runtime = %ServerRuntime{
+      server: FastestMCP.server(context.server_name),
+      event_bus: context.event_bus
+    }
+
+    request_context =
+      Context.new(runtime,
         state_scope: :request,
         session_id: context.session_id,
-        transport: :in_process,
-        event_bus: context.event_bus
+        transport: :in_process
       )
 
     component = %Tool{
@@ -391,16 +335,11 @@ defmodule FastestMCP.Runtime.TaskStoreBackendFailureTest do
       target: "wait",
       context: request_context,
       transport: :in_process,
+      task_ttl_ms: ttl_ms,
       arguments: %{}
     }
 
-    BackgroundTaskStore.submit(
-      context.store,
-      context.task_supervisor,
-      component,
-      operation,
-      executor
-    )
+    BackgroundTaskStore.submit(context.store, component, operation, executor)
   end
 
   defp assert_failure_cleanup(store, task, reason) do
@@ -440,27 +379,8 @@ defmodule FastestMCP.Runtime.TaskStoreBackendFailureTest do
     assert_eventually(fn ->
       state = :sys.get_state(store)
 
-      state.task_monitors == %{} and
-        state.waiter_monitors == %{} and
-        state.waiters == %{} and
-        state.result_waiters == %{} and
-        state.interaction_waiters == %{} and
-        state.relay_requests == %{} and
+      state.running == %{} and state.waiters == %{} and state.interactions == %{} and
         Process.info(store, :monitors) == {:monitors, []}
     end)
-  end
-
-  defp assert_eventually(fun, attempts \\ 100) do
-    cond do
-      fun.() ->
-        :ok
-
-      attempts == 0 ->
-        flunk("condition did not become true")
-
-      true ->
-        Process.sleep(10)
-        assert_eventually(fun, attempts - 1)
-    end
   end
 end

@@ -1,5 +1,5 @@
 defmodule FastestMCP.MiddlewareResponseLimitingTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Middleware
   alias FastestMCP.Middleware.ResponseLimiting
@@ -12,7 +12,7 @@ defmodule FastestMCP.MiddlewareResponseLimitingTest do
     operation = %Operation{method: "tools/call", target: "small_tool"}
 
     assert %{"message" => "hello"} ==
-             ResponseLimiting.call(middleware, operation, fn _operation ->
+             limit(middleware, operation, fn ->
                %{"message" => "hello"}
              end)
   end
@@ -22,11 +22,11 @@ defmodule FastestMCP.MiddlewareResponseLimitingTest do
     operation = %Operation{method: "tools/call", target: "scalar_tool"}
 
     result =
-      ResponseLimiting.call(middleware, operation, fn _operation ->
+      limit(middleware, operation, fn ->
         String.duplicate("x", 50)
       end)
 
-    assert %{"content" => [%{"type" => "text", "text" => text}]} = result
+    assert %{content: [%{"type" => "text", "text" => text}]} = result
     assert byte_size(text) < 50
     assert result |> Serializer.tool_result() |> JSON.encode!() |> byte_size() <= 70
   end
@@ -36,13 +36,38 @@ defmodule FastestMCP.MiddlewareResponseLimitingTest do
     operation = %Operation{method: "tools/call", target: "large_tool"}
 
     result =
-      ResponseLimiting.call(middleware, operation, fn _operation ->
-        %{"content" => [%{"type" => "text", "text" => String.duplicate("x", 10_000)}]}
+      limit(middleware, operation, fn ->
+        FastestMCP.Tools.Result.from(%{
+          "content" => [%{"type" => "text", "text" => String.duplicate("x", 10_000)}]
+        })
       end)
 
-    assert %{"content" => [%{"type" => "text", "text" => text}]} = result
+    assert %{content: [%{"type" => "text", "text" => text}]} = result
     assert text =~ "[Response truncated due to size limit]"
-    assert byte_size(JSON.encode!(result)) <= 500
+    assert byte_size(JSON.encode!(Serializer.tool_result(result))) <= 500
+  end
+
+  test "an InputRequiredResult is a question, not a tool result, and passes through" do
+    middleware = Middleware.response_limiting(max_size: 500)
+    operation = %Operation{method: "tools/call", target: "summarize"}
+
+    question =
+      FastestMCP.InputRequiredResult.new(%{
+        "summary" => %{
+          "method" => "sampling/createMessage",
+          "params" => %{
+            "messages" => [
+              %{
+                "role" => "user",
+                "content" => %{"type" => "text", "text" => String.duplicate("x", 10_000)}
+              }
+            ],
+            "maxTokens" => 100
+          }
+        }
+      })
+
+    assert limit(middleware, operation, fn -> question end) == question
   end
 
   test "tool filtering limits only configured tools" do
@@ -51,19 +76,23 @@ defmodule FastestMCP.MiddlewareResponseLimitingTest do
     unlimited = %Operation{method: "tools/call", target: "unlimited_tool"}
 
     limited_result =
-      ResponseLimiting.call(middleware, limited, fn _operation ->
-        %{"content" => [%{"type" => "text", "text" => String.duplicate("x", 10_000)}]}
+      limit(middleware, limited, fn ->
+        FastestMCP.Tools.Result.from(%{
+          "content" => [%{"type" => "text", "text" => String.duplicate("x", 10_000)}]
+        })
       end)
 
-    assert %{"content" => [%{"text" => limited_text}]} = limited_result
+    assert %{content: [%{"text" => limited_text}]} = limited_result
     assert limited_text =~ "[Response truncated"
 
     unlimited_result =
-      ResponseLimiting.call(middleware, unlimited, fn _operation ->
-        %{"content" => [%{"type" => "text", "text" => String.duplicate("y", 10_000)}]}
+      limit(middleware, unlimited, fn ->
+        FastestMCP.Tools.Result.from(%{
+          "content" => [%{"type" => "text", "text" => String.duplicate("y", 10_000)}]
+        })
       end)
 
-    assert %{"content" => [%{"text" => text}]} = unlimited_result
+    assert %{content: [%{"text" => text}]} = unlimited_result
     assert text != ""
     refute text =~ "[Response truncated"
   end
@@ -73,11 +102,13 @@ defmodule FastestMCP.MiddlewareResponseLimitingTest do
     operation = %Operation{method: "tools/call", target: "any_tool"}
 
     result =
-      ResponseLimiting.call(middleware, operation, fn _operation ->
-        %{"content" => [%{"type" => "text", "text" => String.duplicate("x", 10_000)}]}
+      limit(middleware, operation, fn ->
+        FastestMCP.Tools.Result.from(%{
+          "content" => [%{"type" => "text", "text" => String.duplicate("x", 10_000)}]
+        })
       end)
 
-    assert %{"content" => [%{"text" => text}]} = result
+    assert %{content: [%{"text" => text}]} = result
     refute text =~ "[Response truncated"
   end
 
@@ -86,11 +117,13 @@ defmodule FastestMCP.MiddlewareResponseLimitingTest do
     operation = %Operation{method: "tools/call", target: "large_tool"}
 
     result =
-      ResponseLimiting.call(middleware, operation, fn _operation ->
-        %{"content" => [%{"type" => "text", "text" => String.duplicate("x", 10_000)}]}
+      limit(middleware, operation, fn ->
+        FastestMCP.Tools.Result.from(%{
+          "content" => [%{"type" => "text", "text" => String.duplicate("x", 10_000)}]
+        })
       end)
 
-    assert %{"content" => [%{"text" => text}]} = result
+    assert %{content: [%{"text" => text}]} = result
     assert text =~ "[CUT]"
   end
 
@@ -99,16 +132,16 @@ defmodule FastestMCP.MiddlewareResponseLimitingTest do
     operation = %Operation{method: "tools/call", target: "multi_block"}
 
     result =
-      ResponseLimiting.call(middleware, operation, fn _operation ->
-        %{
+      limit(middleware, operation, fn ->
+        FastestMCP.Tools.Result.from(%{
           "content" => [
             %{"type" => "text", "text" => "First: " <> String.duplicate("a", 500)},
             %{"type" => "text", "text" => "Second: " <> String.duplicate("b", 500)}
           ]
-        }
+        })
       end)
 
-    assert %{"content" => [%{"text" => text}]} = result
+    assert %{content: [%{"text" => text}]} = result
     assert text =~ "[Response truncated"
   end
 
@@ -117,8 +150,8 @@ defmodule FastestMCP.MiddlewareResponseLimitingTest do
     operation = %Operation{method: "tools/call", target: "binary_tool"}
 
     result =
-      ResponseLimiting.call(middleware, operation, fn _operation ->
-        %{
+      limit(middleware, operation, fn ->
+        FastestMCP.Tools.Result.from(%{
           "content" => [
             %{
               "type" => "image",
@@ -126,10 +159,10 @@ defmodule FastestMCP.MiddlewareResponseLimitingTest do
               "mimeType" => "image/png"
             }
           ]
-        }
+        })
       end)
 
-    assert %{"content" => [%{"text" => text}]} = result
+    assert %{content: [%{"text" => text}]} = result
     assert text =~ "[Response truncated"
   end
 
@@ -138,21 +171,21 @@ defmodule FastestMCP.MiddlewareResponseLimitingTest do
     operation = %Operation{method: "tools/call", target: "wrapped_tool"}
 
     result =
-      ResponseLimiting.call(middleware, operation, fn _operation ->
-        %{
+      limit(middleware, operation, fn ->
+        FastestMCP.Tools.Result.from(%{
           "content" => [%{"type" => "text", "text" => String.duplicate("x", 10_000)}],
           "structuredContent" => %{"result" => Enum.to_list(1..100)},
           "meta" => %{"fastestmcp" => %{"wrap_result" => true}}
-        }
+        })
       end)
 
     assert %{
-             "content" => [%{"type" => "text", "text" => text}],
-             "meta" => %{"fastestmcp" => %{"wrap_result" => true}}
+             content: [%{"type" => "text", "text" => text}],
+             meta: %{"fastestmcp" => %{"wrap_result" => true}}
            } = result
 
     assert text =~ "[Response truncated"
-    assert byte_size(JSON.encode!(result)) <= 450
+    assert byte_size(JSON.encode!(Serializer.tool_result(result))) <= 450
   end
 
   test "truncation drops metadata when metadata alone cannot fit" do
@@ -165,8 +198,8 @@ defmodule FastestMCP.MiddlewareResponseLimitingTest do
         %{"meta" => %{"large" => String.duplicate("m", 1_000)}}
       )
 
-    refute Map.has_key?(result, "meta")
-    assert byte_size(JSON.encode!(result)) <= 160
+    assert is_nil(result.meta)
+    assert byte_size(JSON.encode!(Serializer.tool_result(result))) <= 160
   end
 
   test "utf8 truncation preserves valid characters" do
@@ -178,9 +211,9 @@ defmodule FastestMCP.MiddlewareResponseLimitingTest do
         String.duplicate("Hello 🌍 World 🎉 Test ", 100)
       )
 
-    assert %{"content" => [%{"text" => text}]} = result
+    assert %{content: [%{"text" => text}]} = result
     assert text |> String.valid?()
-    assert byte_size(JSON.encode!(result)) <= 100
+    assert byte_size(JSON.encode!(Serializer.tool_result(result))) <= 100
   end
 
   test "invalid max size raises" do
@@ -199,14 +232,15 @@ defmodule FastestMCP.MiddlewareResponseLimitingTest do
     middleware = Middleware.response_limiting(max_size: 250)
     server_name = "response-limit-http-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_middleware(middleware)
-      |> FastestMCP.add_tool("large", fn _arguments, _ctx ->
-        %{"content" => [%{"type" => "text", "text" => String.duplicate("x", 10_000)}]}
-      end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_middleware(middleware)
+    |> FastestMCP.add_tool("large", fn _arguments, _ctx ->
+      FastestMCP.Tools.Result.from(%{
+        "content" => [%{"type" => "text", "text" => String.duplicate("x", 10_000)}]
+      })
+    end)
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
     ProtocolTest.initialize_session(server_name, "response-limit-session")
 
     conn =
@@ -227,23 +261,21 @@ defmodule FastestMCP.MiddlewareResponseLimitingTest do
     middleware = Middleware.response_limiting(max_size: 200)
     server_name = "response-limit-schema-#{System.unique_integer([:positive])}"
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_middleware(middleware)
-      |> FastestMCP.add_tool(
-        "values",
-        fn _arguments, _context -> %{"values" => Enum.to_list(1..30)} end,
-        output_schema: %{
-          "type" => "object",
-          "properties" => %{
-            "values" => %{"type" => "array", "items" => %{"type" => "integer"}}
-          },
-          "required" => ["values"]
-        }
-      )
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_middleware(middleware)
+    |> FastestMCP.add_tool(
+      "values",
+      fn _arguments, _context -> %{"values" => Enum.to_list(1..30)} end,
+      output_schema: %{
+        "type" => "object",
+        "properties" => %{
+          "values" => %{"type" => "array", "items" => %{"type" => "integer"}}
+        },
+        "required" => ["values"]
+      }
+    )
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
     ProtocolTest.initialize_session(server_name, "response-limit-schema-session")
 
     conn =
@@ -272,23 +304,21 @@ defmodule FastestMCP.MiddlewareResponseLimitingTest do
     middleware = Middleware.response_limiting(max_size: 200)
     server_name = "response-limit-unrepresentable-#{System.unique_integer([:positive])}"
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_middleware(middleware)
-      |> FastestMCP.add_tool(
-        "values",
-        fn _arguments, _context -> %{"values" => Enum.to_list(1..200)} end,
-        output_schema: %{
-          "type" => "object",
-          "properties" => %{
-            "values" => %{"type" => "array", "items" => %{"type" => "integer"}}
-          },
-          "required" => ["values"]
-        }
-      )
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_middleware(middleware)
+    |> FastestMCP.add_tool(
+      "values",
+      fn _arguments, _context -> %{"values" => Enum.to_list(1..200)} end,
+      output_schema: %{
+        "type" => "object",
+        "properties" => %{
+          "values" => %{"type" => "array", "items" => %{"type" => "integer"}}
+        },
+        "required" => ["values"]
+      }
+    )
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
     ProtocolTest.initialize_session(server_name, "response-limit-unrepresentable-session")
 
     conn =
@@ -322,5 +352,12 @@ defmodule FastestMCP.MiddlewareResponseLimitingTest do
     assert actual_bytes > minimum_bytes
     assert minimum_bytes > 200
     assert byte_size(conn.resp_body) < 512
+  end
+
+  defp limit(middleware, operation, fun) do
+    assert {:ok, %Operation{result: result}} =
+             ResponseLimiting.call(middleware, operation, &{:ok, %{&1 | result: fun.()}})
+
+    result
   end
 end

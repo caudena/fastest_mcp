@@ -1,28 +1,22 @@
 defmodule FastestMCP.MiddlewareRateLimitingTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Error
   alias FastestMCP.Middleware
   alias FastestMCP.Middleware.RateLimiting
-  alias FastestMCP.Middleware.SlidingWindowRateLimiting
+  alias FastestMCP.Middleware.RateLimiting.SlidingWindow
   alias FastestMCP.Operation
   alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
 
   test "token bucket limiter allows bursts then rate limits" do
-    middleware = Middleware.rate_limiting(max_requests_per_second: 1.0, burst_capacity: 1)
-    on_exit(fn -> RateLimiting.close(middleware) end)
+    middleware =
+      start_middleware!(Middleware.rate_limiting(max_requests_per_second: 1.0, burst_capacity: 1))
 
     operation = %Operation{method: "tools/call"}
 
-    assert :ok ==
-             RateLimiting.call(middleware, operation, fn _operation ->
-               :ok
-             end)
+    assert {:ok, _operation} = RateLimiting.call(middleware, operation, &{:ok, &1})
 
-    error =
-      assert_raise Error, fn ->
-        RateLimiting.call(middleware, operation, fn _operation -> :ok end)
-      end
+    assert {:error, %Error{} = error} = RateLimiting.call(middleware, operation, &{:ok, &1})
 
     assert error.code == :rate_limited
     assert error.message =~ "rate limit exceeded"
@@ -31,162 +25,138 @@ defmodule FastestMCP.MiddlewareRateLimitingTest do
 
   test "token bucket limiter supports global limiting" do
     middleware =
-      Middleware.rate_limiting(
-        max_requests_per_second: 1.0,
-        burst_capacity: 1,
-        global_limit: true
+      start_middleware!(
+        Middleware.rate_limiting(
+          max_requests_per_second: 1.0,
+          burst_capacity: 1,
+          global_limit: true
+        )
       )
 
-    on_exit(fn -> RateLimiting.close(middleware) end)
-
     operation = %Operation{method: "tools/call"}
-    assert :ok == RateLimiting.call(middleware, operation, fn _operation -> :ok end)
+    assert {:ok, _operation} = RateLimiting.call(middleware, operation, &{:ok, &1})
 
-    error =
-      assert_raise Error, fn ->
-        RateLimiting.call(middleware, operation, fn _operation -> :ok end)
-      end
+    assert {:error, %Error{} = error} = RateLimiting.call(middleware, operation, &{:ok, &1})
 
     assert error.message == "global rate limit exceeded"
   end
 
   test "token bucket limiter supports custom client ids" do
     middleware =
-      Middleware.rate_limiting(
-        max_requests_per_second: 1.0,
-        burst_capacity: 1,
-        get_client_id: fn operation -> operation.context.session_id end
+      start_middleware!(
+        Middleware.rate_limiting(
+          max_requests_per_second: 1.0,
+          burst_capacity: 1,
+          get_client_id: fn operation -> operation.context.session_id end
+        )
       )
 
-    on_exit(fn -> RateLimiting.close(middleware) end)
-
-    operation_a = %Operation{method: "tools/call", context: %{session_id: "a"}}
-    operation_b = %Operation{method: "tools/call", context: %{session_id: "b"}}
-
-    assert :ok == RateLimiting.call(middleware, operation_a, fn _operation -> :ok end)
-    assert :ok == RateLimiting.call(middleware, operation_b, fn _operation -> :ok end)
+    assert {:ok, _operation} = RateLimiting.call(middleware, client("a"), &{:ok, &1})
+    assert {:ok, _operation} = RateLimiting.call(middleware, client("b"), &{:ok, &1})
   end
 
   test "token bucket limiter bounds active clients and reuses semantically expired slots" do
     middleware =
-      Middleware.rate_limiting(
-        max_requests_per_second: 1_000.0,
-        burst_capacity: 1,
-        max_clients: 1,
-        get_client_id: fn operation -> operation.context.session_id end
+      start_middleware!(
+        Middleware.rate_limiting(
+          max_requests_per_second: 10.0,
+          burst_capacity: 1,
+          max_clients: 1,
+          get_client_id: fn operation -> operation.context.session_id end
+        )
       )
 
-    on_exit(fn -> RateLimiting.close(middleware) end)
+    assert {:ok, _operation} = RateLimiting.call(middleware, client("a"), &{:ok, &1})
 
-    operation_a = %Operation{method: "tools/call", context: %{session_id: "a"}}
-    operation_b = %Operation{method: "tools/call", context: %{session_id: "b"}}
-
-    assert :ok == RateLimiting.call(middleware, operation_a, fn _operation -> :ok end)
-
-    error =
-      assert_raise Error, fn ->
-        RateLimiting.call(middleware, operation_b, fn _operation -> :ok end)
-      end
+    assert {:error, %Error{} = error} = RateLimiting.call(middleware, client("b"), &{:ok, &1})
 
     assert error.code == :overloaded
     assert error.details == %{max_clients: 1}
 
-    Process.sleep(5)
-    assert :ok == RateLimiting.call(middleware, operation_b, fn _operation -> :ok end)
+    Process.sleep(150)
+    assert {:ok, _operation} = RateLimiting.call(middleware, client("b"), &{:ok, &1})
   end
 
   test "sliding window limiter rejects requests over the configured limit" do
     middleware =
-      Middleware.sliding_window_rate_limiting(max_requests: 1, window_minutes: 1)
-
-    on_exit(fn -> SlidingWindowRateLimiting.close(middleware) end)
+      start_middleware!(
+        Middleware.sliding_window_rate_limiting(max_requests: 1, window_minutes: 1)
+      )
 
     operation = %Operation{method: "tools/call"}
-    assert :ok == SlidingWindowRateLimiting.call(middleware, operation, fn _operation -> :ok end)
+    assert {:ok, _operation} = RateLimiting.call(middleware, operation, &{:ok, &1})
 
-    error =
-      assert_raise Error, fn ->
-        SlidingWindowRateLimiting.call(middleware, operation, fn _operation -> :ok end)
-      end
+    assert {:error, %Error{} = error} = RateLimiting.call(middleware, operation, &{:ok, &1})
 
     assert error.code == :rate_limited
-    assert error.message =~ "rate limit exceeded"
-    assert error.details.retry_after_seconds >= 1
+    assert error.message == "rate limit exceeded: 1 requests per 1 minutes for client: global"
+    assert error.details.retry_after_seconds in 59..60
   end
 
-  test "sliding window state uses queues and rejects new clients at capacity" do
-    {:ok, state} =
-      SlidingWindowRateLimiting.State.start_link(
-        max_requests: 2,
-        window_seconds: 60,
-        max_clients: 1
-      )
-
-    assert :ok == SlidingWindowRateLimiting.State.allow(state, "a")
-    assert {:error, :overloaded} == SlidingWindowRateLimiting.State.allow(state, "b")
-
-    assert %{windows: %{"a" => %{requests: requests, count: 1}}} = :sys.get_state(state)
-    assert :queue.is_queue(requests)
-  end
-
-  test "sliding window removes clients once their windows are semantically empty" do
-    {:ok, state} =
-      SlidingWindowRateLimiting.State.start_link(
-        max_requests: 1,
-        window_seconds: 0,
-        max_clients: 1
-      )
-
-    assert :ok == SlidingWindowRateLimiting.State.allow(state, "a")
-    assert :ok == SlidingWindowRateLimiting.State.allow(state, "b")
-    assert %{windows: %{"b" => %{count: 1}}} = :sys.get_state(state)
-  end
-
-  test "token bucket close is safe after the state process already exits" do
+  test "sliding window limiter rejects new clients at capacity" do
     middleware =
-      Middleware.rate_limiting(max_requests_per_second: 1.0, burst_capacity: 1)
-      |> RateLimiting.activate_runtime()
+      start_middleware!(
+        Middleware.sliding_window_rate_limiting(
+          max_requests: 2,
+          max_clients: 1,
+          get_client_id: fn operation -> operation.context.session_id end
+        )
+      )
 
-    state = RateLimiting.state_pid(middleware)
-    ref = Process.monitor(state)
-    GenServer.stop(state, :normal)
-    assert_receive {:DOWN, ^ref, :process, _pid, _reason}
+    assert {:ok, _operation} = RateLimiting.call(middleware, client("a"), &{:ok, &1})
+    assert {:error, %Error{} = error} = RateLimiting.call(middleware, client("b"), &{:ok, &1})
 
-    assert :ok == RateLimiting.close(middleware)
+    assert error.code == :overloaded
+    assert error.message == "sliding-window rate limiter client capacity exceeded"
+    assert error.details == %{max_clients: 1}
   end
 
-  test "close unlinks a directly activated limiter from its calling process" do
-    parent = self()
+  test "sliding window limiter forgets clients once their windows are empty" do
+    config =
+      Middleware.sliding_window_rate_limiting(
+        max_requests: 1,
+        max_clients: 1,
+        get_client_id: fn operation -> operation.context.session_id end
+      )
 
-    {owner, monitor_ref} =
-      spawn_monitor(fn ->
-        middleware =
-          Middleware.rate_limiting()
-          |> RateLimiting.activate_runtime()
+    # A zero-length window is empty again as soon as time moves on.
+    middleware = start_middleware!(%{config | limiter: SlidingWindow.new(1, 0)})
 
-        send(parent, {:limiter_runtime, RateLimiting.state_pid(middleware)})
-        send(parent, {:limiter_close, RateLimiting.close(middleware)})
-      end)
+    assert {:ok, _operation} = RateLimiting.call(middleware, client("a"), &{:ok, &1})
+    assert {:ok, _operation} = RateLimiting.call(middleware, client("b"), &{:ok, &1})
+  end
 
-    assert_receive {:limiter_runtime, runtime_pid}
-    assert_receive {:limiter_close, :ok}
-    assert_receive {:DOWN, ^monitor_ref, :process, ^owner, :normal}
-    refute Process.alive?(runtime_pid)
+  test "sliding windows keep a queue of the events inside the interval" do
+    window = SlidingWindow.new(2, 10)
+
+    assert {:ok, window} = SlidingWindow.acquire(window, 0)
+    assert {:ok, window} = SlidingWindow.acquire(window, 5)
+    assert {:error, 5, window} = SlidingWindow.acquire(window, 5)
+    assert :queue.is_queue(window.events)
+    refute SlidingWindow.idle?(window, 14)
+
+    assert {:ok, window} = SlidingWindow.acquire(window, 10)
+    assert window.count == 2
+    assert SlidingWindow.idle?(window, 20)
+  end
+
+  test "a limiter no server started returns an internal error naming the cause" do
+    assert {:error, %Error{code: :internal_error, message: message}} =
+             RateLimiting.call(Middleware.rate_limiting(), %Operation{}, &{:ok, &1})
+
+    assert message =~ "FastestMCP.Middleware.RateLimiting has no running state"
   end
 
   test "http transport renders rate-limited JSON-RPC errors on HTTP 200" do
     middleware = Middleware.rate_limiting(max_requests_per_second: 1.0, burst_capacity: 1)
-    on_exit(fn -> RateLimiting.close(middleware) end)
 
     server_name = "rate-http-" <> Integer.to_string(System.unique_integer([:positive]))
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_middleware(middleware)
-      |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_middleware(middleware)
+    |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
     ProtocolTest.initialize_session(server_name, "rate-http-session")
 
     first =
@@ -230,37 +200,45 @@ defmodule FastestMCP.MiddlewareRateLimitingTest do
 
   test "reusing one limiter config across servers keeps runtime state isolated" do
     middleware = Middleware.rate_limiting(max_requests_per_second: 1.0, burst_capacity: 1)
-    on_exit(fn -> RateLimiting.close(middleware) end)
 
     server_a = "rate-shared-a-" <> Integer.to_string(System.unique_integer([:positive]))
     server_b = "rate-shared-b-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    on_exit(fn -> FastestMCP.stop_server(server_b) end)
-    on_exit(fn -> FastestMCP.stop_server(server_a) end)
-
-    server_a_def =
-      FastestMCP.server(server_a)
+    for name <- [server_a, server_b] do
+      FastestMCP.server(name)
       |> FastestMCP.add_middleware(middleware)
       |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+      |> start_server!()
+    end
 
-    server_b_def =
-      FastestMCP.server(server_b)
-      |> FastestMCP.add_middleware(middleware)
-      |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server_a_def)
-    assert {:ok, _pid} = FastestMCP.start_server(server_b_def)
-
-    assert %{"message" => "a-1"} = FastestMCP.call_tool(server_a, "echo", %{"message" => "a-1"})
-    assert %{"message" => "b-1"} = FastestMCP.call_tool(server_b, "echo", %{"message" => "b-1"})
+    assert %{"message" => "a-1"} = FastestMCP.call_tool!(server_a, "echo", %{"message" => "a-1"})
+    assert %{"message" => "b-1"} = FastestMCP.call_tool!(server_b, "echo", %{"message" => "b-1"})
 
     assert :ok = FastestMCP.stop_server(server_a)
 
     error =
       assert_raise Error, fn ->
-        FastestMCP.call_tool(server_b, "echo", %{"message" => "b-2"})
+        FastestMCP.call_tool!(server_b, "echo", %{"message" => "b-2"})
       end
 
     assert error.code == :rate_limited
   end
+
+  test "mounted servers run their stateful middleware with state the root starts" do
+    child =
+      FastestMCP.server(unique_name("rate-child"))
+      |> FastestMCP.add_middleware(
+        Middleware.rate_limiting(max_requests_per_second: 1.0, burst_capacity: 1)
+      )
+      |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+
+    root = start_server!(FastestMCP.server(unique_name("rate-root")) |> FastestMCP.mount(child))
+
+    assert %{"n" => 1} = FastestMCP.call_tool!(root.name, "echo", %{"n" => 1})
+
+    assert {:error, %Error{code: :rate_limited}} =
+             FastestMCP.call_tool(root.name, "echo", %{"n" => 2})
+  end
+
+  defp client(id), do: %Operation{method: "tools/call", context: %{session_id: id}}
 end

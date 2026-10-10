@@ -25,14 +25,17 @@ defmodule FastestMCP.Prompts.Result do
   ```
   """
 
+  import FastestMCP.Util, only: [maybe_put: 3, optional_map!: 2, string_keys: 1]
+
   alias FastestMCP.Prompts.Message
 
-  defstruct messages: [], description: nil, meta: nil
+  defstruct messages: [], description: nil, meta: nil, extra: %{}
 
   @type t :: %__MODULE__{
           messages: [Message.t()],
           description: String.t() | nil,
-          meta: map() | nil
+          meta: map() | nil,
+          extra: map()
         }
 
   @doc "Builds a normalized prompt result."
@@ -40,29 +43,37 @@ defmodule FastestMCP.Prompts.Result do
     %__MODULE__{
       messages: normalize_messages(messages),
       description: Keyword.get(opts, :description),
-      meta: normalize_optional_map(Keyword.get(opts, :meta))
+      meta: optional_map!(Keyword.get(opts, :meta), "prompt result meta")
     }
   end
 
   @doc "Normalizes prompt-result input into `%FastestMCP.Prompts.Result{}`."
   def from(%__MODULE__{} = result), do: result
 
-  def from(%{} = value) when is_map_key(value, :messages) or is_map_key(value, "messages") do
-    new(
-      Map.get(value, :messages, Map.get(value, "messages")),
-      description: Map.get(value, :description, Map.get(value, "description")),
-      meta:
-        Map.get(
-          value,
-          :_meta,
-          Map.get(value, "_meta", Map.get(value, :meta, Map.get(value, "meta")))
-        )
+  # Application code gives envelopes with atom or string keys.
+  def from(%{} = value) do
+    %{"messages" => messages} = value = string_keys(value)
+
+    new(Enum.map(messages, &Message.from/1),
+      description: value["description"],
+      meta: Map.get(value, "_meta", value["meta"])
     )
   end
 
   def from(value) when is_binary(value), do: new(value)
   def from(value) when is_list(value), do: new(value)
 
+  @doc "Builds an explicit envelope from a validated MCP prompt result."
+  def from_raw(%{} = raw) do
+    %__MODULE__{
+      messages: Map.fetch!(raw, "messages"),
+      description: Map.get(raw, "description"),
+      meta: Map.get(raw, "_meta"),
+      extra: Map.drop(raw, ["messages", "description"])
+    }
+  end
+
+  @doc "Converts the helper struct into the normalized prompt-result map used by the runtime."
   def to_map(%__MODULE__{} = result) do
     %{}
     |> Map.put(:messages, Enum.map(result.messages, &Message.to_map/1))
@@ -93,14 +104,4 @@ defmodule FastestMCP.Prompts.Result do
     raise ArgumentError,
           "messages must be a string or list[FastestMCP.Prompts.Message], got #{inspect(other)}"
   end
-
-  defp normalize_optional_map(nil), do: nil
-  defp normalize_optional_map(map) when is_map(map), do: Map.new(map)
-
-  defp normalize_optional_map(other) do
-    raise ArgumentError, "prompt result meta must be a map, got #{inspect(other)}"
-  end
-
-  defp maybe_put(map, _key, nil), do: map
-  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 end

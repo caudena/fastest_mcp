@@ -1,7 +1,6 @@
 defmodule FastestMCP.Base64 do
   @moduledoc false
 
-  @doc false
   @spec valid?(term()) :: boolean()
   def valid?(value) when is_binary(value) do
     match?({:ok, _decoded}, Base.decode64(value)) or

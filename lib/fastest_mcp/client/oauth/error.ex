@@ -23,25 +23,25 @@ defmodule FastestMCP.Client.OAuth.Error do
   @impl true
   def exception(opts) do
     stage = Keyword.fetch!(opts, :stage)
-    reason = Keyword.fetch!(opts, :reason)
+    reason = opts |> Keyword.fetch!(:reason) |> sanitize()
 
     %__MODULE__{
       stage: stage,
       reason: reason,
-      message: "OAuth #{stage_label(stage)} failed: #{reason_label(reason)}"
+      message: "OAuth #{label(stage)} failed: #{reason_label(reason)}"
     }
   end
 
-  defp stage_label(stage), do: stage |> to_string() |> String.replace("_", " ")
+  # Only atoms and HTTP statuses describe a failure without echoing a
+  # response body or a credential.
+  defp sanitize({:http_status, status, _body}), do: {:http_status, status}
+  defp sanitize({:http_status, _status} = reason), do: reason
+  defp sanitize(reason) when is_atom(reason), do: reason
+  defp sanitize(_reason), do: :request_failed
 
-  defp reason_label(reason) when is_atom(reason),
-    do: reason |> to_string() |> String.replace("_", " ")
+  defp label(value), do: value |> to_string() |> String.replace("_", " ")
 
-  defp reason_label({reason, detail}) when is_atom(reason) and is_binary(detail),
-    do: reason_label(reason) <> ": " <> detail
-
-  defp reason_label({:http_status, status}) when is_integer(status),
-    do: "HTTP #{status}"
-
+  defp reason_label({:http_status, status}) when is_integer(status), do: "HTTP #{status}"
+  defp reason_label(reason) when is_atom(reason), do: label(reason)
   defp reason_label(_reason), do: "request rejected"
 end

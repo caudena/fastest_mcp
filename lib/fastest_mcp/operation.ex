@@ -2,12 +2,9 @@ defmodule FastestMCP.Operation do
   @moduledoc """
   Runtime operation struct passed through middleware and transforms.
 
-  This module keeps one focused piece of FastestMCP behavior in a dedicated
-  place so builders, runtimes, transports, and providers can share the same
-  rules without duplicating logic.
-
-  Unless you are extending FastestMCP itself, you will usually meet this
-  module indirectly through higher-level APIs rather than calling it first.
+  The pipeline's executor sets `:result` and `:component` (the component that
+  handled the operation, when there is one); middleware reads both from the
+  operation its `next` function returns. See `FastestMCP.Middleware`.
   """
 
   defstruct [
@@ -18,13 +15,14 @@ defmodule FastestMCP.Operation do
     :version,
     :audience,
     :component,
+    :result,
     :context,
     :transport,
     :call_supervisor,
-    :task_supervisor,
     :task_store,
     :schema_cache,
     :schema_options,
+    invocation: :local,
     task_request: false,
     task_ttl_ms: nil,
     captures: %{},
@@ -39,13 +37,14 @@ defmodule FastestMCP.Operation do
           version: String.t() | nil,
           audience: atom(),
           component: struct() | nil,
+          result: term(),
           context: FastestMCP.Context.t(),
           transport: atom(),
           call_supervisor: pid() | atom(),
-          task_supervisor: pid() | atom() | nil,
           task_store: pid() | atom() | nil,
           schema_cache: :ets.tid() | nil,
           schema_options: keyword(),
+          invocation: :local | :protocol,
           task_request: boolean(),
           task_ttl_ms: pos_integer() | nil,
           captures: map(),

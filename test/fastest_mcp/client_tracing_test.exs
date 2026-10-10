@@ -1,5 +1,5 @@
 defmodule FastestMCP.ClientTracingTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: false
 
   require OpenTelemetry.Tracer, as: Tracer
 
@@ -25,18 +25,13 @@ defmodule FastestMCP.ClientTracingTest do
         arguments
       end)
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    client = Client.connect!({:in_process, server_name}, protocol_version: "2026-07-28")
+    start_server!(server)
+    client = connect!({:in_process, server_name}, protocol_version: "2026-07-28")
     _ = TraceTestHelper.drain_spans()
 
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
-      FastestMCP.stop_server(server_name)
-    end)
-
     Tracer.with_span "phoenix-request" do
-      assert %{"structuredContent" => %{"secret" => "must-not-be-traced"}} =
-               Client.call_tool(client, "echo", %{"secret" => "must-not-be-traced"},
+      assert %{raw: %{"structuredContent" => %{"secret" => "must-not-be-traced"}}} =
+               Client.call_tool!(client, "echo", %{"secret" => "must-not-be-traced"},
                  meta: %{
                    "nested" => %{"preserved" => true},
                    "traceparent" => "00-00000000000000000000000000000000-0000000000000000-00"
@@ -80,25 +75,22 @@ defmodule FastestMCP.ClientTracingTest do
   test "tool error results mark client spans and async spans finish once" do
     server_name = "client-tracing-error-#{System.unique_integer([:positive])}"
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("fails", fn _arguments, _context ->
-        %{"content" => [%{"type" => "text", "text" => "failed"}], "isError" => true}
-      end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("fails", fn _arguments, _context ->
+      FastestMCP.Tools.Result.from(%{
+        "content" => [%{"type" => "text", "text" => "failed"}],
+        "isError" => true
+      })
+    end)
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    client = Client.connect!({:in_process, server_name}, protocol_version: "2026-07-28")
+    client = connect!({:in_process, server_name}, protocol_version: "2026-07-28")
     _ = TraceTestHelper.drain_spans()
 
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
-      FastestMCP.stop_server(server_name)
-    end)
+    assert %Client.ToolResult{is_error: true} = Client.call_tool!(client, "fails")
 
-    assert %Client.ToolResult{is_error: true} = Client.call_tool_result(client, "fails")
-
-    request = Client.request_async(client, "tools/list", %{})
-    assert %{"tools" => [_tool]} = Client.await(request, 1_000)
+    request = Client.request_async!(client, "tools/list", %{})
+    assert %{"tools" => [_tool]} = Client.Request.await!(request, 1_000)
 
     spans = TraceTestHelper.drain_spans()
 
@@ -134,33 +126,30 @@ defmodule FastestMCP.ClientTracingTest do
       end
     end
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("cancelled", blocking_tool.("cancelled"))
-      |> FastestMCP.add_tool("timed_out", blocking_tool.("timed_out"))
-      |> FastestMCP.add_tool("owner_down", blocking_tool.("owner_down"))
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("cancelled", blocking_tool.("cancelled"))
+    |> FastestMCP.add_tool("timed_out", blocking_tool.("timed_out"))
+    |> FastestMCP.add_tool("owner_down", blocking_tool.("owner_down"))
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    client = Client.connect!({:in_process, server_name}, protocol_version: "2026-07-28")
+    client = connect!({:in_process, server_name}, protocol_version: "2026-07-28")
     _ = TraceTestHelper.drain_spans()
 
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
-      FastestMCP.stop_server(server_name)
-    end)
-
     cancelled =
-      Client.request_async(client, "tools/call", %{
+      Client.request_async!(client, "tools/call", %{
         "name" => "cancelled",
         "arguments" => %{}
       })
 
     assert_receive {:blocking_tool, "cancelled", _worker}, 1_000
-    assert :ok = Client.cancel(cancelled, "test cancellation")
-    assert_raise FastestMCP.Error, ~r/was cancelled/, fn -> Client.await(cancelled, 1_000) end
+    assert :ok = Client.Request.cancel!(cancelled, "test cancellation")
+
+    assert_raise FastestMCP.Error, ~r/was cancelled/, fn ->
+      Client.Request.await!(cancelled, 1_000)
+    end
 
     timed_out =
-      Client.request_async(
+      Client.request_async!(
         client,
         "tools/call",
         %{"name" => "timed_out", "arguments" => %{}},
@@ -168,12 +157,15 @@ defmodule FastestMCP.ClientTracingTest do
       )
 
     assert_receive {:blocking_tool, "timed_out", _worker}, 1_000
-    assert_raise FastestMCP.Error, ~r/timed out/, fn -> Client.await(timed_out, 1_000) end
+
+    assert_raise FastestMCP.Error, ~r/timed out/, fn ->
+      Client.Request.await!(timed_out, 1_000)
+    end
 
     owner =
       spawn(fn ->
         _request =
-          Client.request_async(client, "tools/call", %{
+          Client.request_async!(client, "tools/call", %{
             "name" => "owner_down",
             "arguments" => %{}
           })
@@ -182,8 +174,12 @@ defmodule FastestMCP.ClientTracingTest do
     owner_ref = Process.monitor(owner)
     assert_receive {:DOWN, ^owner_ref, :process, ^owner, :normal}, 1_000
 
-    Process.sleep(50)
-    spans = TraceTestHelper.drain_spans()
+    # The client ends the owner's span after it notices the owner is gone.
+    spans =
+      TraceTestHelper.drain_spans_until(
+        &(TraceTestHelper.span_name(&1) == "tools/call owner_down" and
+            TraceTestHelper.span_kind(&1) == :client)
+      )
 
     for name <- ["cancelled", "timed_out", "owner_down"] do
       matching =
@@ -204,33 +200,17 @@ defmodule FastestMCP.ClientTracingTest do
       FastestMCP.server(server_name)
       |> FastestMCP.add_tool("http_echo", fn arguments, _context -> arguments end)
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    start_server!(server)
 
-    bandit =
-      start_supervised!(
-        {Bandit,
-         plug:
-           {FastestMCP.Transport.HTTPApp,
-            server_name: server_name, path: "/mcp", allowed_hosts: :localhost},
-         scheme: :http,
-         port: 0}
-      )
+    %{url: url} = start_http!(server_name, allowed_hosts: :localhost)
 
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
-
-    client =
-      Client.connect!("http://127.0.0.1:#{port}/mcp", protocol_version: "2026-07-28")
+    client = connect!(url, protocol_version: "2026-07-28")
 
     _ = TraceTestHelper.drain_spans()
 
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
-      FastestMCP.stop_server(server_name)
-    end)
-
     Tracer.with_span "http-parent" do
-      assert %{"structuredContent" => %{"transport" => "http"}} =
-               Client.call_tool(client, "http_echo", %{"transport" => "http"},
+      assert %{raw: %{"structuredContent" => %{"transport" => "http"}}} =
+               Client.call_tool!(client, "http_echo", %{"transport" => "http"},
                  headers: [
                    {"traceparent", "00-11111111111111111111111111111111-2222222222222222-01"}
                  ]
@@ -261,20 +241,16 @@ defmodule FastestMCP.ClientTracingTest do
     elixir = System.find_executable("elixir") || flunk("elixir executable not found on PATH")
 
     client =
-      Client.connect!({:stdio, elixir, tracing_stdio_server_args()},
+      connect!({:stdio, elixir, tracing_stdio_server_args()},
         protocol_version: "2026-07-28"
       )
 
     _ = TraceTestHelper.drain_spans()
 
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
-    end)
-
     Tracer.with_span "stdio-parent" do
       assert %Client.ToolResult{
                structured_content: %{"traceparent" => traceparent}
-             } = Client.call_tool_result(client, "trace_context")
+             } = Client.call_tool!(client, "trace_context")
 
       assert is_binary(traceparent)
       assert String.starts_with?(traceparent, "00-")
@@ -318,10 +294,10 @@ defmodule FastestMCP.ClientTracingTest do
         end
       end)
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+    start_server!(server)
 
     client =
-      Client.connect!({:in_process, server_name},
+      connect!({:in_process, server_name},
         protocol_version: "2026-07-28",
         elicitation_handler: fn _message, _params ->
           Tracer.with_span "elicitation-callback" do
@@ -332,12 +308,7 @@ defmodule FastestMCP.ClientTracingTest do
 
     _ = TraceTestHelper.drain_spans()
 
-    on_exit(fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
-      FastestMCP.stop_server(server_name)
-    end)
-
-    assert %Client.ToolResult{is_error: false} = Client.call_tool_result(client, "ask")
+    assert %Client.ToolResult{is_error: false} = Client.call_tool!(client, "ask")
 
     spans = TraceTestHelper.drain_spans()
 

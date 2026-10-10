@@ -1,80 +1,148 @@
 defmodule FastestMCP.Transport.HTTPCommon do
-  @moduledoc """
-  Shared helpers used by the HTTP transports.
-
-  The transport layer is responsible for translating external payloads into
-  the normalized request shape consumed by `FastestMCP.Transport.Engine`,
-  then turning results back into protocol-specific output.
-
-  Most applications only choose which transport to mount. The parsing,
-  response encoding, and Plug or stdio loop details live here so the shared
-  operation pipeline can stay transport-agnostic.
-  """
+  @moduledoc false
 
   import Plug.Conn
 
   require Logger
+  import FastestMCP.Util, only: [maybe_put: 3]
 
   alias FastestMCP.Auth
   alias FastestMCP.Auth.ProtectedResource
+  alias FastestMCP.Component
   alias FastestMCP.Context
   alias FastestMCP.Error
+  alias FastestMCP.Options
   alias FastestMCP.ServerRuntime
+  alias FastestMCP.Telemetry
+  alias FastestMCP.Transport.Request
+  alias FastestMCP.URIPolicy
 
   @localhost_hosts MapSet.new(["localhost", "127.0.0.1", "::1", "[::1]"])
-  @invalid_percent_encoding ~r/%(?![0-9A-Fa-f]{2})/
-  @normalized_allowed_hosts_key :__fastest_mcp_normalized_allowed_hosts__
+  # The validated `:allowed_hosts` and `:cors` origins, kept in the options.
+  @checks_key :__fastest_mcp_request_checks__
   @invalid_host_character ~r/[\x00-\x20\x7F\\\/@?#,*%]/
+  # The request headers MCP clients send, which CORS lets a page send too,
+  # besides the `Mcp-Param-*` headers of tool arguments.
+  @cors_request_headers ~w(authorization content-type accept mcp-protocol-version
+                          mcp-session-id mcp-method mcp-name last-event-id)
 
-  @doc "Builds the HTTP context map passed to authenticators and HTTP helpers."
+  # The runtime of the server a route serves. A server that isn't running may
+  # be restarting: its `:overloaded` error answers 503 with `Retry-After`,
+  # which tells clients to try again, where 404 would end a 2025-11-25 session.
+  def fetch_running(server_name) do
+    with {:error, :not_found} <- ServerRuntime.fetch(server_name),
+         do:
+           {:error,
+            %Error{code: :overloaded, message: "server #{inspect(server_name)} is not running"}}
+  end
+
   def http_context(conn, runtime, opts) do
     protected_resource = protected_resource(runtime)
 
     %{
       base_url: base_url(conn, opts),
-      mcp_base_path: normalize_base_path(Keyword.get(opts, :path, "/mcp")),
+      mcp_base_path: endpoint_path(conn, opts),
       protected_resource: protected_resource,
       expected_resource: expected_resource(protected_resource),
       expected_scopes: expected_scopes(protected_resource),
       server_name: server_name(runtime),
-      server_metadata: server_metadata(runtime)
+      server_metadata: server_metadata(runtime),
+      credentials?: get_req_header(conn, "authorization") != []
     }
   end
 
-  @doc false
-  def authenticate(conn, runtime, opts) do
-    context_opts =
-      ServerRuntime.context_opts(runtime,
-        state_scope: :request,
-        session_id: request_session_id(conn),
-        transport: :streamable_http,
-        request_metadata: auth_request_metadata(conn, runtime)
-      )
+  # The path of the endpoint: `:path`, or the path a router forwards to it.
+  def endpoint_path(conn, opts),
+    do: normalize_base_path(Keyword.get(opts, :path) || forwarded_path(conn) || "/mcp")
 
-    with :ok <- reject_query_access_token(conn),
-         :ok <- validate_protected_resource_request(conn, runtime, opts),
-         :ok <- ensure_protected_resource_auth(runtime.server),
-         {:ok, context} <- Context.build(runtime.server.name, context_opts),
-         {:ok, authenticated_context} <-
-           Auth.resolve(runtime.server.auth, context, auth_input(conn, runtime, opts)) do
-      {:ok, Auth.result_from_context(authenticated_context)}
+  # The base URL of the endpoint: `:base_url`, or the request's own.
+  def base_url(conn, opts) do
+    case runtime_value(Keyword.get(opts, :base_url)) do
+      nil ->
+        %URI{scheme: to_string(conn.scheme), host: conn.host, port: conn.port}
+        |> URIPolicy.drop_default_port()
+        |> URI.to_string()
+
+      base_url ->
+        to_string(base_url)
     end
-  rescue
-    error ->
-      {:error,
-       %Error{
-         code: :internal_error,
-         message: "HTTP authentication failed",
-         details: %{kind: inspect(error.__struct__), reason: Exception.message(error)}
-       }}
   end
 
-  @doc false
+  # The auth result of the server's authenticator for the decoded `request`
+  # (nil when it failed to decode), nil without an authenticator. With one, the
+  # `[:fastest_mcp, :auth, _]` events surround the checks, as in the pipeline,
+  # with the `:request_id` of the operation the request runs.
+  def authenticate(conn, runtime, opts, request \\ nil) do
+    case runtime.server.auth do
+      nil ->
+        check_request(conn, runtime, opts, nil)
+
+      auth ->
+        context =
+          Context.new(runtime,
+            request_id: Keyword.get(opts, :request_id),
+            state_scope: :request,
+            session_id: request_session_id(conn),
+            transport: :streamable_http,
+            request_metadata: auth_request_metadata(conn, runtime)
+          )
+
+        auth
+        |> Auth.span(context, event_metadata(request), fn ->
+          check_request(conn, runtime, opts, context)
+        end)
+        |> tap(&record_crash/1)
+    end
+  end
+
+  # The pipeline records an exception on the span of its operation. A request
+  # that fails authentication runs none, so the span current where it arrived,
+  # such as the span of HTTP instrumentation, records the authenticator's.
+  defp record_crash({:error, %Error{cause: {exception, stacktrace}} = error}) do
+    attributes = %{"fastestmcp.error.code" => to_string(error.code)}
+    Telemetry.record_error(exception, stacktrace, attributes)
+  end
+
+  defp record_crash(_result), do: :ok
+
+  defp check_request(conn, runtime, opts, context) do
+    with :ok <- reject_query_access_token(conn),
+         :ok <- validate_protected_resource_request(conn, runtime, opts),
+         :ok <- ensure_protected_resource_auth(runtime.server) do
+      run_authenticator(runtime.server.auth, context, conn, runtime, opts)
+    end
+  catch
+    kind, reason -> {:error, Auth.failure("HTTP authentication", kind, reason, __STACKTRACE__)}
+  end
+
+  defp run_authenticator(nil, _context, _conn, _runtime, _opts), do: {:ok, nil}
+
+  defp run_authenticator(auth, context, conn, runtime, opts) do
+    with {:ok, authenticated} <- Auth.resolve(auth, context, auth_input(conn, runtime, opts)),
+         do: {:ok, Auth.result_from_context(authenticated)}
+  end
+
+  # What the pipeline's events name of a request: its method, and the kind and
+  # target of the component it calls or lists. A session stream or a client's
+  # response names no method.
+  defp event_metadata(%Request{method: "__transport/" <> _internal}), do: event_metadata(nil)
+
+  defp event_metadata(%Request{method: method, payload: params}) when is_binary(method) do
+    kind = Component.call_kind(method)
+
+    %{
+      method: method,
+      component_type: kind || Component.list_kind(method),
+      target: kind && Map.get(params, Component.call_param(kind))
+    }
+  end
+
+  defp event_metadata(_request), do: %{method: nil, component_type: nil, target: nil}
+
   def auth_input(conn, opts) do
     auth_input(conn, %{}, opts)
   end
 
-  @doc false
   def auth_input(conn, runtime, opts) do
     headers = Map.new(conn.req_headers)
     protected_resource = protected_resource(runtime)
@@ -85,7 +153,6 @@ defmodule FastestMCP.Transport.HTTPCommon do
     |> maybe_put("expected_scopes", expected_scopes(protected_resource))
   end
 
-  @doc false
   def reject_query_access_token(%Plug.Conn{query_string: query_string}) do
     case decoded_query_parameter_names(query_string) do
       {:ok, names} ->
@@ -104,8 +171,8 @@ defmodule FastestMCP.Transport.HTTPCommon do
     end
   end
 
-  @doc false
-  def mcp_resource_uri(conn, opts) do
+  # The URL of `path` on the origin the request reached, from the base URL.
+  def resource_uri(conn, opts, path) do
     uri = URI.parse(base_url(conn, opts))
 
     cond do
@@ -121,17 +188,16 @@ defmodule FastestMCP.Transport.HTTPCommon do
       true ->
         resource_uri =
           uri
-          |> Map.put(:path, normalize_base_path(Keyword.get(opts, :path, "/mcp")))
+          |> Map.put(:path, path)
           |> Map.put(:query, nil)
           |> Map.put(:fragment, nil)
-          |> normalize_default_port()
+          |> URIPolicy.drop_default_port()
           |> URI.to_string()
 
         {:ok, resource_uri}
     end
   end
 
-  @doc "Sends a JSON HTTP response."
   def json(conn, status, payload) do
     body = JSON.encode!(payload)
 
@@ -140,19 +206,14 @@ defmodule FastestMCP.Transport.HTTPCommon do
     |> send_resp(status, body)
   end
 
-  @doc "Renders an error as an HTTP response."
   def render_error(conn, %Error{} = error, auth, http_context) do
     {status, headers, body} = error_response(error, auth, http_context)
 
-    conn =
-      Enum.reduce(headers, conn, fn {key, value}, current ->
-        put_resp_header(current, key, value)
-      end)
-
-    json(conn, status, body)
+    conn
+    |> merge_resp_headers(headers)
+    |> json(status, body)
   end
 
-  @doc "Builds the HTTP error response payload."
   def error_response(%Error{} = error, auth, http_context, payload_override \\ nil) do
     {status, headers} = error_status_and_headers(error, auth, http_context)
 
@@ -163,26 +224,24 @@ defmodule FastestMCP.Transport.HTTPCommon do
     {status, headers, body}
   end
 
-  @doc "Sends an HTTP redirect response."
   def redirect(conn, status, location) do
     conn
     |> put_resp_header("location", location)
     |> send_resp(status, "")
   end
 
-  @doc "Applies DNS-rebinding protection to the request."
   def validate_dns_rebinding(conn, opts) do
-    allowed_hosts = allowed_hosts(opts)
+    checks = request_checks(opts)
 
     result =
-      with :ok <- validate_host_header(conn, allowed_hosts),
-           :ok <- validate_origin_header(conn, allowed_hosts) do
+      with :ok <- validate_host_header(conn, checks.allowed_hosts),
+           :ok <- validate_origin_header(conn, checks) do
         :ok
       end
 
     case result do
       {:error, %Error{} = error} = rejection ->
-        log_dns_rebinding_rejection(conn, allowed_hosts, error)
+        log_dns_rebinding_rejection(conn, checks.allowed_hosts, error)
         rejection
 
       other ->
@@ -190,29 +249,35 @@ defmodule FastestMCP.Transport.HTTPCommon do
     end
   end
 
-  @doc false
-  def normalize_dns_rebinding_options!(opts) when is_list(opts) do
+  # Validates `:allowed_hosts` and `:cors`, and keeps the hosts and origins
+  # normalized in `opts`. A `{module, function, args}` value, as `:base_url`
+  # takes too, is called on each request instead.
+  def normalize_options!(opts) when is_list(opts) do
     reject_unsafe_host_bypass!(opts)
 
-    case Keyword.fetch(opts, @normalized_allowed_hosts_key) do
-      {:ok, %MapSet{}} ->
-        opts
-
-      _missing_or_invalid ->
-        Keyword.put(
-          opts,
-          @normalized_allowed_hosts_key,
-          normalize_allowed_hosts!(Keyword.get(opts, :allowed_hosts, :localhost))
-        )
+    if Keyword.has_key?(opts, @checks_key) do
+      opts
+    else
+      Keyword.put(opts, @checks_key, %{
+        allowed_hosts: runtime_or(Keyword.get(opts, :allowed_hosts, :localhost), &hosts!/1),
+        cors_origins: cors!(Keyword.get(opts, :cors))
+      })
     end
   end
 
-  @doc false
+  # Raises `ArgumentError` for a key of `opts` outside `allowed`; the hosts and
+  # origins that validated options keep normalized are not one of them.
+  def validate_keys!(opts, allowed) do
+    opts |> Keyword.delete(@checks_key) |> Options.keys!(allowed)
+    opts
+  end
+
+  # A listener on another interface than loopback needs host names: an
+  # `allowed_hosts:` list, or a function that returns them.
   def validate_listener_security!(bandit_options, opts) do
-    opts = normalize_dns_rebinding_options!(opts)
     ip = Keyword.fetch!(bandit_options, :ip)
 
-    if loopback_listener?(ip) or concrete_allowed_hosts?(opts) do
+    if loopback_listener?(ip) or checks(opts).allowed_hosts != @localhost_hosts do
       :ok
     else
       raise ArgumentError,
@@ -220,26 +285,64 @@ defmodule FastestMCP.Transport.HTTPCommon do
     end
   end
 
+  # Adds the CORS headers to the response of a request from an origin that
+  # `:cors` allows; other requests are left as they are.
+  def put_cors_headers(conn, opts) do
+    with [origin] <- get_req_header(conn, "origin"),
+         {:ok, parsed} <- parse_origin(origin),
+         true <- cors_origin?(parsed, request_checks(opts).cors_origins) do
+      conn
+      |> put_private(:fastest_mcp_cors_origin, origin)
+      |> put_resp_header("access-control-allow-origin", origin)
+      |> put_resp_header("access-control-expose-headers", "mcp-session-id, www-authenticate")
+      |> put_resp_header("vary", "origin")
+    else
+      _other -> conn
+    end
+  end
+
+  # Answers the CORS preflight request of an origin that `put_cors_headers/2`
+  # allowed, with 204; nil for any other request.
+  def answer_cors_preflight(conn) do
+    if conn.method == "OPTIONS" and get_req_header(conn, "access-control-request-method") != [] and
+         is_binary(conn.private[:fastest_mcp_cors_origin]) do
+      params =
+        for value <- get_req_header(conn, "access-control-request-headers"),
+            name <- String.split(value, ","),
+            name = name |> String.trim() |> String.downcase(),
+            String.starts_with?(name, "mcp-param-"),
+            do: name
+
+      conn
+      |> put_resp_header("access-control-allow-methods", "GET, POST, DELETE")
+      |> put_resp_header(
+        "access-control-allow-headers",
+        Enum.join(Enum.uniq(@cors_request_headers ++ params), ", ")
+      )
+      |> put_resp_header("access-control-max-age", "7200")
+      |> send_resp(204, "")
+    end
+  end
+
   defp error_status_and_headers(%Error{code: :unauthorized} = error, auth, http_context) do
     {401, [{"www-authenticate", Auth.www_authenticate(auth, error, http_context)}]}
   end
 
+  # Only a denial for missing scopes asks the client for a token with them
+  # (`insufficient_scope`): no other token helps with any other 403, such as an
+  # authenticator's own refusal.
   defp error_status_and_headers(%Error{code: :forbidden} = error, auth, http_context) do
     headers =
-      if not opaque_authorization_denial?(error) and
-           (not is_nil(protected_resource(http_context)) or
-              Auth.validated_missing_scopes(error) != []) do
-        [{"www-authenticate", Auth.www_authenticate(auth, error, http_context)}]
-      else
-        []
-      end
+      if Auth.validated_missing_scopes(error) != [],
+        do: [{"www-authenticate", Auth.www_authenticate(auth, error, http_context)}],
+        else: []
 
     {403, headers}
   end
 
   defp error_status_and_headers(%Error{code: :rate_limited} = error, _auth, _http_context) do
     headers =
-      case retry_after_header(error.details) do
+      case retry_after_header(error) do
         nil -> []
         value -> [{"retry-after", value}]
       end
@@ -248,7 +351,7 @@ defmodule FastestMCP.Transport.HTTPCommon do
   end
 
   defp error_status_and_headers(%Error{code: :overloaded} = error, _auth, _http_context) do
-    headers = [{"retry-after", retry_after_header(error.details) || "1"}]
+    headers = [{"retry-after", retry_after_header(error) || "1"}]
 
     {503, headers}
   end
@@ -259,55 +362,30 @@ defmodule FastestMCP.Transport.HTTPCommon do
   defp error_status_and_headers(%Error{code: :not_acceptable}, _auth, _http_context),
     do: {406, []}
 
+  defp error_status_and_headers(%Error{code: :payload_too_large}, _auth, _http_context),
+    do: {413, []}
+
   defp error_status_and_headers(%Error{code: :not_found}, _auth, _http_context), do: {404, []}
 
   defp error_status_and_headers(%Error{code: :method_not_found}, _auth, _http_context),
     do: {404, []}
 
-  defp error_status_and_headers(%Error{code: :invalid_task_id}, _auth, _http_context),
-    do: {400, []}
+  # The server failed before the request ran, for example because the
+  # authenticator raised (500) or a call it made timed out (504).
+  defp error_status_and_headers(%Error{code: :internal_error}, _auth, _http_context),
+    do: {500, []}
 
+  defp error_status_and_headers(%Error{code: :timeout}, _auth, _http_context), do: {504, []}
+
+  # Any other code rejects the request itself.
   defp error_status_and_headers(_error, _auth, _http_context), do: {400, []}
 
-  defp retry_after_header(details) when is_map(details) do
-    case Map.get(details, :retry_after_seconds, Map.get(details, "retry_after_seconds")) do
+  defp retry_after_header(error) do
+    case Error.detail(error, :retry_after_seconds) do
       value when is_integer(value) and value > 0 -> Integer.to_string(value)
       _other -> nil
     end
   end
-
-  defp retry_after_header(_details), do: nil
-
-  defp opaque_authorization_denial?(%Error{details: details}) when is_map(details) do
-    Map.get(details, :authorization_denial, Map.get(details, "authorization_denial")) in [
-      :opaque,
-      "opaque"
-    ]
-  end
-
-  defp opaque_authorization_denial?(_error), do: false
-
-  defp base_url(conn, opts) do
-    case Keyword.get(opts, :base_url) do
-      nil ->
-        %URI{
-          scheme: to_string(conn.scheme),
-          host: conn.host,
-          port: port_for(conn)
-        }
-        |> normalize_default_port()
-        |> URI.to_string()
-
-      base_url ->
-        to_string(base_url)
-    end
-  end
-
-  defp normalize_default_port(%URI{scheme: "http", port: 80} = uri), do: %{uri | port: nil}
-  defp normalize_default_port(%URI{scheme: "https", port: 443} = uri), do: %{uri | port: nil}
-  defp normalize_default_port(uri), do: uri
-  defp port_for(%Plug.Conn{port: nil}), do: nil
-  defp port_for(%Plug.Conn{port: port}), do: port
 
   defp server_name(%{server: %{name: name}}), do: name
   defp server_name(_runtime), do: nil
@@ -340,19 +418,18 @@ defmodule FastestMCP.Transport.HTTPCommon do
 
   defp ensure_protected_resource_auth(_server), do: :ok
 
+  # The request's URL must be the resource.
   defp validate_protected_resource_request(conn, runtime, opts) do
     case protected_resource(runtime) do
       %ProtectedResource{} = protected_resource ->
-        with {:ok, resource_uri} <- mcp_resource_uri(conn, opts),
-             true <- ProtectedResource.matches_resource?(protected_resource, resource_uri) do
-          :ok
-        else
-          _other ->
-            {:error,
-             %Error{
-               code: :forbidden,
-               message: "request URI does not match the configured protected resource"
-             }}
+        case resource_uri(conn, opts, endpoint_path(conn, opts)) do
+          {:ok, uri} ->
+            if ProtectedResource.matches_resource?(protected_resource, uri),
+              do: :ok,
+              else: resource_mismatch(uri, protected_resource)
+
+          {:error, reason} ->
+            resource_mismatch(reason, protected_resource)
         end
 
       nil ->
@@ -360,10 +437,27 @@ defmodule FastestMCP.Transport.HTTPCommon do
     end
   end
 
+  # A plain 403, and the log says why: usually a proxy that ends TLS, which
+  # `base_url` accounts for.
+  defp resource_mismatch(request_url, %ProtectedResource{resource: resource}) do
+    Logger.warning(
+      "FastestMCP rejected an HTTP request whose URL is not the protected resource: " <>
+        "request_url=#{inspect(request_url)}; resource=#{inspect(resource)}; " <>
+        "behind a proxy that ends TLS, set base_url: to the public URL"
+    )
+
+    {:error,
+     %Error{
+       code: :forbidden,
+       message: "request URI does not match the configured protected resource"
+     }}
+  end
+
   defp request_session_id(conn) do
-    conn
-    |> get_req_header("mcp-session-id")
-    |> List.first()
+    case get_req_header(conn, "mcp-session-id") do
+      [session_id | _rest] when session_id != "" -> session_id
+      _none -> nil
+    end
   end
 
   defp auth_request_metadata(conn, runtime) do
@@ -418,9 +512,7 @@ defmodule FastestMCP.Transport.HTTPCommon do
   defp decoded_query_parameter_names(query_string) when query_string in [nil, ""], do: {:ok, []}
 
   defp decoded_query_parameter_names(query_string) when is_binary(query_string) do
-    if Regex.match?(@invalid_percent_encoding, query_string) do
-      {:error, :malformed_query}
-    else
+    if URIPolicy.valid_percent_encoding?(query_string) do
       names =
         query_string
         |> String.split("&")
@@ -432,47 +524,102 @@ defmodule FastestMCP.Transport.HTTPCommon do
         end)
 
       {:ok, names}
+    else
+      {:error, :malformed_query}
     end
-  rescue
-    ArgumentError -> {:error, :malformed_query}
   end
-
-  defp maybe_put(map, _key, nil), do: map
-  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
   defp loopback_listener?(:loopback), do: true
   defp loopback_listener?({127, _b, _c, _d}), do: true
   defp loopback_listener?({0, 0, 0, 0, 0, 0, 0, 1}), do: true
   defp loopback_listener?(_ip), do: false
 
-  defp concrete_allowed_hosts?(opts) do
-    opts
-    |> allowed_hosts()
-    |> MapSet.equal?(@localhost_hosts)
-    |> Kernel.not()
-  end
-
-  defp allowed_hosts(opts) do
-    reject_unsafe_host_bypass!(opts)
-
-    case Keyword.fetch(opts, @normalized_allowed_hosts_key) do
-      {:ok, %MapSet{} = hosts} -> hosts
-      :error -> normalize_allowed_hosts!(Keyword.get(opts, :allowed_hosts, :localhost))
+  # The normalized hosts and origins of `opts`, with `{module, function, args}`
+  # values not yet called.
+  defp checks(opts) do
+    case Keyword.fetch(opts, @checks_key) do
+      {:ok, checks} -> checks
+      :error -> opts |> normalize_options!() |> Keyword.fetch!(@checks_key)
     end
   end
 
-  defp normalize_allowed_hosts!(:localhost), do: @localhost_hosts
+  # The hosts and origins this request is checked against.
+  defp request_checks(opts) do
+    checks = checks(opts)
 
-  defp normalize_allowed_hosts!(hosts) when is_list(hosts) and hosts != [] do
-    hosts
-    |> Enum.map(&normalize_allowed_host!/1)
-    |> MapSet.new()
+    %{
+      allowed_hosts: runtime_value(checks.allowed_hosts, &hosts!/1),
+      cors_origins: runtime_value(checks.cors_origins, &cors_origins!/1)
+    }
   end
 
-  defp normalize_allowed_hosts!(other) do
+  # The value of `{module, function, args}`, validated by `validate`, or
+  # `value` itself.
+  defp runtime_value(value, validate \\ & &1)
+
+  defp runtime_value({module, function, args}, validate)
+       when is_atom(module) and is_atom(function) and is_list(args),
+       do: validate.(apply(module, function, args))
+
+  defp runtime_value(value, _validate), do: value
+
+  # `value` validated by `validate!`, or kept to call on each request.
+  defp runtime_or({module, function, args} = mfa, _validate!)
+       when is_atom(module) and is_atom(function) and is_list(args),
+       do: mfa
+
+  defp runtime_or(value, validate!), do: validate!.(value)
+
+  defp hosts!(:localhost), do: @localhost_hosts
+
+  defp hosts!(hosts) when is_list(hosts) and hosts != [],
+    do: MapSet.new(hosts, &normalize_allowed_host!/1)
+
+  defp hosts!(other) do
     raise ArgumentError,
-          "allowed_hosts must be :localhost or a non-empty list of concrete host names, got #{inspect(other)}"
+          "allowed_hosts must be :localhost, a non-empty list of concrete host names, " <>
+            "or a {module, function, args} that returns one, got #{inspect(other)}"
   end
+
+  defp cors!(nil), do: nil
+
+  defp cors!(cors) do
+    with true <- Keyword.keyword?(cors),
+         [origins: origins] <- cors do
+      runtime_or(origins, &cors_origins!/1)
+    else
+      _other ->
+        raise ArgumentError,
+              "cors must be [origins: origins], such as [origins: [\"https://app.example.com\"]], " <>
+                "got #{inspect(cors)}"
+    end
+  end
+
+  defp cors_origins!(origins) when is_list(origins) and origins != [],
+    do: MapSet.new(origins, &cors_origin!/1)
+
+  defp cors_origins!(other) do
+    raise ArgumentError,
+          "cors origins must be a non-empty list of origins, " <>
+            "or a {module, function, args} that returns one, got #{inspect(other)}"
+  end
+
+  # An origin is a scheme, a host, and a port, as browsers send them: no path
+  # and no wildcard.
+  defp cors_origin!(origin) do
+    with {:ok, {_scheme, host, _port} = parsed} <- parse_origin(origin),
+         false <- Regex.match?(@invalid_host_character, host) do
+      parsed
+    else
+      _other ->
+        raise ArgumentError,
+              "cors origins must be origins such as \"https://app.example.com\", " <>
+                "without a path or a wildcard, got #{inspect(origin)}"
+    end
+  end
+
+  defp cors_origin?(_origin, nil), do: false
+  defp cors_origin?(origin, origins), do: MapSet.member?(origins, origin)
 
   defp reject_unsafe_host_bypass!(opts) do
     if Keyword.has_key?(opts, :unsafe_allow_any_host) do
@@ -496,14 +643,17 @@ defmodule FastestMCP.Transport.HTTPCommon do
     end
   end
 
-  defp validate_origin_header(conn, allowed_hosts) do
+  # A browser's `Origin` must name an allowed host, or an origin `:cors` allows.
+  defp validate_origin_header(conn, checks) do
     case get_req_header(conn, "origin") do
       [] ->
         :ok
 
       [origin] ->
-        with {:ok, host} <- parse_serialized_http_origin(origin),
-             true <- host_allowed?(host, allowed_hosts) do
+        with {:ok, {_scheme, host, _port} = parsed} <- parse_origin(origin),
+             true <-
+               host_allowed?(host, checks.allowed_hosts) or
+                 cors_origin?(parsed, checks.cors_origins) do
           :ok
         else
           false -> forbidden_origin("request origin is not allowed", origin)
@@ -515,7 +665,8 @@ defmodule FastestMCP.Transport.HTTPCommon do
     end
   end
 
-  defp parse_serialized_http_origin(origin) when is_binary(origin) do
+  # `{scheme, host, port}` of a serialized `http` or `https` origin.
+  defp parse_origin(origin) when is_binary(origin) do
     with true <- String.valid?(origin),
          true <- origin == String.trim(origin),
          {:ok, %URI{scheme: scheme, host: host, port: port} = uri} <- URI.new(origin),
@@ -525,14 +676,13 @@ defmodule FastestMCP.Transport.HTTPCommon do
          true <-
            is_nil(uri.userinfo) and is_nil(uri.path) and is_nil(uri.query) and
              is_nil(uri.fragment) do
-      {:ok, normalize_runtime_host(host)}
+      {:ok, {scheme, normalize_runtime_host(host), port}}
     else
       _other -> {:error, :invalid_origin}
     end
-  rescue
-    ArgumentError -> {:error, :invalid_origin}
-    FunctionClauseError -> {:error, :invalid_origin}
   end
+
+  defp parse_origin(_origin), do: {:error, :invalid_origin}
 
   defp validate_origin_port(nil), do: :ok
 
@@ -629,4 +779,7 @@ defmodule FastestMCP.Transport.HTTPCommon do
   defp normalize_base_path(path) do
     "/" <> String.trim(String.trim_leading(to_string(path), "/"), "/")
   end
+
+  defp forwarded_path(%Plug.Conn{script_name: []}), do: nil
+  defp forwarded_path(%Plug.Conn{script_name: names}), do: "/" <> Enum.join(names, "/")
 end

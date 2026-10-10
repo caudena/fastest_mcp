@@ -1,5 +1,13 @@
 defmodule FastestMCP.Client.ResponseCache do
   @moduledoc false
+  # Client-side cache of modern responses that carry a cache hint. Only a
+  # synchronous, credential-free request of a cache-hinted method that is not
+  # a page, MRTR continuation, or progress-bearing request is cached; `scope`
+  # partitions entries by the connection's protocol, peer and auth identity.
+
+  alias FastestMCP.Client.Auth
+  alias FastestMCP.Client.Spec
+  alias FastestMCP.Protocol
 
   @default_max_entries 128
   @default_max_item_size 1_000_000
@@ -52,8 +60,50 @@ defmodule FastestMCP.Client.ResponseCache do
           "response_cache must be false, true, or a keyword list, got: #{inspect(other)}"
   end
 
-  @spec enabled?(t()) :: boolean()
-  def enabled?(%__MODULE__{enabled?: enabled?}), do: enabled?
+  @spec key(t(), Spec.t(), term()) :: term() | nil
+  def key(%__MODULE__{enabled?: false}, _spec, _scope), do: nil
+
+  def key(%__MODULE__{}, %Spec{} = spec, scope) do
+    if cacheable?(spec),
+      do: {spec.method, spec.normalizer, digest(spec.params), scope, partition(spec.auth)}
+  end
+
+  @spec fetch(t(), term() | nil, :use | :refresh | :bypass) :: {:hit, term(), t()} | {:miss, t()}
+  def fetch(cache, key, :use) when not is_nil(key), do: get(cache, key)
+  def fetch(cache, _key, _mode), do: {:miss, cache}
+
+  @spec store(t(), term() | nil, term(), map() | nil) :: t()
+  def store(cache, key, value, %{ttl_ms: ttl_ms}) when not is_nil(key),
+    do: put(cache, key, value, ttl_ms)
+
+  def store(cache, _key, _value, _hint), do: cache
+
+  defp cacheable?(spec) do
+    Protocol.cache_hinted_method?(spec.method) and spec.cache != :bypass and
+      not continuation?(spec.params) and not Spec.progress_bearing?(spec.params) and
+      is_nil(spec.progress_handler) and is_nil(spec.on_notification) and
+      not credentials?(spec.auth)
+  end
+
+  defp continuation?(params),
+    do: Enum.any?(["cursor", "inputResponses", "requestState"], &Map.has_key?(params, &1))
+
+  defp credentials?(auth) do
+    auth = Auth.normalize(auth)
+    present?(auth["authorization"]) or present?(get_in(auth, ["headers", "authorization"]))
+  end
+
+  defp present?(value), do: is_binary(value) and value != ""
+
+  defp partition(auth) do
+    auth
+    |> Auth.normalize()
+    |> Map.delete("authorization")
+    |> Map.update("headers", %{}, &Map.delete(&1, "authorization"))
+    |> digest()
+  end
+
+  defp digest(term), do: :crypto.hash(:sha256, :erlang.term_to_binary(term, [:deterministic]))
 
   @spec get(t(), term(), integer()) :: {:hit, term(), t()} | {:miss, t()}
   def get(cache, key, now_ms \\ System.monotonic_time(:millisecond))

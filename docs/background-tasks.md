@@ -1,397 +1,419 @@
-# Tasks
+# Background Tasks
 
-FastestMCP implements both supported MCP task eras for long-running operations
-and keeps the execution model OTP-native: the server runtime owns task state,
-workers, progress, and interaction flow.
+A background task runs a tool call in a supervised process of its own: the
+caller gets a task id at once and asks for the status and the result later.
+While the task runs, clients can follow its progress, answer the questions it
+asks, and cancel it.
 
-Use tasks when an operation:
+## When to use tasks
 
-- outlives one request/response round-trip
-- should expose progress or status notifications
-- may require elicitation or sampling before it can finish
-- is worth polling, listing, cancelling, or resuming by `taskId`
+Make a tool a task when its work:
 
-## Three Separate Task Surfaces
+- outlives one request, because it takes longer than a client should wait for
+  one response (an HTTP request may stay open for 60 seconds by default);
+- should report progress or status while it runs;
+- asks the user or the model something in the middle of work that must not
+  run again: in an ordinary call on `2026-07-28`, the handler runs again from
+  the start for each answer (see
+  [What works where](sampling-and-elicitation.md#what-works-where));
+- is worth polling, listing, or cancelling by its id.
 
-MCP `2026-07-28` uses the experimental
-`io.modelcontextprotocol/tasks` extension (Tasks v2). A server advertises and a
-client negotiates the extension explicitly. The server directs task creation;
-the wire methods are `tasks/get`, `tasks/update`, and `tasks/cancel`. Terminal
-results are inlined on `tasks/get`, and durations use `ttlMs` and
-`pollIntervalMs`. Multi-round-trip input is delivered with `tasks/update`.
+A quick tool that asks the user something doesn't need a task: the
+[helpers](sampling-and-elicitation.md) work in ordinary calls too.
 
-MCP `2025-11-25` retains experimental core Tasks v1. It augments
-`tools/call` and uses `tasks/get`, `tasks/list`, `tasks/result`,
-`tasks/cancel`, and `notifications/tasks/status`. Its envelopes and duration
-field names are intentionally not translated into Tasks v2.
+## Making a tool a task
 
-These receiver-side `%FastestMCP.BackgroundTask{}` values are work owned by the
-FastestMCP server. They are distinct from `%FastestMCP.PeerTask{}` values
-returned when the server delegates task-augmented sampling or elicitation to
-the connected client. Peer-task handles are scoped to the originating server
-session and expose `fetch/2`, `wait/2`, `result/2`, `cancel/2`, and
-`on_status_change/2` through `FastestMCP.PeerTask`.
-
-The local Elixir API is the third surface and is intentionally broader.
-In-process callers can create
-tool, prompt, resource, and resource-template tasks and can answer local
-interaction waiters with `FastestMCP.send_task_input/5`. Those are runtime APIs,
-not additional MCP wire methods. Choose behavior from the negotiated protocol
-profile; do not mix method sets or fields between eras.
-
-## Enabling Task Execution
-
-Enable tasks per component with `task:`:
+Give the tool `task: true`, and enable the Tasks extension on the server for
+`2026-07-28` clients:
 
 ```elixir
-server =
-  FastestMCP.server("tasks")
-  |> FastestMCP.add_tool(
-    "slow_report",
-    fn %{"id" => id}, ctx ->
-      FastestMCP.Context.report_progress(ctx, 1, 3, "Loading release #{id}")
-      Process.sleep(100)
-      FastestMCP.Context.report_progress(ctx, 2, 3, "Rendering report")
-      Process.sleep(100)
-      %{id: id, status: "ready"}
-    end,
-    task: true
+alias FastestMCP.Context
+alias FastestMCP.Protocol.Extensions
+
+FastestMCP.server("export-demo", extensions: %{Extensions.tasks() => %{}})
+|> FastestMCP.add_tool(
+  "export_notes",
+  fn %{"format" => format}, ctx ->
+    Context.report_progress(ctx, 1, 2, "Collecting notes")
+    Process.sleep(200)
+    Context.report_progress(ctx, 2, 2, "Rendering #{format}")
+    %{format: format, notes: 2}
+  end,
+  description: "Export every note as one document.",
+  input_schema: %{
+    "type" => "object",
+    "properties" => %{"format" => %{"type" => "string"}},
+    "required" => ["format"]
+  },
+  task: true
+)
+|> FastestMCP.start_server!()
+
+client =
+  FastestMCP.Client.connect!({:in_process, "export-demo"},
+    extensions: %{Extensions.tasks() => %{}}
   )
+
+FastestMCP.Client.call_tool!(client, "export_notes", %{"format" => "markdown"}).structured_content
+# => %{"format" => "markdown", "notes" => 2}
 ```
 
-Use explicit task config when you want stronger control:
+The handler is an ordinary tool handler. Because both sides enable the Tasks
+extension, the call runs as a task, and `FastestMCP.Client.call_tool!/4`
+follows it to the result. [Remote tasks](client-callbacks.md#remote-tasks)
+shows how a client works with the task itself.
+
+A server module enables the extension on its `use` line, which passes the
+option to `base_server/1`:
 
 ```elixir
-server =
-  FastestMCP.server("tasks")
-  |> FastestMCP.add_tool(
-    "deploy",
-    fn %{"environment" => environment}, _ctx ->
-      %{environment: environment, accepted: true}
-    end,
-    task: [mode: :required, poll_interval_ms: 1_000]
-  )
+# In lib/my_app/mcp_server.ex
+use FastestMCP.ServerModule, extensions: %{FastestMCP.Protocol.Extensions.tasks() => %{}}
 ```
 
-Task modes:
+The `task:` option takes a mode:
 
-- `:forbidden`
-- `:optional`
-- `:required`
+| `task:` | Mode | The tool runs |
+| --- | --- | --- |
+| `false` (the default) | `:forbidden` | Never as a task. |
+| `true`, or `[mode: :optional]` | `:optional` | As a task when the call can be one, as described below, and as an ordinary call otherwise. |
+| `[mode: :required]` | `:required` | Only as a task. Other calls fail. |
 
-`task: true` is shorthand for `task: [mode: :optional]`.
+`poll_interval_ms:` tells clients how often to ask for the status, by default
+every 5 seconds: `task: [mode: :required, poll_interval_ms: 1_000]`. The
+server's `tasks:` option sets the default `task:` for the components you add
+after it, as in `FastestMCP.server("notes", tasks: true)`; a component's own
+`task:` wins.
 
-For legacy tools, the transport serializer advertises the Tasks v1 execution
-support field. For modern tools, task support is effective only when the Tasks
-extension is negotiated. Prompt/resource task settings are local and are never
-advertised as extra remote methods.
+Who decides that a call is a task depends on the protocol version:
 
-Enable tasks across the whole server with `tasks: true`. Over MCP, only tools
-can be task-augmented; the prompt and resource settings below apply to local
-in-process calls:
+- On `2026-07-28`, the server decides. When the server enables the Tasks
+  extension and the client declares it too, every call to an `:optional` or
+  `:required` tool runs as a task. When either side doesn't, `:optional` tools
+  run as ordinary calls and `:required` tools fail.
+- On `2025-11-25`, the client asks for a task in each call, within a session.
+  The server advertises task support when one of its tools supports tasks,
+  and a `:required` tool rejects a call that doesn't ask.
+
+Over MCP, only tools run as tasks. In process, prompts and resources can be
+tasks too.
+
+## Running tasks locally
+
+In process, pass `task: true` to `FastestMCP.call_tool/4`. It returns a
+`%FastestMCP.BackgroundTask{}` handle at once, which the task functions take:
 
 ```elixir
-server =
-  FastestMCP.server("tasks", tasks: true)
-  |> FastestMCP.add_tool("tool_job", fn _args, _ctx -> %{ok: true} end)
-  |> FastestMCP.add_prompt("draft_release", fn _args, _ctx -> "Ship it." end)
-  |> FastestMCP.add_resource("memo://release", fn _args, _ctx -> %{version: "1.2.3"} end)
+task = FastestMCP.call_tool!("export-demo", "export_notes", %{"format" => "markdown"}, task: true)
+
+FastestMCP.fetch_task!(task).status
+# => :working
+
+FastestMCP.await_task!(task, 5_000)
+# => %{format: "markdown", notes: 2}
+
+FastestMCP.fetch_task!(task).status
+# => :completed
 ```
 
-Component-level `task:` settings override the server default.
+| Function | Does |
+| --- | --- |
+| `FastestMCP.fetch_task/1` | Returns the task's `FastestMCP.TaskRecord`: `status`, `progress`, the `input_requests` it waits for, and, once it finishes, `result` or `error`. |
+| `FastestMCP.await_task/2` | Waits up to a timeout (default 5 seconds) and returns the handler's result. |
+| `FastestMCP.task_result/1` | Waits up to 60 seconds and returns the result. |
+| `FastestMCP.cancel_task/1` | Cancels the task. |
+| `FastestMCP.list_tasks/2` | Lists the tasks, newest first. |
 
-## Local In-Process Task Calls
+Each returns `{:ok, value}` or `{:error, %FastestMCP.Error{}}` and has a `!`
+variant. `fetch_task/3`, `await_task/4`, `task_result/3`, and `cancel_task/3`
+take the server name and a task id instead of a handle. When `await_task/2`
+times out, it returns a `:timeout` error and the task keeps running.
 
-Task-enabled components do not force every in-process caller into asynchronous
-flow. Local calls stay synchronous until the caller explicitly asks for a task.
+`list_tasks/2` returns `%{tasks: tasks, next_cursor: cursor}`. With
+`page_size:`, it returns one page; pass `next_cursor` back as `cursor:` for the
+next:
 
-Tool example:
+```elixir
+%{tasks: [latest], next_cursor: _more} = FastestMCP.list_tasks!("export-demo", page_size: 1)
+
+{latest.target, latest.status}
+# => {"export_notes", :completed}
+```
+
+The mode applies to local calls as well: without `task: true`, an `:optional`
+tool runs as an ordinary call and returns its result, and a `:required` tool
+fails with `:method_not_found`, as does a `:forbidden` tool with `task: true`.
+This holds inside a handler too: calling a task-enabled tool returns its
+result, unless you pass `task: true`. `FastestMCP.render_prompt/4` and
+`FastestMCP.read_resource/3` take `task: true` for prompts and resources that
+support tasks.
+
+## Progress and status
+
+A task's status is one of:
+
+| Status | Meaning |
+| --- | --- |
+| `:working` | The handler runs. |
+| `:input_required` | The handler waits for an answer from the client. |
+| `:completed` | The handler returned. |
+| `:failed` | The handler raised or crashed. |
+| `:cancelled` | Someone cancelled the task. |
+
+`FastestMCP.Context.report_progress/4` in the handler records the latest
+progress on the task, and its message becomes the task's status message:
+
+```elixir
+task = FastestMCP.call_tool!("export-demo", "export_notes", %{"format" => "html"}, task: true)
+
+Process.sleep(50)
+
+Map.take(FastestMCP.fetch_task!(task).progress, [:current, :total, :message])
+# => %{current: 1, total: 2, message: "Collecting notes"}
+```
+
+Clients learn about changes from status notifications:
+`notifications/tasks/status` on `2025-11-25`, sent on the session's stream,
+and `notifications/tasks` on `2026-07-28`, sent to clients that subscribe to
+the task. Each carries the status message. On `2025-11-25`, a client that
+asked for progress also receives the progress notifications.
+[Reporting progress](context.md#reporting-progress) covers progress in
+general.
+
+A task's handler emits the telemetry events `[:fastest_mcp, :task, :start]`,
+`[:fastest_mcp, :task, :stop]`, and `[:fastest_mcp, :task, :exception]`, and
+each of its progress reports emits `[:fastest_mcp, :task, :progress]`; see
+[Telemetry events](observability.md#telemetry-events).
+
+## Tasks that ask for input
+
+Inside a task, `FastestMCP.Interact`, `FastestMCP.Sampling`,
+`FastestMCP.Context.elicit/4`, `FastestMCP.Context.sample/3`, and
+`FastestMCP.Context.list_roots/2` work on both protocol versions, and URL
+elicitation and `FastestMCP.Context.ping_peer/2` on `2025-11-25`. While the
+handler waits for the answer, the task's status is `:input_required`; when the
+answer arrives, the handler continues where it stopped.
+
+Over MCP, the client answers by itself. On `2026-07-28`, it finds the question
+in the task's status and sends the answer with `tasks/update`; on `2025-11-25`,
+the server asks while the client waits for the result with `tasks/result`.
+`FastestMCP.Client` does both with its handlers; see
+[Tasks that ask questions](client-callbacks.md#tasks-that-ask-questions).
+
+In process, answer with `FastestMCP.send_task_input/5`, giving the action
+(`:accept`, `:decline`, or `:cancel`) and, with `:accept`, the content of the
+form:
+
+```elixir
+alias FastestMCP.Interact
+
+FastestMCP.server("clear-demo")
+|> FastestMCP.add_tool(
+  "clear_notes",
+  fn _args, ctx ->
+    case Interact.confirm(ctx, "Delete every note?") do
+      {:ok, true} -> %{cleared: true}
+      _no -> %{cleared: false}
+    end
+  end,
+  task: true
+)
+|> FastestMCP.start_server!()
+
+task = FastestMCP.call_tool!("clear-demo", "clear_notes", %{}, task: true)
+
+Process.sleep(50)
+
+FastestMCP.fetch_task!(task).status
+# => :input_required
+
+FastestMCP.send_task_input!("clear-demo", task.task_id, :accept, %{"confirmed" => true})
+
+FastestMCP.await_task!(task)
+# => %{cleared: true}
+```
+
+The content must match the form the handler asked for: `Interact.confirm/3`
+asks for `"confirmed"`, and `Context.elicit(ctx, message, :boolean)` for
+`"value"` (see [the helpers](sampling-and-elicitation.md#the-helpers)).
+Content that doesn't match fails with `:bad_request`, and the task keeps
+waiting. Input sent before the task asks also fails, so wait until its status
+is `:input_required`.
+
+`send_task_input/5` answers elicitation. `FastestMCP.update_task/4` answers any
+question by its key in `FastestMCP.fetch_task!(task).input_requests`, with the
+answer an MCP client would send, such as the model's message for a sampling
+request. `send_task_input/5` fails with `:bad_request` for a question it can't
+answer, and its message names the question's method and `update_task/4`.
+
+A question waits for its timeout, 60 seconds unless the handler passes
+`timeout_ms:`. Then an elicitation returns `:cancelled` to the handler, and any
+other question fails the task with a `:timeout` error.
+
+## Results, errors, and cancellation
+
+How a task ends depends on its handler:
+
+| The handler | Status | `await_task/2` returns |
+| --- | --- | --- |
+| Returns a value | `:completed` | `{:ok, value}` |
+| Returns an error result, `FastestMCP.Tools.Result.new(message, is_error: true)` | `:completed` or `:failed`, see below | `{:ok, result}` |
+| Raises `FastestMCP.Error` | `:failed` | `{:error, error}` |
+| Raises another exception or exits | `:failed` | `{:error, error}` with code `:component_crash` |
+| Is cancelled | `:cancelled` | `{:error, error}` with code `:cancelled` |
+
+An error result is still the tool's answer, so the task returns it: awaiting
+the task returns the `%FastestMCP.Tools.Result{}`, and clients receive it as
+the tool result. Only the status differs by version. On `2026-07-28` the task
+is `:completed`, because the tool answered. On `2025-11-25` it is `:failed`.
+A task you start in process follows the version of the request it runs in,
+and outside any request, such as in IEx or a test, the `2025-11-25` rule:
+
+```elixir
+alias FastestMCP.Tools.Result
+
+FastestMCP.server("error-result-demo")
+|> FastestMCP.add_tool(
+  "get_note",
+  fn %{"id" => id}, _ctx -> Result.new("No note with id #{id}", is_error: true) end,
+  input_schema: %{
+    "type" => "object",
+    "properties" => %{"id" => %{"type" => "string"}},
+    "required" => ["id"]
+  },
+  task: true
+)
+|> FastestMCP.start_server!()
+
+task = FastestMCP.call_tool!("error-result-demo", "get_note", %{"id" => "7"}, task: true)
+
+{:ok, %Result{is_error: true}} = FastestMCP.await_task(task)
+
+FastestMCP.fetch_task!(task).status
+# => :failed
+```
+
+`FastestMCP.cancel_task!/1` stops the task's process at once, so the handler
+doesn't get to run any more code, and marks the task `:cancelled`. Clients
+cancel with `tasks/cancel`. Cancelling a task that has already finished fails
+with `:bad_request`.
+
+A task isn't bound by the tool's `timeout:` option: it runs until it finishes
+or someone cancels it.
+
+## Task lifetime
+
+A finished task stays readable for its time to live (TTL), 60 seconds after it
+finishes, and then disappears: reading it fails with `:invalid_task_id`. In
+process, set the TTL with `task_ttl_ms:`:
 
 ```elixir
 task =
-  FastestMCP.call_tool(
-    MyApp.MCPServer,
-    "slow_report",
-    %{"id" => 42},
-    task: true
+  FastestMCP.call_tool!("export-demo", "export_notes", %{"format" => "pdf"},
+    task: true,
+    task_ttl_ms: 300_000
   )
 
-status = FastestMCP.fetch_task(task)
-result = FastestMCP.await_task(task, 5_000)
-final = FastestMCP.task_result(task)
+task.ttl_ms
+# => 300000
 ```
 
-For local in-process callers, the same shape works for prompt, resource, and
-resource-template tasks:
+A `2025-11-25` client can ask for a TTL in its request (`task.ttl`), as
+`FastestMCP.Client.call_tool_task/4` does with `task: [ttl_ms: 300_000]`; tasks
+that `2026-07-28` clients start keep the default.
 
-```elixir
-prompt_task =
-  FastestMCP.render_prompt(
-    MyApp.MCPServer,
-    "draft_release",
-    %{"title" => "v1.2.3"},
-    task: true
-  )
+A task belongs to the identity that started it, and on `2025-11-25` also to
+the session. Another caller who asks for it gets the same `:invalid_task_id`
+error as for an unknown id. The handle remembers the owner, so the functions
+that take a handle find the task; give the ones that take an id the owner's
+`principal:` and `auth:`.
 
-resource_task =
-  FastestMCP.read_resource(
-    MyApp.MCPServer,
-    "memo://release",
-    task: true
-  )
-```
+Tasks live in the memory of the running server, in its task store, so they
+end with it. A durable `FastestMCP.TaskBackend` keeps their records across
+restarts; tasks that were running when the server stopped then fail. See
+[Background task storage](production.md#background-task-storage) and
+[Running several nodes](production.md#running-several-nodes). The runtime
+option `max_background_tasks:` limits how many tasks run at once (no limit by
+default); a task beyond it fails with `:overloaded`.
 
-List and cancel tasks from the same runtime:
+## Details
 
-```elixir
-%{tasks: tasks, next_cursor: next_cursor} =
-  FastestMCP.list_tasks(MyApp.MCPServer,
-    session_id: "release-session",
-    page_size: 20
-  )
+### Two task protocols
 
-Enum.each(tasks, fn task ->
-  IO.inspect({task.id, task.status})
-end)
+The two protocol versions define tasks differently, and FastestMCP doesn't
+translate between them:
 
-if next_cursor do
-  FastestMCP.list_tasks(MyApp.MCPServer,
-    session_id: "release-session",
-    page_size: 20,
-    cursor: next_cursor
-  )
-end
+| | `2026-07-28` | `2025-11-25` |
+| --- | --- | --- |
+| Definition | The `io.modelcontextprotocol/tasks` extension (Tasks v2), negotiated by both sides | Core Tasks (v1), experimental |
+| Who starts a task | The server | The client, with a `task` field in `tools/call` |
+| Methods | `tasks/get`, `tasks/update`, `tasks/cancel` | `tasks/get`, `tasks/list`, `tasks/result`, `tasks/cancel` |
+| Final result | Inlined in `tasks/get` | Returned by `tasks/result` |
+| Questions to the client | `inputRequests` in the status, answered with `tasks/update` | Sent while the client waits on `tasks/result` |
+| Durations | `ttlMs`, `pollIntervalMs` | `ttl`, `pollInterval` |
+| Status notifications | `notifications/tasks`, through `subscriptions/listen` | `notifications/tasks/status` |
 
-FastestMCP.cancel_task(task)
-```
+On `2026-07-28`:
 
-## Explicit `task_meta:` and TTL
+- A `:required` tool fails with `:missing_required_client_capability`
+  (JSON-RPC `-32021`) when the client doesn't declare the extension.
+- A server without the extension runs `:optional` tools as ordinary calls,
+  and a `:required` tool fails with `:method_not_found`.
+- A tool that returns an `InputRequiredResult` from a task moves the task to
+  `input_required` with those requests; the client's `tasks/update` answers
+  run the handler again, as in a
+  [multi-round-trip request](sampling-and-elicitation.md#multi-round-trip-requests).
+  In a task, the handler receives the answers of every round so far and its
+  own request state, which stays on the server. The task waits for the answers
+  up to the result's `timeout_ms:`, 60 seconds by default, and then fails with
+  `:timeout`.
+- `tasks/update` and `tasks/cancel` answer with an empty `complete` result.
 
-Use `task_meta:` when you want direct control over task creation metadata
-without changing the component declaration.
+On `2025-11-25`:
 
-```elixir
-alias FastestMCP.TaskMeta
+- The server advertises `tasks` with `list`, `cancel`, and
+  `requests.tools.call` in its `initialize` result when one of its tools
+  supports tasks.
+- A task request needs a session, and a `:required` tool rejects a call that
+  isn't one with `-32601`.
+- The final result, and a failure of `tasks/result`, carry
+  `_meta["io.modelcontextprotocol/related-task"]` with the task id, and the
+  result is validated as the result of the original `tools/call`.
+- The request's progress token belongs to the task until it finishes.
+- An `InputRequiredResult` fails the task at once, since a `2025-11-25`
+  client can't answer one: use the helpers in tasks on this version.
 
-task =
-  FastestMCP.call_tool(
-    MyApp.MCPServer,
-    "slow_report",
-    %{"id" => 42},
-    task_meta: TaskMeta.new(ttl: 30_000)
-  )
-```
+On both versions, every task message is validated against the protocol schema
+before it is sent, a request for a task that isn't a tool call ignores the
+`task` field, and the status message of a failed task is the error result's
+text or the error's message.
 
-Keyword and map input are supported too:
+### Three kinds of handles
 
-```elixir
-FastestMCP.read_resource(
-  MyApp.MCPServer,
-  "memo://release",
-  task_meta: [ttl: 15_000]
-)
-```
+- `%FastestMCP.BackgroundTask{}` is a task the server runs, as above.
+- `%FastestMCP.PeerTask{}` is a task the client runs for a request of the
+  server, on `2025-11-25`; see
+  [Client-side tasks](sampling-and-elicitation.md#client-side-tasks).
+- `%FastestMCP.Client.Task{}` is the client's handle for a task the server
+  runs; see [Remote tasks](client-callbacks.md#remote-tasks).
 
-This is useful when one handler starts another task-capable operation and wants
-the child task to inherit a specific TTL in an Elixir-first way.
+### Local tasks
 
-## Progress and Status
+A local task that asks for sampling or roots needs the client capabilities
+the request requires, as an MCP client would declare them: pass
+`client_capabilities: %{"sampling" => %{}}` to the call that starts it, then
+answer with `FastestMCP.update_task/4`. The same holds for an
+`InputRequiredResult` that a local task returns.
 
-Handlers report task progress through the normal context helpers:
+`task_ttl_ms:` takes any positive number of milliseconds and rounds a fraction
+up.
 
-```elixir
-FastestMCP.Context.report_progress(ctx, 1, 3, "Fetched source data")
-FastestMCP.Context.report_progress(ctx, 2, 3, "Generated markdown")
-FastestMCP.Context.report_progress(ctx, 3, 3, "Published report")
-```
+## See also
 
-That progress is reflected in task state and can be delivered to subscribed
-clients over `notifications/tasks/status`.
-
-The task object also carries the server-suggested poll interval configured by
-`task: [poll_interval_ms: ...]`.
-
-## Interactive Tasks and Elicitation Relay
-
-Background tasks can move into `input_required`, wait for user input, and then
-resume inside the same supervision tree.
-
-On the modern profile, a handler can return
-`FastestMCP.InputRequiredResult` before task creation, or a running Tasks v2
-operation can expose `inputRequests`. The client echoes synchronous MRTR
-answers on the retried operation and sends task answers through
-`tasks/update`. Request state belongs to MRTR; it is not copied onto the Tasks
-v2 envelope.
-
-The following callback-style flow describes legacy Tasks v1:
-
-```elixir
-alias FastestMCP.Elicitation.Accepted
-
-server =
-  FastestMCP.server("tasks")
-  |> FastestMCP.add_tool(
-    "approve_release",
-    fn _args, ctx ->
-      case FastestMCP.Context.elicit(ctx, "Deploy to production?", :boolean) do
-        %Accepted{data: true} -> %{approved: true}
-        %Accepted{data: false} -> %{approved: false}
-      end
-    end,
-    task: true
-  )
-```
-
-For connected legacy clients, the flow is:
-
-1. call the task-capable operation
-2. wait on `tasks/result`
-3. let the server relay `elicitation/create` or `sampling/createMessage`
-4. receive the final result on the same request
-
-FastestMCP exposes an Elixir-only input API for local integrations:
-
-```elixir
-task = FastestMCP.call_tool(MyApp.MCPServer, "approve_release", %{}, task: true)
-
-FastestMCP.send_task_input(
-  MyApp.MCPServer,
-  task.task_id,
-  :accept,
-  %{"confirmed" => true}
-)
-```
-
-This calls the supervised task runtime directly. It does not expose or send a
-`tasks/sendInput` MCP method. Remote interactive tasks use the standard
-`tasks/result` relay instead.
-
-## Task Result Semantics
-
-Every task envelope is validated before it crosses the wire. That includes
-the version-appropriate `CreateTaskResult`, access methods, status
-notifications, and final component result.
-
-Tasks v2 returns a flat create envelope, inlines terminal `result` or `error`
-on `tasks/get`, and removes `tasks/list` and `tasks/result`. A tool execution
-result with `isError: true` is still a completed task; `failed` is reserved for
-a protocol-level error. Cancel and update return an empty complete
-acknowledgement.
-
-For legacy Tasks v1, the final result is validated both as a Tasks payload and
-as the result type of the original augmented method, so a completed
-`tools/call` task cannot return a method-invalid payload.
-
-Terminal task outcomes are mapped deliberately:
-
-- successful MCP result -> task status `completed`
-- tool result with `isError: true` -> task status `failed`, but `tasks/result`
-  still returns the original tool result
-- raised `FastestMCP.Error` or protocol-level failure -> task status `failed`
-  and `tasks/result` re-raises the request error
-- cancellation -> task status `cancelled`
-
-Failed task status messages prefer tool error text when one exists, otherwise
-the `FastestMCP.Error` message.
-
-Successful `tasks/result` payloads carry
-`_meta["io.modelcontextprotocol/related-task"]` so the final result stays tied
-to the originating task:
-
-```elixir
-result = FastestMCP.task_result(task)
-
-%{
-  structuredContent: %{id: 42, status: "ready"},
-  _meta: %{
-    "io.modelcontextprotocol/related-task" => %{taskId: task.task_id}
-  }
-} = result
-```
-
-Request-level task failures preserve the same related-task metadata on the wire
-for JSON-RPC and stdio task-result error responses. That keeps failed
-`tasks/result` envelopes task-associated in the same way as successful ones.
-
-The original request's progress token remains owned by the task after the
-initial `CreateTaskResult` and is released only when the task becomes
-`completed`, `failed`, or `cancelled`. Duplicate tokens, decreasing progress,
-inconsistent totals, and late or unknown updates are rejected or isolated.
-
-## Session and Auth Scoping
-
-Task ownership is bound to the authenticated identity when auth exists. Legacy
-Tasks additionally bind ownership to the MCP session; modern Tasks carry no
-legacy session identifier.
-
-Legacy `tasks/get`, `tasks/list`, `tasks/result`, and `tasks/cancel` operate
-only on tasks visible to the current session and auth fingerprint. Modern
-`tasks/get`, `tasks/update`, and `tasks/cancel` use the current authenticated
-request identity without a session id. Wrong legacy session, wrong auth
-context, expired tasks, and nonexistent task ids resolve to the same
-invalid-task response shape.
-
-Local `FastestMCP.send_task_input/5` applies the same task ownership checks but
-does not cross the MCP transport.
-
-When auth is present, the task auth fingerprint prefers `client_id|sub` so two
-users sharing the same application client id do not see each other's tasks. If
-no subject is available, the runtime falls back to `client_id`, then `sub`, then
-a sanitized hashed identity.
-
-## Runtime Notes
-
-This implementation is intentionally OTP-first and single-node for now:
-
-- task orchestration lives in supervised Elixir processes
-- task state is stored in ETS through the configured `TaskBackend`
-- TTL expiry is enforced inside the runtime
-- legacy session streams and modern subscribers stay inside the server
-  supervision tree
-
-This pass does not add cross-node task routing or an external broker. The
-extension point for future distribution is the task backend, not a separate
-queue API.
-
-`FastestMCP.TaskBackend.Memory` is intentionally process-local. A host that
-requires task recovery across application restarts, deployments, or nodes must
-provide a durable `FastestMCP.TaskBackend` and the associated routing and
-retention policy.
-
-## Capabilities
-
-On `2025-11-25`, FastestMCP advertises task capabilities during initialize:
-
-```elixir
-%{
-  "tasks" => %{
-    "list" => %{},
-    "cancel" => %{},
-    "requests" => %{
-      "tools" => %{"call" => %{}}
-    }
-  }
-} = FastestMCP.initialize(MyApp.MCPServer)["capabilities"]
-```
-
-On `2026-07-28`, the server instead advertises
-`capabilities.extensions["io.modelcontextprotocol/tasks"]`; the client must
-negotiate that extension. `tools.call` is the only component execution surface
-that creates remote Tasks. Passing task
-metadata to a wire method that does not support augmentation is ignored by the
-server, as required by MCP; the connected Elixir client does not offer task
-options for those remote calls.
-
-On the client side, `tasks.requests.sampling.createMessage` and
-`tasks.requests.elicitation.create` are advertised only when the matching
-callback handler exists. Those callbacks run in supervised workers and expose
-`tasks/get`, `tasks/list`, `tasks/result`, and `tasks/cancel` on the same
-connection.
-
-## Related Guides
-
-- [Progress](progress.md)
-- [Sampling and Interaction](sampling-and-interaction.md)
-- [Context](context.md)
-- [Client](client.md)
-- [Runtime State and Storage](runtime-state-and-storage.md)
+- [Sampling and Elicitation](sampling-and-elicitation.md): what a task can ask
+  the client
+- [Client Callbacks](client-callbacks.md): following and answering tasks from
+  `FastestMCP.Client`
+- [Context](context.md#reporting-progress): reporting progress
+- [Production](production.md): task storage and limits
+- [Testing](testing.md): testing tasks

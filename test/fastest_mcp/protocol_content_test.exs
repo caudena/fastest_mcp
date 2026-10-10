@@ -1,5 +1,5 @@
 defmodule FastestMCP.Protocol.ContentTest do
-  use ExUnit.Case, async: true
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Error
   alias FastestMCP.Protocol.Content

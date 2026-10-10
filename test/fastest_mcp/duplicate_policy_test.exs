@@ -1,5 +1,5 @@
 defmodule FastestMCP.DuplicatePolicyTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   import ExUnit.CaptureLog
 
@@ -22,6 +22,51 @@ defmodule FastestMCP.DuplicatePolicyTest do
 
     assert match?([_], ignore_server.tools)
     assert hd(ignore_server.tools).compiled.(%{}, nil) == %{source: :first}
+  end
+
+  test "a name and version in several sources is listed once, as a call resolves it" do
+    server_name = unique_name("dup-sources")
+
+    provider =
+      Local.new()
+      |> Local.add_tool("search_notes", fn _arguments, _ctx -> %{source: :provider} end,
+        description: "provider"
+      )
+      |> Local.add_tool("archive_notes", fn _arguments, _ctx -> %{source: :provider} end,
+        description: "provider"
+      )
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("search_notes", fn _arguments, _ctx -> %{source: :definition} end,
+      description: "definition"
+    )
+    |> FastestMCP.add_tool("archive_notes", fn _arguments, _ctx -> %{source: :definition} end,
+      description: "definition",
+      authorization: fn _authorization -> false end
+    )
+    |> FastestMCP.add_provider(provider)
+    |> start_server!()
+
+    {:ok, _tool} =
+      ComponentManager.add_tool(
+        server_name,
+        "search_notes",
+        fn _arguments, _ctx -> %{source: :manager} end,
+        description: "manager"
+      )
+
+    listed = [{"archive_notes", "provider"}, {"search_notes", "definition"}]
+    assert listed == Enum.map(FastestMCP.list_tools!(server_name), &{&1.name, &1.description})
+
+    assert %{tools: tools} =
+             FastestMCP.Transport.Engine.dispatch!(server_name, %FastestMCP.Transport.Request{
+               method: "tools/list",
+               transport: :stdio
+             })
+
+    assert listed == Enum.map(tools, &{&1["name"], &1["description"]})
+    assert %{source: :definition} == FastestMCP.call_tool!(server_name, "search_notes")
+    assert %{source: :provider} == FastestMCP.call_tool!(server_name, "archive_notes")
   end
 
   test "server on_duplicate warn logs and replaces" do
@@ -74,10 +119,9 @@ defmodule FastestMCP.DuplicatePolicyTest do
   test "component manager adders honor duplicate policy overrides" do
     server_name = "dup-manager-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    assert {:ok, _pid} = FastestMCP.start_server(FastestMCP.server(server_name))
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    start_server!(FastestMCP.server(server_name))
 
-    manager = FastestMCP.component_manager(server_name)
+    manager = FastestMCP.component_manager!(server_name)
 
     assert {:ok, _tool} =
              ComponentManager.add_tool(
@@ -96,7 +140,7 @@ defmodule FastestMCP.DuplicatePolicyTest do
                on_duplicate: :replace
              )
 
-    assert %{source: :second} == FastestMCP.call_tool(server_name, "echo", %{}, version: "1.0.0")
+    assert %{source: :second} == FastestMCP.call_tool!(server_name, "echo", %{}, version: "1.0.0")
 
     assert {:ok, _tool} =
              ComponentManager.add_tool(
@@ -107,6 +151,20 @@ defmodule FastestMCP.DuplicatePolicyTest do
                on_duplicate: :ignore
              )
 
-    assert %{source: :second} == FastestMCP.call_tool(server_name, "echo", %{}, version: "1.0.0")
+    assert %{source: :second} == FastestMCP.call_tool!(server_name, "echo", %{}, version: "1.0.0")
+  end
+
+  test "component manager error policy raises in the caller and keeps the runtime" do
+    server_name = unique_name("dup-manager-error")
+    start_server!(FastestMCP.server(server_name))
+    manager = FastestMCP.component_manager!(server_name)
+
+    assert {:ok, _tool} = ComponentManager.add_tool(manager, "echo", fn _, _ -> :first end)
+
+    assert_raise ArgumentError, ~r/already defined/, fn ->
+      ComponentManager.add_tool(manager, "echo", fn _, _ -> :second end)
+    end
+
+    assert :first == FastestMCP.call_tool!(server_name, "echo", %{})
   end
 end

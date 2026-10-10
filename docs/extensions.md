@@ -1,58 +1,84 @@
-# Protocol Extensions
+# Extensions
 
-MCP `2026-07-28` makes extensions an explicit capability surface. Configure
-them by exact reverse-DNS identifier:
+An MCP extension is an optional addition to the protocol, named by an
+identifier such as `io.modelcontextprotocol/ui`. A server and a client each
+declare the extensions they support, and an extension takes effect only when
+both do. FastestMCP implements the official extensions for interactive UIs
+(MCP Apps), background tasks, and client authorization, and lets you define
+extensions of your own.
 
 ```elixir
 alias FastestMCP.Protocol.Extensions
 
-server =
-  FastestMCP.server("extended",
-    extensions: %{
-      Extensions.apps() => %{},
-      Extensions.tasks() => %{}
-    }
-  )
+FastestMCP.server("extensions-declared",
+  extensions: %{Extensions.apps() => %{}, Extensions.tasks() => %{}}
+)
+|> FastestMCP.add_tool("search_notes", fn _args, _ctx -> %{notes: []} end)
+|> FastestMCP.start_server!()
+
+client = FastestMCP.Client.connect!({:in_process, "extensions-declared"})
+FastestMCP.Client.info!(client).capabilities["extensions"]
+# => %{"io.modelcontextprotocol/tasks" => %{}, "io.modelcontextprotocol/ui" => %{}}
 ```
 
-The connected client has the same `extensions: %{identifier => settings}`
-option. Unknown extension settings remain open data; FastestMCP validates only
-the extension fields it consumes.
+## What extensions are
 
-Tasks and authorization-extension declarations affect only the modern profile.
-Apps capability metadata is also preserved during legacy initialization, but it
-does not retrofit modern core wire shapes onto a `2025-11-25` session.
+The core protocol defines tools, resources, prompts, and the requests around
+them. An extension adds to that: new fields on existing messages, new
+requests, or new rules, versioned on its own schedule. Each side lists the
+extensions it supports in its capabilities, as a map of identifiers to
+settings, and uses an extension's features only with a peer that listed it
+too. On the server, that map is the `extensions:` option of
+`FastestMCP.server/2`; on `FastestMCP.Client`, it is the `extensions:` option
+of `FastestMCP.Client.connect/2`.
 
-## Support Matrix
+FastestMCP supports these extensions:
 
-| Extension | Identifier | Maturity/version | FastestMCP boundary |
+| Extension | Identifier | Status | Where |
 | --- | --- | --- | --- |
-| MCP Apps | `io.modelcontextprotocol/ui` | stable specification `2026-01-26`; Apps v1.0.0 | server resource/tool metadata and connected-client preservation |
-| Tasks | `io.modelcontextprotocol/tasks` | experimental draft | full modern Tasks v2 server/client wire surface |
-| OAuth Client Credentials | `io.modelcontextprotocol/oauth-client-credentials` | draft | connected-client grant only |
-| Enterprise-Managed Authorization | `io.modelcontextprotocol/enterprise-managed-authorization` | stable | connected-client grant and host identity-provider callback |
+| MCP Apps | `io.modelcontextprotocol/ui` | Stable, Apps 1.0 | [MCP Apps](#mcp-apps) below |
+| Tasks | `io.modelcontextprotocol/tasks` | Experimental | [Background Tasks](background-tasks.md#making-a-tool-a-task) |
+| OAuth Client Credentials | `io.modelcontextprotocol/oauth-client-credentials` | Draft | The client's OAuth grants; see [Client Authentication](client-auth.md) |
+| Enterprise-Managed Authorization | `io.modelcontextprotocol/enterprise-managed-authorization` | Stable | The client's OAuth grants; see [Client Authentication](client-auth.md) |
 
-Experimental and draft extensions may change independently of the core
-protocol. Configure their identifiers deliberately and review their versioned
-extension contracts when upgrading.
+`FastestMCP.Protocol.Extensions` has a function for each identifier. Draft and
+experimental extensions can change independently of the core protocol, so
+review them when you upgrade. Extensions belong to the `2026-07-28` protocol;
+of these, only MCP Apps also works with `2025-11-25` clients.
 
-## Active Server Extensions
+You can also list an identifier of your own or of a third party in
+`extensions:`, with any settings. FastestMCP advertises it unchanged to
+`2026-07-28` clients and does nothing else with it: your handlers decide what
+it means. To add requests or behavior of your own, define a
+[server extension](#server-extensions).
 
-`extensions:` is an open capability map: FastestMCP preserves and advertises
-its settings but does not execute arbitrary behavior from it. Use the ordered
-`active_extensions:` list when an extension owns server methods or intercepts
-negotiated tool calls:
+## Server extensions
+
+A server extension adds behavior for the clients that declare it. Define one
+when the clients that use your server, such as your own application or an
+editor plugin that you build, need something that a tool, a resource, or a
+prompt can't express. It can contribute:
+
+- **methods**, requests of its own, such as `reports/run`;
+- **a tool interceptor**, a middleware around the tool calls of clients that
+  declared the extension;
+- **a lifespan**, state that starts and stops with the server.
+
+`FastestMCP.ServerExtension.new/2` defines one, and the `active_extensions:`
+option of `FastestMCP.server/2`, or `FastestMCP.add_extension/2`, adds it. A
+client declares the extension and calls a method with
+`FastestMCP.Client.request/4`:
 
 ```elixir
-extension =
-  FastestMCP.ServerExtension.new("com.example/reports",
-    settings: %{"revision" => 1},
+alias FastestMCP.ServerExtension
+
+reports =
+  ServerExtension.new("com.example/reports",
+    settings: %{"formats" => ["markdown"]},
     methods: [
-      FastestMCP.ServerExtension.method(
+      ServerExtension.method(
         "reports/run",
-        fn params, context ->
-          %{"report" => MyApp.Reports.run(params, context.principal)}
-        end,
+        fn %{"name" => name}, _ctx -> %{"report" => name, "notes" => 2} end,
         params_schema: %{
           "type" => "object",
           "properties" => %{"name" => %{"type" => "string"}},
@@ -62,179 +88,250 @@ extension =
     ]
   )
 
-server =
-  FastestMCP.server("reports",
-    active_extensions: [extension]
-  )
-```
+FastestMCP.server("extensions-reports", active_extensions: [reports])
+|> FastestMCP.add_tool("search_notes", fn _args, _ctx -> %{notes: []} end)
+|> FastestMCP.start_server!()
 
-Active methods are available only on `2026-07-28` requests whose current
-client-capability metadata advertises the same extension identifier. They run
-through the ordinary authentication, middleware, telemetry, supervised-call,
-and request-cleanup boundaries. The optional parameter schema is applied after
-the generic JSON-RPC and MCP metadata checks. A handler receives `(params,
-context)` and must return a JSON object.
-
-An extension can also declare one `lifespan:` and one `tool_interceptor:`. Its
-lifespan state is available at `context.lifespan_context[extension_id]`. The
-interceptor has the same two-arity contract as middleware and runs only for a
-modern `tools/call` request that advertises that extension. Because it is
-installed on the root server, it also wraps mounted tools.
-
-FastestMCP rejects duplicate extension identifiers, passive/active identifier
-collisions, duplicate method ownership, and attempts to shadow core, Tasks, or
-other built-in methods. Mounted child servers cannot own active extensions;
-configure them on the consuming root server so negotiation has one boundary.
-Apps and Tasks remain specialized implementations rather than generic active
-extensions.
-
-Clients advertise configured extension settings on every modern request. Use
-the low-level request API for an extension method whose result has no dedicated
-FastestMCP normalizer:
-
-```elixir
 client =
-  FastestMCP.Client.connect!(endpoint,
-    extensions: %{"com.example/reports" => %{"revision" => 1}}
+  FastestMCP.Client.connect!({:in_process, "extensions-reports"},
+    extensions: %{"com.example/reports" => %{}}
   )
 
-result = FastestMCP.Client.request(client, "reports/run", %{"name" => "daily"})
+%{"report" => report, "notes" => notes} =
+  FastestMCP.Client.request!(client, "reports/run", %{"name" => "weekly"})
+
+{report, notes}
+# => {"weekly", 2}
 ```
 
-Active extension notifications, subscription types, generic output schemas,
-macros, and dynamic plugin loading are outside this API.
+A method receives its parameters and the request's context, and returns a map,
+which becomes the JSON result. It runs like any other request, with
+authentication, middleware, and the extension's `params_schema:`, which
+rejects invalid parameters with `:invalid_params`. A client that didn't
+declare the extension gets `:missing_required_client_capability`, and a
+`2025-11-25` client doesn't see the method at all. The extension's
+`settings:` are advertised in the server's capabilities.
 
-## MCP Apps
-
-`FastestMCP.Apps` builds canonical `ui://` resource content, CSP/permission
-metadata, and tool-to-resource links. Both sides must opt in. Enable Apps on
-the server:
-
-```elixir
-server =
-  FastestMCP.server("apps",
-    extensions: %{FastestMCP.Apps.extension_id() => %{}}
-  )
-```
-
-Advertise the supported media type from the client:
+A `tool_interceptor:` has the contract of a [middleware](middleware.md), and
+runs only for the `2026-07-28` tool calls of clients that declared the
+extension:
 
 ```elixir
-extensions: %{
-  FastestMCP.Apps.extension_id() => FastestMCP.Apps.client_settings()
-}
-```
+require Logger
 
-FastestMCP emits `_meta.ui` only when the server is enabled for Apps and the
-current client advertises `text/html;profile=mcp-app`. Without that negotiated
-pair, the same tool remains a normal MCP tool and its UI metadata is removed.
-The connected client preserves negotiated descriptors and resource documents
-for a consuming Host.
-
-An advertised tool link is checked through the same resource visibility and
-authorization boundary as `resources/read`. Its target must exist as an
-accessible `ui://` resource with the Apps MIME type. Every Apps-linked tool
-must still return a non-empty ordinary `content` array, including to clients
-that do not support Apps; `structuredContent` can carry the UI-oriented data.
-
-`Apps.result/3` treats HTML as opaque bytes. Supply a complete valid HTML5
-document yourself:
-
-```elixir
-FastestMCP.Apps.result(
-  "ui://reports/summary.html",
-  "<!doctype html><html><head><meta charset=\"utf-8\"></head><body>Report</body></html>"
+FastestMCP.ServerExtension.new("com.example/audit",
+  tool_interceptor: fn operation, next ->
+    result = next.(operation)
+    Logger.info("audited a call of #{operation.target}")
+    result
+  end
 )
 ```
 
-FastestMCP validates the `ui://`/MIME/content envelope, but deliberately does
-not implement an HTML parser. CSP entries are schema-shaped source strings;
-values such as `wss://live.example.com` and `https://*.example.com` are
-preserved for Host enforcement. `_meta.ui.visibility` is Apps Host metadata
-and does not change FastestMCP's internal component `visibility:` policy.
+A `lifespan:` is a function of the server, like the lifespans in
+[Lifespans and Dependencies](lifespans-and-dependencies.md#lifespans). The map
+it returns is available to handlers as `ctx.lifespan_context["com.example/audit"]`,
+under the extension's identifier.
 
-The consuming browser or native MCP Host remains responsible for creating the
-View, iframe sandboxing, CSP enforcement, permission and consent UI, and the
-Host/View `postMessage` bridge. FastestMCP does not render untrusted HTML or
-claim to be an Apps Host.
+### Provider-bundled extensions
 
-## Tasks: Two Deliberately Separate Eras
-
-For `2026-07-28`, enable `io.modelcontextprotocol/tasks` and register task
-support on components. Tasks v2 is server-directed and uses `tasks/get`,
-`tasks/update`, and `tasks/cancel`; terminal results are inlined by
-`tasks/get`. Durations use `ttlMs` and `pollIntervalMs`. Multi-round-trip input
-uses `InputRequiredResult` plus `inputResponses`.
-
-For `2025-11-25`, the existing experimental core Tasks v1 surface remains:
-`tasks/get`, `tasks/list`, `tasks/result`, and `tasks/cancel`, with legacy task
-augmentation and field names. It is kept for backwards compatibility and is
-not wire-compatible with Tasks v2.
-
-The local Elixir background-task API is independent of either remote wire
-profile. See [Background Tasks](background-tasks.md) for the three-way split.
-
-## OAuth Client Credentials
-
-This grant is for machine clients. It stays under the existing `oauth:` client
-configuration:
+A mounted server, or a custom provider, can bring the server extensions that
+its components need. Give the extension `auto_register: true`, and the server
+that mounts it adds the extension too:
 
 ```elixir
-oauth: [
-  grant:
-    {:client_credentials,
-     client_id: "worker",
-     token_endpoint_auth_method: "client_secret_basic",
-     client_secret: System.fetch_env!("MCP_CLIENT_SECRET")}
-]
+alias FastestMCP.ServerExtension
+
+catalog =
+  ServerExtension.new("com.example/catalog",
+    auto_register: true,
+    methods: [{"catalog/info", fn _params, _ctx -> %{"revision" => 1} end}]
+  )
+
+child =
+  FastestMCP.server("catalog-child", active_extensions: [catalog])
+  |> FastestMCP.add_tool("list_items", fn _args, _ctx -> %{items: []} end)
+
+FastestMCP.server("catalog-root")
+|> FastestMCP.mount(child, namespace: "catalog")
+|> FastestMCP.start_server!()
+
+client =
+  FastestMCP.Client.connect!({:in_process, "catalog-root"},
+    extensions: %{"com.example/catalog" => %{}}
+  )
+
+FastestMCP.Client.request!(client, "catalog/info")["revision"]
+# => 1
 ```
 
-The tagged grant automatically declares
-`io.modelcontextprotocol/oauth-client-credentials`; a separate `extensions:`
-entry is not required.
+The namespace renames the mounted tools, to `catalog_list_items`, but not the
+extension or its methods. A custom provider returns the same declarations from
+`c:FastestMCP.Provider.required_extensions/1`. Without `auto_register: true`,
+the root must declare the extension itself, with `active_extensions:` or
+`FastestMCP.add_extension/2`, or it fails to start with
+`extension "com.example/catalog" requires an explicit root declaration`. A
+declaration on the root always wins over a bundled one;
+[Bundled extensions](#bundled-extensions) in Details has the rules.
 
-For `private_key_jwt`, provide `assertion_provider:` instead of a secret. The
-arity-one callback or `FastestMCP.Client.OAuth.ClientAssertionProvider`
-implementation receives the discovered client id, token endpoint,
-authorization server, signing algorithms, and grant type. It returns
-`{:ok, jwt}`. FastestMCP does not load keys or implement a second JOSE stack.
+## MCP Apps
 
-## Enterprise-Managed Authorization
-
-Enterprise-managed authorization delegates the workforce identity assertion
-to the host:
+MCP Apps let a tool show an interactive UI in the hosts that support it. Your
+server serves an HTML page as a resource with a `ui://` URI, and links a tool
+to it; when the model calls the tool, the host shows the page in a sandboxed
+frame next to the conversation. Hosts without Apps support use the tool as
+usual. `FastestMCP.Apps` builds the metadata, and both sides opt in: the
+server with the Apps extension, the client with the Apps media type.
 
 ```elixir
-oauth: [
-  grant:
-    {:enterprise_managed,
-     registration: {:pre_registered, [client_id: "enterprise-client"]},
-     provider: &MyApp.MCPIdentity.assertion/1}
-]
+alias FastestMCP.Apps
+
+board = """
+<!doctype html>
+<html>
+  <head><meta charset="utf-8"><title>Notes</title></head>
+  <body><ul id="notes"></ul></body>
+</html>
+"""
+
+FastestMCP.server("extensions-apps", extensions: %{Apps.extension_id() => %{}})
+|> FastestMCP.add_resource(
+  "ui://notes/board.html",
+  fn _args, _ctx -> Apps.result("ui://notes/board.html", board) end,
+  mime_type: Apps.mime_type()
+)
+|> FastestMCP.add_tool(
+  "show_notes",
+  fn _args, _ctx ->
+    notes = [%{id: "1", title: "Release"}, %{id: "2", title: "Groceries"}]
+    FastestMCP.Tools.Result.new("You have 2 notes.", structured_content: %{notes: notes})
+  end,
+  meta: Apps.tool_meta("ui://notes/board.html")
+)
+|> FastestMCP.start_server!()
+
+host =
+  FastestMCP.Client.connect!({:in_process, "extensions-apps"},
+    extensions: %{Apps.extension_id() => Apps.client_settings()}
+  )
+
+[tool] = FastestMCP.Client.list_tools!(host).items
+tool["_meta"]["ui"]
+# => %{"resourceUri" => "ui://notes/board.html", "visibility" => ["model", "app"]}
+
+plain = FastestMCP.Client.connect!({:in_process, "extensions-apps"})
+[tool] = FastestMCP.Client.list_tools!(plain).items
+tool["_meta"]["ui"]
+# => nil
 ```
 
-The tagged grant automatically declares
-`io.modelcontextprotocol/enterprise-managed-authorization` on modern MCP
-requests.
+The pieces:
 
-The arity-one provider or
-`FastestMCP.Client.OAuth.EnterpriseManagedProvider` implementation receives
-the protected resource, authorization server, and scopes. It returns an
-assertion map with `token_endpoint`, `subject_token`, `subject_token_type`, and
-optional `headers` and `form` fields. FastestMCP performs the defined token
-exchange; the host owns sign-in, IdP/SAML/OIDC credential acquisition, secure
-storage, and user policy.
+- `Apps.result/3` builds the resource's contents from a complete HTML document,
+  which FastestMCP sends as it is. Give the resource `mime_type: Apps.mime_type()`.
+- `Apps.tool_meta/2` links a tool to the page. Its `visibility:` option tells
+  the host who uses the tool: the model (`"model"`), the page (`"app"`), or
+  both, the default.
+- The tool still returns ordinary content, here the text "You have 2 notes.",
+  for hosts without Apps; `structured_content` carries the data that the page
+  renders.
+- `Apps.resource_meta/1` describes what the page may do: `csp:` with the
+  domains it may connect to and load from (`connectDomains`,
+  `resourceDomains`, `frameDomains`, `baseUriDomains`), `permissions:` among
+  `camera`, `microphone`, `geolocation`, and `clipboardWrite`, `domain:`, and
+  `prefers_border:`. Pass the same options to `Apps.result/3`, and to the
+  resource as `meta: Apps.resource_meta(options)`.
 
-Client Credentials and Enterprise-Managed Authorization change how the
-connected client obtains a bearer token. They do not turn the FastestMCP server
-into an authorization server. See [Auth](auth.md) and
-[Phoenix Deployment](phoenix-deployment.md).
+FastestMCP provides the metadata and the resources, and checks them; it
+doesn't render HTML. The host creates the page's frame, sandboxes it, enforces
+its content security policy, asks the user for permissions and consent, and
+carries the messages between the page and the host. `FastestMCP.Client`, with
+`Apps.client_settings/1` in its `extensions:`, receives the links and the
+documents for a host that you build.
 
-## Verification Boundary
+## Details
 
-The official runner has executable Tasks and authorization-extension
-scenarios. CI invokes them explicitly. Its Apps package currently supplies no
-server/client conformance scenario, so Apps is gated by native metadata,
-capability filtering, content, and round-trip tests. The runner's optional
-Tasks status-notification scenario is currently always skipped pending its
-`subscriptions/listen` fixture rewrite; native transport tests own that gate.
+### Negotiation on each protocol version
+
+On `2026-07-28`, the server lists its extensions in the `server/discover`
+result, and the client declares its own in the metadata of every request, so
+an extension can apply to one request and not the next. On `2025-11-25`, the
+server advertises only MCP Apps, in its `initialize` result; the other
+extensions, and server extensions, don't exist for those clients. Background
+tasks exist on both versions, in different forms; see
+[Two task protocols](background-tasks.md#two-task-protocols).
+
+An identifier has the form `vendor/name`, with a `/`. FastestMCP validates the
+settings of the extensions it implements: MCP Apps takes only `mimeTypes`, a
+list of strings, and Tasks and the two authorization extensions take no
+settings. Other identifiers keep the settings you give. In a handler,
+`FastestMCP.Protocol.Extensions.enabled?/2` and
+`FastestMCP.Protocol.Extensions.settings/2` with `ctx.client_capabilities`
+tell what the current client declared.
+
+### Server extension rules
+
+When you build a server, `FastestMCP.server/2` and `FastestMCP.add_extension/2`
+raise `ArgumentError` for:
+
+- two server extensions with the same identifier, or one with the identifier
+  of an entry in `extensions:`;
+- two extensions that define the same method;
+- a method that shadows a method of the protocol, such as `tools/call`;
+- MCP Apps or Tasks as a server extension, since FastestMCP implements them
+  itself.
+
+A method name can't start with `notifications/`: methods are requests that
+return a result. A method may also be given as a `{name, handler}` or
+`{name, handler, options}` tuple. Tool interceptors run in the order of the
+extensions, after your middleware, and also wrap the tools of mounted servers.
+Server extensions can't send notifications, define subscription types, or
+declare output schemas.
+
+### Bundled extensions
+
+Before the server starts, FastestMCP collects the extensions of its mounted
+servers, recursively, and the `required_extensions/1` of its providers, which
+provider transforms don't change:
+
+- An extension that the root declares itself wins, whatever order you built
+  the server in.
+- An extension that isn't `auto_register: true` must be declared by the root.
+- Two identical bundled declarations count as one; two different ones with
+  the same identifier make the server fail to start unless the root declares
+  that identifier itself.
+
+The root then runs each extension once: one lifespan, one interceptor. The
+handlers of a mounted server see, in `ctx.lifespan_context`, the state of the
+extensions it brought, next to its own lifespans, but not the rest of the
+parent's. A declaration used by several root servers gets independent state in
+each, and when an extension's lifespan fails, the ones that already started
+are cleaned up.
+
+### MCP Apps rules
+
+- FastestMCP sends `_meta.ui` only when the server enables Apps and the
+  client's settings list `text/html;profile=mcp-app`; for other clients, it
+  removes the links.
+- When Apps is negotiated, every tool link must point to a resource that the
+  caller can read, with a `ui://` URI and the Apps media type; otherwise
+  `tools/list` fails. Reading such a resource must return Apps contents.
+- A tool linked to a page must return content that isn't empty, on both
+  protocol versions; `FastestMCP.Tools.Result.new(nil, structured_content: data)`
+  writes text from the data.
+- FastestMCP validates the `ui://` URIs, the media type, and the shape of the
+  contents, but not the HTML. CSP entries are kept as written, such as
+  `wss://live.example.com` or `https://*.example.com`, for the host to enforce.
+- The `visibility:` of `Apps.tool_meta/2` is for the host; it doesn't change
+  which audiences see the tool (see
+  [Audiences](versioning-and-visibility.md#audiences)).
+
+## See also
+
+- [Background Tasks](background-tasks.md): the Tasks extension
+- [Client Authentication](client-auth.md): the authorization extensions
+- [Providers and Mounting](providers-and-mounting.md): mounted servers and
+  custom providers
+- [Middleware](middleware.md): the contract of tool interceptors
+- `FastestMCP.ServerExtension`, `FastestMCP.Apps`, and
+  `FastestMCP.Protocol.Extensions`

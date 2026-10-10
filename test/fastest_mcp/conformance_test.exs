@@ -1,12 +1,11 @@
 defmodule FastestMCP.ConformanceServerTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: false
 
   @moduletag :conformance
   @moduletag timeout: 600_000
 
   alias FastestMCP.TestSupport.ConformanceFixture
   alias FastestMCP.TestSupport.ConformanceRunner
-  alias FastestMCP.Transport.HTTPApp
 
   test "pinned official runner passes the frozen core requirements on both protocol eras" do
     ConformanceRunner.assert_version!()
@@ -49,22 +48,9 @@ defmodule FastestMCP.ConformanceServerTest do
   end
 
   defp start_conformance_server! do
-    server_name = "conformance-" <> Integer.to_string(System.unique_integer([:positive]))
-    server = ConformanceFixture.build_server(server_name)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
-
-    bandit =
-      start_supervised!(
-        {Bandit,
-         plug: {HTTPApp, server_name: server_name, path: "/mcp", allowed_hosts: :localhost},
-         scheme: :http,
-         port: 0}
-      )
-
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
-    %{url: "http://127.0.0.1:#{port}/mcp"}
+    server_name = unique_name("conformance")
+    server_name |> ConformanceFixture.build_server() |> start_server!()
+    start_http!(server_name, allowed_hosts: :localhost)
   end
 
   defp assert_required_evidence!(expected, output_dir, output, revision) do

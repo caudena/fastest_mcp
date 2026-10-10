@@ -6,14 +6,12 @@ defmodule FastestMCP.Protocol.Sampling do
 
   @type tool_choice :: :auto | :required | :none
 
-  @doc false
   @spec validate_messages(term()) :: :ok | {:error, String.t()}
   def validate_messages(messages) when is_list(messages), do: validate_sequence(messages, 0)
 
   def validate_messages(_messages),
     do: {:error, "sampling messages must be an array"}
 
-  @doc false
   def validate_messages!(messages) do
     case validate_messages(messages) do
       :ok -> messages
@@ -21,7 +19,6 @@ defmodule FastestMCP.Protocol.Sampling do
     end
   end
 
-  @doc false
   @spec validate_result(term(), tool_choice() | map() | nil) ::
           :ok | {:error, String.t()}
   def validate_result(result, tool_choice \\ :auto)
@@ -37,7 +34,6 @@ defmodule FastestMCP.Protocol.Sampling do
   def validate_result(_result, _tool_choice),
     do: {:error, "sampling result must be an object"}
 
-  @doc false
   def validate_result!(result, tool_choice \\ :auto) do
     case validate_result(result, tool_choice) do
       :ok -> result
@@ -45,7 +41,6 @@ defmodule FastestMCP.Protocol.Sampling do
     end
   end
 
-  @doc false
   @spec compile_tool_validators(term(), keyword()) ::
           {:ok, %{optional(String.t()) => term()}}
           | {:error, Error.t() | FastestMCP.Schema.Error.t()}
@@ -78,7 +73,6 @@ defmodule FastestMCP.Protocol.Sampling do
     end)
   end
 
-  @doc false
   @spec validate_tool_inputs(map(), map()) ::
           :ok
           | {:error, {:unknown_tool, term()}}

@@ -1,5 +1,5 @@
 defmodule FastestMCP.ClientResponseCacheUnitTest do
-  use ExUnit.Case, async: true
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Client.ResponseCache
 

@@ -22,10 +22,12 @@ defmodule FastestMCP.Providers.Proxy do
   connection.
   """
 
+  use FastestMCP.Provider
+
   alias FastestMCP.Apps
   alias FastestMCP.Client
   alias FastestMCP.Client.Paginator
-  alias FastestMCP.Component
+  alias FastestMCP.Component.Lookup
   alias FastestMCP.ComponentCompiler
   alias FastestMCP.Components.ResourceTemplate
   alias FastestMCP.Context
@@ -39,7 +41,6 @@ defmodule FastestMCP.Providers.Proxy do
 
   @default_max_pages 256
   @default_max_items 100_000
-  @component_types [:tool, :resource, :resource_template, :prompt]
   @reserved_client_options [
     :auto_initialize,
     :protocol_version,
@@ -139,108 +140,63 @@ defmodule FastestMCP.Providers.Proxy do
   end
 
   @doc "Returns the provider type label."
+  @impl FastestMCP.Provider
   def provider_type(%__MODULE__{}), do: "ProxyProvider"
 
   @doc "Lists remote components through the request-scoped upstream client."
-  def list_components(%__MODULE__{} = proxy, component_type, %Operation{} = operation)
-      when component_type in @component_types do
+  @impl FastestMCP.Provider
+  def list_components(%__MODULE__{} = proxy, kind, %Operation{} = operation) do
     proxy
-    |> remote_descriptors(component_type, operation)
-    |> Enum.map(&compile_descriptor(proxy, component_type, &1, operation))
+    |> remote_descriptors(kind, operation)
+    |> Enum.map(&compile_descriptor(proxy, kind, &1))
   end
-
-  def list_components(%__MODULE__{}, _component_type, _operation), do: []
-
-  @doc false
-  def get_component_candidates(
-        %__MODULE__{} = proxy,
-        component_type,
-        identifier,
-        %Operation{} = operation
-      )
-      when component_type in @component_types do
-    identifier = to_string(identifier)
-
-    proxy
-    |> list_components(component_type, operation)
-    |> Enum.filter(fn component ->
-      Component.identifier(component) == identifier and
-        version_matches?(component, operation.version)
-    end)
-    |> Component.sort_by_version_desc()
-  end
-
-  def get_component_candidates(%__MODULE__{}, _component_type, _identifier, _operation), do: []
 
   @doc "Resolves a remote resource or resource template for one concrete URI."
-  def get_resource_target_candidates(
-        %__MODULE__{} = proxy,
-        uri,
-        %Operation{} = operation
-      ) do
-    uri = to_string(uri)
-
-    exact =
+  @impl FastestMCP.Provider
+  def get_resource_target_candidates(%__MODULE__{} = proxy, uri, %Operation{} = operation) do
+    # Components compiled for a concrete URI forward that exact URI upstream.
+    compile = fn kind ->
       proxy
-      |> remote_descriptors(:resource, operation)
-      |> Enum.map(&compile_descriptor(proxy, :resource, &1, operation, uri))
-      |> Enum.filter(fn resource ->
-        Component.identifier(resource) == uri and version_matches?(resource, operation.version)
-      end)
-      |> Enum.map(&{:exact, &1, %{}})
-
-    if exact == [] do
-      proxy
-      |> remote_descriptors(:resource_template, operation)
-      |> Enum.map(&compile_descriptor(proxy, :resource_template, &1, operation, uri))
-      |> Enum.reduce([], fn template, matches ->
-        if version_matches?(template, operation.version) do
-          case ResourceTemplate.match(template, uri) do
-            nil -> matches
-            captures -> [{:template, template, captures} | matches]
-          end
-        else
-          matches
-        end
-      end)
-      |> Enum.reverse()
-    else
-      exact
+      |> remote_descriptors(kind, operation)
+      |> Enum.map(&compile_descriptor(proxy, kind, &1, uri))
     end
+
+    Lookup.resource_targets(
+      compile.(:resource),
+      fn -> compile.(:resource_template) end,
+      uri,
+      operation.version
+    )
   end
 
   defp remote_descriptors(%__MODULE__{} = proxy, component_type, %Operation{} = operation) do
-    client = upstream_client(proxy, operation.context)
-
-    fetch_page = fn cursor ->
-      opts = if is_nil(cursor), do: [], else: [cursor: cursor]
-
-      try do
-        {:ok, list_remote_page(client, component_type, opts)}
-      rescue
-        exception -> {:error, exception}
-      end
+    with {:ok, client} <- upstream_client(proxy, operation.context),
+         {:ok, descriptors} <- fetch_remote(client, component_type, proxy) do
+      descriptors
+    else
+      error -> raise_upstream!(error, proxy, operation.context)
     end
+  end
+
+  # An upstream without the list method has no such components.
+  defp fetch_remote(client, component_type, proxy) do
+    fetch_page = &list_remote_page(client, component_type, if(&1, do: [cursor: &1], else: []))
 
     case Paginator.fetch_all(fetch_page, max_pages: proxy.max_pages, max_items: proxy.max_items) do
-      {:ok, descriptors} ->
-        descriptors
-
       {:error, %Error{code: :method_not_found}} ->
-        []
+        {:ok, []}
 
-      {:error, exception} when is_exception(exception) ->
-        raise exception
+      {:error, reason} when not is_exception(reason) ->
+        {:error,
+         %Error{
+           code: :internal_error,
+           message: "failed to read proxied component catalog",
+           details: %{component_type: component_type, reason: inspect(reason)}
+         }}
 
-      {:error, reason} ->
-        raise Error,
-          code: :internal_error,
-          message: "failed to read proxied component catalog",
-          details: %{component_type: component_type, reason: inspect(reason)}
+      result ->
+        result
     end
-  rescue
-    exception ->
-      reraise sanitize_upstream_exception(exception, proxy, operation.context), __STACKTRACE__
   end
 
   defp list_remote_page(client, :tool, opts), do: Client.list_tools(client, opts)
@@ -251,74 +207,74 @@ defmodule FastestMCP.Providers.Proxy do
 
   defp list_remote_page(client, :prompt, opts), do: Client.list_prompts(client, opts)
 
-  defp compile_descriptor(proxy, component_type, descriptor, operation, concrete_uri \\ nil)
+  defp compile_descriptor(proxy, component_type, descriptor, concrete_uri \\ nil)
 
-  defp compile_descriptor(proxy, :tool, descriptor, operation, _concrete_uri) do
+  defp compile_descriptor(proxy, :tool, descriptor, _concrete_uri) do
     ComponentCompiler.compile(
       :tool,
-      operation.server_name,
       required_string!(descriptor, "name", :tool),
       fn arguments, context -> forward_tool(proxy, descriptor, arguments, context) end,
       common_component_opts(descriptor) ++
         [
+          annotations: Map.get(descriptor, "annotations"),
           input_schema: Map.get(descriptor, "inputSchema", %{"type" => "object"}),
           output_schema: Map.get(descriptor, "outputSchema"),
           task: false
-        ]
+        ],
+      :remote
     )
   end
 
-  defp compile_descriptor(proxy, :resource, descriptor, operation, concrete_uri) do
+  defp compile_descriptor(proxy, :resource, descriptor, concrete_uri) do
     uri = required_string!(descriptor, "uri", :resource)
     requested_uri = concrete_uri || uri
 
     ComponentCompiler.compile(
       :resource,
-      operation.server_name,
       uri,
       fn _arguments, context -> forward_resource(proxy, descriptor, requested_uri, context) end,
       common_component_opts(descriptor) ++
         [
           name: Map.get(descriptor, "name"),
-          mime_type: Map.get(descriptor, "mimeType", "application/json"),
+          annotations: Map.get(descriptor, "annotations"),
+          mime_type: Map.get(descriptor, "mimeType"),
           size: Map.get(descriptor, "size"),
           task: false
-        ]
+        ],
+      :remote
     )
   end
 
-  defp compile_descriptor(proxy, :resource_template, descriptor, operation, concrete_uri) do
+  defp compile_descriptor(proxy, :resource_template, descriptor, concrete_uri) do
     uri_template = required_string!(descriptor, "uriTemplate", :resource_template)
-    matcher = compile_matcher(uri_template)
 
     ComponentCompiler.compile(
       :resource_template,
-      operation.server_name,
       uri_template,
       fn arguments, context ->
-        requested_uri =
-          concrete_uri || ResourceTemplate.expand_compiled(matcher, arguments)
-
+        requested_uri = concrete_uri || expand_template(uri_template, arguments)
         forward_resource(proxy, descriptor, requested_uri, context)
       end,
       common_component_opts(descriptor) ++
         [
           name: Map.get(descriptor, "name"),
-          mime_type: Map.get(descriptor, "mimeType", "application/json"),
+          annotations: Map.get(descriptor, "annotations"),
+          mime_type: Map.get(descriptor, "mimeType"),
           parameters: descriptor_parameters(descriptor),
           task: false
-        ]
+        ],
+      :remote
     )
   end
 
-  defp compile_descriptor(proxy, :prompt, descriptor, operation, _concrete_uri) do
+  defp compile_descriptor(proxy, :prompt, descriptor, _concrete_uri) do
     ComponentCompiler.compile(
       :prompt,
-      operation.server_name,
       required_string!(descriptor, "name", :prompt),
       fn arguments, context -> forward_prompt(proxy, descriptor, arguments, context) end,
       common_component_opts(descriptor) ++
-        [arguments: Map.get(descriptor, "arguments", []), task: false]
+        [arguments: Map.get(descriptor, "arguments", []), task: false],
+      :remote
     )
   end
 
@@ -340,7 +296,11 @@ defmodule FastestMCP.Providers.Proxy do
     proxy
     |> request_upstream(context, "tools/call", params, request_opts)
     |> normalize_upstream_result!()
+    |> explicit_tool_result()
   end
+
+  defp explicit_tool_result(%InputRequiredResult{} = result), do: result
+  defp explicit_tool_result(result), do: FastestMCP.Tools.Result.from_raw(result)
 
   defp forward_resource(proxy, descriptor, uri, context) do
     params =
@@ -351,6 +311,7 @@ defmodule FastestMCP.Providers.Proxy do
     proxy
     |> request_upstream(context, "resources/read", params)
     |> normalize_upstream_result!()
+    |> explicit_result(FastestMCP.Resources.Result)
   end
 
   defp forward_prompt(proxy, descriptor, arguments, context) do
@@ -365,16 +326,30 @@ defmodule FastestMCP.Providers.Proxy do
     proxy
     |> request_upstream(context, "prompts/get", params)
     |> normalize_upstream_result!()
+    |> explicit_result(FastestMCP.Prompts.Result)
   end
 
+  defp explicit_result(%InputRequiredResult{} = result, _module), do: result
+  defp explicit_result(result, module), do: module.from_raw(result)
+
   defp request_upstream(proxy, context, method, params, opts \\ []) do
-    proxy
-    |> upstream_client(context)
-    |> Client.request_async(method, params, opts)
-    |> Client.await(:infinity)
-  rescue
-    exception ->
-      reraise sanitize_upstream_exception(exception, proxy, context), __STACKTRACE__
+    with {:ok, client} <- upstream_client(proxy, context),
+         {:ok, request} <- Client.request_async(client, method, params, opts),
+         {:ok, result} <- Client.Request.await(request, :infinity) do
+      result
+    else
+      error -> raise_upstream!(error, proxy, context)
+    end
+  end
+
+  # Raises an upstream failure without the credentials forwarded upstream.
+  defp raise_upstream!({:error, reason}, proxy, context) do
+    exception =
+      if is_exception(reason),
+        do: reason,
+        else: Error.internal("operation failed", %{reason: reason})
+
+    raise sanitize_upstream_exception(exception, proxy, context)
   end
 
   defp normalize_upstream_result!(%{"resultType" => "input_required"} = result) do
@@ -419,28 +394,25 @@ defmodule FastestMCP.Providers.Proxy do
 
     case Context.get_request_state(context, key) do
       %Client{} = client ->
-        client
+        {:ok, client}
 
       nil ->
-        client = Client.connect!(proxy.target, upstream_client_opts(proxy, context))
-
-        try do
+        with {:ok, client} <- Client.connect(proxy.target, upstream_client_opts(proxy, context)) do
           :ok = Context.register_cleanup(context, fn -> disconnect_client(client) end)
           :ok = Context.put_request_state(context, key, client)
-          client
-        rescue
-          error ->
-            disconnect_client(client)
-            reraise error, __STACKTRACE__
+          {:ok, client}
         end
     end
   end
 
+  # A stdio upstream has no session stream to turn off.
   defp upstream_client_opts(%__MODULE__{} = proxy, %Context{} = context) do
     proxy.client_opts
     |> Keyword.put(:protocol_version, selected_protocol_version(proxy, context))
     |> Keyword.put(:auto_initialize, true)
-    |> Keyword.put(:session_stream, false)
+    |> then(
+      &if(proxy.target_type == :http, do: Keyword.put(&1, :session_stream, false), else: &1)
+    )
     |> Keyword.put(:extensions, negotiated_extensions(proxy.client_opts, context))
     |> Keyword.put(:progress_handler, progress_handler(context))
     |> put_mrtr_capability_sentinels(context)
@@ -647,11 +619,10 @@ defmodule FastestMCP.Providers.Proxy do
 
   defp scrub_secret_values(value, _secrets), do: value
 
+  # Disconnecting is idempotent and never raises.
   defp disconnect_client(%Client{} = client) do
-    if Client.connected?(client), do: Client.disconnect(client)
+    _ = Client.disconnect(client)
     :ok
-  catch
-    :exit, _reason -> :ok
   end
 
   defp put_forward_meta(params, context, descriptor) do
@@ -664,19 +635,10 @@ defmodule FastestMCP.Providers.Proxy do
     if map_size(meta) == 0, do: params, else: Map.put(params, "_meta", meta)
   end
 
+  # The stored envelope is in wire form.
   defp incoming_request_meta(%Context{} = context) do
-    envelope =
-      Map.get(
-        context.request_metadata,
-        :jsonrpc_envelope,
-        Map.get(context.request_metadata, "jsonrpc_envelope", %{})
-      )
-
-    envelope
-    |> map_value("params", %{})
-    |> map_value("_meta", %{})
-    |> case do
-      %{} = meta -> Map.new(meta, fn {key, value} -> {to_string(key), value} end)
+    case context.request_metadata[:jsonrpc_envelope] do
+      %{"params" => %{"_meta" => %{} = meta}} -> meta
       _other -> %{}
     end
   end
@@ -757,7 +719,6 @@ defmodule FastestMCP.Providers.Proxy do
       title: Map.get(descriptor, "title"),
       description: Map.get(descriptor, "description"),
       icons: Map.get(descriptor, "icons"),
-      annotations: Map.get(descriptor, "annotations"),
       version: descriptor_version(descriptor),
       tags: get_in(meta, ["fastestmcp", "tags"]),
       meta: meta
@@ -775,9 +736,10 @@ defmodule FastestMCP.Providers.Proxy do
     get_in(descriptor, ["_meta", "fastestmcp", "parameters"])
   end
 
-  defp compile_matcher(uri_template) do
+  # Only components listed without a concrete URI expand their template.
+  defp expand_template(uri_template, arguments) do
     {matcher, _variables, _query_variables} = ResourceTemplate.compile_matcher!(uri_template)
-    matcher
+    ResourceTemplate.expand_compiled(matcher, arguments)
   end
 
   defp required_string!(descriptor, key, component_type) do
@@ -791,12 +753,6 @@ defmodule FastestMCP.Providers.Proxy do
           message: "upstream returned an invalid #{component_type} descriptor",
           details: %{field: key, value: value}
     end
-  end
-
-  defp version_matches?(_component, nil), do: true
-
-  defp version_matches?(component, version) do
-    Component.version(component) == to_string(version)
   end
 
   defp normalize_target!(target) when is_binary(target) do
@@ -976,13 +932,4 @@ defmodule FastestMCP.Providers.Proxy do
 
   defp capability_present?(capabilities, key),
     do: match?({:ok, _value}, fetch_capability(capabilities, key))
-
-  defp map_value(map, key, default) when is_map(map) do
-    case Enum.find(map, fn {candidate, _value} -> to_string(candidate) == key end) do
-      nil -> default
-      {_key, value} -> value
-    end
-  end
-
-  defp map_value(_map, _key, default), do: default
 end

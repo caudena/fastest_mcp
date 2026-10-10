@@ -1,13 +1,18 @@
 defmodule FastestMCP.Progress do
   @moduledoc """
-  Request-local progress helper for synchronous calls and background tasks.
+  Request-local progress tracker returned by `FastestMCP.Context.progress/1`.
 
-  This module keeps one focused piece of FastestMCP behavior in a dedicated
-  place so builders, runtimes, transports, and providers can share the same
-  rules without duplicating logic.
+  It keeps `current`, `total` (initially 1), and `message` in the request's
+  state, so every tracker of one request sees the same values. Each update also
+  reports the new values through `FastestMCP.Context.report_progress/4`, which
+  delivers them only when the caller asked for progress; call that function
+  directly when you need its delivery result.
 
-  Unless you are extending FastestMCP itself, you will usually meet this
-  module indirectly through higher-level APIs rather than calling it first.
+      progress =
+        ctx
+        |> FastestMCP.Context.progress()
+        |> FastestMCP.Progress.set_total(3)
+        |> FastestMCP.Progress.increment()
   """
 
   alias FastestMCP.Context
@@ -18,17 +23,19 @@ defmodule FastestMCP.Progress do
 
   @type t :: %__MODULE__{context: Context.t()}
 
-  @doc "Builds a new value for this module from the supplied options."
+  @doc false
   def new(%Context{} = context), do: %__MODULE__{context: context}
 
-  @doc "Returns the current request context for the calling process."
+  @doc "Returns the current progress value, or nil before the first increment."
   def current(%__MODULE__{} = progress), do: state(progress).current
-  @doc "Returns the total work estimate recorded on the progress struct."
+
+  @doc "Returns the total, initially 1."
   def total(%__MODULE__{} = progress), do: state(progress).total
-  @doc "Returns the human-readable progress message."
+
+  @doc "Returns the last message, or nil."
   def message(%__MODULE__{} = progress), do: state(progress).message
 
-  @doc "Updates the total work estimate carried by the progress struct."
+  @doc "Sets the total to a positive integer and reports progress."
   def set_total(%__MODULE__{} = progress, total) when is_integer(total) and total > 0 do
     update(progress, %{total: total})
   end
@@ -37,7 +44,7 @@ defmodule FastestMCP.Progress do
     raise ArgumentError, "progress total must be a positive integer, got #{inspect(other)}"
   end
 
-  @doc "Increments the current progress counter."
+  @doc "Adds a positive integer `amount` (default 1) to the current value and reports progress."
   def increment(progress, amount \\ 1)
 
   def increment(%__MODULE__{} = progress, amount) when is_integer(amount) and amount > 0 do
@@ -49,7 +56,7 @@ defmodule FastestMCP.Progress do
     raise ArgumentError, "progress increment must be a positive integer, got #{inspect(other)}"
   end
 
-  @doc "Sets the current progress message."
+  @doc "Sets the message and reports progress."
   def set_message(%__MODULE__{} = progress, message) when is_binary(message) do
     update(progress, %{message: message})
   end

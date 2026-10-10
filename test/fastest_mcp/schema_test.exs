@@ -1,7 +1,8 @@
 defmodule FastestMCP.SchemaTest do
-  use ExUnit.Case, async: true
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Error
+  alias FastestMCP.Protocol.Schema, as: ProtocolSchema
   alias FastestMCP.Schema
   alias FastestMCP.Schema.HTTPResolver
   alias FastestMCP.Tools.Result, as: ToolResult
@@ -17,22 +18,22 @@ defmodule FastestMCP.SchemaTest do
 
   test "vendored protocol schemas expose definitions for their selected versions" do
     assert {:ok, legacy_initialize} =
-             Schema.compile_protocol_definition(@legacy_version, "InitializeRequest")
+             ProtocolSchema.compile_definition(@legacy_version, "InitializeRequest")
 
     assert legacy_initialize.source["type"] == "object"
 
     assert {:ok, modern_discover} =
-             Schema.compile_protocol_definition("2026-07-28", "DiscoverRequest")
+             ProtocolSchema.compile_definition("2026-07-28", "DiscoverRequest")
 
     assert modern_discover.source["type"] == "object"
 
     assert {:error, legacy_error} =
-             Schema.compile_protocol_definition(@legacy_version, "DiscoverRequest")
+             ProtocolSchema.compile_definition(@legacy_version, "DiscoverRequest")
 
     assert legacy_error.message =~ "unknown MCP protocol schema definition"
 
     assert {:error, modern_error} =
-             Schema.compile_protocol_definition("2026-07-28", "InitializeRequest")
+             ProtocolSchema.compile_definition("2026-07-28", "InitializeRequest")
 
     assert modern_error.message =~ "unknown MCP protocol schema definition"
   end
@@ -50,7 +51,7 @@ defmodule FastestMCP.SchemaTest do
     }
 
     assert {:ok, ^initialize} =
-             Schema.validate_protocol(
+             ProtocolSchema.validate(
                @legacy_version,
                :client_to_server,
                :request,
@@ -59,7 +60,7 @@ defmodule FastestMCP.SchemaTest do
              )
 
     assert {:error, error} =
-             Schema.validate_protocol(
+             ProtocolSchema.validate(
                @legacy_version,
                :client_to_server,
                :request,
@@ -70,7 +71,7 @@ defmodule FastestMCP.SchemaTest do
     assert error.phase == :validation
 
     assert {:error, error} =
-             Schema.compile_protocol(
+             ProtocolSchema.compile(
                @legacy_version,
                :server_to_client,
                :request,
@@ -78,44 +79,44 @@ defmodule FastestMCP.SchemaTest do
              )
 
     assert error.message =~ "unsupported server_to_client request method"
-    assert Schema.protocol_supported?(@legacy_version, :client_to_server, :request, "tools/call")
+    assert ProtocolSchema.supported?(@legacy_version, :client_to_server, :request, "tools/call")
 
-    refute Schema.protocol_supported?(
+    refute ProtocolSchema.supported?(
              @legacy_version,
              :server_to_client,
              :request,
              "tools/call"
            )
 
-    assert Schema.protocol_supported?(
+    assert ProtocolSchema.supported?(
              @legacy_version,
              :server_to_client,
              :response,
              "tools/call"
            )
 
-    assert Schema.protocol_supported?(
+    assert ProtocolSchema.supported?(
              @legacy_version,
              :server_to_client,
              :task_response,
              "tools/call"
            )
 
-    refute Schema.protocol_supported?(
+    refute ProtocolSchema.supported?(
              @legacy_version,
              :client_to_server,
              :task_response,
              "tools/call"
            )
 
-    assert {:ok, first} = Schema.compile_protocol_definition(@legacy_version, "ContentBlock")
-    assert {:ok, second} = Schema.compile_protocol_definition(@legacy_version, "ContentBlock")
+    assert {:ok, first} = ProtocolSchema.compile_definition(@legacy_version, "ContentBlock")
+    assert {:ok, second} = ProtocolSchema.compile_definition(@legacy_version, "ContentBlock")
     assert first === second
   end
 
   test "compiled elicitation schema follows authoritative number semantics" do
-    compiled =
-      Schema.compile_protocol_definition!(@legacy_version, "ElicitRequestFormParams")
+    assert {:ok, compiled} =
+             ProtocolSchema.compile_definition(@legacy_version, "ElicitRequestFormParams")
 
     params = %{
       "message" => "Decimal bounds and default",
@@ -144,7 +145,7 @@ defmodule FastestMCP.SchemaTest do
     }
 
     assert {:ok, ^response} =
-             Schema.validate_protocol(
+             ProtocolSchema.validate(
                @legacy_version,
                :client_to_server,
                :response,
@@ -155,7 +156,7 @@ defmodule FastestMCP.SchemaTest do
     invalid_response = put_in(response, ["result", "content", "score"], %{"nested" => true})
 
     assert {:error, _error} =
-             Schema.validate_protocol(
+             ProtocolSchema.validate(
                @legacy_version,
                :client_to_server,
                :response,
@@ -175,7 +176,7 @@ defmodule FastestMCP.SchemaTest do
     }
 
     assert {:ok, ^result_response} =
-             Schema.validate_protocol(
+             ProtocolSchema.validate(
                @legacy_version,
                :server_to_client,
                :response,
@@ -186,7 +187,7 @@ defmodule FastestMCP.SchemaTest do
     invalid_result = put_in(result_response, ["result", "content"], "not-an-array")
 
     assert {:error, _error} =
-             Schema.validate_protocol(
+             ProtocolSchema.validate(
                @legacy_version,
                :server_to_client,
                :response,
@@ -201,7 +202,7 @@ defmodule FastestMCP.SchemaTest do
     }
 
     assert {:ok, ^error_response} =
-             Schema.validate_protocol(
+             ProtocolSchema.validate(
                @legacy_version,
                :server_to_client,
                :response,
@@ -264,10 +265,12 @@ defmodule FastestMCP.SchemaTest do
   end
 
   test "protocol schemas assert MCP formats and corrected task number semantics" do
-    task_metadata = Schema.compile_protocol_definition!(@legacy_version, "TaskMetadata")
+    assert {:ok, task_metadata} =
+             ProtocolSchema.compile_definition(@legacy_version, "TaskMetadata")
+
     assert {:ok, %{"ttl" => 1.5}} = Schema.validate(task_metadata, %{"ttl" => 1.5})
 
-    task = Schema.compile_protocol_definition!(@legacy_version, "Task")
+    assert {:ok, task} = ProtocolSchema.compile_definition(@legacy_version, "Task")
 
     valid_task = %{
       "taskId" => "task-1",
@@ -283,7 +286,8 @@ defmodule FastestMCP.SchemaTest do
     assert {:error, _error} =
              Schema.validate(task, %{valid_task | "createdAt" => "not-a-date"})
 
-    blob = Schema.compile_protocol_definition!(@legacy_version, "BlobResourceContents")
+    assert {:ok, blob} =
+             ProtocolSchema.compile_definition(@legacy_version, "BlobResourceContents")
 
     assert {:ok, _value} =
              Schema.validate(blob, %{"uri" => "file:///tmp/data", "blob" => "AA=="})
@@ -294,7 +298,8 @@ defmodule FastestMCP.SchemaTest do
     assert {:error, _error} =
              Schema.validate(blob, %{"uri" => "not a URI", "blob" => "AA=="})
 
-    template = Schema.compile_protocol_definition!(@legacy_version, "ResourceTemplate")
+    assert {:ok, template} =
+             ProtocolSchema.compile_definition(@legacy_version, "ResourceTemplate")
 
     assert {:ok, _value} =
              Schema.validate(template, %{"name" => "item", "uriTemplate" => "item://{id}"})
@@ -302,7 +307,8 @@ defmodule FastestMCP.SchemaTest do
     assert {:error, _error} =
              Schema.validate(template, %{"name" => "item", "uriTemplate" => "item://{=id}"})
 
-    subscribe = Schema.compile_protocol_definition!(@legacy_version, "SubscribeRequestParams")
+    assert {:ok, subscribe} =
+             ProtocolSchema.compile_definition(@legacy_version, "SubscribeRequestParams")
 
     assert {:ok, %{"uri" => "item://one"}} =
              Schema.validate(subscribe, %{"uri" => "item://one"})
@@ -501,8 +507,8 @@ defmodule FastestMCP.SchemaTest do
   test "schema compilation and validation deadlines fail closed" do
     slow_resolver = fn
       "https://schemas.example/slow" ->
-        Process.sleep(100)
-        {:ok, true}
+        # Only the compile deadline ends this resolution.
+        Process.sleep(:infinity)
 
       _meta_schema ->
         {:error, :not_found}
@@ -516,12 +522,15 @@ defmodule FastestMCP.SchemaTest do
 
     assert compile_error.message == "JSON Schema compile exceeded 5ms"
 
-    compiled = Schema.compile!(%{"type" => "array", "uniqueItems" => true})
+    compiled =
+      Schema.compile!(%{"type" => "array", "uniqueItems" => true}, validation_timeout_ms: 1)
 
-    assert {:error, validation_error} =
-             Schema.validate(compiled, Enum.to_list(1..100_000), validation_timeout_ms: 1)
-
+    assert {:error, validation_error} = Schema.validate(compiled, Enum.to_list(1..100_000))
     assert validation_error.message == "JSON Schema validation exceeded 1ms"
+
+    assert_raise ArgumentError, ~r/validation_timeout_ms must be a positive integer/, fn ->
+      Schema.compile(%{}, validation_timeout_ms: 0)
+    end
   end
 
   test "remote schemas share source, dialect, reference, and resource-count limits" do
@@ -632,6 +641,68 @@ defmodule FastestMCP.SchemaTest do
            end)
   end
 
+  test "violations name missing properties and leave out summaries of nested ones" do
+    compiled =
+      Schema.compile!(%{
+        "type" => "object",
+        "properties" => %{
+          "query" => %{"type" => "string"},
+          "limit" => %{"type" => "integer"},
+          "filter" => %{
+            "type" => "object",
+            "properties" => %{"tag" => %{"type" => "string"}},
+            "required" => ["tag"],
+            "additionalProperties" => false
+          }
+        },
+        "required" => ["query", "a/b"],
+        "additionalProperties" => false
+      })
+
+    assert {:error, error} = Schema.validate(compiled, %{"limit" => "2"})
+    assert error.message == "#/a~1b a required property is missing"
+
+    assert [
+             %{instance_path: "#/a~1b", keyword: "required", schema_path: "#"},
+             %{instance_path: "#/limit", keyword: "type", schema_path: "#/properties/limit"},
+             %{instance_path: "#/query", keyword: "required", schema_path: "#"}
+           ] = error.violations
+
+    assert {:error, error} =
+             Schema.validate(compiled, %{
+               "query" => "milk",
+               "a/b" => 1,
+               "filter" => %{"secret-name" => 1},
+               "other-secret" => true
+             })
+
+    assert error.message == "#/filter/tag a required property is missing"
+
+    assert [
+             %{
+               instance_path: "#/filter/tag",
+               keyword: "required",
+               schema_path: "#/properties/filter"
+             },
+             %{
+               instance_path: "#/filter",
+               keyword: "additionalProperties",
+               schema_path: "#/properties/filter/additionalProperties"
+             },
+             %{
+               instance_path: "#",
+               keyword: "additionalProperties",
+               schema_path: "#/additionalProperties"
+             }
+           ] = error.violations
+
+    refute inspect(error) =~ "secret"
+
+    dependent = Schema.compile!(%{"type" => "object", "dependentRequired" => %{"a" => ["b"]}})
+    assert {:error, error} = Schema.validate(dependent, %{"a" => 1})
+    assert error.message == "#/b a dependent property is missing"
+  end
+
   test "tool inputs require object roots and arbitrary JSON structured outputs are validated" do
     assert_raise ArgumentError, ~r/input_schema.*type: "object"/, fn ->
       FastestMCP.server("invalid-input-root")
@@ -640,44 +711,44 @@ defmodule FastestMCP.SchemaTest do
 
     server_name = "output-schema-#{System.unique_integer([:positive])}"
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("valid", fn _args -> %{count: 2} end, output_schema: @object_schema)
-      |> FastestMCP.add_tool(
-        "scalar",
-        fn _args ->
-          ToolResult.new("ok", structured_content: "ok")
-        end,
-        output_schema: %{"type" => "string"}
-      )
-      |> FastestMCP.add_tool("wrong_type", fn _args -> %{count: "secret-result"} end,
-        output_schema: @object_schema
-      )
-      |> FastestMCP.add_tool(
-        "missing_structured",
-        fn _args -> %{content: [%{type: "text", text: "only text"}]} end,
-        output_schema: @object_schema
-      )
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("valid", fn _args -> %{count: 2} end, output_schema: @object_schema)
+    |> FastestMCP.add_tool(
+      "scalar",
+      fn _args ->
+        ToolResult.new("ok", structured_content: "ok")
+      end,
+      output_schema: %{"type" => "string"}
+    )
+    |> FastestMCP.add_tool("wrong_type", fn _args -> %{count: "secret-result"} end,
+      output_schema: @object_schema
+    )
+    |> FastestMCP.add_tool(
+      "missing_structured",
+      fn _args ->
+        FastestMCP.Tools.Result.from(%{content: [%{type: "text", text: "only text"}]})
+      end,
+      output_schema: @object_schema
+    )
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    assert %{count: 2} = FastestMCP.call_tool!(server_name, "valid", %{})
 
-    assert %{count: 2} = FastestMCP.call_tool(server_name, "valid", %{})
-
-    assert %{structuredContent: "ok"} = FastestMCP.call_tool(server_name, "scalar", %{})
+    assert %ToolResult{structured_content: "ok"} =
+             FastestMCP.call_tool!(server_name, "scalar", %{})
 
     assert_raise Error, ~r/structuredContent.*does not match output_schema/, fn ->
-      FastestMCP.call_tool(server_name, "wrong_type", %{})
+      FastestMCP.call_tool!(server_name, "wrong_type", %{})
     end
 
     try do
-      FastestMCP.call_tool(server_name, "wrong_type", %{})
+      FastestMCP.call_tool!(server_name, "wrong_type", %{})
     rescue
       error in Error -> refute Exception.message(error) =~ "secret-result"
     end
 
     assert_raise Error, ~r/returned no structuredContent/, fn ->
-      FastestMCP.call_tool(server_name, "missing_structured", %{})
+      FastestMCP.call_tool!(server_name, "missing_structured", %{})
     end
   end
 end

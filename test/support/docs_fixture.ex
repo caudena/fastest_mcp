@@ -1,22 +1,6 @@
 defmodule FastestMCP.TestSupport.DocsFixture do
   @moduledoc false
 
-  def bandit_child_spec(server_name) do
-    {Bandit,
-     plug:
-       {FastestMCP.Transport.HTTPApp,
-        server_name: server_name,
-        path: "/mcp",
-        allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
-     scheme: :http,
-     port: 0}
-  end
-
-  def wait_for_input_required(server_name, task_id, timeout \\ 1_000) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-    do_wait_for_input_required(server_name, task_id, deadline)
-  end
-
   def fetch(map, key) when is_map(map) and is_atom(key) do
     Map.get(map, key) || Map.get(map, Atom.to_string(key))
   end
@@ -41,23 +25,6 @@ defmodule FastestMCP.TestSupport.DocsFixture do
       end
     end)
   end
-
-  defp do_wait_for_input_required(server_name, task_id, deadline) do
-    task = FastestMCP.fetch_task(server_name, task_id)
-
-    cond do
-      task.status == :input_required ->
-        :ok
-
-      System.monotonic_time(:millisecond) >= deadline ->
-        raise ExUnit.AssertionError,
-          message: "timed out waiting for task #{inspect(task_id)} to reach input_required"
-
-      true ->
-        Process.sleep(10)
-        do_wait_for_input_required(server_name, task_id, deadline)
-    end
-  end
 end
 
 defmodule FastestMCP.TestSupport.DocsFixture.OnboardingServer do
@@ -79,14 +46,14 @@ defmodule FastestMCP.TestSupport.DocsFixture.OnboardingServer do
       %{name: "fastest_mcp", version: "0.1.0"}
     end)
     |> FastestMCP.add_prompt("welcome", fn %{"name" => name}, _ctx ->
-      %{
+      FastestMCP.Prompts.Result.from(%{
         messages: [
           %{
             role: "user",
             content: %{type: "text", text: "Welcome #{name}"}
           }
         ]
-      }
+      })
     end)
   end
 end

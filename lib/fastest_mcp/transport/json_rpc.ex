@@ -1,17 +1,18 @@
 defmodule FastestMCP.Transport.JSONRPC do
   @moduledoc false
 
+  import FastestMCP.Util, only: [maybe_put: 3]
+  import FastestMCP.Protocol.Version
+
   alias FastestMCP.Error
   alias FastestMCP.JSONValue
   alias FastestMCP.Protocol
   alias FastestMCP.Protocol.Meta
-  alias FastestMCP.Schema
+  alias FastestMCP.Protocol.Schema, as: ProtocolSchema
   alias FastestMCP.Schema.Error, as: SchemaError
   alias FastestMCP.Transport.Request
 
   @version "2.0"
-  @legacy_protocol_version "2025-11-25"
-  @modern_protocol_version "2026-07-28"
   @modern_application_error_code -31_000
   @protocol_version_meta_key "io.modelcontextprotocol/protocolVersion"
 
@@ -24,6 +25,7 @@ defmodule FastestMCP.Transport.JSONRPC do
   @symbolic_error_codes %{
     parse_error: -32_700,
     invalid_request: -32_600,
+    payload_too_large: -32_600,
     not_found: -32_602,
     method_not_found: -32_601,
     bad_request: -32_602,
@@ -58,11 +60,10 @@ defmodule FastestMCP.Transport.JSONRPC do
     -32_042 => :url_elicitation_required
   }
 
-  @doc "Decodes and validates one JSON-RPC 2.0 message. Batches are not supported."
+  # One JSON-RPC 2.0 message; batches are not supported.
   @spec decode(term()) :: {:ok, decoded()} | {:error, Error.t()}
   def decode(payload), do: decode(payload, direction: :client_to_server)
 
-  @doc false
   @spec decode(term(), keyword()) :: {:ok, decoded()} | {:error, Error.t()}
   def decode(payload, opts) when is_list(payload) and is_list(opts) do
     {:error, invalid_request("JSON-RPC batch requests are not supported")}
@@ -101,7 +102,6 @@ defmodule FastestMCP.Transport.JSONRPC do
   def decode(_payload, opts) when is_list(opts),
     do: {:error, invalid_request("JSON-RPC message must be an object")}
 
-  @doc false
   def sanitize_auth_metadata(%{} = params) do
     case Map.get(params, "_meta") do
       %{} = meta ->
@@ -129,14 +129,12 @@ defmodule FastestMCP.Transport.JSONRPC do
 
   def sanitize_auth_metadata(value), do: value
 
-  @doc false
   def sanitize_stored_envelope(%{"params" => %{} = params} = envelope) do
     Map.put(envelope, "params", sanitize_auth_metadata(params))
   end
 
   def sanitize_stored_envelope(envelope), do: envelope
 
-  @doc false
   @spec validate_client_request(Request.t()) :: :ok | {:error, Error.t()}
   def validate_client_request(%Request{protocol: protocol}) when protocol != :jsonrpc, do: :ok
 
@@ -152,7 +150,6 @@ defmodule FastestMCP.Transport.JSONRPC do
     )
   end
 
-  @doc false
   @spec validate_generic_client_request(map(), String.t()) :: :ok | {:error, Error.t()}
   def validate_generic_client_request(%{} = payload, protocol_version)
       when is_binary(protocol_version) do
@@ -177,7 +174,6 @@ defmodule FastestMCP.Transport.JSONRPC do
     end
   end
 
-  @doc false
   @spec validate_generic_server_response(map(), String.t()) :: :ok | {:error, Error.t()}
   def validate_generic_server_response(%{} = payload, protocol_version)
       when is_binary(protocol_version) do
@@ -196,7 +192,6 @@ defmodule FastestMCP.Transport.JSONRPC do
     end
   end
 
-  @doc "Builds a JSON-RPC success response."
   def success(%Request{request_id: request_id} = request, result) when is_map(result) do
     result = validate_server_meta!(result, request.method)
 
@@ -216,7 +211,6 @@ defmodule FastestMCP.Transport.JSONRPC do
       details: %{jsonrpc_code: -32_603}
   end
 
-  @doc "Builds a JSON-RPC error response while preserving FastestMCP's symbolic error."
   def error(request_or_id, %Error{} = error) do
     protocol_version = request_protocol_version(request_or_id)
 
@@ -254,33 +248,27 @@ defmodule FastestMCP.Transport.JSONRPC do
     validate_server_error(request_or_id, response)
   end
 
-  @doc false
   def notification_error?(%Error{jsonrpc_notification: value}), do: value == true
 
-  @doc false
   def error_id(%Error{jsonrpc_id: id}) when is_binary(id) or is_integer(id), do: id
   def error_id(%Error{}), do: nil
 
-  @doc "Returns the standard JSON-RPC code represented by a FastestMCP error."
   def error_code(%Error{} = error), do: error_code(error, nil)
 
-  @doc false
   def error_code(%Error{details: details, code: code}, protocol_version) do
-    explicit =
-      if is_map(details) do
-        Map.get(details, :jsonrpc_code, Map.get(details, "jsonrpc_code"))
+    code =
+      case details do
+        %{jsonrpc_code: explicit} when is_integer(explicit) -> explicit
+        _other -> symbolic_error_code(code)
       end
 
-    code = if is_integer(explicit), do: explicit, else: symbolic_error_code(code)
-
-    if protocol_version == @modern_protocol_version and legacy_reserved_error_code?(code) do
+    if is_modern(protocol_version) and legacy_reserved_error_code?(code) do
       @modern_application_error_code
     else
       code
     end
   end
 
-  @doc false
   def error_object(%Error{} = error, opts \\ []) do
     protocol_version = Keyword.get(opts, :protocol_version)
 
@@ -289,13 +277,16 @@ defmodule FastestMCP.Transport.JSONRPC do
     |> Map.fetch!("error")
   end
 
-  @doc false
   def decode_error_code(symbolic_code, numeric_code) do
     Map.get(@symbolic_error_names, symbolic_code) ||
       Map.get(@numeric_error_codes, numeric_code, :internal_error)
   end
 
-  @doc "Builds a parse-error value suitable for either transport."
+  def decode_json(text) do
+    with {:error, reason} <- JSON.decode(text),
+         do: {:error, parse_error("invalid JSON", %{reason: inspect(reason)})}
+  end
+
   def parse_error(message, details \\ %{}) do
     %Error{
       code: :parse_error,
@@ -304,11 +295,10 @@ defmodule FastestMCP.Transport.JSONRPC do
     }
   end
 
-  @doc "Validates MCP request metadata and returns normalized task settings."
   def task_metadata(params) when is_map(params) do
     with {:ok, meta} <- meta(params),
          :ok <- validate_progress_token(meta) do
-      case fetch_task(params) do
+      case Map.fetch(params, "task") do
         :error -> {:ok, {false, nil}}
         {:ok, %{} = task} -> validate_task(task)
         {:ok, _other} -> {:error, invalid_params("task must be an object")}
@@ -352,7 +342,7 @@ defmodule FastestMCP.Transport.JSONRPC do
          {:response, _request_id, _response},
          payload
        ) do
-    case Schema.validate_protocol(protocol_version, direction, :response, payload) do
+    case ProtocolSchema.validate(protocol_version, direction, :response, payload) do
       {:ok, ^payload} -> :ok
       {:error, %SchemaError{} = error} -> {:error, protocol_response_error(error)}
     end
@@ -368,7 +358,7 @@ defmodule FastestMCP.Transport.JSONRPC do
           {:error, error}
 
         {:ok, kind} ->
-          case Schema.validate_protocol(protocol_version, direction, kind, method, payload) do
+          case ProtocolSchema.validate(protocol_version, direction, kind, method, payload) do
             {:ok, ^payload} ->
               :ok
 
@@ -384,10 +374,10 @@ defmodule FastestMCP.Transport.JSONRPC do
     opposite_kind = if actual_kind == :request, do: :notification, else: :request
 
     cond do
-      Schema.protocol_supported?(protocol_version, direction, actual_kind, method) ->
+      ProtocolSchema.supported?(protocol_version, direction, actual_kind, method) ->
         {:ok, actual_kind}
 
-      Schema.protocol_supported?(protocol_version, direction, opposite_kind, method) ->
+      ProtocolSchema.supported?(protocol_version, direction, opposite_kind, method) ->
         {:error,
          invalid_request("MCP method #{method} must be a #{opposite_kind}, not a #{actual_kind}")}
 
@@ -397,12 +387,12 @@ defmodule FastestMCP.Transport.JSONRPC do
   end
 
   defp validate_server_response!(%Request{} = request, response) do
-    protocol_version = request.protocol_version || @legacy_protocol_version
+    protocol_version = request.protocol_version || legacy()
     kind = server_response_kind(request, response, protocol_version)
 
     response =
-      if Schema.protocol_supported?(protocol_version, :server_to_client, kind, request.method) do
-        case Schema.validate_protocol(
+      if ProtocolSchema.supported?(protocol_version, :server_to_client, kind, request.method) do
+        case ProtocolSchema.validate(
                protocol_version,
                :server_to_client,
                kind,
@@ -420,11 +410,11 @@ defmodule FastestMCP.Transport.JSONRPC do
   end
 
   defp server_response_kind(
-         %Request{protocol_version: "2026-07-28", method: method},
+         %Request{protocol_version: modern(), method: method},
          %{"result" => %{"resultType" => "task"}},
          protocol_version
        ) do
-    if Schema.protocol_supported?(
+    if ProtocolSchema.supported?(
          protocol_version,
          :server_to_client,
          :task_response,
@@ -434,11 +424,15 @@ defmodule FastestMCP.Transport.JSONRPC do
        else: :response
   end
 
-  defp server_response_kind(%Request{protocol_version: "2026-07-28"}, _response, _version),
-    do: :response
+  defp server_response_kind(
+         %Request{protocol_version: modern()},
+         _response,
+         _version
+       ),
+       do: :response
 
   defp server_response_kind(%Request{task_request: true, method: method}, _response, version) do
-    if Schema.protocol_supported?(version, :server_to_client, :task_response, method),
+    if ProtocolSchema.supported?(version, :server_to_client, :task_response, method),
       do: :task_response,
       else: :response
   end
@@ -452,13 +446,13 @@ defmodule FastestMCP.Transport.JSONRPC do
       if protocol_version == Protocol.current_version() do
         validate_generic_server_error(response, protocol_version)
       else
-        if Schema.protocol_supported?(
+        if ProtocolSchema.supported?(
              protocol_version,
              :server_to_client,
              :response,
              request.method
            ) do
-          case Schema.validate_protocol(
+          case ProtocolSchema.validate(
                  protocol_version,
                  :server_to_client,
                  :response,
@@ -480,18 +474,18 @@ defmodule FastestMCP.Transport.JSONRPC do
     do: response |> validate_generic_server_error() |> validate_server_error_meta()
 
   defp error_protocol_version(%Request{protocol_version: version})
-       when version in ["2025-11-25", "2026-07-28"],
+       when version in [legacy(), modern()],
        do: version
 
   defp error_protocol_version(%Request{payload: payload}) do
     case get_in(payload, ["_meta", @protocol_version_meta_key]) do
       version when is_binary(version) -> Protocol.current_version()
-      _legacy_or_transport_error -> @legacy_protocol_version
+      _legacy_or_transport_error -> legacy()
     end
   end
 
   defp validate_generic_server_error(response, protocol_version \\ Protocol.current_version()) do
-    case Schema.validate_protocol(protocol_version, :server_to_client, :error_response, response) do
+    case ProtocolSchema.validate(protocol_version, :server_to_client, :error_response, response) do
       {:ok, ^response} -> response
       {:error, %SchemaError{}} -> canonical_internal_error(response)
     end
@@ -515,7 +509,7 @@ defmodule FastestMCP.Transport.JSONRPC do
         Protocol.current_version()
 
       true ->
-        @legacy_protocol_version
+        legacy()
     end
   end
 
@@ -700,24 +694,17 @@ defmodule FastestMCP.Transport.JSONRPC do
 
   defp params(_payload), do: {:ok, %{}}
 
+  # Decoded JSON-RPC params have the string keys of the wire.
   defp meta(params) do
-    case Map.get(params, "_meta", Map.get(params, :_meta)) do
+    case Map.get(params, "_meta") do
       nil -> {:ok, %{}}
       %{} = value -> {:ok, value}
       _other -> {:error, invalid_params("params._meta must be an object")}
     end
   end
 
-  defp fetch_task(params) do
-    cond do
-      Map.has_key?(params, "task") -> Map.fetch(params, "task")
-      Map.has_key?(params, :task) -> Map.fetch(params, :task)
-      true -> :error
-    end
-  end
-
   defp validate_progress_token(meta) do
-    case fetch_meta_value(meta, "progressToken", :progressToken) do
+    case Map.fetch(meta, "progressToken") do
       :error ->
         :ok
 
@@ -729,16 +716,8 @@ defmodule FastestMCP.Transport.JSONRPC do
     end
   end
 
-  defp fetch_meta_value(meta, string_key, atom_key) do
-    cond do
-      Map.has_key?(meta, string_key) -> Map.fetch(meta, string_key)
-      Map.has_key?(meta, atom_key) -> Map.fetch(meta, atom_key)
-      true -> :error
-    end
-  end
-
   defp validate_task(task) do
-    case Map.get(task, "ttl", Map.get(task, :ttl)) do
+    case Map.get(task, "ttl") do
       nil -> {:ok, {true, nil}}
       ttl when is_integer(ttl) and ttl > 0 -> {:ok, {true, ttl}}
       _other -> {:error, invalid_params("task.ttl must be a positive integer")}
@@ -814,7 +793,7 @@ defmodule FastestMCP.Transport.JSONRPC do
   defp error_with_protocol(request_or_id, %Error{} = error, protocol_version) do
     request =
       case protocol_version do
-        version when version in [@legacy_protocol_version, @modern_protocol_version] ->
+        version when version in [legacy(), modern()] ->
           %Request{request_id: request_or_id, protocol_version: version, protocol: :jsonrpc}
 
         _other ->
@@ -825,7 +804,7 @@ defmodule FastestMCP.Transport.JSONRPC do
   end
 
   defp request_protocol_version(%Request{protocol_version: version})
-       when version in [@legacy_protocol_version, @modern_protocol_version],
+       when version in [legacy(), modern()],
        do: version
 
   defp request_protocol_version(_request_or_id), do: nil
@@ -846,7 +825,7 @@ defmodule FastestMCP.Transport.JSONRPC do
 
   defp standard_error_data(%Error{code: :url_elicitation_required, details: details})
        when is_map(details) do
-    case Map.get(details, "elicitations", Map.get(details, :elicitations)) do
+    case Map.get(details, "elicitations") do
       elicitations when is_list(elicitations) -> %{"elicitations" => elicitations}
       _other -> %{}
     end
@@ -863,8 +842,8 @@ defmodule FastestMCP.Transport.JSONRPC do
     |> JSONValue.stringify_keys()
   end
 
-  defp standard_error_data(%Error{code: :not_found, details: details}) when is_map(details) do
-    case Map.get(details, :uri, Map.get(details, "uri")) do
+  defp standard_error_data(%Error{code: :not_found} = error) do
+    case Error.detail(error, :uri) do
       uri when is_binary(uri) -> %{"uri" => uri}
       _other -> %{}
     end
@@ -898,7 +877,4 @@ defmodule FastestMCP.Transport.JSONRPC do
 
   defp maybe_put_id(map, :unavailable), do: map
   defp maybe_put_id(map, id), do: Map.put(map, "id", id)
-
-  defp maybe_put(map, _key, nil), do: map
-  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 end

@@ -1,5 +1,5 @@
 defmodule FastestMCP.InputValidationTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Error
 
@@ -31,19 +31,33 @@ defmodule FastestMCP.InputValidationTest do
   test "tool arguments must already have the declared JSON types" do
     server_name = "input-types-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("add", fn %{"a" => a, "b" => b}, _ctx -> a + b end,
-        input_schema: @numeric_schema
-      )
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("add", fn %{"a" => a, "b" => b}, _ctx -> a + b end,
+      input_schema: @numeric_schema
+    )
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
-
-    assert 30 == FastestMCP.call_tool(server_name, "add", %{"a" => 10, "b" => 20})
+    assert 30 == FastestMCP.call_tool!(server_name, "add", %{"a" => 10, "b" => 20})
 
     assert_raise Error, ~r/#\/a value has an invalid JSON type/, fn ->
-      FastestMCP.call_tool(server_name, "add", %{"a" => "10", "b" => 20})
+      FastestMCP.call_tool!(server_name, "add", %{"a" => "10", "b" => 20})
+    end
+  end
+
+  test "server schema_options bound the time spent validating arguments" do
+    server_name = unique_name("input-validation-timeout")
+
+    FastestMCP.server(server_name, schema_options: [validation_timeout_ms: 1])
+    |> FastestMCP.add_tool("count", fn %{"items" => items}, _ctx -> length(items) end,
+      input_schema: %{
+        "type" => "object",
+        "properties" => %{"items" => %{"type" => "array", "uniqueItems" => true}}
+      }
+    )
+    |> start_server!()
+
+    assert_raise Error, ~r/timed out|exceeded 1ms/, fn ->
+      FastestMCP.call_tool!(server_name, "count", %{"items" => Enum.to_list(1..100_000)})
     end
   end
 
@@ -55,31 +69,34 @@ defmodule FastestMCP.InputValidationTest do
                  end
   end
 
+  test "unknown server options raise ArgumentError naming the allowed ones" do
+    assert_raise ArgumentError, ~r/unknown keys \[:ip\], the allowed keys are: .*:auth/, fn ->
+      FastestMCP.server("unknown-server-option", ip: {0, 0, 0, 0})
+    end
+  end
+
   test "nested objects are validated without parsing stringified JSON" do
     server_name = "input-nested-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool(
-        "create_user",
-        fn %{"profile" => profile}, _ctx ->
-          "#{profile["name"]}:#{profile["age"]}:#{profile["email"]}"
-        end,
-        input_schema: @profile_schema
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool(
+      "create_user",
+      fn %{"profile" => profile}, _ctx ->
+        "#{profile["name"]}:#{profile["age"]}:#{profile["email"]}"
+      end,
+      input_schema: @profile_schema
+    )
+    |> start_server!()
 
     profile = %{"name" => "Alice", "age" => 30, "email" => "alice@example.com"}
 
     assert "Alice:30:alice@example.com" ==
-             FastestMCP.call_tool(server_name, "create_user", %{"profile" => profile})
+             FastestMCP.call_tool!(server_name, "create_user", %{"profile" => profile})
 
     encoded = JSON.encode!(profile)
 
     assert_raise Error, ~r/#\/profile value has an invalid JSON type/, fn ->
-      FastestMCP.call_tool(server_name, "create_user", %{"profile" => encoded})
+      FastestMCP.call_tool!(server_name, "create_user", %{"profile" => encoded})
     end
   end
 
@@ -95,38 +112,78 @@ defmodule FastestMCP.InputValidationTest do
       "required" => ["id"]
     }
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_resource_template(
-        "item://{id}{?enabled}",
-        fn %{"id" => id, "enabled" => enabled}, _ctx ->
-          %{id: id, enabled: enabled}
-        end,
-        parameters: schema
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_resource_template(
+      "item://{id}{?enabled}",
+      fn %{"id" => id, "enabled" => enabled}, _ctx ->
+        %{id: id, enabled: enabled}
+      end,
+      parameters: schema
+    )
+    |> start_server!()
 
     assert %{id: "41", enabled: "true"} ==
-             FastestMCP.read_resource(server_name, "item://41?enabled=true")
+             FastestMCP.read_resource!(server_name, "item://41?enabled=true")
   end
 
   test "prompt required arguments are validated" do
     server_name = "prompt-required-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_prompt("greet", fn %{"name" => name}, _ctx -> "Hello, #{name}" end,
-        arguments: [%{name: "name", description: "Name", required: true}]
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_prompt("greet", fn %{"name" => name}, _ctx -> "Hello, #{name}" end,
+      arguments: [%{name: "name", description: "Name", required: true}]
+    )
+    |> start_server!()
 
     assert_raise Error, ~r/missing required argument "name"/, fn ->
-      FastestMCP.render_prompt(server_name, "greet", %{})
+      FastestMCP.render_prompt!(server_name, "greet", %{})
     end
+  end
+
+  test "invalid arguments fail with :invalid_params in process, on the wire, and in the client" do
+    server_name = unique_name("input-invalid-params")
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("add", fn %{"a" => a, "b" => b}, _ctx -> a + b end,
+      input_schema: @numeric_schema
+    )
+    |> FastestMCP.add_prompt("greet", fn %{"name" => name}, _ctx -> "Hello, #{name}" end,
+      arguments: [%{name: "name", required: true}]
+    )
+    |> FastestMCP.add_resource_template("notes://{id}", fn arguments, _ctx -> arguments end,
+      parameters: %{"type" => "object", "properties" => %{"id" => %{"pattern" => "^[0-9]+$"}}}
+    )
+    |> start_server!()
+
+    assert {:error, %Error{code: :invalid_params}} =
+             FastestMCP.call_tool(server_name, "add", %{"a" => "1", "b" => 2})
+
+    assert {:error, %Error{code: :invalid_params}} =
+             FastestMCP.render_prompt(server_name, "greet", %{})
+
+    assert {:error, %Error{code: :invalid_params}} =
+             FastestMCP.read_resource(server_name, "notes://latest")
+
+    {connection_id, _initialize} = ProtocolTest.initialize_stdio(server_name)
+
+    assert %{
+             "error" => %{
+               "code" => -32_602,
+               "data" => %{"fastestmcp" => %{"code" => "invalid_params"}}
+             }
+           } =
+             ProtocolTest.stdio_request(server_name, connection_id, 2, "tools/call", %{
+               "name" => "add",
+               "arguments" => %{"a" => "1", "b" => 2}
+             })
+
+    client = connect!({:in_process, server_name})
+
+    assert {:error, %Error{code: :invalid_params}} =
+             FastestMCP.Client.call_tool(client, "add", %{"a" => "1", "b" => 2})
+
+    assert {:error, %Error{code: :invalid_params}} =
+             FastestMCP.Client.render_prompt(client, "greet", %{})
   end
 
   test "nullable type unions accept nil and strings" do
@@ -139,17 +196,16 @@ defmodule FastestMCP.InputValidationTest do
       }
     }
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("echo_category", fn %{"category" => category}, _ctx -> category end,
-        input_schema: schema
-      )
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("echo_category", fn %{"category" => category}, _ctx -> category end,
+      input_schema: schema
+    )
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    assert nil == FastestMCP.call_tool!(server_name, "echo_category", %{"category" => nil})
 
-    assert nil == FastestMCP.call_tool(server_name, "echo_category", %{"category" => nil})
-    assert "books" == FastestMCP.call_tool(server_name, "echo_category", %{"category" => "books"})
+    assert "books" ==
+             FastestMCP.call_tool!(server_name, "echo_category", %{"category" => "books"})
   end
 
   test "anyOf preserves the matching submitted type" do
@@ -168,17 +224,14 @@ defmodule FastestMCP.InputValidationTest do
       "required" => ["value"]
     }
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("echo_value", fn %{"value" => value}, _ctx -> value end,
-        input_schema: schema
-      )
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("echo_value", fn %{"value" => value}, _ctx -> value end,
+      input_schema: schema
+    )
+    |> start_server!()
 
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
-
-    assert 41 == FastestMCP.call_tool(server_name, "echo_value", %{"value" => 41})
-    assert "41" == FastestMCP.call_tool(server_name, "echo_value", %{"value" => "41"})
+    assert 41 == FastestMCP.call_tool!(server_name, "echo_value", %{"value" => 41})
+    assert "41" == FastestMCP.call_tool!(server_name, "echo_value", %{"value" => "41"})
   end
 
   test "oneOf rejects values that match multiple branches" do
@@ -197,17 +250,14 @@ defmodule FastestMCP.InputValidationTest do
       "required" => ["value"]
     }
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("echo_value", fn %{"value" => value}, _ctx -> value end,
-        input_schema: schema
-      )
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("echo_value", fn %{"value" => value}, _ctx -> value end,
+      input_schema: schema
+    )
+    |> start_server!()
 
     assert_raise Error, ~r/does not match exactly one allowed schema/, fn ->
-      FastestMCP.call_tool(server_name, "echo_value", %{"value" => 7})
+      FastestMCP.call_tool!(server_name, "echo_value", %{"value" => 7})
     end
   end
 
@@ -224,24 +274,21 @@ defmodule FastestMCP.InputValidationTest do
       "additionalProperties" => false
     }
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("echo", fn args, _ctx -> args end, input_schema: schema)
-
-    assert {:ok, _pid} = FastestMCP.start_server(server)
-    on_exit(fn -> FastestMCP.stop_server(server_name) end)
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("echo", fn args, _ctx -> args end, input_schema: schema)
+    |> start_server!()
 
     assert %{"anything" => %{"nested" => "value"}} ==
-             FastestMCP.call_tool(server_name, "echo", %{
+             FastestMCP.call_tool!(server_name, "echo", %{
                "anything" => %{"nested" => "value"}
              })
 
     assert_raise Error, ~r/#\/blocked/, fn ->
-      FastestMCP.call_tool(server_name, "echo", %{"blocked" => "nope"})
+      FastestMCP.call_tool!(server_name, "echo", %{"blocked" => "nope"})
     end
 
     assert_raise Error, ~r/additional properties are not allowed/, fn ->
-      FastestMCP.call_tool(server_name, "echo", %{"extra" => "nope"})
+      FastestMCP.call_tool!(server_name, "echo", %{"extra" => "nope"})
     end
   end
 end

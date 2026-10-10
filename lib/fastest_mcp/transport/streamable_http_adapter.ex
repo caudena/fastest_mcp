@@ -1,15 +1,14 @@
 defmodule FastestMCP.Transport.StreamableHTTPAdapter do
-  @moduledoc """
-  Adapter for MCP 2025-11-25 Streamable HTTP.
-
-  Only the configured MCP endpoint is decoded. Every POST carries exactly one
-  JSON-RPC 2.0 message; GET and DELETE operate on an established HTTP session.
-  """
-
-  @behaviour FastestMCP.Transport.Adapter
+  @moduledoc false
+  # Decodes the Streamable HTTP requests of both MCP profiles. Only the
+  # configured MCP endpoint is served. Every POST carries exactly one JSON-RPC
+  # 2.0 message. Legacy GET and DELETE operate on an established HTTP session;
+  # the modern profile is POST-only.
 
   import Plug.Conn
+  import FastestMCP.Protocol.Version
 
+  alias FastestMCP.Component
   alias FastestMCP.Error
   alias FastestMCP.MIME
   alias FastestMCP.Protocol.HTTPHeaders
@@ -17,245 +16,169 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
   alias FastestMCP.Transport.JSONRPC
   alias FastestMCP.Transport.Request
 
-  @impl true
-  def decode(%Plug.Conn{} = conn), do: decode(conn, [])
+  @routing_headers ["mcp-protocol-version", "mcp-method", "mcp-name", "mcp-session-id"]
 
-  @doc "Decodes one Streamable HTTP request."
-  def decode(%Plug.Conn{} = conn, opts) do
+  # The answer to a request the endpoint never serves, whatever its
+  # credentials: another path gets 404, and a method other than GET, POST, and
+  # DELETE gets 405. Nil for the requests it serves.
+  def unserved(%Plug.Conn{} = conn, opts) do
+    cond do
+      conn.request_path != HTTPCommon.endpoint_path(conn, opts) ->
+        {:respond, 404, %{error: %{code: :not_found, message: "unknown route"}}, []}
+
+      conn.method not in ["GET", "POST", "DELETE"] ->
+        allow =
+          if Keyword.get(opts, :enable_get_streaming, true),
+            do: "GET, POST, DELETE",
+            else: "POST, DELETE"
+
+        method_not_allowed("method #{conn.method} is not allowed", allow)
+
+      true ->
+        nil
+    end
+  end
+
+  # Decodes a request that `unserved/2` let through, and returns the
+  # connection updated while reading its body.
+  def decode_with_conn(%Plug.Conn{} = conn, opts) do
     conn = fetch_query_params(conn)
 
-    base_path =
-      normalize_base_path(Keyword.get(opts, :path) || forwarded_base_path(conn) || "/mcp")
+    context = %{
+      base_url: HTTPCommon.base_url(conn, opts),
+      mcp_base_path: HTTPCommon.endpoint_path(conn, opts),
+      auth_assigns: Keyword.get(opts, :auth_assigns, false),
+      max_body_bytes: Keyword.get(opts, :max_body_bytes, 8_000_000)
+    }
 
-    request_opts = request_context_opts(conn, opts, base_path)
-
-    case route(conn.method, conn.request_path, base_path) do
-      :post ->
-        with :ok <- validate_post_headers(conn),
-             {:ok, payload} <- read_json(conn),
-             {:ok, decoded} <- JSONRPC.decode(payload) do
-          build_jsonrpc_message(
-            conn,
-            decoded,
-            Keyword.put(request_opts, :jsonrpc_envelope, payload)
-          )
-        end
-
-      :get ->
-        if modern_protocol_header?(conn) do
-          {:response, 405,
-           %{error: %{code: :method_not_allowed, message: "MCP 2026 HTTP is POST-only"}},
-           [{"allow", "POST"}]}
-        else
-          if Keyword.get(opts, :enable_get_streaming, true) do
-            with :ok <- require_event_stream_accept(conn) do
-              {:ok, build_get_request(conn, request_opts)}
-            end
-          else
-            {:response, 405,
-             %{error: %{code: :method_not_allowed, message: "GET streaming is disabled"}},
-             [{"allow", "POST, DELETE"}]}
-          end
-        end
-
-      :delete ->
-        if modern_protocol_header?(conn) do
-          {:response, 405,
-           %{error: %{code: :method_not_allowed, message: "MCP 2026 HTTP is POST-only"}},
-           [{"allow", "POST"}]}
-        else
-          {:ok, build_delete_request(conn, request_opts)}
-        end
-
-      {:response, status, payload} ->
-        {:response, status, payload}
+    case conn.method do
+      "POST" -> decode_post(conn, context)
+      "GET" -> {decode_get(conn, opts, context), conn}
+      "DELETE" -> {decode_delete(conn, context), conn}
     end
   end
 
-  @impl true
-  def encode_success(%Request{protocol: :jsonrpc, request_id: nil}, _payload),
-    do: {:empty, 202, []}
+  defp decode_post(conn, context) do
+    case validate_post_headers(conn) do
+      :ok ->
+        {body, conn} = read_json(conn, context.max_body_bytes)
 
-  def encode_success(%Request{method: "initialize"} = request, payload) do
-    {:ok, 200, JSONRPC.success(request, payload), session_response_headers(request)}
-  end
+        result =
+          with {:ok, envelope} <- body,
+               {:ok, decoded} <- JSONRPC.decode(envelope),
+               do: decode_message(conn, decoded, envelope, context)
 
-  def encode_success(%Request{} = request, payload),
-    do: {:ok, 200, JSONRPC.success(request, payload)}
+        {result, conn}
 
-  @impl true
-  def encode_error(%Error{} = error), do: {:ok, 400, JSONRPC.error(nil, error)}
-
-  @doc "Encodes a JSON-RPC error payload."
-  def encode_jsonrpc_error(%Request{} = request, %Error{} = error),
-    do: JSONRPC.error(request, error)
-
-  @doc "Encodes a JSON-RPC success payload."
-  def encode_jsonrpc_success(%Request{} = request, payload), do: JSONRPC.success(request, payload)
-
-  defp route("POST", path, path), do: :post
-  defp route("GET", path, path), do: :get
-  defp route("DELETE", path, path), do: :delete
-
-  defp route(_method, _request_path, _base_path) do
-    {:response, 404, %{error: %{code: :not_found, message: "unknown route"}}}
-  end
-
-  defp build_jsonrpc_message(conn, {:request, method, params, request_id}, opts) do
-    result =
-      with :ok <- validate_session_header(method, conn, opts),
-           :ok <- validate_modern_headers(conn, method, params),
-           {:ok, {task_request, task_ttl_ms}} <- JSONRPC.task_metadata(params) do
-        {:ok,
-         build_request(
-           conn,
-           method,
-           params,
-           Keyword.merge(opts,
-             protocol: :jsonrpc,
-             request_id: request_id,
-             task_request: task_request,
-             task_ttl_ms: task_ttl_ms
-           )
-         )}
-      end
-
-    case result do
-      {:error, %Error{} = error} ->
-        {:error, annotate_request_error(error, request_id)}
-
-      other ->
-        other
+      error ->
+        {error, conn}
     end
   end
 
-  defp build_jsonrpc_message(conn, {:response, request_id, payload}, opts) do
-    {:ok,
-     build_request(
-       conn,
-       "__transport/client_response__",
-       payload,
-       Keyword.merge(opts, protocol: :jsonrpc, request_id: request_id)
-     )}
+  defp decode_message(conn, {:request, method, params, request_id} = decoded, envelope, context) do
+    headers = routing_headers(conn)
+
+    with :ok <- validate_session_header(method, conn),
+         :ok <- validate_modern_headers(conn, headers, method, params),
+         {:ok, request} <- Request.from_jsonrpc(decoded, envelope) do
+      {:ok, post_request(conn, request, headers, context)}
+    else
+      {:error, %Error{} = error} -> {:error, annotate_request_error(error, request_id)}
+    end
   end
 
-  defp build_request(conn, method, payload, opts) do
-    headers = conn |> request_headers() |> normalize_mcp_routing_headers()
-    provided_session_id = headers["mcp-session-id"]
+  defp decode_message(conn, {:response, _request_id, _payload} = decoded, envelope, context) do
+    {:ok, request} = Request.from_jsonrpc(decoded, envelope)
+    {:ok, post_request(conn, request, routing_headers(conn), context)}
+  end
 
-    {payload, jsonrpc_envelope} =
-      if method == "__transport/client_response__" do
-        {payload, Keyword.get(opts, :jsonrpc_envelope)}
-      else
-        {
-          JSONRPC.sanitize_auth_metadata(payload),
-          opts
-          |> Keyword.get(:jsonrpc_envelope)
-          |> JSONRPC.sanitize_stored_envelope()
-        }
-      end
-
-    body_protocol_version =
-      get_in(payload, ["_meta", "io.modelcontextprotocol/protocolVersion"])
-
+  defp post_request(conn, %Request{} = request, headers, context) do
     session_id =
       cond do
-        body_protocol_version == "2026-07-28" -> nil
-        method == "initialize" -> generate_session_id()
-        true -> provided_session_id
+        is_modern(request.protocol_version) -> nil
+        request.method == "initialize" -> generate_session_id()
+        true -> headers["mcp-session-id"]
       end
 
-    %Request{
-      method: method,
-      transport: :streamable_http,
-      session_id: session_id,
-      request_id: Keyword.fetch!(opts, :request_id),
-      protocol_version: body_protocol_version || headers["mcp-protocol-version"],
-      protocol: Keyword.fetch!(opts, :protocol),
-      task_request: Keyword.get(opts, :task_request, false),
-      task_ttl_ms: Keyword.get(opts, :task_ttl_ms),
-      payload: payload,
-      transport_authorization: Map.get(headers, "authorization"),
-      request_metadata:
+    request =
+      http_request(
+        conn,
         %{
-          headers: public_request_headers(headers),
-          method: conn.method,
-          path: conn.request_path,
-          query_params: conn.query_params,
-          session_id: session_id,
-          session_id_provided: not is_nil(provided_session_id),
-          protocol_version: headers["mcp-protocol-version"],
-          jsonrpc_request_id: Keyword.fetch!(opts, :request_id),
-          jsonrpc_envelope: jsonrpc_envelope,
-          jsonrpc_notification:
-            Keyword.fetch!(opts, :protocol) == :jsonrpc and
-              is_nil(Keyword.fetch!(opts, :request_id)),
-          progress_token: get_in(payload, ["_meta", "progressToken"]),
-          log_level: get_in(payload, ["_meta", "io.modelcontextprotocol/logLevel"])
-        }
-        |> put_request_context(opts),
-      auth_input: HTTPCommon.auth_input(conn, opts)
+          request
+          | session_id: session_id,
+            protocol_version: request.protocol_version || headers["mcp-protocol-version"]
+        },
+        headers,
+        context
+      )
+
+    %{
+      request
+      | request_metadata:
+          Map.put(request.request_metadata, :jsonrpc_notification, is_nil(request.request_id))
     }
   end
 
-  defp build_delete_request(conn, opts) do
-    headers = request_headers(conn)
-    session_id = headers["mcp-session-id"]
+  defp decode_get(conn, opts, context) do
+    cond do
+      modern_protocol_header?(conn) ->
+        method_not_allowed("MCP 2026 HTTP is POST-only", "POST")
 
-    %Request{
-      method: "__transport/delete_session__",
-      transport: :streamable_http,
-      session_id: session_id,
-      protocol: :jsonrpc,
-      payload: %{},
-      transport_authorization: Map.get(headers, "authorization"),
-      request_metadata:
-        %{
-          headers: public_request_headers(headers),
-          method: conn.method,
-          path: conn.request_path,
-          query_params: conn.query_params,
-          session_id: session_id,
-          session_id_provided: not is_nil(session_id),
-          protocol_version: headers["mcp-protocol-version"]
-        }
-        |> put_request_context(opts),
-      auth_input: HTTPCommon.auth_input(conn, opts)
-    }
+      Keyword.get(opts, :enable_get_streaming, true) ->
+        with :ok <- require_event_stream_accept(conn),
+             do: {:ok, session_request(conn, "__transport/session_get__", context)}
+
+      true ->
+        method_not_allowed("GET streaming is disabled", "POST, DELETE")
+    end
   end
 
-  defp build_get_request(conn, opts) do
-    headers = request_headers(conn)
-    session_id = headers["mcp-session-id"]
+  defp decode_delete(conn, context) do
+    if modern_protocol_header?(conn),
+      do: method_not_allowed("MCP 2026 HTTP is POST-only", "POST"),
+      else: {:ok, session_request(conn, "__transport/delete_session__", context)}
+  end
 
-    %Request{
-      method: "__transport/session_get__",
-      transport: :streamable_http,
-      session_id: session_id,
-      protocol: :jsonrpc,
-      payload: %{},
-      transport_authorization: Map.get(headers, "authorization"),
-      request_metadata:
-        %{
-          headers: public_request_headers(headers),
-          method: conn.method,
-          path: conn.request_path,
-          query_params: conn.query_params,
-          session_id: session_id,
-          session_id_provided: not is_nil(session_id),
-          protocol_version: headers["mcp-protocol-version"]
-        }
-        |> put_request_context(opts),
-      auth_input: HTTPCommon.auth_input(conn, opts)
+  defp method_not_allowed(message, allow),
+    do:
+      {:respond, 405, %{error: %{code: :method_not_allowed, message: message}},
+       [{"allow", allow}]}
+
+  defp session_request(conn, method, context) do
+    headers = Map.new(conn.req_headers)
+
+    http_request(
+      conn,
+      %Request{method: method, protocol: :jsonrpc, session_id: headers["mcp-session-id"]},
+      headers,
+      context
+    )
+  end
+
+  defp http_request(conn, %Request{} = request, headers, context) do
+    %{
+      request
+      | transport: :streamable_http,
+        session_id_provided?: not is_nil(headers["mcp-session-id"]),
+        transport_authorization: headers["authorization"],
+        auth_input: HTTPCommon.auth_input(conn, auth_assigns: context.auth_assigns),
+        request_metadata:
+          Map.merge(request.request_metadata, %{
+            headers: Map.delete(headers, "authorization"),
+            method: conn.method,
+            path: conn.request_path,
+            query_params: conn.query_params,
+            session_id: request.session_id,
+            protocol_version: headers["mcp-protocol-version"],
+            base_url: context.base_url,
+            mcp_base_path: context.mcp_base_path
+          })
     }
   end
 
   defp validate_post_headers(conn) do
-    content_types = get_req_header(conn, "content-type")
-    accept = get_req_header(conn, "accept")
-
     cond do
-      not valid_json_content_type?(content_types) ->
+      not valid_json_content_type?(get_req_header(conn, "content-type")) ->
         {:error,
          %Error{
            code: :unsupported_media_type,
@@ -263,8 +186,7 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
            details: %{jsonrpc_code: -32_600}
          }}
 
-      not MIME.accepts?(accept, "application/json") or
-          not MIME.accepts?(accept, "text/event-stream") ->
+      not (accepts?(conn, "application/json") and accepts?(conn, "text/event-stream")) ->
         {:error,
          %Error{
            code: :not_acceptable,
@@ -283,7 +205,7 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
   defp valid_json_content_type?(_content_types), do: false
 
   defp require_event_stream_accept(conn) do
-    if conn |> get_req_header("accept") |> MIME.accepts?("text/event-stream") do
+    if accepts?(conn, "text/event-stream") do
       :ok
     else
       {:error,
@@ -295,29 +217,28 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
     end
   end
 
-  defp validate_session_header(method, conn, _opts) do
-    session_header? = get_req_header(conn, "mcp-session-id") != []
+  defp accepts?(conn, media_type),
+    do: conn |> get_req_header("accept") |> MIME.accepts?(media_type)
 
-    if method == "initialize" and session_header? do
-      {:error, %Error{code: :bad_request, message: "initialize must not include MCP-Session-Id"}}
-    else
-      :ok
-    end
+  defp validate_session_header("initialize", conn) do
+    if get_req_header(conn, "mcp-session-id") == [],
+      do: :ok,
+      else:
+        {:error,
+         %Error{code: :bad_request, message: "initialize must not include MCP-Session-Id"}}
   end
 
-  defp validate_modern_headers(conn, method, params) do
-    headers = conn |> request_headers() |> normalize_mcp_routing_headers()
+  defp validate_session_header(_method, _conn), do: :ok
+
+  # A modern request repeats its routing in headers, which must match the body.
+  defp validate_modern_headers(conn, headers, method, params) do
     version = get_in(params, ["_meta", "io.modelcontextprotocol/protocolVersion"])
     header_version = headers["mcp-protocol-version"]
 
-    if is_nil(version) and header_version != "2026-07-28" do
+    if is_nil(version) and not is_modern(header_version) do
       :ok
     else
       expected_name = modern_request_name(method, params)
-
-      name_header_valid? =
-        is_nil(expected_name) or
-          HTTPHeaders.compare_value(expected_name, headers["mcp-name"], "string") == :ok
 
       with :ok <- validate_unique_modern_headers(conn) do
         cond do
@@ -334,7 +255,8 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
           headers["mcp-method"] != method ->
             header_mismatch("Mcp-Method", method, headers["mcp-method"])
 
-          not name_header_valid? ->
+          not (is_nil(expected_name) or
+                   HTTPHeaders.compare_value(expected_name, headers["mcp-name"], "string") == :ok) ->
             header_mismatch("Mcp-Name", expected_name, headers["mcp-name"])
 
           headers["mcp-session-id"] not in [nil, ""] ->
@@ -348,119 +270,78 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
   end
 
   defp validate_unique_modern_headers(conn) do
-    duplicates =
+    duplicate =
       conn.req_headers
       |> Enum.filter(fn {name, _value} -> modern_singleton_header?(name) end)
-      |> Enum.group_by(fn {name, _value} -> String.downcase(name) end, fn {_name, value} ->
-        value
-      end)
+      |> Enum.group_by(fn {name, _value} -> String.downcase(name) end, &elem(&1, 1))
       |> Enum.find(fn {_name, values} -> length(values) > 1 end)
 
-    case duplicates do
-      nil ->
-        :ok
-
-      {name, values} ->
-        header_mismatch(name, "a single header value", values)
+    case duplicate do
+      nil -> :ok
+      {name, values} -> header_mismatch(name, "a single header value", values)
     end
   end
 
-  defp modern_singleton_header?(name) when is_binary(name) do
+  defp modern_singleton_header?(name) do
     name = String.downcase(name)
-
-    name in ["mcp-protocol-version", "mcp-method", "mcp-name", "mcp-session-id"] or
-      String.starts_with?(name, "mcp-param-")
+    name in @routing_headers or String.starts_with?(name, "mcp-param-")
   end
-
-  defp modern_request_name("tools/call", params), do: Map.get(params, "name")
-  defp modern_request_name("resources/read", params), do: Map.get(params, "uri")
-  defp modern_request_name("prompts/get", params), do: Map.get(params, "name")
 
   defp modern_request_name(method, params)
        when method in ["tasks/get", "tasks/update", "tasks/cancel"],
        do: Map.get(params, "taskId")
 
-  defp modern_request_name(_method, _params), do: nil
+  defp modern_request_name(method, params) do
+    if kind = Component.call_kind(method), do: Map.get(params, Component.call_param(kind))
+  end
 
   defp header_mismatch(header, expected, actual) do
     {:error,
      %Error{
        code: :header_mismatch,
        message: "#{header} does not match the JSON-RPC request",
-       details: %{
-         jsonrpc_code: -32_020,
-         header: header,
-         expected: expected,
-         actual: actual
-       }
+       details: %{jsonrpc_code: -32_020, header: header, expected: expected, actual: actual}
      }}
   end
 
-  defp normalize_mcp_routing_headers(headers) do
-    Enum.reduce(
-      ["mcp-protocol-version", "mcp-method", "mcp-name", "mcp-session-id"],
-      headers,
-      fn name, normalized ->
-        case Map.get(normalized, name) do
-          value when is_binary(value) -> Map.put(normalized, name, trim_http_ows(value))
-          _other -> normalized
-        end
-      end
-    )
+  # The request headers with surrounding whitespace trimmed from MCP routing headers.
+  defp routing_headers(conn) do
+    Map.new(conn.req_headers, fn
+      {name, value} when name in @routing_headers ->
+        {name, String.replace(value, ~r/^[\x20\x09]+|[\x20\x09]+$/, "")}
+
+      header ->
+        header
+    end)
   end
 
-  defp trim_http_ows(value), do: String.replace(value, ~r/^[\x20\x09]+|[\x20\x09]+$/, "")
-
-  defp request_context_opts(conn, opts, base_path) do
-    http_context = HTTPCommon.http_context(conn, %{}, Keyword.put(opts, :path, base_path))
-
-    [
-      base_url: http_context.base_url,
-      mcp_base_path: http_context.mcp_base_path,
-      auth_assigns: Keyword.get(opts, :auth_assigns, false)
-    ]
-  end
-
-  defp put_request_context(metadata, opts) do
-    metadata
-    |> Map.put(:base_url, Keyword.fetch!(opts, :base_url))
-    |> Map.put(:mcp_base_path, Keyword.fetch!(opts, :mcp_base_path))
-  end
-
-  defp read_json(conn) do
-    case parsed_body_params(conn) do
-      {:ok, payload} ->
-        {:ok, payload}
-
-      :unavailable ->
-        case read_body(conn) do
-          {:ok, "", _conn} ->
-            {:error, JSONRPC.parse_error("empty request body")}
-
-          {:ok, body, _conn} ->
-            case JSON.decode(body) do
-              {:ok, decoded} ->
-                {:ok, decoded}
-
-              {:error, reason} ->
-                {:error, JSONRPC.parse_error("invalid JSON", %{reason: inspect(reason)})}
-            end
-
-          {:more, _body, _conn} ->
-            {:error, JSONRPC.parse_error("request body too large")}
-        end
+  # A body that `Plug.Parsers` already parsed, or the body read up to
+  # `max_body_bytes`; a longer body is `:payload_too_large`, HTTP 413.
+  defp read_json(conn, max_body_bytes) do
+    case conn.body_params do
+      %Plug.Conn.Unfetched{} -> read_json_body(conn, max_body_bytes)
+      %{"_json" => payload} -> {{:ok, payload}, conn}
+      body_params when is_map(body_params) -> {{:ok, body_params}, conn}
     end
   end
 
-  defp parsed_body_params(%Plug.Conn{body_params: %Plug.Conn.Unfetched{}}), do: :unavailable
-  defp parsed_body_params(%Plug.Conn{body_params: %{"_json" => payload}}), do: {:ok, payload}
+  defp read_json_body(conn, max_body_bytes) do
+    case read_body(conn, length: max_body_bytes) do
+      {:ok, "", conn} ->
+        {{:error, JSONRPC.parse_error("empty request body")}, conn}
 
-  defp parsed_body_params(%Plug.Conn{body_params: body_params}) when is_map(body_params),
-    do: {:ok, body_params}
+      {:ok, body, conn} ->
+        {JSONRPC.decode_json(body), conn}
 
-  defp request_headers(conn), do: Map.new(conn.req_headers)
+      {:more, _body, conn} ->
+        {{:error, %Error{code: :payload_too_large, message: "request body too large"}}, conn}
 
-  defp public_request_headers(headers), do: Map.delete(headers, "authorization")
+      {:error, reason} ->
+        # The adapter cannot return its partially consumed state on read failure.
+        {{:error, JSONRPC.parse_error("request body read failed", %{reason: inspect(reason)})},
+         put_resp_header(conn, "connection", "close")}
+    end
+  end
 
   defp annotate_request_error(%Error{} = error, request_id) do
     jsonrpc_id =
@@ -470,17 +351,7 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
   end
 
   defp modern_protocol_header?(conn),
-    do: Map.get(request_headers(conn), "mcp-protocol-version") == "2026-07-28"
-
-  defp normalize_base_path(path),
-    do: "/" <> String.trim(String.trim_leading(to_string(path), "/"), "/")
-
-  defp forwarded_base_path(%Plug.Conn{script_name: []}), do: nil
-  defp forwarded_base_path(%Plug.Conn{script_name: names}), do: "/" <> Enum.join(names, "/")
-
-  defp session_response_headers(%Request{session_id: session_id}) do
-    if is_binary(session_id), do: [{"mcp-session-id", session_id}], else: []
-  end
+    do: is_modern(Map.new(conn.req_headers)["mcp-protocol-version"])
 
   defp generate_session_id do
     32

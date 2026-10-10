@@ -69,6 +69,21 @@ jobs:
       - name: Run docs example harness
         run: mix test --only docs_examples --exclude external_auth --exclude conformance
 
+  python-interop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.19.5"
+          otp-version: "28.4"
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          python-version: "3.12"
+      - run: mix deps.get --check-locked
+      - run: uv sync --frozen --project test/interop
+      - run: mix test test/fastest_mcp/python_interop_test.exs --include interop
+
   conformance-server:
     needs: hermetic-test
     runs-on: ubuntu-latest
@@ -168,6 +183,7 @@ jobs:
       - docs-examples
       - conformance-server
       - conformance-client
+      - python-interop
     runs-on: ubuntu-latest
 
     steps:

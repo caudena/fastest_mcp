@@ -26,7 +26,7 @@ defmodule FastestMCP.Lifespan do
   @type exit :: nil | (-> any()) | (map() -> any()) | (FastestMCP.Server.t(), map() -> any())
   @type t :: %__MODULE__{enter: enter(), exit: exit(), namespace: String.t() | nil}
 
-  @doc "Builds a new value for this module from the supplied options."
+  @doc "Normalizes a lifespan given as a struct, an `{enter, exit}` pair, or an `enter` function."
   def new(%__MODULE__{} = lifespan), do: lifespan
   def new({enter, exit}), do: new(enter, exit)
 
@@ -34,6 +34,7 @@ defmodule FastestMCP.Lifespan do
     %__MODULE__{enter: enter, exit: nil}
   end
 
+  @doc "Builds a lifespan from `enter` and an `exit` function (nil, or of arity 0, 1, or 2; see `t:exit/0`)."
   def new(enter, exit)
       when is_function(enter, 1) and
              (is_nil(exit) or is_function(exit, 0) or is_function(exit, 1) or is_function(exit, 2)) do

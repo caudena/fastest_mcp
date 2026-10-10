@@ -1,6 +1,7 @@
 defmodule FastestMCP.ErrorExposure do
   @moduledoc false
 
+  alias FastestMCP.Component
   alias FastestMCP.Error
   alias FastestMCP.Server
   alias FastestMCP.Transport.Request
@@ -64,18 +65,24 @@ defmodule FastestMCP.ErrorExposure do
     end
   end
 
+  defp generic_message(%Error{exposure: %{message: message}}, _opts) when is_binary(message),
+    do: message
+
   defp generic_message(%Error{exposure: exposure}, opts) do
+    {request_kind, request_target} = request_call(Keyword.get(opts, :request))
+    task = Keyword.get(opts, :task, %{})
+
     component_type =
       Keyword.get(opts, :component_type) ||
-        get_in(opts, [:task, :component_type]) ||
+        Map.get(task, :component_type) ||
         (is_map(exposure) && Map.get(exposure, :component_type)) ||
-        request_component_type(Keyword.get(opts, :request))
+        request_kind
 
     target =
       Keyword.get(opts, :target) ||
-        get_in(opts, [:task, :target]) ||
-        get_in(opts, [:task, :method]) ||
-        request_target(Keyword.get(opts, :request)) ||
+        Map.get(task, :target) ||
+        Map.get(task, :method) ||
+        request_target ||
         (is_map(exposure) && Map.get(exposure, :identifier))
 
     case {component_label(component_type), target} do
@@ -86,21 +93,21 @@ defmodule FastestMCP.ErrorExposure do
     end
   end
 
-  defp request_component_type(%Request{method: "tools/call"}), do: :tool
-  defp request_component_type(%Request{method: "resources/read"}), do: :resource
-  defp request_component_type(%Request{method: "prompts/get"}), do: :prompt
-  defp request_component_type(_request), do: nil
+  # The kind and target of a call, read, or render request.
+  defp request_call(%Request{method: method, payload: payload}) do
+    case Component.call_kind(method) do
+      nil -> {nil, nil}
+      kind -> {kind, Map.get(payload, Component.call_param(kind))}
+    end
+  end
 
-  defp request_target(%Request{method: "tools/call", payload: %{"name" => name}}), do: name
-  defp request_target(%Request{method: "resources/read", payload: %{"uri" => uri}}), do: uri
-  defp request_target(%Request{method: "prompts/get", payload: %{"name" => name}}), do: name
-  defp request_target(_request), do: nil
+  defp request_call(_request), do: {nil, nil}
 
-  defp component_label(:tool), do: "tool"
-  defp component_label(:resource), do: "resource"
-  defp component_label(:resource_template), do: "resource"
-  defp component_label(:prompt), do: "prompt"
   defp component_label(:callback_task), do: "callback task"
   defp component_label(label) when is_binary(label), do: label
+
+  defp component_label(kind) when kind in [:tool, :resource, :resource_template, :prompt],
+    do: Component.label(kind)
+
   defp component_label(_label), do: nil
 end

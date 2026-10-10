@@ -1,5 +1,5 @@
 defmodule FastestMCP.ClientNotificationAPITest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Client
   alias FastestMCP.Context
@@ -25,78 +25,56 @@ defmodule FastestMCP.ClientNotificationAPITest do
   end
 
   test "connected client receives a notification sent explicitly from context" do
-    parent = self()
+    server_name = unique_name("client-notification-api")
 
-    server_name =
-      "client-notification-api-" <> Integer.to_string(System.unique_integer([:positive]))
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("trigger_notification", fn _args, ctx ->
+      {:ok, _delivery} = Context.send_notification(ctx, "com.example/notification")
+      %{ok: true}
+    end)
+    |> start_server!()
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("trigger_notification", fn _args, ctx ->
-        {:ok, _delivery} = Context.send_notification(ctx, "com.example/notification")
-        %{ok: true}
-      end)
+    client = connect_client!(server_name)
 
-    {client, cleanup} = start_http_client(server_name, server, parent)
+    assert %{structured_content: %{"ok" => true}} =
+             Client.call_tool!(client, "trigger_notification", %{})
 
-    try do
-      assert %{"ok" => true} = Client.call_tool(client, "trigger_notification", %{})
-      assert receive_notification_methods(1) == ["com.example/notification"]
-    after
-      cleanup.()
-    end
+    assert receive_notification_methods(1) == ["com.example/notification"]
   end
 
   test "connected client receives multiple explicit notifications in order" do
-    parent = self()
+    server_name = unique_name("client-notification-api-many")
 
-    server_name =
-      "client-notification-api-many-" <> Integer.to_string(System.unique_integer([:positive]))
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("trigger_all_notifications", fn _args, ctx ->
+      {:ok, _} = Context.send_notification(ctx, "com.example/notification/first")
+      {:ok, _} = Context.send_notification(ctx, "com.example/notification/second")
+      {:ok, _} = Context.send_notification(ctx, "com.example/notification/third")
+      %{ok: true}
+    end)
+    |> start_server!()
 
-    server =
-      FastestMCP.server(server_name)
-      |> FastestMCP.add_tool("trigger_all_notifications", fn _args, ctx ->
-        {:ok, _} = Context.send_notification(ctx, "com.example/notification/first")
-        {:ok, _} = Context.send_notification(ctx, "com.example/notification/second")
-        {:ok, _} = Context.send_notification(ctx, "com.example/notification/third")
-        %{ok: true}
-      end)
+    client = connect_client!(server_name)
 
-    {client, cleanup} = start_http_client(server_name, server, parent)
+    assert %{structured_content: %{"ok" => true}} =
+             Client.call_tool!(client, "trigger_all_notifications", %{})
 
-    try do
-      assert %{"ok" => true} = Client.call_tool(client, "trigger_all_notifications", %{})
-
-      assert receive_notification_methods(3) == [
-               "com.example/notification/first",
-               "com.example/notification/second",
-               "com.example/notification/third"
-             ]
-    after
-      cleanup.()
-    end
+    assert receive_notification_methods(3) == [
+             "com.example/notification/first",
+             "com.example/notification/second",
+             "com.example/notification/third"
+           ]
   end
 
-  defp start_http_client(server_name, server, parent) do
-    assert {:ok, _pid} = FastestMCP.start_server(server)
+  defp connect_client!(server_name) do
+    parent = self()
 
-    bandit =
-      start_supervised!(
-        {Bandit,
-         plug:
-           {FastestMCP.Transport.HTTPApp,
-            server_name: server_name,
-            path: "/mcp",
-            allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"]},
-         scheme: :http,
-         port: 0}
-      )
-
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+    %{url: url} =
+      start_http!(server_name, allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"])
 
     client =
-      Client.connect!(
-        "http://127.0.0.1:#{port}/mcp",
+      connect!(
+        url,
         protocol_version: "2025-11-25",
         session_stream: true,
         notification_handler: fn payload ->
@@ -104,15 +82,8 @@ defmodule FastestMCP.ClientNotificationAPITest do
         end
       )
 
-    assert wait_for_session_stream(client) == :ok
-
-    cleanup = fn ->
-      if Client.connected?(client), do: Client.disconnect(client)
-      Supervisor.stop(bandit)
-      FastestMCP.stop_server(server_name)
-    end
-
-    {client, cleanup}
+    assert_eventually(fn -> Client.info!(client).session_stream_open? end)
+    client
   end
 
   defp receive_notification_methods(count) do
@@ -122,25 +93,6 @@ defmodule FastestMCP.ClientNotificationAPITest do
       after
         1_000 -> flunk("timed out waiting for #{count} client notifications")
       end
-    end
-  end
-
-  defp wait_for_session_stream(client, timeout \\ 1_000) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-    do_wait_for_session_stream(client, deadline)
-  end
-
-  defp do_wait_for_session_stream(client, deadline) do
-    cond do
-      Client.session_stream_open?(client) ->
-        :ok
-
-      System.monotonic_time(:millisecond) >= deadline ->
-        flunk("timed out waiting for the client session stream to open")
-
-      true ->
-        Process.sleep(10)
-        do_wait_for_session_stream(client, deadline)
     end
   end
 end

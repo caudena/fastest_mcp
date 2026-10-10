@@ -1,5 +1,5 @@
 defmodule FastestMCP.LifecycleCleanupFailureTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   import ExUnit.CaptureLog
 

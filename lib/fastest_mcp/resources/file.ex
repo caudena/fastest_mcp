@@ -8,7 +8,7 @@ defmodule FastestMCP.Resources.File do
     * UTF-8 text reads by default
     * explicit binary mode
     * encoding overrides
-    * normalized read errors
+    * read errors that name the file, not its location on the server
 
   ## Example
 
@@ -53,30 +53,37 @@ defmodule FastestMCP.Resources.File do
     }
   end
 
-  @doc "Reads the file and returns a normalized resource result."
+  @doc """
+  Reads the file and returns a normalized resource result.
+
+  A failed read raises `FastestMCP.Error` with the code `:internal_error`; its
+  message names the file but not the directory it is in.
+  """
   def read(%__MODULE__{} = file) do
-    content =
-      if file.binary do
-        Binary.new(File.read!(file.path),
-          mime_type: file.mime_type || "application/octet-stream"
-        )
-      else
-        text =
-          file.path
-          |> File.read!()
-          |> :unicode.characters_to_binary(file.encoding, :utf8)
+    case File.read(file.path) do
+      {:ok, bytes} -> Result.new([content(file, bytes)])
+      {:error, reason} -> read_error!(file, :file.format_error(reason))
+    end
+  end
 
+  defp content(%__MODULE__{binary: true} = file, bytes),
+    do: Binary.new(bytes, mime_type: file.mime_type || "application/octet-stream")
+
+  defp content(file, bytes) do
+    case :unicode.characters_to_binary(bytes, file.encoding, :utf8) do
+      text when is_binary(text) ->
         Text.new(text, mime_type: file.mime_type || mime_from_extension(file.path))
-      end
 
-    Result.new([content])
-  rescue
-    error ->
-      reraise Error.exception(
-                code: :internal_error,
-                message: "Error reading file #{inspect(file.path)}: #{Exception.message(error)}"
-              ),
-              __STACKTRACE__
+      _invalid ->
+        read_error!(file, "the file is not valid UTF-8")
+    end
+  end
+
+  # Clients see the error, so it names the file without its location.
+  defp read_error!(file, reason) do
+    raise Error,
+      code: :internal_error,
+      message: "Error reading file #{inspect(Path.basename(file.path))}: #{reason}"
   end
 
   defp mime_from_extension(path) do

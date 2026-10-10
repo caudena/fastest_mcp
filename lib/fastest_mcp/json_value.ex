@@ -1,7 +1,6 @@
 defmodule FastestMCP.JSONValue do
   @moduledoc false
 
-  @doc "Normalizes an Elixir value into a deterministic JSON-compatible value."
   def normalize(nil), do: nil
   def normalize(value) when is_boolean(value), do: value
 
@@ -25,6 +24,16 @@ defmodule FastestMCP.JSONValue do
 
   def normalize(%Range{} = value), do: value |> Enum.to_list() |> Enum.map(&normalize/1)
 
+  # Terms without a JSON form fail the result that holds them.
+  def normalize(%struct{}) when struct in [Stream, File.Stream, IO.Stream],
+    do: not_json!("a stream", "; call Enum.to_list/1 on it first")
+
+  def normalize(value) when is_function(value), do: not_json!("a function")
+  def normalize(value) when is_pid(value), do: not_json!("a PID")
+  def normalize(value) when is_port(value), do: not_json!("a port")
+  def normalize(value) when is_reference(value), do: not_json!("a reference")
+  def normalize(value) when is_bitstring(value), do: not_json!("a bitstring")
+
   def normalize(%_struct{} = value) do
     value
     |> Map.from_struct()
@@ -44,30 +53,26 @@ defmodule FastestMCP.JSONValue do
   end
 
   def normalize(value) when is_atom(value), do: value
-  def normalize(value), do: value
 
-  @doc "Normalizes a value and converts all object keys to strings for wire payloads."
   def stringify_keys(value) do
     value
     |> normalize()
-    |> do_stringify_keys()
+    |> FastestMCP.Util.stringify_keys()
   end
 
-  @doc "Encodes an Elixir value after JSON normalization."
   def encode!(value), do: value |> normalize() |> JSON.encode!()
+
+  defp not_json!(what, hint \\ "") do
+    raise FastestMCP.Error,
+      code: :internal_error,
+      message: "#{what} cannot be encoded as JSON#{hint}"
+  end
 
   defp normalize_key(key)
        when is_binary(key) or is_atom(key) or is_integer(key) or is_float(key) or is_boolean(key),
        do: key
 
   defp normalize_key(key), do: inspect(key)
-
-  defp do_stringify_keys(value) when is_map(value) do
-    Map.new(value, fn {key, item} -> {to_string(key), do_stringify_keys(item)} end)
-  end
-
-  defp do_stringify_keys(value) when is_list(value), do: Enum.map(value, &do_stringify_keys/1)
-  defp do_stringify_keys(value), do: value
 
   defp stable_sort_key(value), do: JSON.encode!(value)
 end

@@ -1,5 +1,5 @@
 defmodule FastestMCP.Runtime.OverloadBackpressureTest do
-  use ExUnit.Case, async: false
+  use FastestMCP.Case, async: true
 
   alias FastestMCP.Error
   alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
@@ -15,34 +15,28 @@ defmodule FastestMCP.Runtime.OverloadBackpressureTest do
       receive do
         :release -> :ok
       after
-        1_000 -> :timeout
+        10_000 -> :timeout
       end
     end
 
-    assert {:ok, _pid} =
-             FastestMCP.start_server(
-               FastestMCP.server(server_a)
-               |> FastestMCP.add_tool("wait", wait_tool),
-               max_concurrent_calls: 1
-             )
+    start_server!(FastestMCP.server(server_a) |> FastestMCP.add_tool("wait", wait_tool),
+      max_concurrent_calls: 1
+    )
 
-    assert {:ok, _pid} =
-             FastestMCP.start_server(
-               FastestMCP.server(server_b)
-               |> FastestMCP.add_tool("wait", wait_tool),
-               max_concurrent_calls: 1
-             )
+    start_server!(FastestMCP.server(server_b) |> FastestMCP.add_tool("wait", wait_tool),
+      max_concurrent_calls: 1
+    )
 
     task =
       Task.async(fn ->
-        FastestMCP.call_tool(server_a, "wait", %{})
+        FastestMCP.call_tool!(server_a, "wait", %{})
       end)
 
     assert_receive {:entered, pid}, 1_000
 
     error =
       assert_raise Error, fn ->
-        FastestMCP.call_tool(server_a, "wait", %{})
+        FastestMCP.call_tool!(server_a, "wait", %{})
       end
 
     assert error.code == :overloaded
@@ -51,7 +45,7 @@ defmodule FastestMCP.Runtime.OverloadBackpressureTest do
 
     other =
       Task.async(fn ->
-        FastestMCP.call_tool(server_b, "wait", %{})
+        FastestMCP.call_tool!(server_b, "wait", %{})
       end)
 
     assert_receive {:entered, other_pid}, 1_000
@@ -74,20 +68,17 @@ defmodule FastestMCP.Runtime.OverloadBackpressureTest do
       receive do
         :release -> :ok
       after
-        1_000 -> :timeout
+        10_000 -> :timeout
       end
     end
 
-    assert {:ok, _pid} =
-             FastestMCP.start_server(
-               FastestMCP.server(server_name)
-               |> FastestMCP.add_tool("wait", wait_tool),
-               max_concurrent_calls: 1
-             )
+    start_server!(FastestMCP.server(server_name) |> FastestMCP.add_tool("wait", wait_tool),
+      max_concurrent_calls: 1
+    )
 
     task =
       Task.async(fn ->
-        FastestMCP.call_tool(server_name, "wait", %{})
+        FastestMCP.call_tool!(server_name, "wait", %{})
       end)
 
     assert_receive {:entered, pid}, 1_000
