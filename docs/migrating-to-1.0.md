@@ -756,6 +756,9 @@ Over HTTP:
 - A method other than `GET`, `POST`, and `DELETE` gets `405` with an `Allow`
   header, and another path `404`, both before authentication (they got `404`
   `unknown route`, or `401` on a route with an authenticator).
+- A request with more than one `Authorization` header gets `400` with
+  `WWW-Authenticate: Bearer error="invalid_request"` before authentication
+  (since 1.0.1; the authenticator received the last of them).
 - A request for a server that isn't running gets `503` with `Retry-After: 1`
   and `server ... is not running` on every route of the server's HTTP endpoint
   (was `404` `unknown server ...`, which `2025-11-25` clients read as an ended
@@ -823,3 +826,6 @@ should note:
 - Components built by providers have no `server_name`; `SamplingTool.from_tool/2`
   needs a `server_name:` option for them, which
   `FastestMCP.prepare_sampling_tools/2` passes.
+- Middleware that serialized a result with `Transport.Serializer`, for example
+  to log it, calls `FastestMCP.Operation.wire_result/1` on the operation
+  instead (since 1.0.1).

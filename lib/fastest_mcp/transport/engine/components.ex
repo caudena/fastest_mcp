@@ -100,6 +100,27 @@ defmodule FastestMCP.Transport.Engine.Components do
   def serialize(:prompt, _target, _prompt, value, _request, _opts),
     do: Serializer.prompt_result(value)
 
+  # The wire form of the result of a call, read, or render of a `kind`
+  # component, for `request`: a background task's handle, the questions of an
+  # `InputRequiredResult`, or the serialized result. Raises `FastestMCP.Error`
+  # for a result that is not valid MCP.
+  def wire_form(%Operation{result: result} = operation, kind, request, opts) do
+    case result do
+      %InputRequiredResult{} when request.profile == :modern ->
+        InputRequiredResult.to_map(result)
+
+      %InputRequiredResult{} ->
+        version = request.protocol_version
+        raise Error.internal("input_required is not valid for #{request.method} under #{version}")
+
+      %BackgroundTask{} ->
+        TaskWire.create_task_result(result, protocol_version: request.protocol_version)
+
+      value ->
+        serialize(kind, operation.target, operation.component, value, request, opts)
+    end
+  end
+
   # The component a call of `target` would run for this request, or nil.
   def visible_component(runtime, kind, target, opts) do
     case OperationPipeline.visible_component(runtime.server.name, kind, target, opts) do
@@ -131,17 +152,29 @@ defmodule FastestMCP.Transport.Engine.Components do
   defp call(runtime, kind, request, opts) do
     with {:ok, target} <- Request.fetch_param(request, Component.call_param(kind)),
          {:ok, opts} <- call_opts(kind, request, opts),
-         {:ok, %Operation{result: result, component: component}} <-
+         {:ok, operation} <-
            OperationPipeline.invoke(
              runtime.server.name,
              kind,
              target,
              call_arguments(kind, request),
              opts
-           ) do
-      call_result(result, request, &serialize(kind, target, component, &1, request, opts))
+           ),
+         :ok <- answerable(operation.result, request) do
+      Engine.wire(fn -> wire_form(operation, kind, request, opts) end)
     end
   end
+
+  # The client of a modern request must be able to answer the questions of an
+  # `InputRequiredResult`.
+  defp answerable(%InputRequiredResult{} = result, %Request{profile: :modern} = request),
+    do:
+      InputRequiredResult.validate_client_capabilities(
+        result,
+        Request.client_capabilities(request)
+      )
+
+  defp answerable(_result, _request), do: :ok
 
   # A call picks a version with `_meta.fastestmcp.version`.
   defp call_opts(kind, request, opts) do
@@ -165,27 +198,6 @@ defmodule FastestMCP.Transport.Engine.Components do
     with :error <- Request.explicit_session_id(request),
          do: Engine.error(:bad_request, "task requests require an explicit session_id")
   end
-
-  defp call_result(%InputRequiredResult{} = result, %Request{profile: :modern} = request, _fun) do
-    with :ok <-
-           InputRequiredResult.validate_client_capabilities(
-             result,
-             Request.client_capabilities(request)
-           ),
-         do: {:ok, InputRequiredResult.to_map(result)}
-  end
-
-  defp call_result(%InputRequiredResult{}, request, _fun) do
-    {:error,
-     Error.internal(
-       "input_required is not valid for #{request.method} under #{request.protocol_version}"
-     )}
-  end
-
-  defp call_result(%BackgroundTask{} = task, request, _fun),
-    do: {:ok, TaskWire.create_task_result(task, protocol_version: request.protocol_version)}
-
-  defp call_result(result, _request, fun), do: Engine.wire(fn -> fun.(result) end)
 
   # MCP 2026 tools may bind arguments to `Mcp-Param-*` headers, which must match.
   defp put_header_validator(

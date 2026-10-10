@@ -342,6 +342,47 @@ If a middleware raises `FastestMCP.Error`, the request fails with that error.
 Any other exception, or a return value of another shape, fails it with
 `:internal_error`.
 
+### Logging responses
+
+`FastestMCP.Operation.wire_result/1` returns the result of a tool call, a
+resource read, or a prompt as the client receives it: the `result` of the
+JSON-RPC response, a map with string keys, for the protocol version of the
+request. The transports build their responses with the same code, so a
+middleware can log what each client received:
+
+```elixir
+require Logger
+
+log_responses = fn operation, next ->
+  with {:ok, done} <- next.(operation) do
+    if wire = FastestMCP.Operation.wire_result(done) do
+      Logger.info("MCP #{done.method} #{done.target} returned #{JSON.encode!(wire)}")
+    end
+
+    {:ok, done}
+  end
+end
+
+FastestMCP.server("middleware-log-responses")
+|> FastestMCP.add_middleware(log_responses)
+|> FastestMCP.add_tool("count_notes", fn _args, _ctx -> %{count: 2} end)
+|> FastestMCP.start_server!()
+
+FastestMCP.call_tool!("middleware-log-responses", "count_notes")
+# => %{count: 2}
+```
+
+An in-process call has no protocol version of its own, so its line shows what
+a client of the current version receives:
+
+```text
+[info] MCP tools/call count_notes returned {"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"middleware-log-responses","version":"1.0.1"}},"content":[{"text":"{\"count\":2}","type":"text"}],"resultType":"complete","structuredContent":{"count":2}}
+```
+
+For other requests, such as lists, `wire_result/1` returns `nil`. Add this
+middleware first, so that it logs the result after every other middleware has
+changed it.
+
 ### Middleware modules
 
 A middleware can also be a struct whose module implements the
@@ -486,6 +527,10 @@ The result is:
 - for a prompt, a `FastestMCP.Prompts.Result`;
 - for a list, a list of maps that describe the components, with keys such as
   `:name` or `:uri`, `:version`, and `:tags`.
+
+`FastestMCP.Operation.wire_result/1` turns the result of a call, a read, or a
+prompt into the map the client receives; see
+[Logging responses](#logging-responses).
 
 Except over HTTP, `ping` skips authentication, and so do `initialize` and
 `server/discover` when they carry no credentials, so their

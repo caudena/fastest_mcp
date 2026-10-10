@@ -83,6 +83,10 @@ these options:
 > sent it, without redaction. Arguments can hold personal data or secrets, so
 > enable it only where your log may hold them, and limit it with `:methods`.
 
+These lines leave out results. To log what a client receives, write a
+middleware around `FastestMCP.Operation.wire_result/1`; see
+[Logging responses](middleware.md#logging-responses).
+
 ### One line per request
 
 `FastestMCP.Middleware.detailed_timing/1` logs one line when a request ends,
@@ -141,9 +145,9 @@ A tool whose handler raises then logs:
 [error] Error in tools/call: RuntimeError: could not reach the export service
 ** (RuntimeError) could not reach the export service
     (my_app 0.1.0) lib/my_app/mcp_server.ex:11: anonymous fn/2 in MyApp.MCPServer.server/1
-    (fastest_mcp 1.0.0) lib/fastest_mcp/telemetry.ex:34: FastestMCP.Telemetry.with_context/2
-    (fastest_mcp 1.0.0) lib/fastest_mcp/context.ex:262: FastestMCP.Context.with_request/2
-    (fastest_mcp 1.0.0) lib/fastest_mcp/server_runtime/calls.ex:37: FastestMCP.ServerRuntime.Calls.run_task/2
+    (fastest_mcp 1.0.1) lib/fastest_mcp/telemetry.ex:34: FastestMCP.Telemetry.with_context/2
+    (fastest_mcp 1.0.1) lib/fastest_mcp/context.ex:262: FastestMCP.Context.with_request/2
+    (fastest_mcp 1.0.1) lib/fastest_mcp/server_runtime/calls.ex:37: FastestMCP.ServerRuntime.Calls.run_task/2
     (elixir 1.20.4) lib/task/supervised.ex:105: Task.Supervised.invoke_mfa/2
     (elixir 1.20.4) lib/task/supervised.ex:40: Task.Supervised.reply/4
 ```
@@ -151,10 +155,14 @@ A tool whose handler raises then logs:
 The middleware's other options are in [Middleware](middleware.md).
 
 An authenticator that raises, throws, or exits fails the request before any
-middleware runs, so `error_handling/1` doesn't log it. The
-`[:fastest_mcp, :auth, :exception]` [event](#the-events) carries the exception
-as `reason`, with its `stacktrace`, and the [span](#what-is-traced) records it.
-Over HTTP, the client gets `500`.
+middleware runs, so `error_handling/1` doesn't log it. FastestMCP logs it
+instead, with one `:error` line that names the authenticator, the exception's
+module, and the stack trace, but not the exception's message or the arguments
+in the stack trace, which can hold credentials; see
+[Authenticating with a function](auth.md#authenticating-with-a-function). The
+`[:fastest_mcp, :auth, :exception]` [event](#the-events) carries the whole
+exception as `reason`, with its `stacktrace`, and the [span](#what-is-traced)
+records it. Over HTTP, the client gets `500`.
 
 ## Telemetry events
 
@@ -523,6 +531,11 @@ Without any middleware, FastestMCP logs:
 - a warning for each HTTP request rejected by the
   [host check](transports.md#host-and-listener-safety), with the host and
   origins it received and the hosts it allows;
+- a warning for each HTTP request whose URL isn't the configured protected
+  resource, with both URLs; see [OAuth](phoenix.md#oauth);
+- an error for each authenticator that raises, throws, exits, or returns
+  something other than `{:ok, identity}` or `{:error, reason}`; see
+  [When a handler crashes](#when-a-handler-crashes);
 - a warning when a `2025-11-25` client reuses a request id in a session; see
   [Request ids](production.md#request-ids);
 - a warning when a component replaces another of the same name, on a server

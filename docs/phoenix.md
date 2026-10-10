@@ -395,12 +395,50 @@ end
   paths under `/mcp`, so the metadata needs its own route.
 - Give the metadata route the server's name in `server_name`, and both routes
   the same `allowed_hosts`. Both read the metadata from the running server.
-- Behind a proxy, add `base_url: {MyAppWeb.Endpoint, :url, []}`, the endpoint's
-  public URL, to both routes, in the same way as the hosts in
-  [Allowed hosts](#allowed-hosts). FastestMCP compares the URL of each request
-  with the configured resource, and when TLS ends at a proxy, Phoenix sees `http`
-  and possibly an internal host or port: every request then gets `403`, and the
-  log names both URLs.
+
+Some clients look for the metadata at the bare path,
+`/.well-known/oauth-protected-resource`, too. To answer them, forward the bare
+path with `bare_path: true`, in place of the metadata route above. A `forward`
+also receives the paths below its own, so this one route serves both paths,
+on Phoenix 1.7 too, which forwards to a plug only once:
+
+```elixir
+# In lib/my_app_web/router.ex
+scope "/" do
+  forward "/.well-known/oauth-protected-resource", FastestMCP.Transport.WellKnownHTTP,
+    server_name: MyApp.MCPServer,
+    allowed_hosts: :localhost,
+    bare_path: true
+end
+```
+
+FastestMCP compares the URL of each request with the configured resource, and
+answers another URL with `403`. Behind a proxy that ends TLS, Phoenix sees
+`http`, and possibly an internal host or port, so every request gets `403`,
+and FastestMCP logs a warning that names both URLs:
+
+```text
+[warning] FastestMCP rejected an HTTP request whose URL is not the protected resource: request_url="http://notes.example.com/mcp"; resource="https://notes.example.com/mcp"; behind a proxy that ends TLS, set base_url: to the public URL
+```
+
+Give both routes `base_url:`, the URL that clients use: the scheme, host, and
+port of the resource. Like the hosts in [Allowed hosts](#allowed-hosts), it
+can be a function that FastestMCP calls on each request. The endpoint's own
+URL, `{MyAppWeb.Endpoint, :url, []}`, is that URL when the endpoint's `url:`
+names the public host, as the `config/runtime.exs` of `mix phx.new` does with
+`PHX_HOST`. Otherwise, for example when its `url:` names `localhost`, set a
+fixed URL in your config, or derive it from the resource you configured:
+
+```elixir
+# In lib/my_app/mcp_server.ex
+# The scheme, host, and port of the configured resource.
+def base_url do
+  resource = Application.fetch_env!(:my_app, __MODULE__)[:protected_resource][:resource]
+  URI.to_string(%{URI.parse(resource) | path: nil})
+end
+```
+
+Then pass `base_url: {MyApp.MCPServer, :base_url, []}` to both routes.
 
 ## The route in production
 
@@ -621,7 +659,11 @@ end
 ```
 
 Phoenix 1.8 forwards to the same plug any number of times, so there both
-routes can name `FastestMCP.Transport.WellKnownHTTP`.
+routes can name `FastestMCP.Transport.WellKnownHTTP`. Only one server can
+answer the bare path: when the first route is the `bare_path: true` route of
+[OAuth](#oauth), forwarded at `/.well-known/oauth-protected-resource`, list
+the second server's route before it, since that forward also receives the
+second server's path.
 
 To offer the components of several servers at one URL instead, mount them into
 one server; see [Providers and Mounting](providers-and-mounting.md).
@@ -705,8 +747,8 @@ module. `FastestMCP.Transport.HTTPApp` takes the same options and needs
 of the `forward`. The options that matter most in a Phoenix app are
 `allowed_hosts`, `auth_assigns` (a list of assign names, `:all`, or `false`,
 the default), `base_url`, and `cors`. `FastestMCP.Transport.WellKnownHTTP`
-takes `server_name`, `allowed_hosts`, `base_url`, and `cors`, with the same
-meanings.
+takes `server_name`, `allowed_hosts`, `base_url`, `cors`, and `bare_path`,
+with the same meanings.
 
 Phoenix evaluates these options when it compiles the router and calls the
 plug's `init/1` with them on each request. Values must be known at compile
@@ -733,13 +775,14 @@ resource.
 ### The metadata route
 
 `FastestMCP.Transport.WellKnownHTTP` answers only `GET` requests for the exact
-metadata path, with `Cache-Control: public, max-age=300`. Other methods get
-`405`. A request whose host or port doesn't match the configured resource gets
-`404`, as do other paths. Clients find the path in the `resource_metadata`
-parameter of the `WWW-Authenticate` header that FastestMCP sends with `401` and
-`403` responses. A resource without a path, such as
-`https://notes.example.com`, has its metadata at
-`/.well-known/oauth-protected-resource`.
+metadata path, and with `bare_path: true` for
+`/.well-known/oauth-protected-resource` too, with
+`Cache-Control: public, max-age=300`. Other methods get `405`. A request whose
+host or port doesn't match the configured resource gets `404`, as do other
+paths. Clients find the path in the `resource_metadata` parameter of the
+`WWW-Authenticate` header that FastestMCP sends with `401` and `403` responses.
+A resource without a path, such as `https://notes.example.com`, has its
+metadata at `/.well-known/oauth-protected-resource`.
 
 ### Request bodies
 

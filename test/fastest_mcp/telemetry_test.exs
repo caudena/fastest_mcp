@@ -149,6 +149,7 @@ defmodule FastestMCP.TelemetryTest do
                      %{server_name: ^server_name}}
   end
 
+  @tag :capture_log
   test "the auth exception event of an authenticator that raised carries the exception" do
     attach_telemetry([[:fastest_mcp, :auth, :exception]])
     server_name = unique_name("auth-crash-telemetry")

@@ -632,7 +632,8 @@ FastestMCP.call_tool!("notes-headers", "tenant")
 The headers never include `authorization`, and by default leave out `accept`,
 `content-type`, `content-length`, and `host`; pass `include_all: true` to get
 those. A call without HTTP has no headers. `Context.http_request/1` returns the
-method, path, query parameters, and headers together.
+method, path, query parameters, and headers together, as a
+`FastestMCP.HTTPRequest`, or `nil` for a request that didn't come over HTTP.
 
 `Context.access_token/1` returns the bearer token of an HTTP request, for
 example to call another API on the user's behalf. A background task doesn't

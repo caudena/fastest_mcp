@@ -186,11 +186,21 @@ defmodule FastestMCP.Auth.ProtectedResource do
 
   def matches_resource?(%__MODULE__{}, _candidate), do: false
 
-  @doc "Builds an RFC 9728/RFC 6750 Bearer challenge."
+  @doc """
+  Builds an RFC 9728/RFC 6750 Bearer challenge that names the metadata URL.
+
+  Options: `:scopes` (the required scopes by default), `:error`, a
+  `FastestMCP.Error` or an RFC 6750 error code, `:error_description`, and
+  `:realm`, which comes first.
+  """
   def www_authenticate(%__MODULE__{} = protected_resource, opts \\ []) do
     scopes = Keyword.get(opts, :scopes, protected_resource.required_scopes)
 
-    [~s(resource_metadata="#{URIPolicy.quote_value(metadata_url(protected_resource))}")]
+    []
+    |> maybe_append_parameter("realm", Keyword.get(opts, :realm))
+    |> Kernel.++([
+      ~s(resource_metadata="#{URIPolicy.quote_value(metadata_url(protected_resource))}")
+    ])
     |> maybe_append_scope(scopes)
     |> maybe_append_error(Keyword.get(opts, :error))
     |> maybe_append_parameter("error_description", Keyword.get(opts, :error_description))
@@ -375,6 +385,9 @@ defmodule FastestMCP.Auth.ProtectedResource do
 
   defp maybe_append_error(parameters, %Error{code: :forbidden}),
     do: parameters ++ [~s(error="insufficient_scope")]
+
+  defp maybe_append_error(parameters, %Error{code: :invalid_request}),
+    do: parameters ++ [~s(error="invalid_request")]
 
   defp maybe_append_error(parameters, %Error{}),
     do: parameters ++ [~s(error="invalid_token")]

@@ -1,5 +1,43 @@
 # Changelog
 
+## 1.0.1 - 2026-10-10
+
+### Fixes
+
+- answer an HTTP request with more than one `Authorization` header with `400`
+  and `WWW-Authenticate: Bearer error="invalid_request"` before
+  authentication, on every HTTP entry point and both protocol versions,
+  instead of giving the authenticator the last of them
+- log an authenticator that raises, throws, exits, or returns something other
+  than `{:ok, identity}` or `{:error, reason}`, once and on every transport,
+  with its module or function, the exception's module, and the stack trace,
+  but not the exception's message or the arguments of stack frames, which can
+  hold credentials, instead of failing the request with a `500` that nothing
+  logged
+- document `FastestMCP.HTTPRequest`, which `FastestMCP.Context.http_request/1`
+  returns
+
+### New features
+
+- add the `realm:` HTTP option, a realm that comes first in every
+  `WWW-Authenticate` challenge of the route, with or without protected
+  resource metadata
+- add `bare_path: true` to `FastestMCP.Transport.WellKnownHTTP` and the HTTP
+  options, which serves the protected resource metadata at
+  `/.well-known/oauth-protected-resource` too, so one Phoenix `forward` of
+  that path serves both paths
+- add `FastestMCP.Operation.wire_result/1`, the result of a tool call,
+  resource read, or prompt as the client receives it, built by the code the
+  transports use, for middleware that logs responses
+- give an HTTP authenticator the JSON-RPC message of the request as
+  `"request"` in its input (`nil` for `GET` and `DELETE`)
+
+### Documentation
+
+- say in the Phoenix guide that `base_url:` must be the URL clients use, when
+  the endpoint's own URL is that URL, and how to derive it from the configured
+  protected resource otherwise
+
 ## 1.0.0 - 2026-10-10
 
 This is a breaking Elixir API release. Applications upgrading from 0.3.x should

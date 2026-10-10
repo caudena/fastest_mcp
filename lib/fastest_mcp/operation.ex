@@ -4,8 +4,11 @@ defmodule FastestMCP.Operation do
 
   The pipeline's executor sets `:result` and `:component` (the component that
   handled the operation, when there is one); middleware reads both from the
-  operation its `next` function returns. See `FastestMCP.Middleware`.
+  operation its `next` function returns, and `wire_result/1` gives the result
+  as the client receives it. See `FastestMCP.Middleware`.
   """
+
+  alias FastestMCP.Transport.Engine
 
   defstruct [
     :server_name,
@@ -50,4 +53,22 @@ defmodule FastestMCP.Operation do
           captures: map(),
           arguments: map()
         }
+
+  @doc """
+  Returns the result of a `tools/call`, `resources/read`, or `prompts/get`
+  operation as the client receives it: the `result` of the JSON-RPC response,
+  a map with string keys, ready for `JSON.encode!/1`, for the protocol
+  version of the operation's request, or the current version for an
+  in-process call. Transports build their responses with the same code.
+
+  Returns `nil` for any other operation, such as a list, whose response
+  FastestMCP builds after the middleware has run. A result that isn't valid
+  MCP raises the `FastestMCP.Error` that the request fails with.
+
+  Call it in middleware on the operation that `next` returns; middleware added
+  before yours can still change the result. See
+  [Logging responses](middleware.md#logging-responses).
+  """
+  @spec wire_result(t()) :: map() | nil
+  def wire_result(%__MODULE__{} = operation), do: Engine.wire_result(operation)
 end

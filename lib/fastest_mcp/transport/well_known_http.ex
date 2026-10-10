@@ -8,16 +8,20 @@ defmodule FastestMCP.Transport.WellKnownHTTP do
   that forward cannot receive `/.well-known/...` requests. A direct Plug mount
   may still provide the value explicitly. Unconfigured routes return `404`.
 
-  It takes `:server_name`, `:allowed_hosts`, `:base_url`, and `:cors`, as
-  `FastestMCP.Transport.HTTPApp` does, `:protected_resource`, and for its
-  listener child spec `:port`, `:scheme`, and `:bandit_options`. Any other
-  option raises `ArgumentError`.
+  It takes `:server_name`, `:allowed_hosts`, `:base_url`, `:cors`, and
+  `:bare_path`, as `FastestMCP.Transport.HTTPApp` does, `:protected_resource`,
+  and for its listener child spec `:port`, `:scheme`, and `:bandit_options`.
+  Any other option raises `ArgumentError`. With `bare_path: true`, it also
+  serves the document at the bare path, `/.well-known/oauth-protected-resource`,
+  where some clients look for it; a Phoenix `forward` of that path then serves
+  both.
   """
 
   import Plug.Conn
 
   alias FastestMCP.Auth.ProtectedResource
   alias FastestMCP.Error
+  alias FastestMCP.Options
   alias FastestMCP.Transport.HTTPCommon
 
   @option_keys [
@@ -26,10 +30,14 @@ defmodule FastestMCP.Transport.WellKnownHTTP do
     :base_url,
     :cors,
     :protected_resource,
+    :bare_path,
     :port,
     :scheme,
     :bandit_options
   ]
+
+  # Where a client finds the metadata of a resource at the root of its origin.
+  @bare_path "/.well-known/oauth-protected-resource"
 
   @doc """
   Returns a child spec that starts a Bandit listener serving this plug for
@@ -87,15 +95,23 @@ defmodule FastestMCP.Transport.WellKnownHTTP do
 
   @doc false
   def validate_options!(opts) when is_list(opts) do
+    opts =
+      opts
+      |> HTTPCommon.normalize_options!()
+      |> HTTPCommon.validate_keys!(@option_keys)
+
+    with {:ok, bare_path} <- Keyword.fetch(opts, :bare_path),
+         do: Options.check!(bare_path, :boolean, :bare_path)
+
     opts
-    |> HTTPCommon.normalize_options!()
-    |> HTTPCommon.validate_keys!(@option_keys)
   end
 
   @doc false
+  # The MCP endpoint's own metadata route (`FastestMCP.Transport.HTTPApp`)
+  # dispatches here too, with its options.
   def dispatch(conn, opts, %ProtectedResource{} = protected_resource) do
     cond do
-      not ProtectedResource.matches_path?(protected_resource, conn.request_path) ->
+      not metadata_path?(conn.request_path, opts, protected_resource) ->
         :pass
 
       not matches_resource_origin?(conn, opts, protected_resource) ->
@@ -118,6 +134,12 @@ defmodule FastestMCP.Transport.WellKnownHTTP do
   end
 
   def dispatch(_conn, _opts, nil), do: :pass
+
+  # The path of the metadata, or with `bare_path: true` the bare path too.
+  defp metadata_path?(path, opts, protected_resource) do
+    ProtectedResource.matches_path?(protected_resource, path) or
+      (Keyword.get(opts, :bare_path, false) and path == @bare_path)
+  end
 
   defp render_not_found(conn, opts) do
     render_error(conn, opts, %Error{code: :not_found, message: "unknown route"})

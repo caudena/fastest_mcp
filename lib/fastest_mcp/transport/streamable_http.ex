@@ -45,9 +45,14 @@ defmodule FastestMCP.Transport.StreamableHTTP do
     :enable_get_streaming,
     :auth_assigns,
     :base_url,
+    :realm,
+    :bare_path,
     :middleware,
     :routes
   ]
+
+  # A realm is sent as an HTTP quoted-string: visible ASCII and spaces.
+  @realm ~r/\A[\x20-\x7E]+\z/
 
   # The errors that MCP 2026-07-28 answers with 400 over HTTP.
   @modern_400_errors [
@@ -111,6 +116,16 @@ defmodule FastestMCP.Transport.StreamableHTTP do
 
     with {:ok, bytes} <- Keyword.fetch(opts, :max_body_bytes),
          do: Options.check!(bytes, :pos_integer, :max_body_bytes)
+
+    with {:ok, bare_path} <- Keyword.fetch(opts, :bare_path),
+         do: Options.check!(bare_path, :boolean, :bare_path)
+
+    with {:ok, realm} <- Keyword.fetch(opts, :realm),
+         false <- is_binary(realm) and realm =~ @realm do
+      raise ArgumentError,
+            "realm must be a non-empty string of visible ASCII characters and spaces, " <>
+              "got: #{inspect(realm)}"
+    end
 
     opts
     |> HTTPCommon.normalize_options!()
