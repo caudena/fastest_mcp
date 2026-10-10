@@ -263,10 +263,9 @@ defmodule FastestMCP.Transport.StreamableHTTP do
       session_id in [nil, ""] ->
         {:error, %Error{code: :bad_request, message: "MCP-Session-Id is required"}}
 
-      is_nil(protocol_version) ->
-        {:error, %Error{code: :bad_request, message: "MCP-Protocol-Version is required"}}
-
-      not is_legacy(protocol_version) ->
+      # Without the header, the request uses the version its session negotiated
+      # at initialize, as MCP's backwards compatibility asks.
+      not is_nil(protocol_version) and not is_legacy(protocol_version) ->
         {:error,
          %Error{
            code: :bad_request,

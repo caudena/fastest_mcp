@@ -307,6 +307,45 @@ defmodule FastestMCP.StreamableHTTPTest do
     assert preflight.status == 204
   end
 
+  test "a session request without MCP-Protocol-Version uses the version of its session" do
+    # MCP's backwards compatibility: a server that gets no version header uses the
+    # version negotiated at initialize.
+    server_name = unique_name("http-no-version-header")
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("echo", fn %{"text" => text}, _ctx -> text end,
+      input_schema: %{
+        "type" => "object",
+        "properties" => %{"text" => %{"type" => "string"}},
+        "required" => ["text"]
+      }
+    )
+    |> start_server!()
+
+    {session_id, _initialize_response} = ProtocolTest.http_initialize(server_name)
+    assert ProtocolTest.http_mark_initialized(server_name, session_id).status == 202
+
+    call = fn id, version ->
+      body =
+        ProtocolTest.jsonrpc_request(id, "tools/call", %{
+          "name" => "echo",
+          "arguments" => %{"text" => "hi"}
+        })
+
+      ProtocolTest.http_post_raw(server_name, JSON.encode!(body),
+        session_id: session_id,
+        protocol_version: version
+      )
+    end
+
+    conn = call.(2, nil)
+    assert conn.status == 200
+    assert %{"result" => %{"content" => [%{"text" => "hi"}]}} = JSON.decode!(conn.resp_body)
+
+    # A version the server doesn't support is still refused.
+    assert call.(3, "2099-01-01").status == 400
+  end
+
   test "a request for a server that isn't running gets 503 with Retry-After" do
     server_name = unique_name("http-not-running")
 

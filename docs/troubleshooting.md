@@ -239,9 +239,12 @@ Other causes of `400`:
 
 - **`JSON-RPC batch requests are not supported`**: the body is a JSON array.
   Each `POST` carries one JSON-RPC message.
-- **`MCP-Session-Id is required`** or **`MCP-Protocol-Version is required`**:
-  a `2025-11-25` request after `initialize` left out a session header; see
+- **`MCP-Session-Id is required`**: a `2025-11-25` request after
+  `initialize` left out the session header; see
   [HTTP sessions on 2025-11-25](transports.md#http-sessions-on-2025-11-25).
+- **`unsupported MCP-Protocol-Version`**: a `2025-11-25` request names a
+  version the server doesn't support. Without the header, a session request
+  uses the version of its session.
 
 ## The client gets 413 Content Too Large
 

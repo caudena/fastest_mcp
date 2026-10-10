@@ -496,7 +496,9 @@ performs for you:
    stream for server messages, and `DELETE` ends the session with `204`.
 
 A request without a session id gets `400`, and a request for an unknown or
-ended session gets `404`. Until `notifications/initialized` arrives, the
+ended session gets `404`. A session request without `MCP-Protocol-Version`
+uses the version its session negotiated, as MCP's backwards compatibility asks,
+and one that names a version the server doesn't support gets `400`. Until `notifications/initialized` arrives, the
 server accepts only that notification and `ping`. Every `POST` except
 `initialize` is answered with an event stream unless `json_response: true`.
 Server messages that belong to a request, such as its progress and the

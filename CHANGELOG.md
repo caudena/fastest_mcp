@@ -283,6 +283,10 @@ change and the code to update.
 
 ### Fixes
 
+- accept a `2025-11-25` session request without `MCP-Protocol-Version`, with
+  the version its session negotiated, as MCP's backwards compatibility asks,
+  instead of `400` `MCP-Protocol-Version is required`; a version the server
+  doesn't support still gets `400`
 - keep the server running when a process that a lifespan links to exits
   normally
 - keep the components and server-wide visibility rules changed at runtime

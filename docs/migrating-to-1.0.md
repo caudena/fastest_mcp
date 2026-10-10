@@ -737,6 +737,9 @@ list (was `:resource_required`).
 
 Over HTTP:
 
+- A `2025-11-25` session request without `MCP-Protocol-Version` uses the
+  version its session negotiated (it got `400`
+  `MCP-Protocol-Version is required`).
 - A `401` for a request without an `Authorization` header carries a challenge
   without an error: `Bearer`, or `Bearer resource_metadata="...", scope="..."`
   with protected resource metadata (both had `error="invalid_token"` and the
