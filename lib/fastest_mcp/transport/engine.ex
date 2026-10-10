@@ -15,6 +15,8 @@ defmodule FastestMCP.Transport.Engine do
   alias FastestMCP.Component
   alias FastestMCP.Context
   alias FastestMCP.Error
+  alias FastestMCP.JSONValue
+  alias FastestMCP.Operation
   alias FastestMCP.OperationPipeline
   alias FastestMCP.OperationPipeline.Capabilities
   alias FastestMCP.Protocol
@@ -54,7 +56,34 @@ defmodule FastestMCP.Transport.Engine do
     with {:ok, runtime} <- runtime(server),
          {:ok, request} <- prepare(runtime, request),
          {:ok, result} <- handle(runtime, request, request_opts(runtime, request, opts)) do
-      {:ok, finalize(runtime, request, result)}
+      {:ok, finalize(runtime.server, request, result)}
+    end
+  end
+
+  # The result of a call, read, or render `operation` as `dispatch/3` answers
+  # its request, with string keys, for the protocol version the request
+  # negotiated, or the current one in process; nil for any other operation.
+  # Raises `FastestMCP.Error` for a result that is not valid MCP.
+  def wire_result(%Operation{method: method, context: context} = operation) do
+    if kind = Component.call_kind(method) do
+      version = context.negotiated_protocol_version || Protocol.current_version()
+
+      request = %Request{
+        method: method,
+        protocol: :jsonrpc,
+        protocol_version: version,
+        profile: Protocol.profile(version)
+      }
+
+      opts = [
+        client_capabilities: context.client_capabilities,
+        server_extensions: server_extensions(context.server, request)
+      ]
+
+      operation
+      |> Components.wire_form(kind, request, opts)
+      |> then(&finalize(context.server, request, &1))
+      |> JSONValue.stringify_keys()
     end
   end
 
@@ -447,7 +476,7 @@ defmodule FastestMCP.Transport.Engine do
       task_ttl_ms: request.task_ttl_ms,
       input_responses: Map.get(request.payload, "inputResponses", %{}),
       request_state: Map.get(request.payload, "requestState"),
-      server_extensions: server_extensions(runtime, request)
+      server_extensions: server_extensions(runtime.server, request)
     )
     |> put_transport_auth(request)
     |> put_negotiated_context(request)
@@ -499,11 +528,11 @@ defmodule FastestMCP.Transport.Engine do
 
   defp put_negotiated_context(opts, _request), do: opts
 
-  defp server_extensions(runtime, %Request{profile: profile})
+  defp server_extensions(server, %Request{profile: profile})
        when profile in [:modern, :legacy],
-       do: Server.effective_extensions(runtime.server, profile)
+       do: Server.effective_extensions(server, profile)
 
-  defp server_extensions(runtime, _request), do: runtime.server.extensions
+  defp server_extensions(server, _request), do: server.extensions
 
   defp handle(runtime, %Request{method: method} = request, opts) when method in @task_methods,
     do: Tasks.handle(runtime, request, opts)
@@ -617,11 +646,11 @@ defmodule FastestMCP.Transport.Engine do
 
   # The server announces changes of its lists (`listChanged`), so a list stays
   # fresh for a minute; a discovery or read result may change at any time.
-  defp finalize(runtime, %Request{protocol: :jsonrpc, profile: :modern} = request, result) do
+  defp finalize(server, %Request{protocol: :jsonrpc, profile: :modern} = request, result) do
     result =
       result
       |> Map.put_new("resultType", "complete")
-      |> put_server_info(runtime)
+      |> put_server_info(server)
 
     if Protocol.cache_hinted_method?(request.method) and result["resultType"] == "complete" do
       ttl_ms = if Component.list_kind(request.method), do: @list_ttl_ms, else: 0
@@ -634,14 +663,14 @@ defmodule FastestMCP.Transport.Engine do
     end
   end
 
-  defp finalize(_runtime, _request, result), do: result
+  defp finalize(_server, _request, result), do: result
 
-  defp put_server_info(result, runtime) do
+  defp put_server_info(result, server) do
     meta =
       result
       |> Map.get("_meta", Map.get(result, :_meta, %{}))
       |> Map.new()
-      |> Map.put("io.modelcontextprotocol/serverInfo", Capabilities.server_info(runtime.server))
+      |> Map.put("io.modelcontextprotocol/serverInfo", Capabilities.server_info(server))
 
     result
     |> Map.delete(:_meta)

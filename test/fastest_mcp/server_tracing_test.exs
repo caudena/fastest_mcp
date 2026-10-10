@@ -170,6 +170,7 @@ defmodule FastestMCP.ServerTracingTest do
     refute response.resp_body =~ "server_tracing_test"
   end
 
+  @tag :capture_log
   test "an authenticator that raised is recorded once on the current span, over HTTP too" do
     server_name = unique_name("trace-auth-crash")
 

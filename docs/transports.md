@@ -122,7 +122,8 @@ end)
 
 Routes added this way are served by the same listener, behind the same
 [host check](#host-and-listener-safety) as the endpoint. When the server sets
-OAuth protected resource metadata, the listener serves that document too; see
+OAuth protected resource metadata, the listener serves that document too, and
+with `bare_path: true` at `/.well-known/oauth-protected-resource` as well; see
 [OAuth protected resource metadata](auth.md#oauth-protected-resource-metadata).
 
 ### Long requests
@@ -460,6 +461,8 @@ take the same options. A Phoenix router evaluates them when it compiles; see
 | `:enable_get_streaming` | `true` | Allow `GET` streams on `2025-11-25`; `false` answers `405`. |
 | `:auth_assigns` | `false` | Conn assigns passed to authentication; see [Authenticate requests](phoenix.md#authenticate-requests). |
 | `:base_url` | from the request | The public URL used in OAuth metadata, or `{module, function, args}` that returns it on each request; see [OAuth protected resource metadata](auth.md#oauth-protected-resource-metadata). |
+| `:realm` | none | A realm that comes first in every `WWW-Authenticate` challenge of the route: `realm: "notes"` gives `Bearer realm="notes"`. Visible ASCII characters and spaces. |
+| `:bare_path` | `false` | With OAuth protected resource metadata, also serve the metadata at `/.well-known/oauth-protected-resource`, where some clients look for it. In Phoenix, set it on the metadata route; see [OAuth](phoenix.md#oauth). |
 | `:middleware` | `[]` | Functions `fn conn, next -> conn end` run before the endpoint. |
 | `:routes` | `[]` | Extra `{method, path, handler}` routes, like `FastestMCP.add_http_route/4`. |
 
@@ -521,7 +524,7 @@ instead, and `initialize` cannot be cancelled.
 | --- | --- |
 | `202` | A notification or a client response was accepted. |
 | `204` | A `DELETE` ended a session, or a [CORS](#browser-clients) preflight request was allowed. |
-| `400` | A malformed request, a JSON-RPC batch, missing session headers, a header mismatch, or a malformed `Last-Event-ID`; on `2026-07-28`, also a request whose `_meta` or params don't fit the method, an unsupported protocol version, or a missing client capability. |
+| `400` | A malformed request, a JSON-RPC batch, missing session headers, a header mismatch, more than one `Authorization` header (with the challenge `Bearer error="invalid_request"`), or a malformed `Last-Event-ID`; on `2026-07-28`, also a request whose `_meta` or params don't fit the method, an unsupported protocol version, or a missing client capability. |
 | `401` | Authentication failed; see [Authentication and Authorization](auth.md). |
 | `403` | The host check rejected the request, or authorization failed. |
 | `404` | Another path (before authentication), an unknown or ended session, or on `2026-07-28` an unknown method. |

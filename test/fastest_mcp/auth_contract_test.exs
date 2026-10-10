@@ -1,6 +1,7 @@
 defmodule FastestMCP.AuthContractTest do
   use FastestMCP.Case, async: true
 
+  import ExUnit.CaptureLog
   import Plug.Conn
   import Plug.Test
 
@@ -40,6 +41,24 @@ defmodule FastestMCP.AuthContractTest do
 
     def authenticate(_input, _context, _opts), do: {:error, :unauthorized}
   end
+
+  # Fails as `opts.how` says, with the input's token in the exception's
+  # message, its stack trace, or the value it throws, exits with, or returns.
+  defmodule FailingProvider do
+    @behaviour FastestMCP.Auth
+
+    def authenticate(input, _context, %{how: :raise}), do: Map.fetch!(input, :user)
+
+    def authenticate(input, _context, %{how: :bif}),
+      do: :erlang.binary_to_existing_atom(input["authorization"], :utf8)
+
+    def authenticate(input, _context, %{how: :throw}), do: throw({:token, input["authorization"]})
+    def authenticate(input, _context, %{how: :exit}), do: exit({:token, input["authorization"]})
+    def authenticate(input, _context, %{how: :return}), do: {:token, input["authorization"]}
+  end
+
+  # A function authenticator that raises, for the name the log gives it.
+  def failing_authenticate(input, _context), do: Map.fetch!(input, :user)
 
   test "server auth is declarative and invalid providers are rejected early" do
     server =
@@ -227,6 +246,7 @@ defmodule FastestMCP.AuthContractTest do
              JSON.decode!(conn.resp_body)
   end
 
+  @tag :capture_log
   test "an authenticator that crashes is masked like a handler crash, and its input stays hidden" do
     token = "Bearer token-in-the-auth-input"
     crash = fn input, _ctx -> Map.fetch!(input, :user) end
@@ -276,6 +296,7 @@ defmodule FastestMCP.AuthContractTest do
     end
   end
 
+  @tag :capture_log
   test "over HTTP, an authenticator that crashes gets 500 on both protocol versions" do
     token = "Bearer token-in-the-auth-input"
 
@@ -791,6 +812,7 @@ defmodule FastestMCP.AuthContractTest do
     end
   end
 
+  @tag :capture_log
   test "client-visible authentication errors name no authenticator module" do
     outcomes = [
       {fn _input, _ctx -> {:error, :unauthorized} end, 401, "unauthorized"},
@@ -826,6 +848,7 @@ defmodule FastestMCP.AuthContractTest do
     end
   end
 
+  @tag :capture_log
   test "an authenticator that throws or exits fails as one that raises" do
     attach_telemetry([[:fastest_mcp, :auth, :exception]])
 
@@ -970,6 +993,326 @@ defmodule FastestMCP.AuthContractTest do
 
     assert_receive {:telemetry, [:fastest_mcp, :auth, :exception], _measurements,
                     %{server_name: ^server_name, method: "tools/list"}}
+  end
+
+  test "a request with more than one Authorization header gets 400 before authentication" do
+    test_pid = self()
+    server_name = unique_name("auth-repeated-authorization")
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_auth(fn input, _ctx ->
+      send(test_pid, {:authenticated, input["authorization"]})
+
+      if input["authorization"] == "Bearer valid-token",
+        do: {:ok, %{principal: %{"sub" => "user-1"}}},
+        else: {:error, :unauthorized}
+    end)
+    |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+    |> start_server!()
+
+    valid = {"authorization", "Bearer valid-token"}
+    junk = {"authorization", "Bearer junk"}
+
+    {session_id, _initialize, _initialized} =
+      ProtocolTest.initialize_http(server_name, headers: [valid])
+
+    assert_received {:authenticated, "Bearer valid-token"}
+    assert_received {:authenticated, "Bearer valid-token"}
+
+    session = fn conn ->
+      conn
+      |> put_req_header("mcp-session-id", session_id)
+      |> put_req_header("mcp-protocol-version", "2025-11-25")
+    end
+
+    post = fn payload ->
+      conn(:post, "/mcp", JSON.encode!(payload))
+      |> put_req_header("content-type", "application/json")
+      |> put_req_header("accept", "application/json, text/event-stream")
+    end
+
+    modern =
+      ProtocolTest.modern_request(1, "tools/call", %{"name" => "echo"})
+      |> post.()
+      |> put_req_header("mcp-protocol-version", "2026-07-28")
+      |> put_req_header("mcp-method", "tools/call")
+      |> put_req_header("mcp-name", "echo")
+
+    initialize =
+      post.(ProtocolTest.jsonrpc_request(2, "initialize", ProtocolTest.initialize_params()))
+
+    call =
+      ProtocolTest.jsonrpc_request(3, "tools/call", %{"name" => "echo"}) |> post.() |> session.()
+
+    stream = conn(:get, "/mcp") |> put_req_header("accept", "text/event-stream") |> session.()
+    delete = conn(:delete, "/mcp") |> session.()
+
+    # A junk token before a valid one, or after it: neither reaches the
+    # authenticator, on either protocol version.
+    for {conn, headers} <- [
+          {modern, [junk, valid]},
+          {initialize, [junk, valid]},
+          {call, [valid, junk]},
+          {stream, [valid, junk]},
+          {delete, [valid, junk]}
+        ] do
+      response =
+        conn
+        |> prepend_req_headers(headers)
+        |> Map.put(:host, "localhost")
+        |> StreamableHTTP.call(server_name: server_name, json_response: true)
+
+      assert response.status == 400
+
+      assert get_resp_header(response, "www-authenticate") == [
+               ~s(Bearer error="invalid_request", error_description="request has more than one Authorization header")
+             ]
+    end
+
+    refute_received {:authenticated, _authorization}
+
+    # Through a listener, which keeps repeated headers apart.
+    %{port: port} = start_http!(server_name)
+    body = JSON.encode!(ProtocolTest.modern_request(4, "tools/list"))
+
+    response =
+      raw_http_request(port, [
+        "POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n",
+        "Accept: application/json, text/event-stream\r\n",
+        "MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/list\r\n",
+        "Authorization: Bearer junk\r\nAuthorization: Bearer valid-token\r\n",
+        "Content-Length: #{byte_size(body)}\r\nConnection: close\r\n\r\n",
+        body
+      ])
+
+    assert response.status == 400
+    assert response.headers["www-authenticate"] =~ ~s(error="invalid_request")
+    refute_received {:authenticated, _authorization}
+  end
+
+  test "realm: comes first in every challenge of the route" do
+    server_name = unique_name("auth-realm")
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_auth(FastestMCP.Auth.StaticToken,
+      tokens: %{"reader-token" => %{client_id: "reader", scopes: ["notes:read"]}}
+    )
+    |> FastestMCP.add_tool("delete_notes", fn _args, _ctx -> "deleted" end,
+      authorization: FastestMCP.Authorization.require_scopes("notes:write")
+    )
+    |> start_server!()
+
+    # The realm is quoted and escaped as an HTTP quoted-string.
+    opts = [realm: ~s(notes "private" mcp)]
+    realm = ~s(realm="notes \\"private\\" mcp")
+    delete = %{"name" => "delete_notes"}
+
+    missing = ProtocolTest.modern_http_request(server_name, 1, "tools/list", %{}, opts)
+
+    invalid =
+      ProtocolTest.modern_http_request(
+        server_name,
+        2,
+        "tools/list",
+        %{},
+        [headers: [{"authorization", "Bearer unknown-token"}]] ++ opts
+      )
+
+    forbidden =
+      ProtocolTest.modern_http_request(
+        server_name,
+        3,
+        "tools/call",
+        delete,
+        [headers: [{"authorization", "Bearer reader-token"}, {"mcp-name", "delete_notes"}]] ++
+          opts
+      )
+
+    repeated =
+      ProtocolTest.modern_request(4, "tools/list")
+      |> then(&conn(:post, "/mcp", JSON.encode!(&1)))
+      |> put_req_header("content-type", "application/json")
+      |> put_req_header("accept", "application/json, text/event-stream")
+      |> put_req_header("mcp-protocol-version", "2026-07-28")
+      |> put_req_header("mcp-method", "tools/list")
+      |> prepend_req_headers([{"authorization", "Bearer a"}, {"authorization", "Bearer b"}])
+      |> Map.put(:host, "localhost")
+      |> StreamableHTTP.call([server_name: server_name] ++ opts)
+
+    assert Enum.map(
+             [missing, invalid, forbidden, repeated],
+             &get_resp_header(&1, "www-authenticate")
+           ) ==
+             [
+               ["Bearer #{realm}"],
+               [
+                 ~s(Bearer #{realm}, error="invalid_token", error_description="invalid credentials")
+               ],
+               [
+                 ~s(Bearer #{realm}, error="insufficient_scope", scope="notes:write", error_description="access token does not grant the required scopes")
+               ],
+               [
+                 ~s(Bearer #{realm}, error="invalid_request", error_description="request has more than one Authorization header")
+               ]
+             ]
+
+    # A realm is a non-empty string of visible ASCII characters and spaces.
+    for realm <- ["", "line\nbreak", "tab\there", :notes, "café"] do
+      assert_raise ArgumentError, ~r/realm must be/, fn ->
+        FastestMCP.http_app(server_name, realm: realm)
+      end
+    end
+  end
+
+  test "over HTTP, the authenticator's input carries the JSON-RPC message of the request" do
+    test_pid = self()
+    server_name = unique_name("auth-request-input")
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_auth(fn input, _ctx ->
+      send(test_pid, {:auth_input, input})
+      {:ok, %{principal: %{"sub" => "user-1"}}}
+    end)
+    |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+    |> start_server!()
+
+    call = %{"name" => "echo", "arguments" => %{"text" => "hi"}}
+
+    modern =
+      ProtocolTest.modern_http_request(server_name, 7, "tools/call", call,
+        headers: [{"mcp-name", "echo"}]
+      )
+
+    assert modern.status == 200
+
+    assert_received {:auth_input,
+                     %{
+                       "request" => %{
+                         "jsonrpc" => "2.0",
+                         "id" => 7,
+                         "method" => "tools/call",
+                         "params" => %{"name" => "echo", "arguments" => %{"text" => "hi"}}
+                       }
+                     }}
+
+    {session_id, _initialize, _initialized} = ProtocolTest.initialize_http(server_name)
+    assert_received {:auth_input, %{"request" => %{"id" => 1, "method" => "initialize"}}}
+
+    assert_received {:auth_input, %{"request" => %{"method" => "notifications/initialized"}}}
+
+    # A DELETE carries no JSON-RPC message.
+    deleted =
+      conn(:delete, "/mcp")
+      |> Map.put(:host, "localhost")
+      |> put_req_header("mcp-session-id", session_id)
+      |> put_req_header("mcp-protocol-version", "2025-11-25")
+      |> StreamableHTTP.call(server_name: server_name)
+
+    assert deleted.status == 204
+    assert_received {:auth_input, %{"request" => nil}}
+
+    # In process, the input is the one the call passes.
+    FastestMCP.call_tool!(server_name, "echo", %{}, auth_input: %{"token" => "in-process"})
+    assert_received {:auth_input, %{"token" => "in-process"} = input}
+    refute Map.has_key?(input, "request")
+  end
+
+  @tag :capture_log
+  test "an authenticator that fails with an internal error is logged once, without its message or arguments" do
+    # Unique, so that no other test logs it.
+    secret = unique_name("token-in-the-auth-input")
+    token = "Bearer " <> secret
+    provider = inspect(FailingProvider)
+
+    for {how, outcome} <- [
+          raise: "raised KeyError",
+          bif: "raised ArgumentError",
+          throw: "threw",
+          exit: "exited",
+          return: "returned neither {:ok, result} nor {:error, reason}"
+        ] do
+      server_name = unique_name("auth-failure-log")
+
+      FastestMCP.server(server_name)
+      |> FastestMCP.add_auth(FailingProvider, how: how)
+      |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+      |> start_server!()
+
+      requests = [
+        fn ->
+          FastestMCP.call_tool(server_name, "echo", %{}, auth_input: %{"authorization" => token})
+        end,
+        fn ->
+          ProtocolTest.modern_stdio_request(server_name, 1, "tools/call", %{"name" => "echo"},
+            auth_input: %{"authorization" => token}
+          )
+        end,
+        fn ->
+          ProtocolTest.modern_http_request(server_name, 2, "tools/call", %{"name" => "echo"},
+            headers: [{"authorization", token}, {"mcp-name", "echo"}]
+          )
+        end
+      ]
+
+      for request <- requests do
+        log = capture_log(request)
+
+        # One line names the authenticator and what it did; other tests may
+        # log at the same time.
+        assert [_line] =
+                 Regex.scan(
+                   ~r/FastestMCP authenticator #{provider} #{Regex.escape(outcome)}/,
+                   log
+                 )
+
+        refute log =~ secret
+
+        if how in [:raise, :bif],
+          do: assert(log =~ "#{provider}.authenticate/3")
+
+        if how == :bif, do: assert(log =~ ":erlang.binary_to_existing_atom/2")
+      end
+    end
+
+    # A function authenticator is named by its function.
+    server_name = unique_name("auth-failure-log-function")
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_auth(&__MODULE__.failing_authenticate/2)
+    |> start_server!()
+
+    log = capture_log(fn -> FastestMCP.list_tools(server_name, auth_input: %{"a" => token}) end)
+
+    assert log =~
+             "FastestMCP authenticator FastestMCP.AuthContractTest.failing_authenticate/2 raised KeyError"
+
+    refute log =~ secret
+  end
+
+  # Sends one HTTP/1.1 request to the loopback listener on `port` and returns
+  # the status and headers of the response.
+  defp raw_http_request(port, request) do
+    {:ok, socket} = :gen_tcp.connect(~c"127.0.0.1", port, [:binary, active: false])
+    :ok = :gen_tcp.send(socket, request)
+    response = receive_until_closed(socket, "")
+    [head, _body] = String.split(response, "\r\n\r\n", parts: 2)
+    [status_line | header_lines] = String.split(head, "\r\n")
+    ["HTTP/1.1", status, _reason] = String.split(status_line, " ", parts: 3)
+
+    headers =
+      Map.new(header_lines, fn line ->
+        [name, value] = String.split(line, ":", parts: 2)
+        {String.downcase(name), String.trim(value)}
+      end)
+
+    %{status: String.to_integer(status), headers: headers}
+  end
+
+  defp receive_until_closed(socket, received) do
+    case :gen_tcp.recv(socket, 0, 5_000) do
+      {:ok, data} -> receive_until_closed(socket, received <> data)
+      {:error, :closed} -> received
+    end
   end
 
   # The number of `:authenticated` messages in the mailbox, which it empties.

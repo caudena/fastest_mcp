@@ -125,8 +125,13 @@ Over HTTP, the input is a map with these keys:
 | --- | --- |
 | `"authorization"` | The `Authorization` header, or `nil` |
 | `"headers"` | All request headers, with lowercase names |
+| `"request"` | The JSON-RPC message of a `POST`, as the client sent it, such as `%{"jsonrpc" => "2.0", "id" => 1, "method" => "tools/call", "params" => %{"name" => "add_note"}}`; `nil` for a `GET` or a `DELETE`, and for a body that isn't a JSON-RPC message |
 | `"assigns"` | The assigns listed in the route's `auth_assigns:` option, if any |
 | `"expected_resource"` and `"expected_scopes"` | With [protected resource metadata](#oauth-protected-resource-metadata), the resource and its required scopes |
+
+The authenticator runs before FastestMCP checks the message's arguments or
+its session, so use `"request"` to log or audit what the caller asked for,
+such as the method and the tool.
 
 For an in-process call, and a `FastestMCP.Client` connected in process, the
 input is the `auth_input:` map you pass, as you pass it. Over stdio, it is the
@@ -159,8 +164,19 @@ client gets the message `authenticator MyApp.MCPAuthenticator failed`, or
 `authenticator failed` for a function, and the exception's module, which is
 `ErlangError` for a throw or an exit, but not its message, which can hold the
 request's credentials; with `mask_error_details: true`, it gets
-`authentication failed`. FastestMCP
-doesn't log the exception: the error keeps it in its `cause`, the
+`authentication failed`. FastestMCP logs one error for it, on every transport,
+that names the authenticator, by its module or its function, the exception's
+module, and the stack trace:
+
+```text
+[error] FastestMCP authenticator MyApp.MCPAuthenticator raised KeyError, so the request failed with an internal error
+    (my_app 0.1.0) lib/my_app/mcp_authenticator.ex:12: MyApp.MCPAuthenticator.authenticate/3
+    (fastest_mcp 1.0.1) lib/fastest_mcp/auth.ex:179: FastestMCP.Auth.authenticate/3
+```
+
+The line leaves out the exception's message, and the arguments that stack
+frames of built-in functions carry, since both can hold credentials. The
+error keeps the whole exception in its `cause`, the
 [`[:fastest_mcp, :auth, :exception]` event](observability.md#the-events)
 carries it with its stack trace, and the request's
 [span](observability.md#opentelemetry-tracing) records it.
@@ -426,8 +442,10 @@ config :my_app, MyApp.MCPServer,
   `scopes_supported`, so set it.
 
 The metadata needs a route of its own in your router; see
-[OAuth](phoenix.md#oauth) in the Phoenix guide. A request without a token then
-gets a challenge like this one:
+[OAuth](phoenix.md#oauth) in the Phoenix guide. Some clients look for it at
+the bare path, `/.well-known/oauth-protected-resource`, too: the route's
+`bare_path: true` serves it there as well. A request without a token then gets
+a challenge like this one:
 
 ```text
 WWW-Authenticate: Bearer resource_metadata="http://localhost:4000/.well-known/oauth-protected-resource/mcp", scope="notes:read"
@@ -507,12 +525,17 @@ request's `_meta.fastestmcp.auth` map, which a `FastestMCP.Client` sends with
 `serve_stdio/1`, without replacing any. A request with an `access_token`
 query parameter is rejected
 with `400` before the authenticator runs: tokens belong in the `Authorization`
-header.
+header. A request with more than one `Authorization` header, which names no
+single set of credentials, is rejected before it too, with `400` and the
+challenge `Bearer error="invalid_request"`, as RFC 6750 asks.
 
 The challenge of a `401` names an error only when the request carried an
 `Authorization` header: a request without credentials gets `Bearer`, or with
 protected resource metadata `Bearer resource_metadata="...", scope="..."`, as
-RFC 6750 asks. Every authentication emits the
+RFC 6750 asks. The route's `realm:` option puts a realm first in every
+challenge, as in `Bearer realm="notes"` or
+`Bearer realm="notes", resource_metadata="..."`; see
+[HTTP options](transports.md#http-options). Every authentication emits the
 [authentication telemetry events](observability.md#the-events), over HTTP too.
 
 ### Denied requests

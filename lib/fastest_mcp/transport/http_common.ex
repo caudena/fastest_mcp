@@ -47,7 +47,8 @@ defmodule FastestMCP.Transport.HTTPCommon do
       expected_scopes: expected_scopes(protected_resource),
       server_name: server_name(runtime),
       server_metadata: server_metadata(runtime),
-      credentials?: get_req_header(conn, "authorization") != []
+      credentials?: get_req_header(conn, "authorization") != [],
+      realm: Keyword.get(opts, :realm)
     }
   end
 
@@ -75,7 +76,7 @@ defmodule FastestMCP.Transport.HTTPCommon do
   def authenticate(conn, runtime, opts, request \\ nil) do
     case runtime.server.auth do
       nil ->
-        check_request(conn, runtime, opts, nil)
+        check_request(conn, runtime, opts, nil, request)
 
       auth ->
         context =
@@ -89,7 +90,7 @@ defmodule FastestMCP.Transport.HTTPCommon do
 
         auth
         |> Auth.span(context, event_metadata(request), fn ->
-          check_request(conn, runtime, opts, context)
+          check_request(conn, runtime, opts, context, request)
         end)
         |> tap(&record_crash/1)
     end
@@ -105,21 +106,41 @@ defmodule FastestMCP.Transport.HTTPCommon do
 
   defp record_crash(_result), do: :ok
 
-  defp check_request(conn, runtime, opts, context) do
+  # `context` is nil without an authenticator, which only the checks run for.
+  defp check_request(conn, runtime, opts, context, request) do
     with :ok <- reject_query_access_token(conn),
+         :ok <- reject_repeated_authorization(conn),
          :ok <- validate_protected_resource_request(conn, runtime, opts),
          :ok <- ensure_protected_resource_auth(runtime.server) do
-      run_authenticator(runtime.server.auth, context, conn, runtime, opts)
+      if context,
+        do: run_authenticator(context, auth_input(conn, runtime, opts, request)),
+        else: {:ok, nil}
     end
   catch
     kind, reason -> {:error, Auth.failure("HTTP authentication", kind, reason, __STACKTRACE__)}
   end
 
-  defp run_authenticator(nil, _context, _conn, _runtime, _opts), do: {:ok, nil}
-
-  defp run_authenticator(auth, context, conn, runtime, opts) do
-    with {:ok, authenticated} <- Auth.resolve(auth, context, auth_input(conn, runtime, opts)),
+  defp run_authenticator(%Context{} = context, input) do
+    with {:ok, authenticated} <- Auth.resolve(context.server.auth, context, input),
          do: {:ok, Auth.result_from_context(authenticated)}
+  end
+
+  # `Authorization` is a singleton field (RFC 9110): several of them name no
+  # single set of credentials, and RFC 6750 answers such a request with `400`
+  # and an `invalid_request` challenge.
+  defp reject_repeated_authorization(conn) do
+    case get_req_header(conn, "authorization") do
+      [_first, _second | _rest] ->
+        {:error,
+         %Error{
+           code: :invalid_request,
+           message: "request has more than one Authorization header",
+           details: %{header: "authorization"}
+         }}
+
+      _one_or_none ->
+        :ok
+    end
   end
 
   # What the pipeline's events name of a request: its method, and the kind and
@@ -143,15 +164,25 @@ defmodule FastestMCP.Transport.HTTPCommon do
     auth_input(conn, %{}, opts)
   end
 
-  def auth_input(conn, runtime, opts) do
+  # The authenticator's input for `request`, the decoded request (nil when
+  # there is none): its JSON-RPC message is `"request"`, nil for a `GET`, a
+  # `DELETE`, or a body that isn't a JSON-RPC message.
+  def auth_input(conn, runtime, opts, request \\ nil) do
     headers = Map.new(conn.req_headers)
     protected_resource = protected_resource(runtime)
 
-    %{"authorization" => headers["authorization"], "headers" => headers}
+    %{
+      "authorization" => headers["authorization"],
+      "headers" => headers,
+      "request" => jsonrpc_message(request)
+    }
     |> maybe_put("assigns", selected_auth_assigns(conn.assigns, Keyword.get(opts, :auth_assigns)))
     |> maybe_put("expected_resource", expected_resource(protected_resource))
     |> maybe_put("expected_scopes", expected_scopes(protected_resource))
   end
+
+  defp jsonrpc_message(%Request{request_metadata: %{jsonrpc_envelope: message}}), do: message
+  defp jsonrpc_message(_request), do: nil
 
   def reject_query_access_token(%Plug.Conn{query_string: query_string}) do
     case decoded_query_parameter_names(query_string) do
@@ -339,6 +370,14 @@ defmodule FastestMCP.Transport.HTTPCommon do
 
     {403, headers}
   end
+
+  # Repeated `Authorization` headers (`invalid_request`).
+  defp error_status_and_headers(
+         %Error{code: :invalid_request, details: %{header: "authorization"}} = error,
+         auth,
+         http_context
+       ),
+       do: {400, [{"www-authenticate", Auth.www_authenticate(auth, error, http_context)}]}
 
   defp error_status_and_headers(%Error{code: :rate_limited} = error, _auth, _http_context) do
     headers =

@@ -69,6 +69,7 @@ defmodule FastestMCP.ProtectedResourceTest do
     assert normalized.verified_scopes == auth_result.scopes
   end
 
+  @tag :capture_log
   test "canonical and compatibility auth evidence cannot contradict each other" do
     context =
       Context.new(test_runtime(unique_name("conflicting-auth-evidence")), state_scope: :request)
@@ -349,6 +350,114 @@ defmodule FastestMCP.ProtectedResourceTest do
     # Running without protected resource metadata, it has no such route.
     FastestMCP.server(server_name) |> start_server!()
     assert request.().status == 404
+  end
+
+  test "bare_path: true serves the metadata at the bare well-known path too" do
+    server_name = unique_name("protected-bare-path")
+
+    FastestMCP.server(server_name, auth: allow_auth(), protected_resource: protected_resource())
+    |> start_server!()
+
+    # One `forward "/.well-known/oauth-protected-resource"` receives both
+    # paths, as Phoenix passes them on.
+    forwarded = fn method, url, opts ->
+      %URI{path: path} = URI.parse(url)
+
+      method
+      |> conn(url)
+      |> Map.merge(%{
+        script_name: [".well-known", "oauth-protected-resource"],
+        path_info: path |> String.split("/", trim: true) |> Enum.drop(2)
+      })
+      |> WellKnownHTTP.call(
+        WellKnownHTTP.init(
+          [server_name: server_name, allowed_hosts: ["mcp.example.com", "alias.example.com"]] ++
+            opts
+        )
+      )
+    end
+
+    bare = "https://mcp.example.com/.well-known/oauth-protected-resource"
+
+    for url <- [bare, bare <> "/public/mcp"] do
+      response = forwarded.(:get, url, bare_path: true)
+      assert response.status == 200
+      assert get_resp_header(response, "cache-control") == ["public, max-age=300"]
+      assert JSON.decode!(response.resp_body) == ProtectedResource.metadata(protected_resource())
+    end
+
+    # The bare path follows the rules of the metadata path.
+    assert forwarded.(:post, bare, bare_path: true).status == 405
+
+    assert forwarded.(:get, "https://alias.example.com/.well-known/oauth-protected-resource",
+             bare_path: true
+           ).status == 404
+
+    # Only with the option, and no other path under the forward.
+    assert forwarded.(:get, bare, []).status == 404
+    assert forwarded.(:get, bare <> "/other/mcp", bare_path: true).status == 404
+
+    # The metadata route of the endpoint itself, as a standalone listener
+    # serves it, takes the option too.
+    for {opts, status} <- [{[bare_path: true], 200}, {[], 404}] do
+      app =
+        FastestMCP.http_app(
+          server_name,
+          [allowed_hosts: ["mcp.example.com"], path: "/public/mcp"] ++ opts
+        )
+
+      assert Plug.run(conn(:get, bare), [app]).status == status
+    end
+
+    for init <- [&WellKnownHTTP.init/1, &FastestMCP.Transport.HTTPApp.init/1] do
+      assert_raise ArgumentError, ~r/bare_path must be a boolean/, fn ->
+        init.(server_name: server_name, bare_path: "yes")
+      end
+    end
+  end
+
+  test "the realm comes first in a protected resource's challenges" do
+    server_name = unique_name("protected-realm")
+
+    authenticator = fn
+      %{"authorization" => "Bearer no-scope"} = input, _context ->
+        {:ok, %{principal: %{"sub" => "user-1"}, audiences: [input["expected_resource"]]}}
+
+      _input, _context ->
+        {:error, :unauthorized}
+    end
+
+    FastestMCP.server(server_name, auth: authenticator, protected_resource: protected_resource())
+    |> start_server!()
+
+    app =
+      FastestMCP.http_app(server_name,
+        allowed_hosts: ["mcp.example.com"],
+        path: "/public/mcp",
+        json_response: true,
+        realm: "example"
+      )
+
+    url = "https://mcp.example.com/public/mcp"
+
+    metadata =
+      ~s(resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource/public/mcp")
+
+    challenges =
+      for authorization <- [nil, "Bearer unknown", "Bearer no-scope"] do
+        response = initialize_request(app, url, authorization: authorization)
+        get_resp_header(response, "www-authenticate")
+      end
+
+    assert challenges == [
+             [~s(Bearer realm="example", #{metadata}, scope="files:read")],
+             [
+               ~s(Bearer realm="example", #{metadata}, scope="files:read", error="invalid_token", error_description="unauthorized")
+             ],
+             [
+               ~s(Bearer realm="example", #{metadata}, scope="files:read", error="insufficient_scope", error_description="access token does not grant the required scopes")
+             ]
+           ]
   end
 
   test "protected HTTP auth receives the exact resource and required scopes" do

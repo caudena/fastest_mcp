@@ -940,7 +940,12 @@ defmodule FastestMCP.Context do
     :ok
   end
 
-  @doc "Returns the immutable HTTP request snapshot for this context."
+  @doc """
+  Returns the HTTP request of the context as a `FastestMCP.HTTPRequest`:
+  its method, path, query parameters, and headers. Returns `nil` for a
+  request that didn't come over HTTP.
+  """
+  @spec http_request(t()) :: FastestMCP.HTTPRequest.t() | nil
   def http_request(%__MODULE__{} = context) do
     method = context.request_metadata[:method]
     path = context.request_metadata[:path]

@@ -246,6 +246,11 @@ Other causes of `400`:
 - **`unsupported MCP-Protocol-Version`**: a `2025-11-25` request names a
   version the server doesn't support. Without the header, a session request
   uses the version of its session.
+- **`request has more than one Authorization header`**, with
+  `www-authenticate: Bearer error="invalid_request"`: the request carried two
+  `Authorization` headers, for example the client's and one that a proxy
+  added. FastestMCP rejects it before authentication, since it names no single
+  set of credentials; send one.
 
 ## The client gets 413 Content Too Large
 
@@ -279,8 +284,16 @@ The server's authenticator raised, here a `KeyError`, threw, exited, or
 returned something other than `{:ok, identity}` or `{:error, reason}`, so the
 request never ran. A
 `FastestMCP.Client` returns the error `:internal_error` with the same message.
-FastestMCP doesn't log the exception: the `[:fastest_mcp, :auth, :exception]`
-event and the span of the request hold it; see
+Your log names the authenticator and shows where it failed:
+
+```text
+[error] FastestMCP authenticator MyApp.MCPAuthenticator raised KeyError, so the request failed with an internal error
+    (my_app 0.1.0) lib/my_app/mcp_authenticator.ex:12: MyApp.MCPAuthenticator.authenticate/3
+```
+
+The line leaves out the exception's message, which can hold credentials; the
+`[:fastest_mcp, :auth, :exception]` event and the span of the request hold
+the whole exception; see
 [When a handler crashes](observability.md#when-a-handler-crashes). Make the
 authenticator return `{:error, :unauthorized}` for input it doesn't expect; see
 [Authenticating with a function](auth.md#authenticating-with-a-function).
@@ -338,7 +351,7 @@ message. Here, `IO.write("Starting the notes server...")` ran before the server
 started, and the first answer begins:
 
 ```text
-Starting the notes server...{"id":1,"jsonrpc":"2.0","result":{"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"notes","version":"1.0.0"}},"cacheScope":"private",
+Starting the notes server...{"id":1,"jsonrpc":"2.0","result":{"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"notes","version":"1.0.1"}},"cacheScope":"private",
 ```
 
 Look for:

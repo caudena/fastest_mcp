@@ -4,7 +4,7 @@ defmodule FastestMCP.MixProject do
   def project do
     [
       app: :fastest_mcp,
-      version: "1.0.0",
+      version: "1.0.1",
       description:
         "Production-grade Model Context Protocol (MCP) SDK for Elixir and Phoenix. FastestMCP is an idiomatic Elixir rewrite of Python's FastMCP (fast_mcp), with server and client support for MCP 2026-07-28 and 2025-11-25, OAuth, MCP Apps, Tasks, Streamable HTTP, stdio, strict validation, and observability.",
       source_url: "https://github.com/caudena/fastest_mcp",
@@ -176,6 +176,7 @@ defmodule FastestMCP.MixProject do
         FastestMCP.Apps,
         FastestMCP.InputRequiredResult,
         FastestMCP.RequestContext,
+        FastestMCP.HTTPRequest,
         FastestMCP.BackgroundTask,
         FastestMCP.TaskRecord,
         FastestMCP.PeerTask,
