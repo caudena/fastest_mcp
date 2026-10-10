@@ -6,7 +6,7 @@ defmodule FastestMCP.ComponentVisibility do
   alias FastestMCP.ComponentManager
   alias FastestMCP.Context
   alias FastestMCP.Error
-  alias FastestMCP.EventBus
+  alias FastestMCP.Notifications
   alias FastestMCP.Registry
   alias FastestMCP.ServerRuntime
 
@@ -81,15 +81,8 @@ defmodule FastestMCP.ComponentVisibility do
     server_name = normalize_server_name(server_name)
 
     with {:ok, runtime} <- ServerRuntime.fetch_running(server_name) do
-      if ComponentManager.update_visibility_rules(runtime.component_manager, update) == :changed do
-        EventBus.emit(
-          runtime.event_bus,
-          server_name,
-          [:components, :changed],
-          %{count: length(families)},
-          %{families: families}
-        )
-      end
+      if ComponentManager.update_visibility_rules(runtime.component_manager, update) == :changed,
+        do: Notifications.list_changed(runtime, families)
 
       :ok
     end

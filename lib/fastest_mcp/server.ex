@@ -72,11 +72,15 @@ defmodule FastestMCP.Server do
       `:inject`, `:task`, `:timeout`, `:authorization` (or `:auth`), and
       `:schema_options`
     * tools - `:input_schema`, `:output_schema`, `:annotations`, `:completions`
-    * resources - `:name`, `:mime_type` (default `"application/json"`),
-      `:size`, `:annotations`
+    * resources - `:name`, `:mime_type` (without it, each read names the type
+      of its value), `:size`, `:annotations`
     * resource templates - `:name`, `:mime_type`, `:parameters`,
       `:completions`, `:annotations`, `:resource_security` (default `:inherit`)
     * prompts - `:arguments`
+
+  A tool name has 1 to 128 letters, digits, `_`, `-`, or `.`, and resource
+  annotations hold the values MCP defines for `audience`, `priority`, and
+  `lastModified`; anything else raises `ArgumentError` too.
 
   The [tools](tools.md), [resources](resources.md), and [prompts](prompts.md)
   guides describe each option.
@@ -95,6 +99,7 @@ defmodule FastestMCP.Server do
   alias FastestMCP.Middleware.ToolSearch
   alias FastestMCP.Protocol.Extensions
   alias FastestMCP.Protocol.Schema, as: ProtocolSchema
+  alias FastestMCP.Options
   alias FastestMCP.Provider
   alias FastestMCP.ProviderTransforms.Namespace
   alias FastestMCP.Providers.MountedServer, as: MountedServerProvider
@@ -165,18 +170,40 @@ defmodule FastestMCP.Server do
           prompts: [struct()]
         }
 
+  @option_keys [
+    :on_duplicate,
+    :auth,
+    :protected_resource,
+    :middleware,
+    :transforms,
+    :lifespans,
+    :lifespan,
+    :dependencies,
+    :tasks,
+    :tool_search,
+    :metadata,
+    :experimental_capabilities,
+    :extensions,
+    :active_extensions,
+    :application_sessions,
+    :resource_security,
+    :url_elicitation_allowed_hosts,
+    :mask_error_details,
+    :schema_options
+  ]
+
   @doc """
   Builds an empty server definition named `name` (an atom or a string).
 
-  Options:
+  Options (any other key raises `ArgumentError`):
 
     * `:on_duplicate` - the duplicate registration policy above (default `:error`)
     * `:auth` - an authenticator, as `FastestMCP.Auth.new/2` accepts it
     * `:protected_resource` - RFC 9728 metadata for
       `FastestMCP.Auth.ProtectedResource.new/1` (atom keys)
-    * `:middleware`, `:transforms`, `:lifespans`, `:dependencies` - initial
-      entries, as `add_middleware/2`, `add_transform/2`, `add_lifespan/2`, and
-      `add_dependency/3` add them
+    * `:middleware`, `:transforms`, `:lifespans` (or one `:lifespan`),
+      `:dependencies` - initial entries, as `add_middleware/2`,
+      `add_transform/2`, `add_lifespan/2`, and `add_dependency/3` add them
     * `:tasks` - the default `task:` option of the components added later:
       `false` (default), `true`, or `[mode: :optional | :required,
       poll_interval_ms: ms]`
@@ -190,12 +217,13 @@ defmodule FastestMCP.Server do
       `FastestMCP.ApplicationSession`
     * `:resource_security` - a `FastestMCP.ResourceSecurity` policy
     * `:url_elicitation_allowed_hosts` - the HTTPS hosts URL elicitations may use
-    * `:mask_error_details` - hide the details of unexpected handler failures
-      from clients (default `false`)
+    * `:mask_error_details` - hide the details of unexpected handler and
+      authenticator failures from clients (default `false`)
     * `:schema_options` - JSON Schema options, see `FastestMCP.Schema`
   """
   def new(name, opts \\ []) do
     validate_removed_options!(opts)
+    Options.keys!(opts, @option_keys)
 
     schema_options = normalize_schema_options(Keyword.get(opts, :schema_options, []))
     extensions = Extensions.normalize(Keyword.get(opts, :extensions))
@@ -241,6 +269,10 @@ defmodule FastestMCP.Server do
     server
   end
 
+  @doc false
+  # The options of `new/2`.
+  def option_keys, do: @option_keys
+
   @doc "Adds a tool; see [Component Options](#module-component-options)."
   def add_tool(%__MODULE__{} = server, name, handler, opts \\ []),
     do: add_component(server, :tool, name, handler, opts)
@@ -265,7 +297,7 @@ defmodule FastestMCP.Server do
 
   @doc """
   Registers `resolver` as dependency `name` for handlers to read with
-  `FastestMCP.Context.dependency/2`; see [dependency injection](dependency-injection.md).
+  `FastestMCP.Context.dependency/2`; see [Dependencies](lifespans-and-dependencies.md#dependencies).
   """
   def add_dependency(%__MODULE__{} = server, name, resolver) do
     %{
@@ -428,7 +460,16 @@ defmodule FastestMCP.Server do
     provider = MountedServerProvider.new(mounted_server, opts)
 
     if namespace do
-      add_provider(server, Provider.add_transform(provider, Namespace.new(namespace)))
+      transform = Namespace.new(namespace)
+
+      for tool <- mounted_server.tools do
+        ComponentCompiler.check_built_tool_name!(
+          tool.name,
+          Namespace.transform_component(transform, tool, nil).name
+        )
+      end
+
+      add_provider(server, Provider.add_transform(provider, transform))
     else
       add_provider(server, provider)
     end

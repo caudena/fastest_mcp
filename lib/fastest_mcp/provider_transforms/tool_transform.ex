@@ -11,14 +11,16 @@ defmodule FastestMCP.ProviderTransforms.ToolTransform do
 
   use FastestMCP.ProviderTransform
 
+  alias FastestMCP.ComponentCompiler
   alias FastestMCP.Components.Tool
 
   defstruct names: %{}, reverse_names: %{}
 
   @doc """
   Builds the transform from a map of source tool names to `%{name: new_name}`
-  (or `[name: new_name]`). A mapping without `:name`, or two tools renamed to
-  the same name, raises `ArgumentError`.
+  (or `[name: new_name]`). A mapping without `:name`, a new name that breaks
+  MCP's naming rules for tools, or two tools renamed to the same name, raises
+  `ArgumentError`.
   """
   def new(mappings) when is_map(mappings) do
     names =
@@ -38,7 +40,7 @@ defmodule FastestMCP.ProviderTransforms.ToolTransform do
   defp name!(source, config) when is_map(config) or is_list(config) do
     case Map.new(config)[:name] do
       nil -> raise ArgumentError, "tool transform for #{inspect(to_string(source))} needs :name"
-      name -> to_string(name)
+      name -> ComponentCompiler.tool_name!(name)
     end
   end
 

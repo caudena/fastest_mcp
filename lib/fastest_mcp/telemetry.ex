@@ -40,7 +40,7 @@ defmodule FastestMCP.Telemetry do
   def with_server_span(%Operation{} = operation, fun, opts \\ []) when is_function(fun, 0) do
     parent_context =
       if Keyword.get(opts, :extract_parent?, true) do
-        extract_trace_context(operation.context.request_metadata)
+        parent_context(operation.context.request_metadata)
       else
         current_context()
       end
@@ -84,6 +84,25 @@ defmodule FastestMCP.Telemetry do
 
     Tracer.set_status(:error, Exception.message(exception))
     :ok
+  end
+
+  # The parent of a server span: the trace a request names in `_meta` or a
+  # `traceparent` header, unless the current span, such as the span of HTTP
+  # instrumentation in the process that received the request, belongs to that
+  # trace or the request names none.
+  defp parent_context(request_metadata) do
+    current = current_context()
+    remote = extract_trace_context(request_metadata)
+
+    if same_trace?(current, remote), do: current, else: remote
+  end
+
+  defp same_trace?(current, remote) do
+    current_span = Tracer.current_span_ctx(current)
+    remote_span = Tracer.current_span_ctx(remote)
+
+    Span.is_valid(current_span) and
+      (not Span.is_valid(remote_span) or Span.trace_id(current_span) == Span.trace_id(remote_span))
   end
 
   def extract_trace_context(nil), do: current_context()
@@ -259,20 +278,14 @@ defmodule FastestMCP.Telemetry do
       map_string(principal, "sub")
   end
 
-  defp enduser_scope(%Context{auth: auth, capabilities: capabilities}) do
-    scopes =
-      auth
-      |> map_list("scopes")
-      |> case do
-        [] -> normalize_list(capabilities)
-        list -> list
-      end
+  # The scopes the authenticator verified, or else the identity's capabilities.
+  defp enduser_scope(%Context{verified_scopes: [], capabilities: capabilities}),
+    do: capabilities |> normalize_list() |> join_scopes()
 
-    case scopes do
-      [] -> nil
-      values -> Enum.join(values, " ")
-    end
-  end
+  defp enduser_scope(%Context{verified_scopes: scopes}), do: join_scopes(scopes)
+
+  defp join_scopes([]), do: nil
+  defp join_scopes(scopes), do: Enum.join(scopes, " ")
 
   defp trace_carrier(metadata) do
     metadata
@@ -351,14 +364,4 @@ defmodule FastestMCP.Telemetry do
   end
 
   defp map_string(_other, _key), do: nil
-
-  defp map_list(nil, _key), do: []
-
-  defp map_list(map, key) when is_map(map) do
-    map
-    |> map_string(key)
-    |> normalize_list()
-  end
-
-  defp map_list(_other, _key), do: []
 end

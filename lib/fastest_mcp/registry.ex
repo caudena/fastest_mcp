@@ -1,11 +1,11 @@
 defmodule FastestMCP.Registry do
   @moduledoc false
   # Process names for running servers, server owners, sessions, and URL
-  # elicitations, backed by a unique-key `Registry`. Entries disappear with
-  # their processes; lookups also skip a process that has exited but whose
-  # entry the Registry has not removed yet. Registry metadata holds per-server
-  # component visibility rules, which are read on every request and written
-  # rarely.
+  # elicitations, and the settings of client connections, backed by a
+  # unique-key `Registry`. Entries disappear with their processes; lookups
+  # also skip a process that has exited but whose entry the Registry has not
+  # removed yet. Registry metadata holds per-server component visibility
+  # rules, which are read on every request and written rarely.
 
   def child_spec(_opts) do
     Registry.child_spec(
@@ -19,6 +19,9 @@ defmodule FastestMCP.Registry do
 
   def lookup_server(server_name), do: whereis({:server, to_string(server_name)})
   def lookup_server_owner(server_name), do: whereis({:server_owner, to_string(server_name)})
+
+  def lookup_runtime_supervisor(server_name),
+    do: whereis({:runtime_supervisor, to_string(server_name)})
 
   def lookup_session(server_name, session_id),
     do: whereis({:session, to_string(server_name), to_string(session_id)})
@@ -67,6 +70,20 @@ defmodule FastestMCP.Registry do
     case Registry.lookup(__MODULE__, {:component_index, to_string(server_name)}) do
       [{_pid, table}] -> {:ok, table}
       [] -> {:error, :not_found}
+    end
+  end
+
+  # The settings a client connection publishes for the operations its callers
+  # run, so that they need no call to the connection.
+  def register_client(settings) do
+    {:ok, _owner} = Registry.register(__MODULE__, {:client, self()}, settings)
+    :ok
+  end
+
+  def client_settings(pid) do
+    case Registry.lookup(__MODULE__, {:client, pid}) do
+      [{^pid, settings}] -> if Process.alive?(pid), do: {:ok, settings}, else: not_found()
+      [] -> not_found()
     end
   end
 

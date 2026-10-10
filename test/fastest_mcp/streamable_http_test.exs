@@ -256,6 +256,79 @@ defmodule FastestMCP.StreamableHTTPTest do
            } = JSON.decode!(response.resp_body)
   end
 
+  test "methods the endpoint doesn't serve get 405 with Allow, before authentication", %{
+    server_name: open
+  } do
+    protected = unique_name("http-methods-protected")
+
+    FastestMCP.server(protected)
+    |> FastestMCP.add_auth(fn _input, _ctx -> {:error, :unauthorized} end)
+    |> start_server!()
+
+    for server_name <- [open, protected],
+        method <- [:options, :put, :patch, :head],
+        version <- [nil, "2025-11-25", "2026-07-28"] do
+      conn =
+        conn(method, "/mcp")
+        |> localhost()
+        |> then(&if(version, do: put_req_header(&1, "mcp-protocol-version", version), else: &1))
+        |> Plug.run([FastestMCP.http_app(server_name)])
+
+      assert {conn.status, get_resp_header(conn, "allow")} == {405, ["GET, POST, DELETE"]}
+
+      if method != :head,
+        do: assert(%{"error" => %{"code" => "method_not_allowed"}} = JSON.decode!(conn.resp_body))
+    end
+
+    without_get =
+      conn(:options, "/mcp")
+      |> localhost()
+      |> StreamableHTTP.call(server_name: protected, enable_get_streaming: false)
+
+    assert {without_get.status, get_resp_header(without_get, "allow")} == {405, ["POST, DELETE"]}
+
+    # Another path is unknown, also on an authenticated route.
+    other =
+      conn(:post, "/mcp/other", "{}")
+      |> localhost()
+      |> put_req_header("content-type", "application/json")
+      |> StreamableHTTP.call(server_name: protected)
+
+    assert other.status == 404
+
+    # The CORS preflight of an allowed origin is still answered.
+    preflight =
+      conn(:options, "/mcp")
+      |> localhost()
+      |> put_req_header("origin", "http://localhost:6274")
+      |> put_req_header("access-control-request-method", "POST")
+      |> StreamableHTTP.call(server_name: protected, cors: [origins: ["http://localhost:6274"]])
+
+    assert preflight.status == 204
+  end
+
+  test "a request for a server that isn't running gets 503 with Retry-After" do
+    server_name = unique_name("http-not-running")
+
+    modern = ProtocolTest.modern_http_request(server_name, 1, "tools/list")
+    legacy = ProtocolTest.http_request(server_name, "expired-or-not", 2, "tools/list")
+
+    for conn <- [modern, legacy] do
+      assert {conn.status, get_resp_header(conn, "retry-after")} == {503, ["1"]}
+
+      assert %{"error" => %{"code" => "overloaded", "message" => message}} =
+               JSON.decode!(conn.resp_body)
+
+      assert message == "server #{inspect(server_name)} is not running"
+    end
+
+    # A client takes it as a reason to retry later, not for an ended session.
+    %{url: url} = start_http!(server_name)
+
+    assert {:error, %Error{code: :overloaded, details: %{status: 503}}} =
+             FastestMCP.Client.connect(url)
+  end
+
   test "GET streaming configuration requires a boolean" do
     assert_raise ArgumentError, ~r/:enable_get_streaming must be a boolean/, fn ->
       StreamableHTTP.init(enable_get_streaming: :sometimes)
@@ -373,7 +446,7 @@ defmodule FastestMCP.StreamableHTTPTest do
 
     assert unauthorized_initialize.status == 401
     assert get_resp_header(unauthorized_initialize, "mcp-session-id") == []
-    assert ["Bearer " <> _rest] = get_resp_header(unauthorized_initialize, "www-authenticate")
+    assert get_resp_header(unauthorized_initialize, "www-authenticate") == ["Bearer"]
 
     {session_id, initialize_response} =
       ProtocolTest.http_initialize(server_name, headers: authorization("alice"))
@@ -493,6 +566,56 @@ defmodule FastestMCP.StreamableHTTPTest do
     assert %{"error" => %{"code" => -32_602}} = JSON.decode!(invalid_params.resp_body)
 
     assert ProtocolTest.http_request(server_name, session_id, 4, "ping").status == 200
+  end
+
+  test "on 2026-07-28, errors of the operation stay on HTTP 200 and malformed requests get 400" do
+    server_name = unique_name("http-modern-statuses")
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("add", fn %{"a" => a, "b" => b}, _ctx -> a + b end,
+      input_schema: %{
+        "type" => "object",
+        "properties" => %{"a" => %{"type" => "integer"}, "b" => %{"type" => "integer"}},
+        "required" => ["a", "b"]
+      }
+    )
+    |> FastestMCP.add_tool("explode", fn _args, _ctx -> raise "boom" end)
+    |> start_server!()
+
+    call = fn id, name, arguments ->
+      ProtocolTest.modern_http_request(
+        server_name,
+        id,
+        "tools/call",
+        %{"name" => name, "arguments" => arguments},
+        headers: [{"mcp-name", name}]
+      )
+    end
+
+    for {response, code} <- [
+          {call.(1, "add", %{"a" => "1"}), "invalid_params"},
+          {call.(2, "missing", %{}), "not_found"},
+          {call.(3, "explode", %{}), "component_crash"}
+        ] do
+      assert response.status == 200, response.resp_body
+
+      assert get_in(JSON.decode!(response.resp_body), ["error", "data", "fastestmcp", "code"]) ==
+               code
+    end
+
+    # A request whose `_meta` leaves out the client's capabilities is malformed.
+    meta =
+      ProtocolTest.modern_request(4, "tools/list")["params"]["_meta"]
+      |> Map.delete("io.modelcontextprotocol/clientCapabilities")
+
+    malformed =
+      ProtocolTest.modern_http_post(
+        server_name,
+        ProtocolTest.jsonrpc_request(4, "tools/list", %{"_meta" => meta})
+      )
+
+    assert malformed.status == 400
+    assert get_in(JSON.decode!(malformed.resp_body), ["error", "code"]) == -32_602
   end
 
   defp initialize_request,

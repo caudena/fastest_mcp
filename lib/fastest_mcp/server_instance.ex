@@ -6,6 +6,7 @@ defmodule FastestMCP.ServerInstance do
   alias FastestMCP.Registry
   alias FastestMCP.ServerModule
   alias FastestMCP.ServerRuntime
+  alias FastestMCP.ServerRuntime.Config
   alias FastestMCP.Transport.StreamableHTTP
   alias FastestMCP.Transport.WellKnownHTTP
 
@@ -33,10 +34,12 @@ defmodule FastestMCP.ServerInstance do
     Supervisor.init(children, strategy: :one_for_one)
   end
 
+  # The start arguments hold the validated config, whose secret inspect
+  # output leaves out.
   defp runtime_child_spec(server, runtime_opts) do
     %{
       id: {ServerRuntime, server.name},
-      start: {ServerRuntime, :start_link, [{server, runtime_opts}]}
+      start: {ServerRuntime, :start_link, [{server, Config.new!(runtime_opts)}]}
     }
   end
 

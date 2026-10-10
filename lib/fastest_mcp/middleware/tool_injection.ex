@@ -11,6 +11,7 @@ defmodule FastestMCP.Middleware.ToolInjection do
   @behaviour FastestMCP.Middleware
 
   alias FastestMCP.Operation
+  alias FastestMCP.Transport.Serializer
 
   defstruct [:middleware, tools: [], tools_by_name: %{}]
 
@@ -45,7 +46,21 @@ defmodule FastestMCP.Middleware.ToolInjection do
         {"list_prompts", &list_prompts_tool/2,
          [description: "List prompts available on this server."]},
         {"get_prompt", &get_prompt_tool/2,
-         [description: "Render a prompt available on this server."]}
+         [
+           description: "Render a prompt available on this server.",
+           input_schema: %{
+             "type" => "object",
+             "properties" => %{
+               "name" => %{"type" => "string", "description" => "The name of the prompt."},
+               "arguments" => %{
+                 "type" => "object",
+                 "additionalProperties" => %{"type" => "string"},
+                 "description" => "The prompt's arguments, by name."
+               }
+             },
+             "required" => ["name"]
+           }
+         ]}
       ],
       opts
     )
@@ -57,7 +72,16 @@ defmodule FastestMCP.Middleware.ToolInjection do
         {"list_resources", &list_resources_tool/2,
          [description: "List resources and resource templates available on this server."]},
         {"read_resource", &read_resource_tool/2,
-         [description: "Read a resource available on this server."]}
+         [
+           description: "Read a resource available on this server.",
+           input_schema: %{
+             "type" => "object",
+             "properties" => %{
+               "uri" => %{"type" => "string", "description" => "The URI of the resource."}
+             },
+             "required" => ["uri"]
+           }
+         ]}
       ],
       opts
     )
@@ -175,8 +199,10 @@ defmodule FastestMCP.Middleware.ToolInjection do
   # Listed tools are `Component.metadata/1` maps.
   defp listed_tool_name(tool) when is_map(tool), do: to_string(Map.get(tool, :name))
 
+  # The lists describe each component as the matching MCP list does.
   defp list_prompts_tool(_arguments, context) do
-    %{"prompts" => FastestMCP.list_prompts!(context.server_name, inherited_opts(context))}
+    prompts = FastestMCP.list_prompts!(context.server_name, inherited_opts(context))
+    %{"prompts" => Enum.map(prompts, &Serializer.prompt_metadata/1)}
   end
 
   defp get_prompt_tool(arguments, context) do
@@ -193,10 +219,17 @@ defmodule FastestMCP.Middleware.ToolInjection do
   end
 
   defp list_resources_tool(_arguments, context) do
+    opts = inherited_opts(context)
+
     %{
-      "resources" => FastestMCP.list_resources!(context.server_name, inherited_opts(context)),
-      "resource_templates" =>
-        FastestMCP.list_resource_templates!(context.server_name, inherited_opts(context))
+      "resources" =>
+        context.server_name
+        |> FastestMCP.list_resources!(opts)
+        |> Enum.map(&Serializer.resource_metadata/1),
+      "resourceTemplates" =>
+        context.server_name
+        |> FastestMCP.list_resource_templates!(opts)
+        |> Enum.map(&Serializer.resource_template_metadata/1)
     }
   end
 

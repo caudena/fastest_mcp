@@ -25,6 +25,7 @@ defmodule FastestMCP.Transport.JSONRPC do
   @symbolic_error_codes %{
     parse_error: -32_700,
     invalid_request: -32_600,
+    payload_too_large: -32_600,
     not_found: -32_602,
     method_not_found: -32_601,
     bad_request: -32_602,

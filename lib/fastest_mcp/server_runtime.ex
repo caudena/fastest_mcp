@@ -1,9 +1,12 @@
 defmodule FastestMCP.ServerRuntime do
   @moduledoc false
-  # Supervision tree of one running server. Children restart together and stop
-  # in reverse order, so sessions close before lifespans are cleaned up. Once
-  # every child runs, the published `%ServerRuntime{}` snapshot is readable with
-  # `fetch/1` without calling a process.
+  # Supervision tree of one running server: the component manager, then the
+  # rest of the runtime. The runtime's children restart together when one of
+  # them fails, while the component manager, and with it the components and
+  # visibility rules changed at runtime, lives on until the server stops.
+  # Children stop in reverse order, so sessions close before lifespans are
+  # cleaned up. Once every child runs, the published `%ServerRuntime{}`
+  # snapshot is readable with `fetch/1` without calling a process.
 
   use Supervisor
 
@@ -24,6 +27,7 @@ defmodule FastestMCP.ServerRuntime do
     :config,
     :component_manager,
     :component_index,
+    :component_generations,
     :schema_cache,
     :session_state_store,
     :terminated_session_store,
@@ -35,15 +39,16 @@ defmodule FastestMCP.ServerRuntime do
     :task_store,
     :session_supervisor,
     :notification_supervisor,
-    :pagination_cursor_secret,
-    :runtime_generation,
+    :signing_secret,
     lifespan_context: %{},
     strict_request_ids: false
   ]
 
   @type t :: %__MODULE__{}
 
-  def start(%Server{} = server, opts \\ []), do: ServerSupervisor.start_server(server, opts)
+  # Invalid options raise `ArgumentError` here, in the caller.
+  def start(%Server{} = server, opts \\ []),
+    do: ServerSupervisor.start_server(server, Config.new!(opts))
 
   def stop(server_name) do
     with {:error, :not_found} <- stop_process(Registry.lookup_server_owner(server_name)) do
@@ -82,9 +87,7 @@ defmodule FastestMCP.ServerRuntime do
     name = to_string(server.name)
     via = &Registry.via({&1, name})
 
-    children = [
-      {ComponentManager,
-       server_name: name, on_duplicate: server.on_duplicate, name: via.(:component_manager)},
+    runtime = [
       # State of stateful middleware, started by Lifecycle. Middleware holds
       # the pid it was attached to, so a crash restarts the whole runtime.
       Supervisor.child_spec({DynamicSupervisor, name: via.(:middleware), max_restarts: 0},
@@ -117,7 +120,21 @@ defmodule FastestMCP.ServerRuntime do
       {Publisher, name}
     ]
 
-    Supervisor.init(children, strategy: :one_for_all)
+    # The runtime restarts its own children; if it gives up, or the component
+    # manager fails, the server's supervisor stops too.
+    children = [
+      {ComponentManager,
+       server_name: name, on_duplicate: server.on_duplicate, name: via.(:component_manager)},
+      %{
+        id: :runtime,
+        type: :supervisor,
+        start:
+          {Supervisor, :start_link,
+           [runtime, [strategy: :one_for_all, name: via.(:runtime_supervisor)]]}
+      }
+    ]
+
+    Supervisor.init(children, strategy: :one_for_all, max_restarts: 0)
   end
 
   def snapshot(server_name) do

@@ -5,6 +5,7 @@ defmodule FastestMCP.ClientTaskTest do
   alias FastestMCP.Client.Task, as: RemoteTask
   alias FastestMCP.Context
   alias FastestMCP.Elicitation.Accepted
+  alias FastestMCP.Interact
 
   test "remote task handles cache terminal status and final result" do
     server_name = "client-task-cache-" <> Integer.to_string(System.unique_integer([:positive]))
@@ -161,7 +162,7 @@ defmodule FastestMCP.ClientTaskTest do
              ]
            } = Client.render_prompt!(client, "draft", %{})
 
-    assert %{"env" => "dev"} = Client.read_resource!(client, "memo://config")
+    assert %{"env" => "dev"} = read_json!(client, "memo://config")
   end
 
   test "tasks/result relays elicitation over HTTP without the sendInput shortcut" do
@@ -201,6 +202,76 @@ defmodule FastestMCP.ClientTaskTest do
     assert_tool_result(RemoteTask.result!(task), task_id, %{"name" => "Alice"})
   end
 
+  test "a 2025-11-25 task asks for roots, a ping, and a URL elicitation through tasks/result" do
+    parent = self()
+    server_name = unique_name("client-task-requests")
+
+    # Each handler asks once the tools/call response has closed its stream.
+    after_go = fn ask ->
+      fn _args, ctx ->
+        send(parent, {:started, self()})
+
+        receive do
+          :go -> ask.(ctx)
+        end
+      end
+    end
+
+    FastestMCP.server(server_name, url_elicitation_allowed_hosts: ["notes.example.com"])
+    |> FastestMCP.add_auth(fn _input, _ctx -> {:ok, %{principal: %{"sub" => "42"}}} end)
+    |> FastestMCP.add_tool(
+      "roots",
+      after_go.(&%{roots: Enum.map(Context.list_roots(&1), fn root -> root.uri end)}),
+      task: true
+    )
+    |> FastestMCP.add_tool("ping", after_go.(&%{ping: inspect(Context.ping_peer(&1))}),
+      task: true
+    )
+    |> FastestMCP.add_tool(
+      "url",
+      after_go.(fn ctx ->
+        {:ok, %{url: url}} = Interact.url(ctx, "Connect", "https://notes.example.com/connect")
+        %{url: url}
+      end),
+      task: true
+    )
+    |> start_server!()
+
+    for session_stream <- [false, true] do
+      client =
+        connect_client!(server_name,
+          session_stream: session_stream,
+          roots: [%{uri: "file:///work", name: "Work"}],
+          url_elicitation_handler: fn _request -> :accept end
+        )
+
+      for {tool, expected} <- [
+            {"roots", %{"roots" => ["file:///work"]}},
+            {"ping", %{"ping" => ":ok"}},
+            {"url", %{"url" => "https://notes.example.com/connect"}}
+          ] do
+        task = Client.call_tool_task!(client, tool, %{}, task: true)
+        assert_receive {:started, handler}
+        send(handler, :go)
+        assert RemoteTask.result!(task).structured_content == expected
+      end
+    end
+  end
+
+  test "call_tool_task/4 asks for the TTL that task: [ttl_ms: ms] names" do
+    server_name = unique_name("client-task-ttl")
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("echo", fn _args, _ctx -> %{ok: true} end, task: true)
+    |> start_server!()
+
+    client = connect_client!(server_name)
+    task = Client.call_tool_task!(client, "echo", %{}, task: [ttl_ms: 30_000])
+
+    assert RemoteTask.fetch!(task)["ttl"] == 30_000
+    assert RemoteTask.result!(task).structured_content == %{"ok" => true}
+  end
+
   defp assert_tool_result(result, task_id, structured_content) do
     assert %{
              "content" => [%{"type" => "text", "text" => text}],
@@ -218,5 +289,11 @@ defmodule FastestMCP.ClientTaskTest do
       start_http!(server_name, allowed_hosts: ["127.0.0.1", "localhost", "www.example.com"])
 
     connect!(url, Keyword.put_new(opts, :protocol_version, "2025-11-25"))
+  end
+
+  # The JSON value of a resource's one text content.
+  defp read_json!(client, uri, opts \\ []) do
+    assert %{"contents" => [%{"text" => text}]} = Client.read_resource!(client, uri, opts)
+    JSON.decode!(text)
   end
 end

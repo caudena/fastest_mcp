@@ -12,10 +12,16 @@ defmodule FastestMCP.ProviderTransforms.Namespace do
   use FastestMCP.ProviderTransform
 
   alias FastestMCP.Component
+  alias FastestMCP.ComponentCompiler
 
   defstruct [:namespace]
 
-  @doc "Builds the transform; a blank `namespace` leaves identifiers unchanged."
+  @doc """
+  Builds the transform; a blank `namespace` leaves identifiers unchanged.
+
+  A namespace takes the characters of a tool name (letters, digits, `_`, `-`,
+  and `.`), so namespaced names stay valid; any other raises `ArgumentError`.
+  """
   def new(namespace) do
     %__MODULE__{namespace: normalize_namespace(namespace)}
   end
@@ -41,12 +47,17 @@ defmodule FastestMCP.ProviderTransforms.Namespace do
   defp normalize_namespace(nil), do: nil
 
   defp normalize_namespace(namespace) do
-    namespace
-    |> to_string()
-    |> String.trim()
-    |> case do
-      "" -> nil
-      value -> value
+    case namespace |> to_string() |> String.trim() do
+      "" ->
+        nil
+
+      value ->
+        if ComponentCompiler.name_characters?(value) do
+          value
+        else
+          raise ArgumentError,
+                ~s(namespace must be letters, digits, "_", "-", or ".", got: #{inspect(value)})
+        end
     end
   end
 

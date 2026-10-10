@@ -24,6 +24,51 @@ defmodule FastestMCP.DuplicatePolicyTest do
     assert hd(ignore_server.tools).compiled.(%{}, nil) == %{source: :first}
   end
 
+  test "a name and version in several sources is listed once, as a call resolves it" do
+    server_name = unique_name("dup-sources")
+
+    provider =
+      Local.new()
+      |> Local.add_tool("search_notes", fn _arguments, _ctx -> %{source: :provider} end,
+        description: "provider"
+      )
+      |> Local.add_tool("archive_notes", fn _arguments, _ctx -> %{source: :provider} end,
+        description: "provider"
+      )
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("search_notes", fn _arguments, _ctx -> %{source: :definition} end,
+      description: "definition"
+    )
+    |> FastestMCP.add_tool("archive_notes", fn _arguments, _ctx -> %{source: :definition} end,
+      description: "definition",
+      authorization: fn _authorization -> false end
+    )
+    |> FastestMCP.add_provider(provider)
+    |> start_server!()
+
+    {:ok, _tool} =
+      ComponentManager.add_tool(
+        server_name,
+        "search_notes",
+        fn _arguments, _ctx -> %{source: :manager} end,
+        description: "manager"
+      )
+
+    listed = [{"archive_notes", "provider"}, {"search_notes", "definition"}]
+    assert listed == Enum.map(FastestMCP.list_tools!(server_name), &{&1.name, &1.description})
+
+    assert %{tools: tools} =
+             FastestMCP.Transport.Engine.dispatch!(server_name, %FastestMCP.Transport.Request{
+               method: "tools/list",
+               transport: :stdio
+             })
+
+    assert listed == Enum.map(tools, &{&1["name"], &1["description"]})
+    assert %{source: :definition} == FastestMCP.call_tool!(server_name, "search_notes")
+    assert %{source: :provider} == FastestMCP.call_tool!(server_name, "archive_notes")
+  end
+
   test "server on_duplicate warn logs and replaces" do
     log =
       capture_log(fn ->

@@ -7,7 +7,10 @@ defmodule FastestMCP.Error do
   still raise a `FastestMCP.Error` to fail with a specific code.
 
   `:cause` holds `{exception, stacktrace}` when the error wraps an unexpected
-  exception. It is never serialized.
+  exception, such as one a handler raised. It is never serialized.
+  `:from_operation` is `true` for an error that an operation (a call, read,
+  list, or completion) returned, as opposed to a request that a transport
+  rejected before it ran one.
   """
 
   defexception [
@@ -20,6 +23,7 @@ defmodule FastestMCP.Error do
     jsonrpc_id: :unavailable,
     jsonrpc_notification: false,
     terminate_session_after_delivery: false,
+    from_operation: false,
     cause: nil
   ]
 
@@ -33,6 +37,7 @@ defmodule FastestMCP.Error do
           jsonrpc_id: String.t() | integer() | :unavailable,
           jsonrpc_notification: boolean(),
           terminate_session_after_delivery: boolean(),
+          from_operation: boolean(),
           cause: {Exception.t(), Exception.stacktrace()} | nil
         }
 

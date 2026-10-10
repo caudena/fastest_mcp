@@ -1,6 +1,11 @@
 defmodule FastestMCP.Util do
   @moduledoc false
 
+  @version Mix.Project.config()[:version]
+
+  # FastestMCP's own version, as in its mix.exs.
+  def version, do: @version
+
   def maybe_put(container, _key, nil), do: container
   def maybe_put(map, key, value) when is_map(map), do: Map.put(map, key, value)
   def maybe_put(keyword, key, value) when is_list(keyword), do: Keyword.put(keyword, key, value)

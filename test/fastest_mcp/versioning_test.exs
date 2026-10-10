@@ -46,6 +46,33 @@ defmodule FastestMCP.VersioningTest do
     assert 2 == FastestMCP.call_tool!(server_name, "calc", %{}, version: "2.0")
   end
 
+  test "prompts/get renders the version a client asks for" do
+    server_name = unique_name("versioning-prompts")
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_prompt("summarize", fn _args, _ctx -> "Version one" end, version: "1.0.0")
+    |> FastestMCP.add_prompt("summarize", fn _args, _ctx -> "Version two" end, version: "2.0.0")
+    |> start_server!()
+
+    assert %{"messages" => [%{"content" => %{"text" => "Version one"}}]} =
+             Engine.dispatch!(server_name, %Request{
+               method: "prompts/get",
+               transport: :stdio,
+               payload: %{
+                 "name" => "summarize",
+                 "_meta" => %{"fastestmcp" => %{"version" => "1.0.0"}}
+               }
+             })
+
+    client = connect!({:in_process, server_name})
+
+    assert %{"messages" => [%{"content" => %{"text" => "Version one"}}]} =
+             FastestMCP.Client.render_prompt!(client, "summarize", %{}, version: "1.0.0")
+
+    assert %{"messages" => [%{"content" => %{"text" => "Version two"}}]} =
+             FastestMCP.Client.render_prompt!(client, "summarize", %{})
+  end
+
   test "provider candidates fall back to the highest visible version and expose what executed" do
     parent = self()
     server_name = "provider-version-fallback-#{System.unique_integer([:positive])}"
@@ -279,7 +306,7 @@ defmodule FastestMCP.VersioningTest do
       1
     )
 
-    assert_raise Error, ~r/disabled/, fn ->
+    assert_raise Error, ~r/unknown tool "calc"/, fn ->
       Engine.dispatch!(server_name, %Request{
         method: "tools/call",
         transport: :stdio,
@@ -415,7 +442,7 @@ defmodule FastestMCP.VersioningTest do
                }
              })
 
-    assert_raise Error, ~r/disabled/, fn ->
+    assert_raise Error, ~r{unknown resource "memo://config"}, fn ->
       Engine.dispatch!(server_name, %Request{
         method: "resources/read",
         transport: :stdio,
@@ -426,7 +453,7 @@ defmodule FastestMCP.VersioningTest do
       })
     end
 
-    assert_raise Error, ~r/disabled/, fn ->
+    assert_raise Error, ~r{unknown resource "memo://users/42"}, fn ->
       Engine.dispatch!(server_name, %Request{
         method: "resources/read",
         transport: :stdio,

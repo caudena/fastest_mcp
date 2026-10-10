@@ -68,6 +68,12 @@ defmodule FastestMCP.InitializationTest do
            } = result
   end
 
+  test "server info defaults to FastestMCP's version and names modules without Elixir." do
+    info = FastestMCP.OperationPipeline.Capabilities.server_info(FastestMCP.server(MyApp.Notes))
+
+    assert info == %{"name" => "MyApp.Notes", "version" => Mix.Project.config()[:version]}
+  end
+
   test "initialize omits completion capability when the server exposes no completion sources" do
     server_name =
       "initialize-no-completion-" <> Integer.to_string(System.unique_integer([:positive]))
@@ -125,7 +131,7 @@ defmodule FastestMCP.InitializationTest do
     result = FastestMCP.initialize!(server_name)
 
     assert result["protocolVersion"] == ProtocolTest.protocol_version()
-    refute Map.has_key?(result["capabilities"], "resources")
+    assert result["capabilities"]["resources"] == %{}
     refute Map.has_key?(result["capabilities"], "tasks")
 
     assert get_in(result, ["capabilities", "experimental", "feature_flags", "beta"]) == true
@@ -236,7 +242,7 @@ defmodule FastestMCP.InitializationTest do
     assert result["capabilities"]["prompts"] == %{}
   end
 
-  test "wire capability projection omits invisible families and client-only features" do
+  test "wire capabilities offer every family, without hidden components' features or client-only ones" do
     server_name = "initialize-visible-capabilities-#{System.unique_integer([:positive])}"
 
     FastestMCP.server(server_name)
@@ -268,14 +274,22 @@ defmodule FastestMCP.InitializationTest do
 
     http_capabilities = JSON.decode!(http_response.resp_body)["result"]["capabilities"]
 
-    assert http_capabilities == %{"logging" => %{}}
+    # The hidden task tool and completable prompt add no tasks or completions.
+    expected = %{
+      "logging" => %{},
+      "tools" => %{"listChanged" => true},
+      "resources" => %{"listChanged" => true, "subscribe" => true},
+      "prompts" => %{"listChanged" => true}
+    }
+
+    assert http_capabilities == expected
 
     {_connection_id, stdio_response} =
       ProtocolTest.initialize_stdio(server_name,
         params: %{"capabilities" => client_capabilities}
       )
 
-    assert get_in(stdio_response, ["result", "capabilities"]) == %{"logging" => %{}}
+    assert get_in(stdio_response, ["result", "capabilities"]) == expected
   end
 
   test "empty elicitation capability is stored as effective form support" do

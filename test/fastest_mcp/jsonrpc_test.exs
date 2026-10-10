@@ -339,8 +339,7 @@ defmodule FastestMCP.JSONRPCTest do
 
     assert response.status == 401
     assert response.resp_body == ""
-    assert [challenge] = Plug.Conn.get_resp_header(response, "www-authenticate")
-    assert String.starts_with?(challenge, "Bearer ")
+    assert Plug.Conn.get_resp_header(response, "www-authenticate") == ["Bearer"]
   end
 
   test "malformed messages still return parse and invalid-request errors", %{
@@ -471,10 +470,9 @@ defmodule FastestMCP.JSONRPCTest do
   test "strict_request_ids must be a boolean" do
     server_name = unique_name("request-id-policy-invalid")
 
-    assert {:error, %ArgumentError{message: message}} =
-             FastestMCP.start_server(FastestMCP.server(server_name), strict_request_ids: "yes")
-
-    assert message =~ "strict_request_ids must be a boolean"
+    assert_raise ArgumentError, ~r/strict_request_ids must be a boolean/, fn ->
+      FastestMCP.start_server(FastestMCP.server(server_name), strict_request_ids: "yes")
+    end
   end
 
   test "request id exhaustion returns one bounded correlated error before terminating HTTP and stdio sessions" do

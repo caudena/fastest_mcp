@@ -9,7 +9,7 @@ defmodule FastestMCP.Client.Transport.InProcess do
   alias FastestMCP.ServerRuntime
 
   @impl true
-  def open(transport, owner, opts) do
+  def open(transport, owner) do
     connection_id = make_ref()
 
     with {:ok, _runtime} <- ServerRuntime.fetch(transport.server_name),
@@ -17,8 +17,7 @@ defmodule FastestMCP.Client.Transport.InProcess do
            ConnectionSupervisor.start_link(
              owner: owner,
              server_name: transport.server_name,
-             connection_id: connection_id,
-             auth_input: Keyword.get(opts, :auth_input, %{})
+             connection_id: connection_id
            ) do
       case ConnectionSupervisor.coordinator(supervisor) do
         {:ok, coordinator} ->
@@ -54,13 +53,13 @@ defmodule FastestMCP.Client.Transport.InProcess do
   def connected?(_transport), do: false
 
   @impl true
-  def send_envelope(%{coordinator: coordinator}, envelope) when is_pid(coordinator) do
-    Coordinator.send_envelope(coordinator, envelope)
+  def send_line(%{coordinator: coordinator}, line, auth_input) when is_pid(coordinator) do
+    Coordinator.send_line(coordinator, line, auth_input)
   catch
     :exit, _reason -> {:error, :closed}
   end
 
-  def send_envelope(_transport, _envelope), do: {:error, :closed}
+  def send_line(_transport, _line, _auth_input), do: {:error, :closed}
 
   @impl true
   def close(%{coordinator: coordinator, supervisor: supervisor}) do

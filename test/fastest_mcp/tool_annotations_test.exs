@@ -54,6 +54,80 @@ defmodule FastestMCP.ToolAnnotationsTest do
     end
   end
 
+  test "tool names follow MCP's naming rules when you define them" do
+    add = fn name -> FastestMCP.add_tool(FastestMCP.server("tool-names"), name, fn -> :ok end) end
+
+    for name <- ["search notes", "notes/search", "", String.duplicate("a", 129), "búsqueda"] do
+      assert_raise ArgumentError, ~r/tool name must be 1 to 128 letters, digits/, fn ->
+        add.(name)
+      end
+    end
+
+    for name <- ["getUser", "DATA_EXPORT_v2", "admin.tools.list", "search-notes"] do
+      assert [%{name: ^name}] = add.(name).tools
+    end
+
+    assert [_tool] = add.(String.duplicate("a", 128)).tools
+
+    assert_raise ArgumentError, ~r/tool name/, fn ->
+      FastestMCP.Components.Tool.new("search notes", fn -> :ok end)
+    end
+
+    assert_raise ArgumentError, ~r/tool name/, fn ->
+      FastestMCP.Providers.Local.add_tool(FastestMCP.Providers.Local.new(), "a b", fn -> :ok end)
+    end
+
+    # Composed names stay valid: a namespace and a rename use the same rules.
+    assert_raise ArgumentError, ~r/namespace must be letters, digits/, fn ->
+      FastestMCP.ProviderTransforms.Namespace.new("my notes")
+    end
+
+    assert_raise ArgumentError, ~r/namespace/, fn ->
+      FastestMCP.mount(FastestMCP.server("parent"), FastestMCP.server("child"), namespace: "a/b")
+    end
+
+    assert_raise ArgumentError, ~r/tool name/, fn ->
+      FastestMCP.ProviderTransforms.ToolTransform.new(%{"search" => %{name: "find notes"}})
+    end
+  end
+
+  test "resource annotations hold the values MCP defines" do
+    server =
+      FastestMCP.server("resource-annotations")
+      |> FastestMCP.add_resource("notes://help", fn -> "help" end,
+        annotations: %{
+          audience: ["user", "assistant"],
+          priority: 0.5,
+          lastModified: "2025-01-12T15:00:58Z",
+          cacheable: true
+        }
+      )
+      |> FastestMCP.add_resource_template("notes://{id}", fn _args -> "note" end,
+        annotations: %{"priority" => 1, "lastModified" => ~U[2025-01-12 15:00:58Z]}
+      )
+
+    assert [_resource] = server.resources
+
+    for {annotations, message} <- [
+          {%{audience: ["admin"]},
+           ~r/annotation audience must be a list of "user" and "assistant"/},
+          {%{audience: "user"}, ~r/annotation audience/},
+          {%{priority: 1.5}, ~r/annotation priority must be a number from 0 to 1/},
+          {%{"priority" => "high"}, ~r/annotation priority/},
+          {%{lastModified: "yesterday"}, ~r/annotation lastModified must be an ISO 8601/}
+        ] do
+      assert_raise ArgumentError, message, fn ->
+        FastestMCP.add_resource(server, "notes://bad", fn -> "bad" end, annotations: annotations)
+      end
+
+      assert_raise ArgumentError, message, fn ->
+        FastestMCP.add_resource_template(server, "bad://{id}", fn _args -> "bad" end,
+          annotations: annotations
+        )
+      end
+    end
+  end
+
   test "transport metadata emits fastestmcp _meta and strips internal fastestmcp fields" do
     server_name = "tool-meta-" <> Integer.to_string(System.unique_integer([:positive]))
 

@@ -24,6 +24,16 @@ defmodule FastestMCP.JSONValue do
 
   def normalize(%Range{} = value), do: value |> Enum.to_list() |> Enum.map(&normalize/1)
 
+  # Terms without a JSON form fail the result that holds them.
+  def normalize(%struct{}) when struct in [Stream, File.Stream, IO.Stream],
+    do: not_json!("a stream", "; call Enum.to_list/1 on it first")
+
+  def normalize(value) when is_function(value), do: not_json!("a function")
+  def normalize(value) when is_pid(value), do: not_json!("a PID")
+  def normalize(value) when is_port(value), do: not_json!("a port")
+  def normalize(value) when is_reference(value), do: not_json!("a reference")
+  def normalize(value) when is_bitstring(value), do: not_json!("a bitstring")
+
   def normalize(%_struct{} = value) do
     value
     |> Map.from_struct()
@@ -43,7 +53,6 @@ defmodule FastestMCP.JSONValue do
   end
 
   def normalize(value) when is_atom(value), do: value
-  def normalize(value), do: value
 
   def stringify_keys(value) do
     value
@@ -52,6 +61,12 @@ defmodule FastestMCP.JSONValue do
   end
 
   def encode!(value), do: value |> normalize() |> JSON.encode!()
+
+  defp not_json!(what, hint \\ "") do
+    raise FastestMCP.Error,
+      code: :internal_error,
+      message: "#{what} cannot be encoded as JSON#{hint}"
+  end
 
   defp normalize_key(key)
        when is_binary(key) or is_atom(key) or is_integer(key) or is_float(key) or is_boolean(key),

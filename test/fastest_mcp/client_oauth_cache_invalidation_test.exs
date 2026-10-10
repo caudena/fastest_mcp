@@ -164,8 +164,8 @@ defmodule FastestMCP.ClientOAuthCacheInvalidationTest do
     assert %{structured_content: %{"tool" => "first_tool"}} =
              Client.call_tool!(client, "first_tool", %{})
 
-    assert %{"credential" => "token-one"} = Client.read_resource!(client, "memory://auth")
-    assert %{"credential" => "token-one"} = Client.read_resource!(client, "memory://auth")
+    assert %{"credential" => "token-one"} = read_json!(client, "memory://auth")
+    assert %{"credential" => "token-one"} = read_json!(client, "memory://auth")
 
     assert Agent.get(state, & &1.tool_lists) == 1
     assert Agent.get(state, & &1.resource_reads) == 1
@@ -181,7 +181,7 @@ defmodule FastestMCP.ClientOAuthCacheInvalidationTest do
     assert %{structured_content: %{"tool" => "second_tool"}} =
              Client.call_tool!(client, "second_tool", %{})
 
-    assert %{"credential" => "token-two"} = Client.read_resource!(client, "memory://auth")
+    assert %{"credential" => "token-two"} = read_json!(client, "memory://auth")
 
     snapshot = Agent.get(state, & &1)
     assert snapshot.token_requests == 2
@@ -195,5 +195,11 @@ defmodule FastestMCP.ClientOAuthCacheInvalidationTest do
 
   defp json_response(document) do
     {:ok, 200, [{"content-type", "application/json"}], JSON.encode!(document)}
+  end
+
+  # The JSON value of a resource's one text content.
+  defp read_json!(client, uri, opts \\ []) do
+    assert %{"contents" => [%{"text" => text}]} = Client.read_resource!(client, uri, opts)
+    JSON.decode!(text)
   end
 end

@@ -30,10 +30,25 @@ defmodule FastestMCP.Runtime.RegistryOwnershipTest do
     assert :ok = FastestMCP.stop_server(server.name)
   end
 
+  test "invalid runtime options raise in the caller and start nothing" do
+    server = FastestMCP.server(unique_name("invalid-options"))
+
+    assert_raise ArgumentError, ~r/max_sessions must be a positive integer/, fn ->
+      FastestMCP.start_server(server, max_sessions: 0)
+    end
+
+    assert_raise ArgumentError, ~r/unknown keys \[:max_session\], the allowed keys are: /, fn ->
+      FastestMCP.start_server(server, max_session: 10)
+    end
+
+    assert {:error, :not_found} = Registry.lookup_server(server.name)
+  end
+
   test "failed startup leaves no registration behind" do
     server = FastestMCP.server(unique_name("failed-start"))
+    failing = FastestMCP.add_lifespan(server, fn _server -> {:error, :unavailable} end)
 
-    assert {:error, %ArgumentError{}} = FastestMCP.start_server(server, max_sessions: 0)
+    assert {:error, _reason} = FastestMCP.start_server(failing)
     assert {:error, :not_found} = Registry.lookup_server(server.name)
 
     assert {:ok, runtime} = FastestMCP.start_server(server)
@@ -42,7 +57,7 @@ defmodule FastestMCP.Runtime.RegistryOwnershipTest do
     assert {:error, :not_found} = Registry.lookup_server(server.name)
   end
 
-  test "a failed child restarts the whole runtime under the same supervisor" do
+  test "a failed child restarts the runtime under the same supervisor, keeping its component manager" do
     server = start_server!(FastestMCP.server(unique_name("persistent-child")))
     {:ok, runtime} = Registry.lookup_server(server.name)
     {:ok, before} = FastestMCP.ServerRuntime.fetch(server.name)
@@ -58,7 +73,7 @@ defmodule FastestMCP.Runtime.RegistryOwnershipTest do
       end)
 
     assert {:ok, ^runtime} = Registry.lookup_server(server.name)
-    assert restarted.component_manager.pid != before.component_manager.pid
+    assert restarted.component_manager.pid == before.component_manager.pid
     assert {:ok, _tools} = FastestMCP.list_tools(server.name)
   end
 

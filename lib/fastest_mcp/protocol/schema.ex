@@ -2,7 +2,9 @@ defmodule FastestMCP.Protocol.Schema do
   @moduledoc false
   # Selects and compiles definitions of the vendored MCP wire schemas
   # (priv/schema) by protocol version, message direction, kind, and method.
-  # Each compiled definition is cached in :persistent_term for the VM's life.
+  # The schema files are compiled into this module, gzipped, so a build
+  # without a priv directory, such as an escript, validates messages too. Each
+  # compiled definition is cached in :persistent_term for the VM's life.
 
   import FastestMCP.Protocol.Version
 
@@ -24,12 +26,19 @@ defmodule FastestMCP.Protocol.Schema do
   # are client requests and whose notifications are server notifications.
   @schema_dir Path.expand("../../../priv/schema", __DIR__)
 
-  schemas =
-    for {key, file} <- Map.put(@sources, :tasks, @tasks_source), into: %{} do
+  schema_files =
+    for file <- [@tasks_source | Map.values(@sources)], into: %{} do
       path = Path.join(@schema_dir, file)
       @external_resource path
-      {key, path |> File.read!() |> JSON.decode!() |> Map.fetch!("$defs")}
+      {file, File.read!(path)}
     end
+
+  @schema_files Map.new(schema_files, fn {file, json} -> {file, :zlib.gzip(json)} end)
+
+  schemas =
+    for {key, file} <- Map.put(@sources, :tasks, @tasks_source),
+        into: %{},
+        do: {key, schema_files |> Map.fetch!(file) |> JSON.decode!() |> Map.fetch!("$defs")}
 
   extension =
     Map.new(schemas.tasks, fn {name, definition} -> {@tasks_prefix <> name, definition} end)
@@ -223,12 +232,8 @@ defmodule FastestMCP.Protocol.Schema do
 
   defp schema_id(version), do: "urn:fastestmcp:mcp-schema:" <> version
 
-  defp read_schema(file) do
-    :fastest_mcp
-    |> Application.app_dir(Path.join("priv/schema", file))
-    |> File.read!()
-    |> JSON.decode!()
-  end
+  defp read_schema(file),
+    do: @schema_files |> Map.fetch!(file) |> :zlib.gunzip() |> JSON.decode!()
 
   # A `<Result>Response` validates a response carrying that result or an
   # error. Where the schema itself defines one (only for some 2026 results), it

@@ -20,6 +20,32 @@ defmodule FastestMCP.OpenAPIProviderEdgeCasesTest do
     assert FastestMCP.list_tools!(server.name) == []
   end
 
+  test "operation ids become valid tool names" do
+    spec = %{
+      "openapi" => "3.0.0",
+      "info" => %{"title" => "Names", "version" => "1.0.0"},
+      "paths" => %{
+        "/orgs/{org}/repos" => %{
+          "get" => %{"operationId" => "repos/list-for-org", "responses" => ok()}
+        },
+        "/users" => %{"get" => %{"operationId" => "List users", "responses" => ok()}}
+      }
+    }
+
+    server =
+      FastestMCP.from_openapi(spec,
+        name: unique_name("openapi-names"),
+        requester: fn _method, _url, _opts ->
+          {:ok, 200, [{"content-type", "application/json"}], JSON.encode!(%{})}
+        end
+      )
+
+    start_server!(server)
+
+    assert ["List_users", "repos_list-for-org"] ==
+             server.name |> FastestMCP.list_tools!() |> Enum.map(& &1.name)
+  end
+
   test "provider without server url or requester raises" do
     spec = %{
       "openapi" => "3.0.0",

@@ -26,6 +26,8 @@ defmodule FastestMCP.Providers.OpenAPI do
     cookie: ~w(form)
   }
 
+  # `headers:` may hold credentials, which inspect output leaves out.
+  @derive {Inspect, except: [:headers]}
   defstruct [
     :name,
     :spec,
@@ -33,6 +35,7 @@ defmodule FastestMCP.Providers.OpenAPI do
     :requester,
     timeout_ms: 5_000,
     schema_options: [],
+    headers: [],
     tools: []
   ]
 
@@ -63,7 +66,8 @@ defmodule FastestMCP.Providers.OpenAPI do
       base_url: base_url && String.trim_trailing(to_string(base_url), "/"),
       requester: requester,
       timeout_ms: Keyword.get(opts, :timeout_ms, 5_000),
-      schema_options: schema_options
+      schema_options: schema_options,
+      headers: normalize_headers!(Keyword.get(opts, :headers, []))
     }
 
     %{provider | tools: build_tools(provider)}
@@ -115,8 +119,7 @@ defmodule FastestMCP.Providers.OpenAPI do
         operation,
         body_view,
         body_required?,
-        provider.spec,
-        provider.schema_options
+        provider
       )
 
     input_schema = build_input_schema(parameter_bindings)
@@ -133,6 +136,7 @@ defmodule FastestMCP.Providers.OpenAPI do
         base_url: provider.base_url,
         requester: provider.requester,
         timeout_ms: provider.timeout_ms,
+        headers: provider.headers,
         bindings: parameter_bindings,
         initial_body: initial_request_body(body_view, body_required?),
         body_content_type: body_content_type,
@@ -145,7 +149,7 @@ defmodule FastestMCP.Providers.OpenAPI do
     ComponentCompiler.compile(
       :tool,
       operation_name(method, path, operation),
-      fn arguments, _context -> execute_operation(plan, arguments || %{}) end,
+      fn arguments, context -> execute_operation(plan, arguments || %{}, context) end,
       description: operation_description(operation),
       input_schema: input_schema,
       output_schema: output_schema,
@@ -153,7 +157,7 @@ defmodule FastestMCP.Providers.OpenAPI do
     )
   end
 
-  defp execute_operation(%RequestPlan{} = plan, arguments) do
+  defp execute_operation(%RequestPlan{} = plan, arguments, context) do
     args = stringify_keys(arguments)
 
     path =
@@ -172,8 +176,9 @@ defmodule FastestMCP.Providers.OpenAPI do
       |> Enum.flat_map(&query_pairs(&1, args))
 
     headers =
-      plan.bindings.header
-      |> Enum.flat_map(&header_pairs(&1, args))
+      plan.headers
+      |> Enum.flat_map(&configured_header(&1, context))
+      |> Kernel.++(Enum.flat_map(plan.bindings.header, &header_pairs(&1, args)))
       |> add_cookie_header(plan.bindings.cookie, args)
 
     body =
@@ -235,16 +240,16 @@ defmodule FastestMCP.Providers.OpenAPI do
     |> maybe_put_map("required", required |> Enum.reverse() |> Enum.uniq())
   end
 
-  defp build_parameter_bindings(
-         path_parameters,
-         operation,
-         body_schema,
-         body_required?,
-         spec,
-         options
-       ) do
+  defp build_parameter_bindings(path_parameters, operation, body_schema, body_required?, provider) do
+    %{spec: spec, schema_options: options} = provider
     operation_parameters = normalized_parameters(Map.get(operation, "parameters", []), spec)
-    parameters = merge_parameters(path_parameters, operation_parameters)
+    configured = MapSet.new(provider.headers, fn {name, _value} -> String.downcase(name) end)
+
+    # A header that the provider sends itself is no argument.
+    parameters =
+      path_parameters
+      |> merge_parameters(operation_parameters)
+      |> Enum.reject(&(&1["in"] == "header" and String.downcase(&1["name"]) in configured))
 
     body_bindings =
       body_schema
@@ -435,7 +440,7 @@ defmodule FastestMCP.Providers.OpenAPI do
   defp validate_body!(:no_body, nil, _required), do: :ok
 
   defp validate_body!(:no_body, _validator, true),
-    do: raise(Error, code: :bad_request, message: "OpenAPI request body is required")
+    do: raise(Error, code: :invalid_params, message: "OpenAPI request body is required")
 
   defp validate_body!(body, validator, _required) do
     case Schema.validate(validator, body) do
@@ -444,7 +449,7 @@ defmodule FastestMCP.Providers.OpenAPI do
 
       {:error, error} ->
         raise Error,
-          code: :bad_request,
+          code: :invalid_params,
           message: "invalid OpenAPI request body",
           details: %{violations: error.violations}
     end
@@ -523,6 +528,8 @@ defmodule FastestMCP.Providers.OpenAPI do
 
   defp normalize_media_type(content_type), do: MIME.normalize(content_type)
 
+  # Tool names take letters, digits, `_`, `-`, and `.`; an operationId such
+  # as `repos/list-for-org` becomes `repos_list-for-org`.
   defp operation_name(method, path, operation) do
     case operation["operationId"] do
       nil ->
@@ -532,7 +539,7 @@ defmodule FastestMCP.Providers.OpenAPI do
         |> String.trim("_")
 
       value ->
-        to_string(value)
+        value |> to_string() |> String.replace(~r/[^A-Za-z0-9_.-]+/, "_")
     end
   end
 
@@ -549,6 +556,19 @@ defmodule FastestMCP.Providers.OpenAPI do
         encode_query_value(binding.source_name, value, binding.style, binding.explode)
         |> Enum.map(fn {key, item} -> {key, to_string(item)} end)
     end
+  end
+
+  # A configured header's value is a string, or a function of no arguments or
+  # of the handler context that returns one; `nil` leaves the header out.
+  defp configured_header({name, value}, context) do
+    value =
+      cond do
+        is_function(value, 0) -> value.()
+        is_function(value, 1) -> value.(context)
+        true -> value
+      end
+
+    if is_nil(value), do: [], else: [{name, to_string(value)}]
   end
 
   defp header_pairs(binding, args) do
@@ -612,7 +632,7 @@ defmodule FastestMCP.Providers.OpenAPI do
         |> Keyword.put(:content_type, content_type)
 
       true ->
-        raise Error, code: :bad_request, message: "raw OpenAPI request bodies must be strings"
+        raise Error, code: :invalid_params, message: "raw OpenAPI request bodies must be strings"
     end
   end
 
@@ -873,6 +893,26 @@ defmodule FastestMCP.Providers.OpenAPI do
   end
 
   defp multipart_fields(body, _encoding), do: body
+
+  defp normalize_headers!(headers) when is_map(headers) or is_list(headers) do
+    Enum.map(headers, fn
+      {name, value}
+      when (is_binary(name) or is_atom(name)) and
+             (is_binary(value) or is_function(value, 0) or is_function(value, 1)) ->
+        {to_string(name), value}
+
+      _other ->
+        invalid_headers!(headers)
+    end)
+  end
+
+  defp normalize_headers!(headers), do: invalid_headers!(headers)
+
+  defp invalid_headers!(headers) do
+    raise ArgumentError,
+          "headers must be a map or a list of {name, value} pairs, where a value is a string " <>
+            "or a function of no arguments or of the handler context, got: #{inspect(headers)}"
+  end
 
   defp normalize_schema_options!(options) when is_list(options) do
     if Keyword.keyword?(options) do

@@ -1,102 +1,100 @@
 defmodule FastestMCP.MiddlewarePingTest do
   use FastestMCP.Case, async: true
 
-  alias FastestMCP.EventBus
+  alias FastestMCP.Client
   alias FastestMCP.Middleware
   alias FastestMCP.Middleware.Ping
-  alias FastestMCP.ServerRuntime
   alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
-  alias FastestMCP.Transport.StdioAdapter
+  alias FastestMCP.TestSupport.RawPeer
 
-  test "ping middleware starts one loop per stdio session and cleans up when the session expires" do
-    middleware = Middleware.ping(interval_ms: 10)
-    server_name = "ping-stdio-" <> Integer.to_string(System.unique_integer([:positive]))
+  @event [:fastest_mcp, :session, :ping]
 
-    FastestMCP.server(server_name)
-    |> FastestMCP.add_middleware(middleware)
-    |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
-    |> start_server!(session_idle_ttl: 1_000)
+  test "the client of each 2025-11-25 session that listens is pinged at every interval" do
+    middleware = Middleware.ping(interval_ms: 50)
+    server_name = start_ping_server!(middleware)
+    attach_telemetry([@event])
 
-    assert {:ok, runtime} = ServerRuntime.fetch(server_name)
-    assert :ok = EventBus.subscribe(runtime.event_bus, server_name)
+    client = connect!({:in_process, server_name}, protocol_version: "2025-11-25")
+    [%{"text" => session_id}] = Client.call_tool!(client, "whoami", %{}).content
 
-    {connection_id, _initialize_response} = ProtocolTest.initialize_stdio(server_name)
+    for _ping <- 1..2 do
+      assert_receive {:telemetry, @event, %{system_time: _, duration: duration},
+                      %{
+                        server_name: ^server_name,
+                        session_id: ^session_id,
+                        transport: :in_process,
+                        result: :ok
+                      }},
+                     1_000
 
-    {:ok, %{session_id: session_id}} =
-      StdioAdapter.decode(ProtocolTest.jsonrpc_request(99, "ping"),
-        connection_id: connection_id
-      )
-
-    response =
-      ProtocolTest.stdio_request(
-        server_name,
-        connection_id,
-        2,
-        "tools/call",
-        %{"name" => "echo", "arguments" => %{"message" => "hello"}}
-      )
-
-    assert response["jsonrpc"] == "2.0"
-
-    assert_receive {:fastest_mcp_event, ^server_name, [:session, :ping], %{system_time: _},
-                    %{session_id: ^session_id, transport: :stdio}}
+      assert duration >= 0
+    end
 
     assert MapSet.member?(Middleware.ping_sessions(middleware), {server_name, session_id})
 
-    _response =
-      ProtocolTest.stdio_request(
-        server_name,
-        connection_id,
-        3,
-        "tools/call",
-        %{"name" => "echo", "arguments" => %{"message" => "again"}}
-      )
-
-    assert MapSet.size(Middleware.ping_sessions(middleware)) == 1
-
-    # The session expires after its idle ttl and takes its ping loop along.
-    assert_eventually(fn -> MapSet.size(Middleware.ping_sessions(middleware)) == 0 end, 5_000)
+    # The pings end with the session, and so do their timers.
+    Client.disconnect!(client)
+    assert_eventually(fn -> MapSet.size(Middleware.ping_sessions(middleware)) == 0 end)
+    flush_pings(server_name)
+    refute_receive {:telemetry, @event, _measurements, %{server_name: ^server_name}}, 150
+    assert [state] = Middleware.runtimes(middleware)
+    assert :sys.get_state(state).sessions == %{}
   end
 
-  test "ping middleware starts for explicit HTTP sessions and skips in-process calls" do
-    middleware = Middleware.ping(interval_ms: 10)
-    server_name = "ping-http-" <> Integer.to_string(System.unique_integer([:positive]))
+  test "a client that doesn't answer gets timed-out pings, and its session keeps working" do
+    middleware = Middleware.ping(interval_ms: 200, timeout_ms: 100)
+    server_name = start_ping_server!(middleware)
+    attach_telemetry([@event])
 
-    FastestMCP.server(server_name)
-    |> FastestMCP.add_middleware(middleware)
-    |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
-    |> start_server!(session_idle_ttl: 1_000)
+    peer = RawPeer.connect(:stdio, server_name, %{})
+    on_exit(fn -> RawPeer.close(peer) end)
+    session_id = peer.session_id
 
-    assert {:ok, runtime} = ServerRuntime.fetch(server_name)
-    assert :ok = EventBus.subscribe(runtime.event_bus, server_name)
+    {pending, peer} = RawPeer.start_request(peer, 2, "tools/call", echo("first"))
+    {:ok, 200, %{"result" => _result}, peer} = RawPeer.await_response(peer, pending)
 
-    assert %{"message" => "in-process"} ==
-             FastestMCP.call_tool!(server_name, "echo", %{"message" => "in-process"},
-               session_id: "ignored"
-             )
+    # The first ping goes unanswered and times out.
+    {:ok, %{"method" => "ping", "id" => _unanswered}, peer} =
+      RawPeer.recv_until(peer, &(&1["method"] == "ping"), 1_000)
+
+    assert_receive {:telemetry, @event, _measurements,
+                    %{session_id: ^session_id, transport: :stdio, result: :timeout}},
+                   1_000
+
+    {pending, peer} = RawPeer.start_request(peer, 3, "tools/call", echo("still there"))
+
+    {:ok, 200, %{"result" => %{"structuredContent" => %{"message" => "still there"}}}, peer} =
+      RawPeer.await_response(peer, pending)
+
+    # An answered ping succeeds.
+    {:ok, %{"method" => "ping", "id" => ping_id}, peer} =
+      RawPeer.recv_until(peer, &(&1["method"] == "ping"), 1_000)
+
+    {:ok, 202, "", _peer} = RawPeer.respond(peer, ping_id, %{})
+
+    assert_receive {:telemetry, @event, _measurements, %{session_id: ^session_id, result: :ok}},
+                   1_000
+  end
+
+  test "a session without a stream to the client is not pinged" do
+    middleware = Middleware.ping(interval_ms: 20)
+    server_name = start_ping_server!(middleware)
+    attach_telemetry([@event])
+
+    # An in-process call names no client, so it is never followed.
+    assert %{"message" => "hi"} ==
+             FastestMCP.call_tool!(server_name, "echo", %{"message" => "hi"}, session_id: "local")
 
     assert MapSet.size(Middleware.ping_sessions(middleware)) == 0
 
-    {session_id, _initialize_response, initialized_response} =
-      ProtocolTest.initialize_http(server_name)
+    # A 2025-11-25 HTTP session without its GET stream has no way to the client.
+    {session_id, _initialize, _initialized} = ProtocolTest.initialize_http(server_name)
 
-    assert initialized_response.status == 202
+    assert ProtocolTest.http_request(server_name, session_id, 2, "tools/call", echo("http")).status ==
+             200
 
-    conn =
-      ProtocolTest.http_request(
-        server_name,
-        session_id,
-        2,
-        "tools/call",
-        %{"name" => "echo", "arguments" => %{"message" => "http"}}
-      )
-
-    assert conn.status == 200
-
-    assert_receive {:fastest_mcp_event, ^server_name, [:session, :ping], %{system_time: _},
-                    %{session_id: ^session_id, transport: :streamable_http}}
-
-    assert MapSet.member?(Middleware.ping_sessions(middleware), {server_name, session_id})
+    assert_eventually(fn -> MapSet.size(Middleware.ping_sessions(middleware)) == 0 end)
+    refute_receive {:telemetry, @event, _measurements, %{server_name: ^server_name}}, 100
   end
 
   test "ping middleware no server started returns an internal error naming the cause" do
@@ -106,9 +104,41 @@ defmodule FastestMCP.MiddlewarePingTest do
     assert message =~ "FastestMCP.Middleware.Ping has no running state"
   end
 
-  test "ping middleware rejects non-positive intervals" do
-    assert_raise ArgumentError, "interval_ms must be positive", fn ->
+  test "ping middleware rejects non-positive intervals and timeouts" do
+    assert_raise ArgumentError, "interval_ms must be a positive integer, got: 0", fn ->
       Middleware.ping(interval_ms: 0)
+    end
+
+    assert_raise ArgumentError, "timeout_ms must be a positive integer, got: -1", fn ->
+      Middleware.ping(timeout_ms: -1)
+    end
+
+    assert_raise ArgumentError, ~r/unknown keys \[:interval\]/, fn ->
+      Middleware.ping(interval: 10)
+    end
+  end
+
+  defp start_ping_server!(middleware) do
+    server_name = unique_name("ping")
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_middleware(middleware)
+    |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+    |> FastestMCP.add_tool("whoami", fn _arguments, ctx -> ctx.session_id end)
+    |> start_server!()
+
+    server_name
+  end
+
+  defp echo(message), do: %{"name" => "echo", "arguments" => %{"message" => message}}
+
+  # Drops the events of pings that finished while the session ended.
+  defp flush_pings(server_name) do
+    receive do
+      {:telemetry, @event, _measurements, %{server_name: ^server_name}} ->
+        flush_pings(server_name)
+    after
+      0 -> :ok
     end
   end
 end

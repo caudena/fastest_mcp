@@ -583,6 +583,19 @@ defmodule FastestMCP.ClientProtocolResponseTest do
     end
   end
 
+  test "automatic HTTP negotiation never downgrades an authentication error" do
+    for {jsonrpc_code, code} <- [{-32_003, :unauthorized}, {-32_004, :forbidden}] do
+      url =
+        start_protocol_server({:non_legacy_discovery_error, jsonrpc_code, 400},
+          test_pid: self()
+        )
+
+      assert {:error, %Error{code: ^code}} = Client.connect(url)
+      assert_receive {:client_protocol_request, %{"method" => "server/discover"}}
+      refute_receive {:client_protocol_request, %{"method" => "initialize"}}, 100
+    end
+  end
+
   test "supported_protocol_versions cannot replace the fixed library support set" do
     url = start_protocol_server(:unsupported_initialize)
 

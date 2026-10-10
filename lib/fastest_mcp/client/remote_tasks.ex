@@ -117,9 +117,9 @@ defmodule FastestMCP.Client.RemoteTasks do
   ## Waiting
 
   # Waits for `status:`/`statuses:`, by default for any status but working or
-  # submitted.
+  # submitted, until the call's own `timeout_ms:` or 60 seconds.
   def wait(client_ref, task_id, opts) do
-    with {:ok, client, opts} <- Requests.operation(client_ref, opts) do
+    with {:ok, client, operation_opts} <- Requests.operation(client_ref, opts) do
       task_id = to_string(task_id)
       targets = targets(opts)
 
@@ -131,8 +131,8 @@ defmodule FastestMCP.Client.RemoteTasks do
       deadline = Deadline.from_options(opts, timeout)
 
       Trace.span("tasks/get", task_id, fn trace ->
-        with {:ok, _task} <- register(client, task_id, nil, opts),
-             do: await_status(context(client, task_id, deadline, opts, trace), targets)
+        with {:ok, _task} <- register(client, task_id, nil, operation_opts),
+             do: await_status(context(client, task_id, deadline, operation_opts, trace), targets)
       end)
     end
   end
@@ -174,9 +174,14 @@ defmodule FastestMCP.Client.RemoteTasks do
 
   defp current_status(ctx) do
     with {:ok, info} <- info(ctx.client, ctx.task_id) do
-      if info.status, do: {:ok, info.status}, else: get(ctx)
+      if status = cached_status(info), do: {:ok, status}, else: get(ctx)
     end
   end
+
+  # A cached input_required status may predate answers sent with `update/3`,
+  # so it is fetched again before the client answers or reports it.
+  defp cached_status(%{status: %{"status" => "input_required"}}), do: nil
+  defp cached_status(info), do: info.status
 
   # A status notification matching `targets`, or `:timeout` after `window`.
   defp notified(ctx, targets, window) do
@@ -194,10 +199,13 @@ defmodule FastestMCP.Client.RemoteTasks do
 
   ## Results
 
-  # A remote task handle's final result, normalized by its kind.
+  # A remote task handle's final result, normalized by its kind. It waits
+  # until the call's own `timeout_ms:` or 60 seconds.
   def result(%RemoteTask{} = task, opts) do
-    with {:ok, client, opts} <- Requests.operation(task.client, opts),
-         {:ok, result} <- final_result(client, task, opts, nil),
+    with {:ok, client, operation_opts} <- Requests.operation(task.client, opts),
+         task_timeout = Keyword.get(opts, :timeout_ms, @default_timeout_ms),
+         operation_opts = Keyword.put_new(operation_opts, :task_timeout_ms, task_timeout),
+         {:ok, result} <- final_result(client, task, operation_opts, nil),
          do: {:ok, normalize(task.kind, result)}
   end
 
@@ -236,7 +244,7 @@ defmodule FastestMCP.Client.RemoteTasks do
     ctx = context(client, task_id, Deadline.from_options(opts, timeout), opts, trace)
     ctx = Map.put(ctx, :info, info)
 
-    case info.status do
+    case cached_status(info) do
       nil -> with {:ok, status} <- get(ctx), do: drive(ctx, status, @initial_poll_ms, 1, nil)
       status -> drive(ctx, status, @initial_poll_ms, 0, nil)
     end
@@ -339,23 +347,27 @@ defmodule FastestMCP.Client.RemoteTasks do
   end
 
   defp get(ctx) do
-    spec = Spec.new("tasks/get", params(ctx.task_id, ctx.meta), :task, [], ctx.trace)
+    params = params(ctx.task_id, ctx.meta)
+    spec = Spec.new("tasks/get", params, :task, [deadline: ctx.deadline], ctx.trace)
 
-    with {:ok, status} <- Requests.run(ctx.client, %{spec | deadline: ctx.deadline}),
+    with {:ok, status} <- Requests.run(ctx.client, spec),
          :ok <- cache(ctx.client, [{ctx.task_id, status}]),
          do: {:ok, status}
   end
 
   defp respond(ctx, responses, trace) do
     params = update_params(ctx.task_id, responses, ctx.meta)
-    spec = Spec.new("tasks/update", params, :identity, [], trace || ctx.trace)
-    Requests.run(ctx.client, %{spec | deadline: ctx.deadline})
+
+    spec =
+      Spec.new("tasks/update", params, :identity, [deadline: ctx.deadline], trace || ctx.trace)
+
+    Requests.run(ctx.client, spec)
   end
 
   defp params(task_id, opts), do: Wire.put_meta(%{"taskId" => to_string(task_id)}, opts)
 
   defp update_params(task_id, input_responses, opts) do
-    %{"taskId" => to_string(task_id), "inputResponses" => Map.new(input_responses)}
+    %{"taskId" => to_string(task_id), "inputResponses" => ClientOptions.wire_map(input_responses)}
     |> Wire.put_meta(opts)
   end
 
@@ -404,6 +416,5 @@ defmodule FastestMCP.Client.RemoteTasks do
   defp validate_output(_method, _validator, _task_id, _result), do: :ok
 
   defp normalize(:tool, result), do: ToolResult.from_raw(result)
-  defp normalize(:resource, result), do: Wire.normalize_response(:resource_read, result)
   defp normalize(_kind, result), do: result
 end

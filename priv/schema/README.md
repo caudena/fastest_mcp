@@ -14,7 +14,8 @@ independently from the core protocol:
 
 The package includes these schemas and their upstream license notices.
 `FastestMCP.Protocol.Schema` compiles the protocol definitions through JSV and
-derives its method tables from them at compile time. Focused tests exercise
+derives its method tables from them at compile time, when it also embeds the
+protocol schemas in its code, so they are not read from `priv` at runtime. Focused tests exercise
 FastestMCP's dialect, resolver, caching, and resource-limit contract; general
 JSON Schema conformance is delegated to JSV. See `docs/schema-validation.md`
 for the supported boundary.

@@ -4,14 +4,22 @@ defmodule FastestMCP.Notifications do
   # notification envelopes. A listener is a map of what it follows:
   #
   #   * `:session_id` - the session it belongs to: list changes of other
-  #     sessions do not reach it
+  #     sessions do not reach it, nor do any session's reach a listener
+  #     without one
   #   * `:tasks` - `{:session, session_id}` for the tasks of a session, or
   #     `{:ids, task_ids, owner}` for tasks by id that `owner` owns
   #   * `:families` - the component families whose list changes it gets
   #   * `:resource_uris` - the resources whose updates it gets
+  #
+  # Every change of a running server's lists goes through `list_changed/3`,
+  # which first moves on the generation of each changed family, so that the
+  # response cache, which keys on it, never answers with what it kept before.
 
+  alias FastestMCP.EventBus
   alias FastestMCP.Protocol
+  alias FastestMCP.ServerRuntime
 
+  @generations %{tools: 1, resources: 2, prompts: 3}
   @list_changed %{
     tools: "notifications/tools/list_changed",
     resources: "notifications/resources/list_changed",
@@ -22,6 +30,25 @@ defmodule FastestMCP.Notifications do
     "resourcesListChanged" => :resources,
     "promptsListChanged" => :prompts
   }
+
+  # Announces that the lists of `families` changed on the running server; a
+  # `:session_id` in `metadata` limits the notifications to that session.
+  def list_changed(%ServerRuntime{} = runtime, families, metadata \\ %{}) do
+    for family <- families,
+        do: :atomics.add(runtime.component_generations, Map.fetch!(@generations, family), 1)
+
+    EventBus.emit(
+      runtime.event_bus,
+      runtime.server.name,
+      [:components, :changed],
+      %{count: length(families)},
+      Map.put(metadata, :families, families)
+    )
+  end
+
+  # How many times the list of `family` changed while the server runs.
+  def generation(%ServerRuntime{} = runtime, family),
+    do: :atomics.get(runtime.component_generations, Map.fetch!(@generations, family))
 
   # The listener of a legacy session with its negotiated server capabilities.
   def session_listener(session_id, capabilities, resource_uris) do
@@ -74,11 +101,12 @@ defmodule FastestMCP.Notifications do
     end
   end
 
+  # A change with a `:session_id` changed what that session sees, so only the
+  # session's own listener hears of it; a listener without a session, such as
+  # an MCP 2026 subscription, hears of changes for every client only.
   def notifications([:components, :changed], metadata, listener) do
-    scope = Map.get(listener, :session_id)
-    session_id = metadata[:session_id]
-
-    if is_nil(scope) or is_nil(session_id) or to_string(session_id) == scope do
+    if is_nil(metadata[:session_id]) or
+         to_string(metadata[:session_id]) == Map.get(listener, :session_id) do
       families = Map.get(listener, :families, [])
 
       for family <- metadata |> Map.get(:families) |> List.wrap() |> Enum.map(&family/1),

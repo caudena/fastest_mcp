@@ -476,6 +476,47 @@ defmodule FastestMCP.Protocol.SchemaTest do
     assert legacy_error.message =~ "unknown MCP protocol schema definition"
   end
 
+  # An escript has the application's code but no priv directory: the schemas
+  # must come with the code.
+  test "a build without priv/schema, as in an escript, serves both protocol versions" do
+    build =
+      Path.join(System.tmp_dir!(), "fastest-mcp-no-priv-#{System.unique_integer([:positive])}")
+
+    ebin = Path.join([build, "fastest_mcp", "ebin"])
+    File.mkdir_p!(ebin)
+    File.cp_r!(Path.join(Mix.Project.build_path(), "lib/fastest_mcp/ebin"), ebin)
+    on_exit(fn -> File.rm_rf!(build) end)
+
+    code_paths =
+      Mix.Project.build_path()
+      |> Path.join("lib/*/ebin")
+      |> Path.wildcard()
+      |> Enum.reject(&String.ends_with?(&1, "/lib/fastest_mcp/ebin"))
+      |> Kernel.++([ebin])
+      |> Enum.flat_map(&["-pa", &1])
+
+    code = """
+    Application.put_env(:opentelemetry, :span_processor, :simple)
+    Application.put_env(:opentelemetry, :traces_exporter, :none)
+    Application.put_env(:opentelemetry, :create_application_tracers, false)
+    {:ok, _apps} = Application.ensure_all_started(:fastest_mcp)
+    false = File.exists?(Application.app_dir(:fastest_mcp, "priv"))
+
+    FastestMCP.server("no-priv")
+    |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+    |> FastestMCP.Transport.Stdio.serve()
+    """
+
+    elixir = System.find_executable("elixir") || flunk("elixir executable not found")
+
+    for version <- [@modern_version, @legacy_version] do
+      client = connect!({:stdio, elixir, code_paths ++ ["-e", code]}, protocol_version: version)
+
+      assert %{structured_content: %{"version" => ^version}} =
+               FastestMCP.Client.call_tool!(client, "echo", %{"version" => version})
+    end
+  end
+
   defp validate_definition(name, value) do
     {:ok, compiled} = ProtocolSchema.compile_definition(@modern_version, name)
     Schema.validate(compiled, value)

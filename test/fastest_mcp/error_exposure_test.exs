@@ -123,7 +123,7 @@ defmodule FastestMCP.ErrorExposureTest do
 
     validation_error = json_body(validation_response)["error"]
     assert validation_error["code"] == -32_602
-    assert get_in(validation_error, ["data", "fastestmcp", "code"]) == "bad_request"
+    assert get_in(validation_error, ["data", "fastestmcp", "code"]) == "invalid_params"
 
     assert is_list(
              get_in(validation_error, [

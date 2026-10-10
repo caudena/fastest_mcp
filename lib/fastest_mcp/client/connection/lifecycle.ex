@@ -3,7 +3,8 @@ defmodule FastestMCP.Client.Connection.Lifecycle do
   # The connection's phase machine and negotiated session. `initialize` (MCP
   # 2025-11-25) moves :new through :initializing and `server/discover` (MCP
   # 2026-07-28) through :discovering to :initialized; session recovery passes
-  # through :recovering; a failed negotiation is :failed. The caller that
+  # through :recovering. A failed request returns to the phase before it; a
+  # failure after the server answered initialize is :failed. The caller that
   # negotiates is monitored, and readiness waiters are stored callers answered
   # by `reply_waiters/2` or by their deadline.
 
@@ -125,7 +126,7 @@ defmodule FastestMCP.Client.Connection.Lifecycle do
       lifecycle
       | initialize_result: nil,
         client_capabilities: nil,
-        phase: :failed,
+        phase: if(lifecycle.initialize_result, do: :failed, else: :new),
         negotiation: nil
     }
   end

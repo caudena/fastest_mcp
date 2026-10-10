@@ -8,6 +8,11 @@ defmodule FastestMCP.ClientInProcessTest do
   alias FastestMCP.Error
   alias FastestMCP.Protocol.Extensions
 
+  defmodule Scope do
+    @moduledoc false
+    defstruct [:user]
+  end
+
   test "modern client discovers and correlates concurrent requests through the shared engine" do
     server_name = unique_name("modern")
     test_pid = self()
@@ -288,6 +293,56 @@ defmodule FastestMCP.ClientInProcessTest do
     assert :ok = Client.Request.cancel!(listener, "test complete")
   end
 
+  test "an in-process client follows the 2026-07-28 tasks of a server with auth" do
+    server_name = unique_name("tasks-auth")
+    task_extensions = %{Extensions.tasks() => %{}}
+
+    FastestMCP.server(server_name, extensions: task_extensions)
+    |> FastestMCP.add_auth(FastestMCP.Auth.StaticToken,
+      tokens: %{"dev-token" => %{client_id: "docs", principal: %{"sub" => "alice"}}}
+    )
+    |> FastestMCP.add_tool(
+      "confirm_task",
+      fn _args, ctx -> %{answer: inspect(FastestMCP.Interact.confirm(ctx, "Ship?"))} end,
+      task: true
+    )
+    |> start_server!()
+
+    client =
+      connect!({:in_process, server_name},
+        extensions: task_extensions,
+        auth_input: %{"authorization" => "Bearer dev-token"},
+        elicitation_handler: fn _message, _params -> {:accept, %{"confirmed" => true}} end
+      )
+
+    assert Client.call_tool!(client, "confirm_task", %{}, task_timeout_ms: 3_000).structured_content ==
+             %{"answer" => "{:ok, true}"}
+
+    task = Client.call_tool_task!(client, "confirm_task", %{})
+    assert %{"taskId" => task_id} = RemoteTask.fetch!(task)
+    assert task_id == task.task_id
+    assert %{structured_content: %{"answer" => "{:ok, true}"}} = RemoteTask.result!(task)
+  end
+
+  test "a 2025-11-25 client that did not negotiate tasks doesn't list tools that require one" do
+    server_name = unique_name("legacy-required-task")
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("plain", fn _args, _ctx -> :ok end)
+    |> start_server!()
+
+    client = connect!({:in_process, server_name}, protocol_version: "2025-11-25")
+    refute get_in(Client.info!(client).initialize_result, ["capabilities", "tasks"])
+
+    {:ok, _tool} =
+      FastestMCP.ComponentManager.add_tool(server_name, "export", fn _args, _ctx -> :ok end,
+        task: [mode: :required]
+      )
+
+    assert Enum.map(Client.list_tools!(client).items, & &1["name"]) == ["plain"]
+    assert "export" in Enum.map(FastestMCP.list_tools!(server_name), & &1.name)
+  end
+
   test "current and per-call auth input traverses normal authentication" do
     server_name = unique_name("auth")
 
@@ -334,17 +389,14 @@ defmodule FastestMCP.ClientInProcessTest do
              ["structuredContent", "principal"]
            ) == ["in-process-test", "gamma"]
 
-    error =
-      assert_raise Error, fn ->
-        Client.request!(
-          client,
-          "tools/call",
-          %{"name" => "principal", "arguments" => %{}},
-          authorization: "Bearer secret"
-        )
-      end
-
-    assert error.code == :invalid_params
+    assert_raise ArgumentError, ~r/does not accept \[:authorization\]/, fn ->
+      Client.request!(
+        client,
+        "tools/call",
+        %{"name" => "principal", "arguments" => %{}},
+        authorization: "Bearer secret"
+      )
+    end
   end
 
   test "in-process auth is verified without retaining wire auth in public request metadata" do
@@ -393,6 +445,70 @@ defmodule FastestMCP.ClientInProcessTest do
 
     refute request_context =~ secret
     refute context =~ secret
+  end
+
+  test "auth input reaches the authenticator as Elixir terms, as in an in-process call" do
+    server_name = unique_name("assign-auth")
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_auth(
+      FastestMCP.Auth.from_assign(:current_scope,
+        principal: fn scope -> %{"sub" => to_string(scope.user.id)} end
+      )
+    )
+    |> FastestMCP.add_tool("whoami", fn _args, ctx ->
+      %{sub: ctx.principal["sub"], transport: Context.request_context(ctx).transport}
+    end)
+    |> start_server!()
+
+    as = fn id -> %{"assigns" => %{"current_scope" => %Scope{user: %{id: id}}}} end
+
+    assert {:ok, %{sub: "42", transport: :in_process}} =
+             FastestMCP.call_tool(server_name, "whoami", %{}, auth_input: as.(42))
+
+    for version <- ["2026-07-28", "2025-11-25"] do
+      client =
+        connect!({:in_process, server_name}, protocol_version: version, auth_input: as.(42))
+
+      assert Client.call_tool!(client, "whoami").structured_content ==
+               %{"sub" => "42", "transport" => "in_process"}
+
+      assert Client.call_tool!(client, "whoami", %{}, auth_input: as.(7)).structured_content[
+               "sub"
+             ] == "7"
+
+      assert :ok = Client.set_auth(client, auth_input: as.(9))
+      assert Client.call_tool!(client, "whoami").structured_content["sub"] == "9"
+    end
+  end
+
+  test "a log handler receives info and above, and set_log_level/3 works on both versions" do
+    server_name = unique_name("log-levels")
+    test_pid = self()
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("log", fn _args, ctx ->
+      Context.debug(ctx, "debug message")
+      Context.info(ctx, "info message")
+      "logged"
+    end)
+    |> start_server!()
+
+    for version <- ["2026-07-28", "2025-11-25"] do
+      client =
+        connect!({:in_process, server_name},
+          protocol_version: version,
+          log_handler: fn message -> send(test_pid, {:log, version, message["data"]}) end
+        )
+
+      Client.call_tool!(client, "log")
+      assert_receive {:log, ^version, "info message"}
+      refute_receive {:log, ^version, "debug message"}, 100
+
+      assert :ok = Client.set_log_level(client, :debug)
+      Client.call_tool!(client, "log")
+      assert_receive {:log, ^version, "debug message"}
+    end
   end
 
   test "HTTP, SSE, and stdio-process options are rejected" do
@@ -523,6 +639,28 @@ defmodule FastestMCP.ClientInProcessTest do
       assert {:monitors, monitors} = Process.info(self(), :monitors)
       refute {:process, client.pid} in monitors
       assert {:error, %Error{code: :cancelled}} = Client.Request.await(request, 1_000)
+    end
+
+    test "a cancelled or timed-out request leaves no message in the owner's mailbox", %{
+      client: client
+    } do
+      call = %{"name" => "block", "arguments" => %{}}
+
+      {:ok, request} = Client.request_async(client, "tools/call", call)
+      assert_receive :handler_started
+      assert :ok = Client.Request.cancel(request)
+      refute_receive {:fastest_mcp_client_response, _ref, _reply}, 200
+      assert {:error, %Error{code: :cancelled}} = Client.Request.await(request, 100)
+
+      {:ok, request} = Client.request_async(client, "tools/call", call)
+      assert_receive :handler_started
+      assert {:error, %Error{code: :timeout}} = Client.Request.await(request, 50)
+      refute_receive {:fastest_mcp_client_response, _ref, _reply}, 200
+
+      {:ok, request} = Client.start_tool_result(client, "block")
+      assert_receive :handler_started
+      assert {:error, %Error{code: :timeout}} = Client.ToolResultRequest.await(request, 50)
+      refute_receive {:fastest_mcp_tool_result, _ref, _result}, 500
     end
 
     test "low-level await reports connection death instead of waiting forever", %{

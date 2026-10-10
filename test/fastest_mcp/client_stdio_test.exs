@@ -129,17 +129,16 @@ defmodule FastestMCP.ClientStdioTest do
              Client.call_tool!(client, "whoami", %{})
   end
 
-  test "stdio authentication metadata is omitted unless the legacy option is explicit" do
+  test "stdio credentials need the legacy authentication metadata option" do
     elixir = System.find_executable("elixir") || flunk("elixir executable not found on PATH")
 
-    client =
-      connect!(
-        {:stdio, elixir, auth_metadata_probe_stdio_server_args()},
-        protocol_version: "2025-11-25",
-        access_token: "must-not-be-written-to-json-rpc"
-      )
-
-    assert get_in(Client.info!(client).initialize_result, ["serverInfo", "name"]) == "clean-wire"
+    assert_raise ArgumentError,
+                 ~r/sends credentials only with legacy_stdio_auth_metadata: true/,
+                 fn ->
+                   Client.connect({:stdio, elixir, ["-e", "IO.read(:stdio, :eof)"]},
+                     access_token: "must-not-be-written-to-json-rpc"
+                   )
+                 end
   end
 
   test "stdio clients reject max_in_flight values above one" do
@@ -186,6 +185,62 @@ defmodule FastestMCP.ClientStdioTest do
            } = Client.info!(client)
 
     assert %{items: [%{"name" => "fallback-ok"}]} = Client.list_tools!(client)
+  end
+
+  test "a stdio server that exits while connecting reports its exit status" do
+    sh = System.find_executable("sh")
+
+    assert {:error, %Error{message: "stdio server exited with status 3", details: %{status: 3}}} =
+             Client.connect({:stdio, sh, ["-c", "exit 3"]})
+
+    assert {:error, %Error{message: "stdio server exited with status 7", details: %{status: 7}}} =
+             Client.connect({:stdio, sh, ["-c", "read request; exit 7"]})
+  end
+
+  test "a stdio server that misses init_timeout_ms fails with a timeout, not 2025-11-25" do
+    sh = System.find_executable("sh")
+
+    # Wakes after the discovery deadline, then answers the initialize request
+    # (id 2) that follows the cancelled discovery.
+    script = """
+    sleep 0.5
+    read discover
+    read cancelled
+    read initialize
+    printf '%s\\n' '{"jsonrpc":"2.0","id":"2","result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"slow","version":"1"}}}'
+    cat >/dev/null
+    """
+
+    assert {:error, %Error{code: :timeout}} =
+             Client.connect({:stdio, sh, ["-c", script]}, init_timeout_ms: 300)
+  end
+
+  test "a stdio server with an authenticator connects on 2026-07-28, and calls without credentials fail" do
+    elixir = System.find_executable("elixir") || flunk("elixir executable not found on PATH")
+    client = connect!({:stdio, elixir, rejecting_stdio_server_args()})
+
+    assert Client.info!(client).protocol_version == "2026-07-28"
+
+    assert {:error, %Error{code: :unauthorized, message: "unauthorized"}} =
+             Client.call_tool(client, "ping", %{})
+  end
+
+  test "an authentication error from server/discover is returned, not taken for 2025-11-25" do
+    sh = System.find_executable("sh")
+
+    for {jsonrpc_code, code} <- [{-32_003, :unauthorized}, {-32_004, :forbidden}] do
+      # Rejects discovery, and would answer initialize as a 2025-11-25 server.
+      script = """
+      read discover
+      printf '%s\\n' '{"jsonrpc":"2.0","id":"1","error":{"code":#{jsonrpc_code},"message":"no credentials"}}'
+      read initialize
+      printf '%s\\n' '{"jsonrpc":"2.0","id":"2","result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"legacy","version":"1"}}}'
+      cat >/dev/null
+      """
+
+      assert {:error, %Error{code: ^code, message: "no credentials"}} =
+               Client.connect({:stdio, sh, ["-c", script]})
+    end
   end
 
   test "stdio client routes notifications without consuming the matching response" do
@@ -582,6 +637,27 @@ defmodule FastestMCP.ClientStdioTest do
     Enum.flat_map(code_paths, fn path -> ["-pa", path] end) ++ ["-e", code]
   end
 
+  defp rejecting_stdio_server_args do
+    code_paths =
+      Mix.Project.build_path()
+      |> Path.join("lib/*/ebin")
+      |> Path.wildcard()
+
+    code = """
+    Application.put_env(:opentelemetry, :span_processor, :simple)
+    Application.put_env(:opentelemetry, :traces_exporter, :none)
+    Application.put_env(:opentelemetry, :create_application_tracers, false)
+    Application.ensure_all_started(:fastest_mcp)
+
+    FastestMCP.server("stdio-rejecting")
+    |> FastestMCP.add_auth(fn _input, _ctx -> {:error, :unauthorized} end)
+    |> FastestMCP.add_tool("ping", fn _arguments, _ctx -> "pong" end)
+    |> FastestMCP.Transport.Stdio.serve()
+    """
+
+    Enum.flat_map(code_paths, fn path -> ["-pa", path] end) ++ ["-e", code]
+  end
+
   defp legacy_fallback_stdio_server_args do
     code_paths =
       Mix.Project.build_path()
@@ -816,48 +892,6 @@ defmodule FastestMCP.ClientStdioTest do
 
             _other ->
               :ok
-          end
-
-          loop.(loop)
-      end
-    end
-
-    loop.(loop)
-    '''
-
-    Enum.flat_map(code_paths, fn path -> ["-pa", path] end) ++ ["-e", code]
-  end
-
-  defp auth_metadata_probe_stdio_server_args do
-    code_paths =
-      Mix.Project.build_path()
-      |> Path.join("lib/*/ebin")
-      |> Path.wildcard()
-
-    code = ~S'''
-    loop = fn loop ->
-      case IO.read(:stdio, :line) do
-        :eof ->
-          :ok
-
-        line ->
-          request = JSON.decode!(line)
-
-          if request["method"] == "initialize" do
-            auth = get_in(request, ["params", "_meta", "fastestmcp", "auth"])
-
-            IO.puts(JSON.encode!(%{
-              "jsonrpc" => "2.0",
-              "id" => request["id"],
-              "result" => %{
-                "protocolVersion" => "2025-11-25",
-                "capabilities" => %{},
-                "serverInfo" => %{
-                  "name" => if(auth, do: "injected-wire", else: "clean-wire"),
-                  "version" => "1.0.0"
-                }
-              }
-            }))
           end
 
           loop.(loop)

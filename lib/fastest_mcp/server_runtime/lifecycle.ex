@@ -17,6 +17,7 @@ defmodule FastestMCP.ServerRuntime.Lifecycle do
   alias FastestMCP.Registry
   alias FastestMCP.RuntimeQuota
   alias FastestMCP.Server
+  alias FastestMCP.ServerRuntime.Config
   alias FastestMCP.TTLStore
 
   def start_link({server, config}) do
@@ -64,6 +65,9 @@ defmodule FastestMCP.ServerRuntime.Lifecycle do
                sse_replay_bytes: config.sse_replay_max_total_bytes
              ),
            component_index: ComponentIndex.create(name, Server.all_components(server)),
+           # Counts the changes of the tool, resource, and prompt lists; see
+           # `FastestMCP.Notifications.list_changed/3`.
+           component_generations: :atomics.new(3, signed: false),
            schema_cache:
              :ets.new(:fastest_mcp_schema_cache, [
                :set,
@@ -72,8 +76,7 @@ defmodule FastestMCP.ServerRuntime.Lifecycle do
                write_concurrency: true
              ]),
            strict_request_ids: config.strict_request_ids,
-           pagination_cursor_secret: :crypto.strong_rand_bytes(32),
-           runtime_generation: Base.url_encode64(:crypto.strong_rand_bytes(16), padding: false)
+           signing_secret: Config.signing_secret(config)
          }
        }}
     else
@@ -91,14 +94,19 @@ defmodule FastestMCP.ServerRuntime.Lifecycle do
     {:noreply, state}
   end
 
-  def handle_info({:EXIT, pid, reason}, state),
-    do: {:stop, {:linked_process_exit, pid, reason}, state}
+  # Processes that lifespans and providers link to stop the runtime when they
+  # crash, but not when they finish normally, as a task does; the session
+  # state store stops it either way. GenServer handles the parent's exit.
+  def handle_info({:EXIT, pid, reason}, state) do
+    if reason == :normal and pid != state.info.session_state_store.store,
+      do: {:noreply, state},
+      else: {:stop, {:linked_process_exit, pid, reason}, state}
+  end
 
   @impl true
   def terminate(_reason, state) do
     shutdown_providers(state.server)
     Lifespan.cleanup_all(state.lifespan_cleanups)
-    Registry.put_visibility_rules(state.server.name, [])
   end
 
   defp schedule_sweep(:infinity), do: :ok

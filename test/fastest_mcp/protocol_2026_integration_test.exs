@@ -169,10 +169,11 @@ defmodule FastestMCP.Protocol2026IntegrationTest do
 
     tools = ProtocolTest.modern_http_request(server_name, 2, "tools/list")
 
+    # The server announces list changes, so a list stays fresh for a minute.
     assert %{
              "result" => %{
                "resultType" => "complete",
-               "ttlMs" => 0,
+               "ttlMs" => 60_000,
                "cacheScope" => "private",
                "tools" => tools_list
              }
@@ -462,9 +463,11 @@ defmodule FastestMCP.Protocol2026IntegrationTest do
   end
 
   test "modern missing client capabilities use -32021 data while legacy keeps -32601" do
+    # A background task's context, which reaches its client through the task.
     modern = %Context{
       client_capabilities: %{},
-      negotiated_protocol_version: @modern_version
+      negotiated_protocol_version: @modern_version,
+      task_metadata: %{task_id: "task-1"}
     }
 
     modern_error = assert_raise Error, fn -> Context.list_roots(modern) end
@@ -474,7 +477,8 @@ defmodule FastestMCP.Protocol2026IntegrationTest do
 
     legacy = %Context{
       client_capabilities: %{},
-      negotiated_protocol_version: "2025-11-25"
+      negotiated_protocol_version: "2025-11-25",
+      session_id: "session-1"
     }
 
     legacy_error = assert_raise Error, fn -> Context.list_roots(legacy) end
@@ -540,15 +544,9 @@ defmodule FastestMCP.Protocol2026IntegrationTest do
         log_handler: fn params -> send(parent, {:modern_log, params}) end
       )
 
+    # A client with a log handler asks for info and above.
     assert %{content: [%{"type" => "text", "text" => "logged"}]} =
              Client.call_tool!(client, "logging")
-
-    refute_receive {:modern_log, _params}, 100
-
-    assert %{content: [%{"type" => "text", "text" => "logged"}]} =
-             Client.call_tool!(client, "logging", %{},
-               meta: %{"io.modelcontextprotocol/logLevel" => "info"}
-             )
 
     assert_receive {:modern_log, %{"level" => "info", "data" => "visible info"}}, 1_000
 
@@ -556,6 +554,17 @@ defmodule FastestMCP.Protocol2026IntegrationTest do
                    1_000
 
     refute_receive {:modern_log, %{"level" => "debug"}}, 100
+
+    # A request's own metadata names another level.
+    assert %{content: [%{"type" => "text", "text" => "logged"}]} =
+             Client.call_tool!(client, "logging", %{},
+               meta: %{"io.modelcontextprotocol/logLevel" => "warning"}
+             )
+
+    assert_receive {:modern_log, %{"level" => "warning", "data" => "visible warning"}},
+                   1_000
+
+    refute_receive {:modern_log, _params}, 100
   end
 
   defp modern_meta do

@@ -1,8 +1,10 @@
 defmodule FastestMCP.Providers.MountedServer do
   @moduledoc """
   A provider that exposes another server definition's components, routes, and
-  extensions inside a parent server, running the child's middleware and
-  lifespans.
+  extensions inside a parent server, running the child's middleware,
+  lifespans, and dependencies. The child's handlers serve the request of the
+  server the client called: their context names that server and uses its
+  session.
 
   `FastestMCP.mount/3` builds and adds one, with `namespace:` as a shorthand
   for a `FastestMCP.ProviderTransforms.Namespace` transform. Build it directly
@@ -224,10 +226,14 @@ defmodule FastestMCP.Providers.MountedServer do
     }
   end
 
+  # The mounted server's handlers share the request of the server the client
+  # called: its name, session, stores, and event bus stay in the context. They
+  # resolve their own server's dependencies first, then the dependencies of the
+  # servers it is mounted in, and see its lifespan context.
   defp child_context(%__MODULE__{} = provider, context) do
     %{
       context
-      | server_name: provider.server.name,
+      | dependencies: Map.merge(context.dependencies, provider.server.dependencies),
         lifespan_context:
           Map.merge(
             provider.lifespan_context || %{},

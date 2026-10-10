@@ -1,6 +1,9 @@
 defmodule FastestMCP.MountedProviderTest do
   use FastestMCP.Case, async: true
 
+  alias FastestMCP.Client
+  alias FastestMCP.Context
+
   test "mounted servers expose namespaced tools, resources, prompts, and child middleware" do
     test_pid = self()
     parent_name = "mounted-parent-" <> Integer.to_string(System.unique_integer([:positive]))
@@ -220,6 +223,148 @@ defmodule FastestMCP.MountedProviderTest do
     assert_receive :parent_exit, 1_000
   end
 
+  test "mounted handlers resolve their own server's dependencies over the parent's" do
+    parent_name = unique_name("mounted-dependencies")
+    dependency = &FastestMCP.Context.dependency/2
+
+    grandchild =
+      FastestMCP.server("dependency-grandchild")
+      |> FastestMCP.add_dependency(:level, fn -> "grandchild" end)
+      |> FastestMCP.add_tool("deps", fn _args, ctx ->
+        %{level: dependency.(ctx, :level), child: dependency.(ctx, :child_only)}
+      end)
+
+    child =
+      FastestMCP.server("dependency-child")
+      |> FastestMCP.add_dependency(:level, fn -> "child" end)
+      |> FastestMCP.add_dependency(:child_only, fn -> "child" end)
+      # Runs in the handler's process before the grandchild's handler, in the
+      # same request: the grandchild must still get its own value.
+      |> FastestMCP.add_middleware(fn operation, next ->
+        "child" = dependency.(operation.context, :level)
+        next.(operation)
+      end)
+      |> FastestMCP.add_tool("deps", fn _args, ctx ->
+        %{level: dependency.(ctx, :level), parent: dependency.(ctx, :parent_only)}
+      end)
+      |> FastestMCP.mount(grandchild, namespace: "grandchild")
+
+    FastestMCP.server(parent_name)
+    |> FastestMCP.add_dependency(:level, fn -> "parent" end)
+    |> FastestMCP.add_dependency(:parent_only, fn -> "parent" end)
+    |> FastestMCP.add_tool("deps", fn _args, ctx -> %{level: dependency.(ctx, :level)} end)
+    |> FastestMCP.mount(child, namespace: "child")
+    |> start_server!()
+
+    assert %{level: "parent"} == FastestMCP.call_tool!(parent_name, "deps")
+
+    assert %{level: "child", parent: "parent"} ==
+             FastestMCP.call_tool!(parent_name, "child_deps")
+
+    assert %{level: "grandchild", child: "child"} ==
+             FastestMCP.call_tool!(parent_name, "child_grandchild_deps")
+  end
+
+  test "mounted handlers use the session of the server the client called" do
+    parent_name = unique_name("mounted-session")
+    test_pid = self()
+
+    # Each level's handler keeps a visit count in session state, logs it,
+    # reports progress, sends a notification, and, for a client, asks for its
+    # roots, which the session caches.
+    visit = fn level ->
+      fn _args, ctx ->
+        visits = Context.get_state(ctx, :visits, 0) + 1
+        :ok = Context.set_state(ctx, :visits, visits)
+        client? = not is_nil(ctx.negotiated_protocol_version)
+
+        %{
+          visits: visits,
+          session: ctx.session_id,
+          log: inspect(Context.info(ctx, "#{level} visit #{visits}")),
+          progress: inspect(Context.report_progress(ctx, visits, 10)),
+          notification:
+            inspect(Context.send_notification(ctx, "notifications/com.example/visited", %{})),
+          roots: client? && ctx |> Context.list_roots() |> Enum.map(& &1.uri),
+          cached_roots: client? && Enum.map(Context.cached_roots(ctx) || [], & &1.uri)
+        }
+      end
+    end
+
+    hide = fn _args, ctx ->
+      :ok = Context.disable_components(ctx, names: ["visit"])
+      "hidden"
+    end
+
+    grandchild =
+      FastestMCP.server("session-grandchild")
+      |> FastestMCP.add_tool("visit", visit.("grandchild"))
+      |> FastestMCP.add_tool("hide", hide)
+
+    child =
+      FastestMCP.server("session-child")
+      |> FastestMCP.add_tool("visit", visit.("child"))
+      |> FastestMCP.mount(grandchild, namespace: "grandchild")
+
+    FastestMCP.server(parent_name)
+    |> FastestMCP.add_tool("visit", visit.("parent"))
+    |> FastestMCP.mount(child, namespace: "child")
+    |> start_server!()
+
+    client =
+      connect!({:in_process, parent_name},
+        protocol_version: "2025-11-25",
+        roots: [%{uri: "file:///work", name: "Work"}],
+        log_handler: &send(test_pid, {:log, &1["data"]}),
+        notification_handler: &send(test_pid, {:notification, &1["method"]})
+      )
+
+    sessions =
+      for {tool, visits, level} <- [
+            {"visit", 1, "parent"},
+            {"child_visit", 2, "child"},
+            {"child_grandchild_visit", 3, "grandchild"}
+          ] do
+        result =
+          Client.call_tool!(client, tool, %{},
+            progress_handler: &send(test_pid, {:progress, &1["progress"]})
+          )
+
+        assert %{
+                 "visits" => ^visits,
+                 "log" => ":ok",
+                 "progress" => ":ok",
+                 "roots" => ["file:///work"],
+                 "cached_roots" => ["file:///work"]
+               } = result.structured_content
+
+        assert result.structured_content["notification"] =~ "{:ok, "
+        assert_receive {:log, message}
+        assert message == "#{level} visit #{visits}"
+        assert_receive {:progress, ^visits}
+        assert_receive {:notification, "notifications/com.example/visited"}
+        result.structured_content["session"]
+      end
+
+    # Every level sees the session of the client's connection.
+    assert ["stdio-" <> _id = session_id, session_id, session_id] = sessions
+
+    # A grandchild's handler hides a tool from this session only, by the name
+    # the client sees.
+    assert [%{"text" => "hidden"}] =
+             Client.call_tool!(client, "child_grandchild_hide", %{}).content
+
+    assert_receive {:notification, "notifications/tools/list_changed"}
+    refute "visit" in Enum.map(Client.list_tools!(client).items, & &1["name"])
+    assert "visit" in Enum.map(FastestMCP.list_tools!(parent_name), & &1.name)
+
+    # In-process calls that name a session use that session at every level.
+    for {tool, visits} <- [{"child_grandchild_visit", 1}, {"child_visit", 2}, {"visit", 3}] do
+      assert %{visits: ^visits, session: "s1", log: ":ok"} =
+               FastestMCP.call_tool!(parent_name, tool, %{}, session_id: "s1")
+    end
+  end
+
   test "local components can override mounted tools with the same name" do
     parent_name =
       "mounted-local-override-" <> Integer.to_string(System.unique_integer([:positive]))
@@ -233,7 +378,8 @@ defmodule FastestMCP.MountedProviderTest do
     |> FastestMCP.add_tool("greet", fn %{"name" => name}, _ctx -> "Parent override, #{name}" end)
     |> start_server!()
 
-    assert [%{name: "greet"}, %{name: "greet"}] = FastestMCP.list_tools!(parent_name)
+    # The name is listed once, as the call resolves it: the parent's own tool.
+    assert [%{name: "greet"}] = FastestMCP.list_tools!(parent_name)
 
     assert "Parent override, World" ==
              FastestMCP.call_tool!(parent_name, "greet", %{"name" => "World"})

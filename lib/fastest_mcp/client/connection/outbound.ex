@@ -3,6 +3,8 @@ defmodule FastestMCP.Client.Connection.Outbound do
   # The connection's in-flight client→server requests, keyed by local
   # reference and indexed by JSON-RPC id. `finish/3` is the one teardown: it
   # stops a request's timer, HTTP exchange, worker and monitors, then replies.
+  # A request of `FastestMCP.Client.request_async/4` replies to an alias of
+  # its owner, which drops the reply once the owner stopped waiting.
 
   import FastestMCP.Util, only: [maybe_put: 3]
   import FastestMCP.Protocol.Version
@@ -157,9 +159,9 @@ defmodule FastestMCP.Client.Connection.Outbound do
 
   def reply(%Request{reply_to: {:sync, from}}, reply), do: GenServer.reply(from, reply)
 
-  def reply(%Request{reply_to: {:async, owner}} = request, reply) do
+  def reply(%Request{reply_to: {:async, _owner, reply_alias}} = request, reply) do
     finish_trace(request, reply)
-    send(owner, {:fastest_mcp_client_response, request.ref, reply})
+    send(reply_alias, {:fastest_mcp_client_response, request.ref, reply})
     :ok
   end
 
@@ -190,7 +192,6 @@ defmodule FastestMCP.Client.Connection.Outbound do
 
     with :ok <- check_budget(owner(reply_to), spec.deadline),
          :ok <- Lifecycle.check_request(state.lifecycle, spec.method, spec.normalizer),
-         :ok <- Auth.check_transport(state.transport, spec.auth),
          :ok <- check_connected(state.transport),
          :ok <- check_capacity(state),
          :ok <- check_supported(state, spec.method),
@@ -199,7 +200,7 @@ defmodule FastestMCP.Client.Connection.Outbound do
          {:ok, envelope} <- envelope(spec, id, view),
          key = cache_key(state, spec, reply_to, view),
          {:miss, state} <- cached(state, key, spec.cache) do
-      send_request(state, spec, reply_to, id, envelope, key)
+      send_request(state, spec, reply_to, id, {envelope, Auth.input(view, spec.auth)}, key)
     else
       {:hit, result, state} ->
         Trace.annotate_request(spec, view, %{"fastestmcp.cache.hit" => true})
@@ -223,15 +224,22 @@ defmodule FastestMCP.Client.Connection.Outbound do
     end
   end
 
+  # A stdio server that exited before negotiation finished left its error.
   defp check_connected(%{type: type} = transport) when type in [:stdio, :in_process] do
-    if Transport.connected?(transport),
-      do: :ok,
-      else:
+    cond do
+      Transport.connected?(transport) ->
+        :ok
+
+      error = transport[:exit_error] ->
+        {:error, error}
+
+      true ->
         {:error,
          %Error{
            code: :internal_error,
            message: "#{Transport.name(type)} client transport is closed"
          }}
+    end
   end
 
   defp check_connected(_transport), do: :ok
@@ -310,7 +318,8 @@ defmodule FastestMCP.Client.Connection.Outbound do
     end
   end
 
-  defp send_request(state, spec, reply_to, id, envelope, key) do
+  # An in-process server receives the auth input beside the envelope.
+  defp send_request(state, spec, reply_to, id, {envelope, auth_input}, key) do
     ref = make_ref()
     {owner_ref, next} = State.monitor(state, owner(reply_to), {:owner, ref})
     timeout_ms = Deadline.remaining(spec.deadline)
@@ -347,7 +356,7 @@ defmodule FastestMCP.Client.Connection.Outbound do
         {:ok, request, start_worker(next, request, envelope)}
 
       _connected ->
-        case Transport.write(state.transport, envelope) do
+        case Transport.write(state.transport, envelope, auth_input) do
           :ok ->
             {:ok, request, next}
 
@@ -365,7 +374,7 @@ defmodule FastestMCP.Client.Connection.Outbound do
   defp next_id(state), do: update_in(state.outbound.next_id, &(&1 + 1))
 
   defp owner({:sync, {pid, _tag}}), do: pid
-  defp owner({:async, pid}), do: pid
+  defp owner({:async, pid, _reply_alias}), do: pid
 
   defp start_worker(state, %Request{ref: ref, spec: spec} = request, envelope) do
     view = TransportSnapshot.new(state)
@@ -458,11 +467,10 @@ defmodule FastestMCP.Client.Connection.Outbound do
 
   # Sends one notification over the transport the snapshot describes.
   def notify(view, method, params, opts) do
-    with :ok <- Auth.check_transport(view.transport, opts),
-         {:ok, message} <- Wire.notification(method, params, view, opts) do
+    with {:ok, message} <- Wire.notification(method, params, view) do
       case view.transport.type do
         :streamable_http -> HTTP.send_notification(message, view, opts)
-        _connected -> Transport.write(view.transport, message)
+        _connected -> Transport.write(view.transport, message, Auth.input(view, opts))
       end
     end
   end
@@ -503,8 +511,9 @@ defmodule FastestMCP.Client.Connection.Outbound do
   # Re-sends a modern subscription under a new JSON-RPC id.
   def reopen(state, %Request{} = request) do
     id = Integer.to_string(state.outbound.next_id)
+    view = TransportSnapshot.new(state)
 
-    case envelope(request.spec, id, TransportSnapshot.new(state)) do
+    case envelope(request.spec, id, view) do
       {:ok, envelope} ->
         request = %{
           request
@@ -517,7 +526,7 @@ defmodule FastestMCP.Client.Connection.Outbound do
             state |> next_id() |> put(request) |> start_worker(request, envelope)
 
           _connected ->
-            case Transport.write(state.transport, envelope) do
+            case Transport.write(state.transport, envelope, Auth.input(view, request.spec.auth)) do
               :ok -> state |> next_id() |> put(request)
               # The child may exit between Port.open/2 and the first command;
               # the listener stays detached for the next restart attempt.

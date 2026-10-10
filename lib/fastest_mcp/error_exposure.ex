@@ -65,6 +65,9 @@ defmodule FastestMCP.ErrorExposure do
     end
   end
 
+  defp generic_message(%Error{exposure: %{message: message}}, _opts) when is_binary(message),
+    do: message
+
   defp generic_message(%Error{exposure: exposure}, opts) do
     {request_kind, request_target} = request_call(Keyword.get(opts, :request))
     task = Keyword.get(opts, :task, %{})

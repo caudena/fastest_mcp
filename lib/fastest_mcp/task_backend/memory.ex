@@ -2,8 +2,10 @@ defmodule FastestMCP.TaskBackend.Memory do
   @moduledoc """
   The default task backend: an ETS table owned by the server's task store.
 
-  Task records live as long as the server runtime. A host that needs tasks to
-  survive restarts or span nodes provides a durable `FastestMCP.TaskBackend`.
+  Task records live as long as the server runtime. A host whose finished tasks
+  must stay readable after a restart provides a durable
+  `FastestMCP.TaskBackend`. Each node keeps its own task records: a starting
+  server fails the unfinished tasks it finds, so nodes must never share them.
   """
 
   @behaviour FastestMCP.TaskBackend

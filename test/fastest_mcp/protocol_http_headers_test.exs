@@ -11,6 +11,22 @@ defmodule FastestMCP.Protocol.HTTPHeadersTest do
 
   @max_safe_integer 9_007_199_254_740_991
 
+  # A tool that a peer names freely, as a proxy passes it on: definitions
+  # take only MCP's tool-name characters.
+  defmodule PeerNamedTool do
+    use FastestMCP.Provider
+
+    defstruct [:tool]
+
+    def new(name, schema) do
+      tool = FastestMCP.Components.Tool.new("lookup", & &1, input_schema: schema)
+      %__MODULE__{tool: %{tool | name: name}}
+    end
+
+    def list_components(%__MODULE__{tool: tool}, :tool, _operation), do: [tool]
+    def list_components(%__MODULE__{}, _kind, _operation), do: []
+  end
+
   test "validates annotations once and mirrors primitive arguments" do
     schema = %{
       "type" => "object",
@@ -200,9 +216,7 @@ defmodule FastestMCP.Protocol.HTTPHeadersTest do
     }
 
     FastestMCP.server(server_name)
-    |> FastestMCP.add_tool(tool_name, fn arguments, _context -> arguments end,
-      input_schema: schema
-    )
+    |> FastestMCP.add_provider(PeerNamedTool.new(tool_name, schema))
     |> start_server!()
 
     encoded_name = "=?base64?" <> Base.encode64(tool_name) <> "?="
@@ -345,9 +359,7 @@ defmodule FastestMCP.Protocol.HTTPHeadersTest do
     }
 
     FastestMCP.server(server_name)
-    |> FastestMCP.add_tool(tool_name, fn arguments, _context -> arguments end,
-      input_schema: schema
-    )
+    |> FastestMCP.add_provider(PeerNamedTool.new(tool_name, schema))
     |> start_server!()
 
     %{url: url} = start_http!(server_name, allowed_hosts: ["127.0.0.1", "localhost"])

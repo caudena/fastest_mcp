@@ -1,8 +1,10 @@
 defmodule FastestMCP.SessionCoordinatorTest do
   use FastestMCP.Case, async: true
 
+  alias FastestMCP.Context
   alias FastestMCP.Error
   alias FastestMCP.Registry
+  alias FastestMCP.ServerRuntime
   alias FastestMCP.Session
   alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
 
@@ -480,10 +482,10 @@ defmodule FastestMCP.SessionCoordinatorTest do
     assert :ok = Session.detach_sink(server_name, session_id, sink_ref)
 
     assert {:ok, %{queued: true}} =
-             Session.send_notification(server_name, session_id, "example/first")
+             send_notification(server_name, session_id, "example/first")
 
     assert {:error, :queue_overloaded} =
-             Session.send_notification(server_name, session_id, "example/second")
+             send_notification(server_name, session_id, "example/second")
 
     assert {:ok, %{sink_ref: next_sink_ref, queued: 1}} =
              Session.attach_sink(server_name, session_id, self(), kind: :get)
@@ -494,7 +496,7 @@ defmodule FastestMCP.SessionCoordinatorTest do
     assert :ok = Session.detach_sink(server_name, session_id, next_sink_ref)
 
     assert {:error, :queue_overloaded} =
-             Session.send_notification(
+             send_notification(
                server_name,
                session_id,
                "example/oversized",
@@ -705,16 +707,16 @@ defmodule FastestMCP.SessionCoordinatorTest do
     assert {:ok, session_pid} = Registry.lookup_session(server_name, session_id)
 
     assert {:ok, %{event_id: event_id}} =
-             Session.send_notification(
+             send_notification(
                server_name,
                session_id,
-               "notifications/resources/list_changed"
+               "notifications/com.example/replayed"
              )
 
     assert is_binary(event_id)
 
     assert_receive {:fastest_mcp_session_message, ^sink_ref, ^event_id,
-                    %{"method" => "notifications/resources/list_changed"}}
+                    %{"method" => "notifications/com.example/replayed"}}
 
     assert :sys.get_state(session_pid).replay.total_bytes > 0
     monitor = Process.monitor(session_pid)
@@ -806,7 +808,7 @@ defmodule FastestMCP.SessionCoordinatorTest do
     assert :ok = Session.detach_sink(server_name, session_id, original_ref)
 
     assert {:ok, %{delivery_sink_ref: ^repeated_ref}} =
-             Session.send_notification(server_name, session_id, "notifications/current-owner")
+             send_notification(server_name, session_id, "notifications/current-owner")
 
     assert_receive {:repeated,
                     {:fastest_mcp_session_message, ^repeated_ref, _event_id,
@@ -869,10 +871,10 @@ defmodule FastestMCP.SessionCoordinatorTest do
     assert {:ok, session_pid} = Registry.lookup_session(server_name, session_id)
 
     assert {:error, :sse_replay_unavailable} =
-             Session.send_notification(
+             send_notification(
                server_name,
                session_id,
-               "notifications/resources/list_changed"
+               "notifications/com.example/replayed"
              )
 
     refute_receive {:fastest_mcp_session_message, ^sink_ref, _event_id, _envelope}
@@ -985,6 +987,12 @@ defmodule FastestMCP.SessionCoordinatorTest do
     })
 
     {server_name, session_id}
+  end
+
+  # A notification of the server's own, as a handler in the session sends it.
+  defp send_notification(server_name, session_id, method, params \\ %{}) do
+    {:ok, runtime} = ServerRuntime.fetch(server_name)
+    Context.send_notification(Context.new(runtime, session_id: session_id), method, params)
   end
 
   defp start_session_with_sink!(runtime_opts \\ []) do

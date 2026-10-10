@@ -16,6 +16,7 @@ defmodule FastestMCP.Transport.Dispatch do
   alias FastestMCP.ErrorExposure
   alias FastestMCP.Session
   alias FastestMCP.SessionSupervisor
+  alias FastestMCP.Telemetry
   alias FastestMCP.Transport.Engine
   alias FastestMCP.Transport.JSONRPC
   alias FastestMCP.Transport.Request
@@ -28,13 +29,16 @@ defmodule FastestMCP.Transport.Dispatch do
     end
   end
 
-  # Starts the worker of `request`; it replies with the outcome.
+  # Starts the worker of `request`; it replies with the outcome. The worker
+  # continues the caller's OpenTelemetry context, such as the span of HTTP
+  # instrumentation around the request.
   def start(runtime, %Request{} = request, opts) do
     {group_leader, opts} = Keyword.pop(opts, :group_leader)
+    trace_context = Telemetry.current_context()
 
     Task.Supervisor.async_nolink(runtime.stream_task_supervisor, fn ->
       if group_leader, do: Process.group_leader(self(), group_leader)
-      work(runtime, request, opts)
+      Telemetry.with_context(trace_context, fn -> work(runtime, request, opts) end)
     end)
   end
 

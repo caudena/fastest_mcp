@@ -252,6 +252,32 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
     assert lifecycle_error.details.jsonrpc_code == -32_021
   end
 
+  test "a tool that requires a task fails on 2026-07-28 when the server lacks the Tasks extension" do
+    parent = self()
+    server_name = unique_name("tasks-required-no-extension")
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("required", fn _arguments, _context -> send(parent, :ran) end,
+      task: [mode: :required]
+    )
+    |> start_server!()
+
+    error =
+      assert_raise Error, fn ->
+        Engine.dispatch!(
+          server_name,
+          modern_request("tools/call", %{"name" => "required", "arguments" => %{}}, %{
+            "extensions" => tasks_extensions()
+          })
+        )
+      end
+
+    assert error.code == :method_not_found
+    assert error.message =~ "requires background task execution"
+    assert error.message =~ Extensions.tasks()
+    refute_received :ran
+  end
+
   test "tasks/get, tasks/update, and tasks/cancel implement the modern lifecycle" do
     server_name = unique_name("tasks-lifecycle")
 
@@ -874,6 +900,90 @@ defmodule FastestMCP.Tasks2026ExtensionTest do
     refute_receive {:mcp_request, %{"method" => "tasks/cancel"}}, 200
     send(worker, :release)
     assert %{"status" => "completed"} = wait_for_status(server_name, task_id, "completed")
+  end
+
+  test "call_tool_task/4 fails before calling unless both sides declare the Tasks extension" do
+    parent = self()
+
+    for {server_extensions, client_extensions} <- [
+          {tasks_extensions(), %{}},
+          {%{}, tasks_extensions()}
+        ] do
+      server_name = unique_name("tasks-handle-missing")
+
+      FastestMCP.server(server_name, extensions: server_extensions)
+      |> FastestMCP.add_tool("work", fn _arguments, _context -> send(parent, :ran) end,
+        task: true
+      )
+      |> start_server!()
+
+      client =
+        connect!({:in_process, server_name},
+          protocol_version: @modern_version,
+          extensions: client_extensions
+        )
+
+      assert {:error, %Error{code: :bad_request, message: message}} =
+               Client.call_tool_task(client, "work")
+
+      assert message =~ Extensions.tasks()
+      refute_receive :ran, 100
+    end
+  end
+
+  test "Task.result/2 right after Task.update/3 does not answer the old questions again" do
+    parent = self()
+    server_name = unique_name("tasks-update-result")
+
+    FastestMCP.server(server_name, extensions: tasks_extensions())
+    |> FastestMCP.add_tool(
+      "ask",
+      fn _arguments, context ->
+        case Context.input_responses(context) do
+          responses when map_size(responses) == 0 ->
+            InputRequiredResult.new(%{
+              "answer" => %{
+                "method" => "elicitation/create",
+                "params" => %{
+                  "message" => "Answer",
+                  "requestedSchema" => %{
+                    "type" => "object",
+                    "properties" => %{"answer" => %{"type" => "string"}}
+                  }
+                }
+              }
+            })
+
+          %{"answer" => answer} ->
+            answer
+        end
+      end,
+      task: [mode: :optional, poll_interval_ms: 10]
+    )
+    |> start_server!()
+
+    client =
+      connect!({:in_process, server_name},
+        protocol_version: @modern_version,
+        extensions: tasks_extensions(),
+        elicitation_handler: fn _message, _params ->
+          send(parent, :handler_answered)
+          {:accept, %{"answer" => "from the handler"}}
+        end
+      )
+
+    task = Client.call_tool_task!(client, "ask")
+    status = RemoteTask.wait!(task, status: "input_required")
+    [key] = Map.keys(status["inputRequests"])
+
+    RemoteTask.update!(task, %{
+      key => %{"action" => "accept", "content" => %{"answer" => "from update"}}
+    })
+
+    assert %{"action" => "accept", "content" => %{"answer" => "from update"}} =
+             RemoteTask.result!(task).structured_content
+
+    refute_received :handler_answered
   end
 
   test "modern task response descriptors accept discriminators and result metadata" do

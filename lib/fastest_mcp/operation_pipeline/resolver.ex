@@ -24,11 +24,15 @@ defmodule FastestMCP.OperationPipeline.Resolver do
 
   require Logger
 
-  # Lookups pass over candidates hidden with these codes to lower versions.
-  @hidden_codes [:disabled, :not_visible, :filtered, :forbidden]
+  # A component hidden with these codes is unknown to MCP clients.
+  @hidden_codes [:disabled, :not_visible, :filtered]
+  # Lookups pass over candidates that fail with these codes to lower versions.
+  @skipped_codes [:forbidden | @hidden_codes]
   @tool_fold_page_size 128
 
-  # Every visible component of `kind`, sorted by identifier and version.
+  # Every visible component of `kind`, sorted by identifier and version. A
+  # name and version that several sources define is listed once, from the
+  # source a call would pick: the definition, then providers in order.
   def visible_components(server, kind, operation) do
     server.name
     |> ComponentIndex.list(kind)
@@ -36,6 +40,7 @@ defmodule FastestMCP.OperationPipeline.Resolver do
       Enum.flat_map(server.providers, &Provider.Dispatch.list_components(&1, kind, operation))
     )
     |> visible(server, operation)
+    |> Enum.uniq_by(&Component.key/1)
     |> Enum.sort_by(&{Component.identifier(&1), Component.version(&1) || ""})
   end
 
@@ -51,16 +56,17 @@ defmodule FastestMCP.OperationPipeline.Resolver do
 
     [local | provider_pages]
     |> List.flatten()
+    |> Enum.uniq_by(&Component.key/1)
     |> Pagination.source_page(after_key, limit)
     |> Map.fetch!(:items)
   end
 
   # The highest visible version of `target`, or an error.
   def resolve(server, kind, target, operation) do
-    case select(candidates(server, kind, target, operation), server, operation) do
-      nil -> {:error, Error.not_found(kind, target)}
-      selected -> selected
-    end
+    server
+    |> candidates(kind, target, operation)
+    |> select(server, operation)
+    |> unknown_unless_found(operation, fn -> Error.not_found(kind, target) end)
   end
 
   # `{:ok, {:exact | :template, component, captures}}` for a resource URI, or
@@ -88,7 +94,7 @@ defmodule FastestMCP.OperationPipeline.Resolver do
              do: {:ok, {:exact, component, %{}}}
       end
 
-    selected || {:error, unknown_resource(uri, operation)}
+    unknown_unless_found(selected, operation, fn -> unknown_resource(uri, operation) end)
   end
 
   # The `uris` that resolve for `operation`; an unexpected error halts.
@@ -101,7 +107,7 @@ defmodule FastestMCP.OperationPipeline.Resolver do
         {:ok, _target} ->
           {:cont, {:ok, [uri | accessible]}}
 
-        {:error, %Error{code: code}} when code in [:not_found | @hidden_codes] ->
+        {:error, %Error{code: code}} when code in [:not_found | @skipped_codes] ->
           {:cont, {:ok, accessible}}
 
         {:error, _error} = error ->
@@ -152,7 +158,7 @@ defmodule FastestMCP.OperationPipeline.Resolver do
       when is_integer(max_scan) and max_scan > 0 and is_function(fun, 2) do
     server = operation.context.server
     operation = catalog_operation(operation)
-    state = %{acc: acc, scanned: 0, truncated: false}
+    state = %{acc: acc, scanned: 0, truncated: false, seen: MapSet.new()}
     state = fold_tools(server.tools, server, operation, max_scan, state, fun)
 
     state =
@@ -164,6 +170,21 @@ defmodule FastestMCP.OperationPipeline.Resolver do
 
     {state.acc, Map.take(state, [:scanned, :truncated])}
   end
+
+  # Without a match the target is unknown, and so is a match that is hidden
+  # from an MCP client; in-process callers keep the precise code. `:forbidden`
+  # stays, as it starts an OAuth step-up.
+  defp unknown_unless_found(nil, _operation, unknown), do: {:error, unknown.()}
+
+  defp unknown_unless_found(
+         {:error, %Error{code: code}},
+         %Operation{invocation: :protocol},
+         unknown
+       )
+       when code in @hidden_codes,
+       do: {:error, unknown.()}
+
+  defp unknown_unless_found(selected, _operation, _unknown), do: selected
 
   defp candidates(server, kind, target, operation) do
     ComponentIndex.candidates(server.name, kind, target, operation.version) ++
@@ -185,7 +206,7 @@ defmodule FastestMCP.OperationPipeline.Resolver do
             do: {:halt, {:ok, visible}},
             else: {:cont, first_error}
 
-        {:error, %Error{code: code} = error} when code in @hidden_codes ->
+        {:error, %Error{code: code} = error} when code in @skipped_codes ->
           {:cont, first_error || {:error, error}}
 
         {:error, %Error{}} = error ->
@@ -204,13 +225,14 @@ defmodule FastestMCP.OperationPipeline.Resolver do
     end
   end
 
-  # Legacy clients only see task-required tools they negotiated tasks for.
+  # Legacy clients only see task-required tools they negotiated tasks for;
+  # direct calls in process see them all.
   defp negotiated_visible?(_component, %{method: "initialize"}), do: true
 
   defp negotiated_visible?(%Tool{} = tool, operation) do
     is_modern(operation.context.negotiated_protocol_version) or
       tool.task.mode != :required or
-      operation.transport == :in_process or
+      operation.invocation == :local or
       Protocol.capability?(
         operation.context.server_capabilities,
         ["tasks", "requests", "tools", "call"]
@@ -312,10 +334,12 @@ defmodule FastestMCP.OperationPipeline.Resolver do
 
       state =
         with true <- Lookup.version_matches?(component, operation.version),
-             %{} = tool <- visible_one(component, server, operation) do
-          %{state | acc: fun.(tool, state.acc)}
+             %{} = tool <- visible_one(component, server, operation),
+             key = Component.key(tool),
+             false <- MapSet.member?(state.seen, key) do
+          %{state | acc: fun.(tool, state.acc), seen: MapSet.put(state.seen, key)}
         else
-          _hidden -> state
+          _hidden_or_listed -> state
         end
 
       if state.scanned >= max_scan,
@@ -338,7 +362,7 @@ defmodule FastestMCP.OperationPipeline.Resolver do
         {:skip, _reason} ->
           {:cont, first_error}
 
-        {:error, %Error{code: code} = error} when code in @hidden_codes ->
+        {:error, %Error{code: code} = error} when code in @skipped_codes ->
           {:cont, first_error || {:error, error}}
 
         {:error, %Error{}} = error ->

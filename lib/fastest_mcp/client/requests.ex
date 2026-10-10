@@ -3,7 +3,8 @@ defmodule FastestMCP.Client.Requests do
   # Client→server requests. An operation validates its options and pins its
   # client once, builds a `%FastestMCP.Client.Spec{}` per request, and sends
   # it synchronously (`run/2`) or as a request owned by the caller (`start/2`,
-  # `await/2`, `cancel/2`). Results are tagged tuples.
+  # `await/2`, `cancel/2`). Results are tagged tuples. An operation's
+  # `timeout_ms:` defaults to the connection's.
 
   import FastestMCP.Protocol.Version
 
@@ -21,13 +22,16 @@ defmodule FastestMCP.Client.Requests do
   alias FastestMCP.Deadline
   alias FastestMCP.Error
 
-  @default_timeout_ms 5_000
-
   ## Plumbing
 
   def operation(client_ref, opts) do
     opts = Options.operation!(opts)
-    with {:ok, client} <- Connection.pin(client_ref), do: {:ok, client, opts}
+
+    with {:ok, client} <- Connection.pin(client_ref),
+         {:ok, settings} <- Connection.settings(client) do
+      :ok = Options.supported!(opts, settings)
+      {:ok, client, Keyword.put_new(opts, :timeout_ms, settings.timeout_ms)}
+    end
   end
 
   defp operate(client_ref, opts, fun) do
@@ -40,13 +44,17 @@ defmodule FastestMCP.Client.Requests do
          do: Connection.call(client, {:request, spec}, Connection.call_timeout(remaining))
   end
 
+  # The monitor of the connection is also the alias that the reply comes to:
+  # once the owner stops waiting, a late reply is dropped.
   def start(%Client{pid: pid} = client, %Spec{} = spec) do
+    monitor = :erlang.monitor(:process, pid, alias: :demonitor)
+
     with :ok <- Spec.check(spec),
          {:ok, remaining} <- Deadline.check(spec.deadline, spec.method),
          {:ok, ref, request_id, task_augmented?} <-
            Connection.call(
              client,
-             {:request_async, spec, self()},
+             {:request_async, spec, self(), monitor},
              Connection.call_timeout(remaining)
            ) do
       {:ok,
@@ -56,9 +64,14 @@ defmodule FastestMCP.Client.Requests do
          request_id: request_id,
          method: spec.method,
          owner: self(),
-         monitor: Process.monitor(pid),
+         monitor: monitor,
+         cancelled: :atomics.new(1, []),
          task_augmented: task_augmented?
        }}
+    else
+      error ->
+        Process.demonitor(monitor, [:flush])
+        error
     end
   end
 
@@ -74,10 +87,11 @@ defmodule FastestMCP.Client.Requests do
   # Every page of a list method within one deadline; later pages bypass the
   # response cache.
   def pages(client, method, normalizer, opts, deadline, trace) do
+    opts = opts |> Keyword.delete(:timeout_ms) |> Keyword.put(:deadline, deadline)
+
     fetch = fn cursor ->
       opts = if cursor, do: Keyword.merge(opts, cursor: cursor, cache: :bypass), else: opts
-      spec = Spec.new(method, Wire.pagination(opts), normalizer, opts, trace)
-      run(client, %{spec | deadline: deadline})
+      run(client, Spec.new(method, Wire.pagination(opts), normalizer, opts, trace))
     end
 
     with {:ok, result} <-
@@ -114,25 +128,28 @@ defmodule FastestMCP.Client.Requests do
 
   def await(%ClientRequest{owner: owner} = request, timeout)
       when owner == self() and (timeout == :infinity or (is_integer(timeout) and timeout >= 0)) do
-    receive do
-      {:fastest_mcp_client_response, ref, reply} when ref == request.ref ->
-        Process.demonitor(request.monitor, [:flush])
-        reply
+    if :atomics.get(request.cancelled, 1) == 1 do
+      {:error, %Error{code: :cancelled, message: "#{request.method} was cancelled"}}
+    else
+      receive do
+        {:fastest_mcp_client_response, ref, reply} when ref == request.ref ->
+          Process.demonitor(request.monitor, [:flush])
+          reply
 
-      {:DOWN, monitor, :process, _pid, reason} when monitor == request.monitor ->
-        {:error, Connection.exit_error(reason)}
-    after
-      timeout ->
-        Process.demonitor(request.monitor, [:flush])
-        # Completion or the connection's request timer can win this race.
-        _ = cancel(request, "await timed out")
+        {:DOWN, monitor, :process, _pid, reason} when monitor == request.monitor ->
+          {:error, Connection.exit_error(reason)}
+      after
+        timeout ->
+          # Completion or the connection's request timer can win this race.
+          _ = cancel(request, "await timed out")
 
-        {:error,
-         %Error{
-           code: :timeout,
-           message: "#{request.method} timed out",
-           details: %{timeout_ms: timeout}
-         }}
+          {:error,
+           %Error{
+             code: :timeout,
+             message: "#{request.method} timed out",
+             details: %{timeout_ms: timeout}
+           }}
+      end
     end
   end
 
@@ -140,16 +157,33 @@ defmodule FastestMCP.Client.Requests do
     raise ArgumentError, "an asynchronous client request must be awaited by its owner process"
   end
 
+  # Cancelled by its owner, a request has no result: the alias drops its
+  # reply, and `await/2` returns the cancellation. Cancelled by another
+  # process, the owner receives the cancellation.
   def cancel(%ClientRequest{client: client, ref: ref} = request, reason)
       when is_binary(reason) or is_nil(reason) do
-    with :ok <- Connection.call(client, {:cancel_request, ref, reason}) do
-      if request.owner == self(), do: Process.demonitor(request.monitor, [:flush])
-      :ok
+    owner? = request.owner == self()
+
+    if owner? do
+      Process.demonitor(request.monitor, [:flush])
+      :atomics.put(request.cancelled, 1, 1)
     end
+
+    result = Connection.call(client, {:cancel_request, ref, reason})
+
+    if owner? do
+      receive do
+        {:fastest_mcp_client_response, ^ref, _reply} -> :ok
+      after
+        0 -> :ok
+      end
+    end
+
+    result
   end
 
   def listen(client_ref, filter, opts) do
-    params = %{"notifications" => Map.new(filter)}
+    params = %{"notifications" => Options.wire_map(filter)}
     opts = Keyword.put(opts, :timeout_ms, :infinity)
     request_async(client_ref, "subscriptions/listen", params, opts)
   end
@@ -175,7 +209,8 @@ defmodule FastestMCP.Client.Requests do
   def discover(client_ref, opts) do
     operate(client_ref, opts, fn client, opts ->
       with {:ok, token} <- Connection.call(client, :begin_discover) do
-        opts = Keyword.put(opts, :deadline, Deadline.from_options(opts, @default_timeout_ms))
+        deadline = Deadline.from_options(opts, Keyword.fetch!(opts, :timeout_ms))
+        opts = Keyword.put(opts, :deadline, deadline)
 
         result =
           with {:ok, result} <- discover_request(client, opts, 1),
@@ -204,7 +239,7 @@ defmodule FastestMCP.Client.Requests do
   end
 
   defp notify(client, method, opts) do
-    timeout = Keyword.get(opts, :timeout_ms, @default_timeout_ms)
+    timeout = Keyword.fetch!(opts, :timeout_ms)
     deadline = opts |> Deadline.from_options(timeout) |> Deadline.cap(timeout)
 
     with {:ok, remaining} <- Deadline.check(deadline, method) do
@@ -221,13 +256,22 @@ defmodule FastestMCP.Client.Requests do
   def ping(client_ref, opts),
     do: operate(client_ref, opts, &request(&1, "ping", %{}, :identity, &2))
 
+  # On 2026-07-28 the level goes with each later request; on 2025-11-25
+  # logging/setLevel sets it for the session.
   def set_log_level(client_ref, level, opts) do
-    params = %{"level" => log_level!(level)}
+    level = log_level!(level)
 
     operate(client_ref, opts, fn client, opts ->
-      with {:ok, _result} <-
-             request(client, "logging/setLevel", Wire.put_meta(params, opts), :identity, opts),
-           do: :ok
+      with {:ok, version} <- Connection.call(client, {:set_log_level, level}) do
+        if is_modern(version) do
+          :ok
+        else
+          params = Wire.put_meta(%{"level" => level}, opts)
+
+          with {:ok, _result} <- request(client, "logging/setLevel", params, :identity, opts),
+               do: :ok
+        end
+      end
     end)
   end
 
@@ -249,10 +293,12 @@ defmodule FastestMCP.Client.Requests do
   def complete(client_ref, ref, argument, opts) do
     operate(client_ref, opts, fn client, opts ->
       params =
-        %{"ref" => Map.new(ref), "argument" => Map.new(argument)}
+        %{"ref" => Options.wire_map(ref), "argument" => Options.wire_map(argument)}
         |> FastestMCP.Util.maybe_put(
           "context",
-          if(opts[:context_arguments], do: %{"arguments" => Map.new(opts[:context_arguments])})
+          if(opts[:context_arguments],
+            do: %{"arguments" => Options.wire_map(opts[:context_arguments])}
+          )
         )
         |> Wire.put_meta(opts)
 
@@ -292,7 +338,7 @@ defmodule FastestMCP.Client.Requests do
 
   defp list_all(client_ref, method, normalizer, opts) do
     operate(client_ref, opts, fn client, opts ->
-      deadline = Deadline.from_options(opts, @default_timeout_ms)
+      deadline = Deadline.from_options(opts, Keyword.fetch!(opts, :timeout_ms))
       opts = Keyword.delete(opts, :cursor)
 
       Trace.span(method, nil, fn trace ->
@@ -309,7 +355,7 @@ defmodule FastestMCP.Client.Requests do
       params = %{"uri" => uri} |> Wire.put_version(opts[:version]) |> Wire.put_meta(opts)
 
       Trace.span("resources/read", uri, fn trace ->
-        Mrtr.run(client, Spec.new("resources/read", params, :resource_read, opts, trace), opts)
+        Mrtr.run(client, Spec.new("resources/read", params, :identity, opts, trace), opts)
       end)
     end)
   end
@@ -318,7 +364,10 @@ defmodule FastestMCP.Client.Requests do
     name = to_string(name)
 
     operate(client_ref, opts, fn client, opts ->
-      params = Wire.put_meta(%{"name" => name, "arguments" => Map.new(arguments)}, opts)
+      params =
+        %{"name" => name, "arguments" => Options.wire_map(arguments)}
+        |> Wire.put_version(opts[:version])
+        |> Wire.put_meta(opts)
 
       Trace.span("prompts/get", name, fn trace ->
         Mrtr.run(client, Spec.new("prompts/get", params, :prompt, opts, trace), opts)

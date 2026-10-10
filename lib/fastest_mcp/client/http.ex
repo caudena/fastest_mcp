@@ -75,7 +75,7 @@ defmodule FastestMCP.Client.HTTP do
           :ok
 
         {:ok, status, body} ->
-          error = Wire.http_error(body, status, "HTTP notification failed")
+          error = Wire.http_error(body, status, message["method"])
           report_stale_session(state, message["method"], status, error)
           {:error, error}
 
@@ -234,18 +234,13 @@ defmodule FastestMCP.Client.HTTP do
       {:http, {^request_ref, :stream_end, _headers}} ->
         finish(ctx, body, headers)
 
-      {:http, {^request_ref, {{_version, status, reason}, response_headers, response_body}}} ->
+      {:http, {^request_ref, {{_version, status, _reason}, response_headers, response_body}}} ->
         max_bytes = ctx.state.max_response_bytes
         bytes = IO.iodata_length(response_body)
 
         error =
           if bytes <= max_bytes,
-            do:
-              Wire.http_error(
-                response_body,
-                status,
-                "HTTP client request failed with HTTP #{status} #{reason}"
-              ),
+            do: Wire.http_error(response_body, status, ctx.method),
             else: Wire.response_too_large(ctx.method, bytes, max_bytes, status, true)
 
         {:http_error, status, normalize_headers(response_headers), error}
@@ -548,8 +543,8 @@ defmodule FastestMCP.Client.HTTP do
             {:stop, error}
         end
 
-      {:http, {^request_ref, {{_version, status, reason}, _headers, body}}} ->
-        error = Wire.session_stream_error(status, reason, body)
+      {:http, {^request_ref, {{_version, status, _reason}, _headers, body}}} ->
+        error = Wire.http_error(body, status, "the session stream")
         if status == 404, do: {:missing_session, error}, else: {:stop, error}
 
       {:http, {^request_ref, {:error, reason}}} ->

@@ -1,14 +1,14 @@
 defmodule FastestMCP.Client.Auth do
   @moduledoc false
-  # Client credentials as one string-keyed auth input ("authorization",
-  # "headers", and transport metadata keys), merged from the connection's
-  # input and per-request options. A configured OAuth client owns the HTTP
-  # authorization header.
+  # Client credentials as one auth input with string keys at its top level
+  # ("authorization", "headers", and the keys of `auth_input:`), merged from
+  # the connection's input and per-request options. A configured OAuth client
+  # owns the HTTP authorization header. An in-process server receives the
+  # auth input as it is, Elixir terms included.
 
   import FastestMCP.Util, only: [maybe_put: 3]
 
   alias FastestMCP.Client.OAuth
-  alias FastestMCP.Error
 
   @options [:auth_input, :authorization, :access_token, :headers]
 
@@ -59,25 +59,8 @@ defmodule FastestMCP.Client.Auth do
     |> maybe_put("headers", non_empty(headers))
   end
 
-  # In-process servers read credentials from auth input metadata only.
-  def check_transport(%{type: :in_process}, opts) do
-    case Enum.filter([:authorization, :access_token, :headers], &Keyword.has_key?(opts, &1)) do
-      [] ->
-        :ok
-
-      unsupported ->
-        {:error,
-         %Error{
-           code: :invalid_params,
-           message: "in-process requests accept auth_input, not HTTP authorization options",
-           details: %{unsupported_options: unsupported}
-         }}
-    end
-  end
-
-  def check_transport(_transport, _opts), do: :ok
-
-  # Stdio and in-process servers read credentials from request metadata.
+  # A stdio server with `legacy_stdio_auth_metadata: true` reads credentials
+  # from request metadata.
   def put_metadata(params, auth_input, enabled?)
       when not enabled? or map_size(auth_input) == 0,
       do: params

@@ -25,6 +25,7 @@ defmodule FastestMCP.Client.TransportSnapshot do
     :elicitation_handler,
     :url_elicitation_handler,
     :auth_input,
+    :log_level,
     :legacy_stdio_auth_metadata?,
     :oauth,
     :timeout_ms,
@@ -54,6 +55,9 @@ defmodule FastestMCP.Client.TransportSnapshot do
       elicitation_handler: config.elicitation_handler,
       url_elicitation_handler: config.url_elicitation_handler,
       auth_input: config.auth_input,
+      # A log handler alone asks for `info` and above, as a 2025-11-25 session
+      # receives by default.
+      log_level: config.log_level || if(config.log_handler, do: "info"),
       legacy_stdio_auth_metadata?: config.legacy_stdio_auth_metadata,
       oauth: state.oauth,
       timeout_ms: config.timeout_ms,

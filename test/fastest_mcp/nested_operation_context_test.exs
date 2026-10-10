@@ -102,6 +102,22 @@ defmodule FastestMCP.NestedOperationContextTest do
              FastestMCP.await_task!(server_name, task_id, 1_000, session_id: "nested-session")
   end
 
+  test "a nested call that names a session keeps session state when its caller has none" do
+    server_name = unique_name("nested-named-session")
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("inner", fn _args, ctx ->
+      %{session_id: ctx.session_id, state_scope: ctx.state_scope}
+    end)
+    |> FastestMCP.add_tool("outer", fn _args, _ctx ->
+      FastestMCP.call_tool!(server_name, "inner", %{}, session_id: "named")
+    end)
+    |> start_server!()
+
+    assert %{session_id: "named", state_scope: :session} ==
+             FastestMCP.call_tool!(server_name, "outer")
+  end
+
   test "nested calls preserve request scope and negotiated client context" do
     server_name = "nested-request-scope-" <> Integer.to_string(System.unique_integer([:positive]))
 

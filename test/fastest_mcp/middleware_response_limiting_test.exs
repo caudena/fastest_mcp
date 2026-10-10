@@ -47,6 +47,29 @@ defmodule FastestMCP.MiddlewareResponseLimitingTest do
     assert byte_size(JSON.encode!(Serializer.tool_result(result))) <= 500
   end
 
+  test "an InputRequiredResult is a question, not a tool result, and passes through" do
+    middleware = Middleware.response_limiting(max_size: 500)
+    operation = %Operation{method: "tools/call", target: "summarize"}
+
+    question =
+      FastestMCP.InputRequiredResult.new(%{
+        "summary" => %{
+          "method" => "sampling/createMessage",
+          "params" => %{
+            "messages" => [
+              %{
+                "role" => "user",
+                "content" => %{"type" => "text", "text" => String.duplicate("x", 10_000)}
+              }
+            ],
+            "maxTokens" => 100
+          }
+        }
+      })
+
+    assert limit(middleware, operation, fn -> question end) == question
+  end
+
   test "tool filtering limits only configured tools" do
     middleware = Middleware.response_limiting(max_size: 100, tools: ["limited_tool"])
     limited = %Operation{method: "tools/call", target: "limited_tool"}

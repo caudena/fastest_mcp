@@ -17,10 +17,9 @@ defmodule FastestMCP.Client.Catalog do
   alias FastestMCP.Deadline
   alias FastestMCP.Error
   alias FastestMCP.Protocol
+  alias FastestMCP.Protocol.Extensions
   alias FastestMCP.Protocol.HTTPHeaders
   alias FastestMCP.Schema
-
-  @default_timeout_ms 5_000
 
   def snapshot(client_ref, opts) do
     with {:ok, client, opts} <- Requests.operation(client_ref, opts),
@@ -33,7 +32,7 @@ defmodule FastestMCP.Client.Catalog do
     unless mode in [:use, :refresh, :bypass],
       do: raise(ArgumentError, "cache must be :use, :refresh, or :bypass")
 
-    deadline = Deadline.from_options(opts, @default_timeout_ms)
+    deadline = Deadline.from_options(opts, Keyword.fetch!(opts, :timeout_ms))
 
     with {:ok, catalog} <- fetch(client, :all, mode, deadline, opts, trace),
          :ok <- check_limits(catalog, opts) do
@@ -59,9 +58,13 @@ defmodule FastestMCP.Client.Catalog do
         {:ok, descriptor} ->
           {:ok, descriptor, snapshot}
 
+        # The violations name the tool, and what in its schema failed to compile.
         {:error, %Schema.Error{} = error} ->
-          {:error,
-           ProtocolError.new("tools/list", :server_to_client, :response, error.violations)}
+          violations =
+            if error.violations == [], do: [%{message: error.message}], else: error.violations
+
+          violations = Enum.map(violations, &Map.put_new(&1, :tool, name))
+          {:error, ProtocolError.new("tools/list", :server_to_client, :response, violations)}
 
         {:error, reason} ->
           {:error,
@@ -192,10 +195,22 @@ defmodule FastestMCP.Client.Catalog do
 
   def http_parameter_headers(_snapshot, _descriptor, _arguments), do: {:ok, %{}}
 
-  # Legacy task augmentation must match the server's and the tool's support;
-  # modern tasks are server-directed.
-  def validate_task_mode(%{protocol_version: modern()}, _descriptor, _task_requested?),
-    do: :ok
+  # Legacy task augmentation must match the server's and the tool's support.
+  # Modern tasks are server-directed, and need the Tasks extension on both
+  # sides: without it, a call for a task handle would run as an ordinary call.
+  def validate_task_mode(%{protocol_version: modern()} = snapshot, descriptor, task_requested?) do
+    if task_requested? and not snapshot.tasks? do
+      {:error,
+       %Error{
+         code: :bad_request,
+         message:
+           "tool #{inspect(descriptor.name)} runs as a task only when the client and the server " <>
+             "both declare the Tasks extension (#{Extensions.tasks()})"
+       }}
+    else
+      :ok
+    end
+  end
 
   def validate_task_mode(snapshot, descriptor, task_requested?) do
     capable? = Protocol.capability?(snapshot.capabilities, ["tasks", "requests", "tools", "call"])

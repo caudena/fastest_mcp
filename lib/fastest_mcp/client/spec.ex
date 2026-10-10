@@ -14,8 +14,6 @@ defmodule FastestMCP.Client.Spec do
   alias FastestMCP.Error
   alias FastestMCP.Telemetry
 
-  @default_timeout_ms 5_000
-
   @enforce_keys [:method, :params, :normalizer, :deadline]
   defstruct [
     :method,
@@ -36,16 +34,16 @@ defmodule FastestMCP.Client.Spec do
 
   @type t :: %__MODULE__{}
 
-  # The deadline is `timeout_ms` from now, capped by an operation `deadline`.
+  # The deadline is `timeout_ms` from now, which every operation sets, capped
+  # by an operation `deadline`; a request that an operation makes for itself,
+  # such as a page of a list, has the operation's `deadline` alone.
   def new(method, params, normalizer, opts, trace) do
-    timeout = Keyword.get(opts, :timeout_ms, @default_timeout_ms)
-
     traced(
       %__MODULE__{
         method: method,
         params: scoped_progress_token(params, opts[:progress_handler]),
         normalizer: normalizer,
-        deadline: opts |> Deadline.from_options(timeout) |> Deadline.cap(timeout),
+        deadline: deadline(opts),
         progress_handler: opts[:progress_handler],
         on_notification: opts[:on_notification],
         cache: Keyword.get(opts, :cache, :use),
@@ -54,6 +52,13 @@ defmodule FastestMCP.Client.Spec do
       },
       trace
     )
+  end
+
+  defp deadline(opts) do
+    case Keyword.fetch(opts, :timeout_ms) do
+      {:ok, timeout} -> opts |> Deadline.from_options(timeout) |> Deadline.cap(timeout)
+      :error -> Keyword.fetch!(opts, :deadline)
+    end
   end
 
   # Without a span, a request propagates the caller's trace context.

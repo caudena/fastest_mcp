@@ -1,9 +1,7 @@
 defmodule FastestMCP.Interact do
   @moduledoc """
-  Friendly interaction helpers built on top of `FastestMCP.Context`.
-
-  The helpers keep the transport and task semantics in `Context`, while exposing
-  an Elixir-native API for common prompts:
+  Questions to the user, built on `FastestMCP.Context.elicit/4`, that return
+  plain Elixir data:
 
       case FastestMCP.Interact.confirm(ctx, "Proceed?") do
         {:ok, true} -> :approved
@@ -11,6 +9,11 @@ defmodule FastestMCP.Interact do
         :declined -> :declined
         :cancelled -> :cancelled
       end
+
+  They work on both protocol versions and in background tasks. On
+  `2026-07-28`, the client answers and sends the request again, and the
+  handler runs again from the start: ask before you change anything. See
+  [Sampling and Elicitation](sampling-and-elicitation.md).
   """
 
   import FastestMCP.Util, only: [maybe_put: 3, stringify_keys: 1]

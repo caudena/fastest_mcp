@@ -13,6 +13,7 @@ defmodule FastestMCP.Transport.Stdio.Connection do
   import FastestMCP.Protocol.Version
 
   alias FastestMCP.Error
+  alias FastestMCP.Secret
   alias FastestMCP.Server
   alias FastestMCP.ServerRuntime
   alias FastestMCP.ServerSupervisor
@@ -35,6 +36,7 @@ defmodule FastestMCP.Transport.Stdio.Connection do
     :writer,
     :stderr,
     :opts,
+    :auth_input,
     sink_ref: nil,
     requests: %{},
     subscriptions: %{}
@@ -46,6 +48,7 @@ defmodule FastestMCP.Transport.Stdio.Connection do
   @impl true
   def init(%{owner: owner, server: server, input: input, output: output, opts: opts}) do
     Process.flag(:trap_exit, true)
+    {auth_input, opts} = Keyword.pop(opts, :auth_input, %{})
     owner_monitor = Process.monitor(owner)
     stdout? = output in [:stdio, :standard_io, Process.group_leader()]
     stderr = Process.whereis(:standard_error)
@@ -64,7 +67,9 @@ defmodule FastestMCP.Transport.Stdio.Connection do
          reader: spawn_link(fn -> read_loop(input, connection) end),
          writer: spawn_link(fn -> write_loop(output) end),
          stderr: stderr,
-         opts: opts
+         opts: opts,
+         # Crash reports print the state: the input can hold credentials.
+         auth_input: %Secret{value: auth_input}
        }}
     else
       {:error, reason} ->
@@ -73,8 +78,14 @@ defmodule FastestMCP.Transport.Stdio.Connection do
     end
   end
 
+  # `FastestMCP.Client` in process sends each line with its auth input, as
+  # Elixir terms; other lines get the connection's.
   @impl true
-  def handle_info({:stdio_line, line}, state), do: serve_line(state, line)
+  def handle_info({:stdio_line, {line, auth_input}}, state),
+    do: serve_line(state, line, Keyword.put(state.opts, :auth_input, auth_input))
+
+  def handle_info({:stdio_line, line}, state),
+    do: serve_line(state, line, Keyword.put(state.opts, :auth_input, state.auth_input.value))
 
   def handle_info({ref, outcome}, state) when is_map_key(state.requests, ref) do
     Process.demonitor(ref, [:flush])
@@ -169,10 +180,10 @@ defmodule FastestMCP.Transport.Stdio.Connection do
     )
   end
 
-  defp serve_line(state, line) do
+  defp serve_line(state, line, opts) do
     with text when text != "" <- String.trim(line),
          {:ok, message} <- JSONRPC.decode_json(text),
-         {:ok, request} <- StdioAdapter.decode(message, state.opts) do
+         {:ok, request} <- StdioAdapter.decode(message, opts) do
       serve_request(state, request)
     else
       "" ->

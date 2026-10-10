@@ -211,10 +211,15 @@ defmodule FastestMCP.Middleware do
   @doc """
   Builds stateful middleware that logs, counts, and normalizes failures.
 
+  A failure is logged, counted, and reported by the exception a handler or
+  middleware raised, which the error keeps in its `:cause`, or else by the
+  `FastestMCP.Error` itself.
+
   Options: `:logger` (a function of the message, or of level and message;
-  default `Logger.log/2`), `:include_traceback` (default `false`),
-  `:transform_errors` (default `true`; `false` returns the error unchanged),
-  and `:error_callback`, called with the exception and the operation.
+  default `Logger.log/2`), `:include_traceback` (default `false`; `true` logs
+  the stack trace of a raised exception), `:transform_errors` (default `true`;
+  `false` returns the error unchanged), and `:error_callback`, called with the
+  exception and the operation.
   """
   def error_handling(opts \\ []), do: ErrorHandling.new(opts)
 
@@ -236,15 +241,22 @@ defmodule FastestMCP.Middleware do
   def logging(opts \\ []), do: Logging.new(opts)
 
   @doc """
-  Builds stateful middleware that keeps transport sessions alive: every
-  session that sent a request with its session id gets a ping each
-  `:interval_ms` (default 30,000).
+  Builds stateful middleware that pings the clients of `2025-11-25` sessions.
+
+  For every session that sent a request with its session id, while the client
+  listens on the session's stream (an HTTP `GET` stream, or stdio), it sends
+  the client an MCP `ping` request each `:interval_ms` (default 30,000) after
+  the previous ping finished, and emits `[:fastest_mcp, :session, :ping]` with
+  the ping's `:result`: `:ok`, `:timeout` when the client didn't answer within
+  `:timeout_ms` (default 10,000), or `:error`. A failed ping changes nothing
+  else. A session without such a stream is pinged again after its next
+  request, and an ended session no longer is.
   """
   def ping(opts \\ []), do: Ping.new(opts)
 
   @doc """
-  Returns the `{server_name, session_id}` pairs a `ping/1` middleware keeps
-  alive, over the servers using it.
+  Returns the `{server_name, session_id}` pairs a `ping/1` middleware pings,
+  over the servers using it.
   """
   defdelegate ping_sessions(ping), to: Ping, as: :active_sessions
 
@@ -268,6 +280,11 @@ defmodule FastestMCP.Middleware do
   `:call_tool` (default 1 hour; `:call_tool` also takes `:included_tools` and
   `:excluded_tools`). Other options: `:max_item_size` (default 1,000,000
   bytes), `:cleanup_interval_ms` (default 60,000), and `:logger`.
+
+  A change of the server's tools, resources, or prompts while it runs (through
+  the component manager, visibility rules, or `FastestMCP.notify_list_changed/2`)
+  drops what the cache kept of that kind: its list, and its tool results,
+  resource reads, or prompts.
   """
   def response_caching(opts \\ []), do: ResponseCaching.new(opts)
 
@@ -316,9 +333,18 @@ defmodule FastestMCP.Middleware do
   def structured_logging(opts \\ []),
     do: Logging.new(Keyword.put(opts, :structured_logging, true))
 
-  @doc "Injects `list_prompts` and `get_prompt` tools; see `tool_injection/2`."
+  @doc """
+  Injects the tools `list_prompts`, which returns the prompts as `prompts/list`
+  describes them, and `get_prompt`, which takes `name` and `arguments`; see
+  `tool_injection/2`.
+  """
   def prompt_tools(opts \\ []), do: ToolInjection.prompt_tools(opts)
-  @doc "Injects `list_resources` and `read_resource` tools; see `tool_injection/2`."
+
+  @doc """
+  Injects the tools `list_resources`, which returns the resources and resource
+  templates as `resources/list` and `resources/templates/list` describe them,
+  and `read_resource`, which takes `uri`; see `tool_injection/2`.
+  """
   def resource_tools(opts \\ []), do: ToolInjection.resource_tools(opts)
 
   @doc """

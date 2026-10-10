@@ -4,7 +4,6 @@ defmodule FastestMCP.BidirectionalTransportTest do
   alias FastestMCP.Auth.Result, as: AuthResult
   alias FastestMCP.Context
   alias FastestMCP.Elicitation.Accepted
-  alias FastestMCP.Elicitation.URL
   alias FastestMCP.PeerTask
   alias FastestMCP.Registry
   alias FastestMCP.Root
@@ -373,10 +372,8 @@ defmodule FastestMCP.BidirectionalTransportTest do
                  principal: "wrong-peer"
                )
 
-      assert {:ok, completed} =
+      assert :ok =
                FastestMCP.complete_elicitation(server_name, elicitation_id, principal: "raw-peer")
-
-      assert completed.completed_at
 
       assert {:error, :already_completed} =
                FastestMCP.complete_elicitation(server_name, elicitation_id, principal: "raw-peer")
@@ -802,13 +799,11 @@ defmodule FastestMCP.BidirectionalTransportTest do
 
       assert url == "https://connect.example.com/matrix/#{elicitation_id}"
 
-      assert {:ok, %URL{elicitation_id: ^elicitation_id, completed_at: completed_at}} =
+      assert :ok =
                FastestMCP.complete_elicitation(server_name, elicitation_id,
                  principal: "matrix-peer",
                  auth: %{provider: :matrix}
                )
-
-      assert is_integer(completed_at)
 
       {:ok,
        %{

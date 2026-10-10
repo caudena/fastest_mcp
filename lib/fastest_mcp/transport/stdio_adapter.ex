@@ -1,7 +1,9 @@
 defmodule FastestMCP.Transport.StdioAdapter do
   @moduledoc false
   # Decodes the JSON-RPC messages of MCP's newline-delimited stdio transport.
-  # Every message of a connection belongs to the connection's session.
+  # Every message of a connection belongs to the connection's session. A
+  # `FastestMCP.Client` connected in process uses this transport too, with
+  # `transport: :in_process`.
 
   alias FastestMCP.Error
   alias FastestMCP.Transport.JSONRPC
@@ -16,12 +18,12 @@ defmodule FastestMCP.Transport.StdioAdapter do
       {:ok,
        %{
          request
-         | transport: :stdio,
+         | transport: Keyword.get(opts, :transport, :stdio),
            session_id: session_id,
            session_id_provided?: true,
            protocol_version: request.protocol_version || initialize_version(decoded),
            auth_input:
-             Map.merge(Map.new(Keyword.get(opts, :auth_input, %{})), wire_auth(decoded)),
+             Map.merge(wire_auth(decoded), Map.new(Keyword.get(opts, :auth_input, %{}))),
            request_metadata:
              Map.merge(request.request_metadata, %{
                method: request.method,
@@ -46,7 +48,8 @@ defmodule FastestMCP.Transport.StdioAdapter do
   defp initialize_version({:request, "initialize", params, _id}), do: params["protocolVersion"]
   defp initialize_version(_decoded), do: nil
 
-  # A stdio client authenticates through `_meta.fastestmcp.auth`.
+  # A stdio client may send credentials in `_meta.fastestmcp.auth`; the
+  # `:auth_input` the server was given wins over them.
   defp wire_auth({:request, _method, params, _id}) do
     case get_in(params, ["_meta", "fastestmcp", "auth"]) do
       %{} = auth -> auth

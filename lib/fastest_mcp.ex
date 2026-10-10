@@ -93,7 +93,9 @@ defmodule FastestMCP do
   alias FastestMCP.Context
   alias FastestMCP.Error
   alias FastestMCP.EventBus
+  alias FastestMCP.Notifications
   alias FastestMCP.OperationPipeline
+  alias FastestMCP.Options
   alias FastestMCP.Pagination
   alias FastestMCP.Protocol
   alias FastestMCP.Provider
@@ -145,11 +147,20 @@ defmodule FastestMCP do
 
   Options: `:name` (default: the document's `info.title`), `:base_url`
   (default: its first server URL), `:timeout_ms` per request (default 5,000),
-  `:schema_options`, and `:requester`, a `fn method, url, opts -> {:ok,
-  status, headers, body} | {:error, reason} end` that replaces the HTTP client
-  (for example in tests).
+  `:headers`, `:schema_options`, and `:requester`, a `fn method, url, opts ->
+  {:ok, status, headers, body} | {:error, reason} end` that replaces the HTTP
+  client (for example in tests).
+
+  `:headers` is a map or list of `{name, value}` pairs that every request
+  sends, such as an API key. A value is a string, or a function of no
+  arguments or of the handler context that returns one (or `nil`, which
+  leaves the header out) for each request. A header parameter of the document
+  with one of these names is no argument of its tool.
+
+  Unknown options raise `ArgumentError`.
   """
   def from_openapi(openapi_spec, opts \\ []) when is_map(openapi_spec) and is_list(opts) do
+    Options.keys!(opts, [:name, :base_url, :timeout_ms, :headers, :schema_options, :requester])
     provider = OpenAPI.new(Keyword.put(opts, :openapi_spec, openapi_spec))
     server_name = Keyword.get(opts, :name, provider.name)
 
@@ -190,9 +201,12 @@ defmodule FastestMCP do
   For a server, `opts` are runtime options, among them `:max_sessions`
   (default 10,000), `:session_idle_ttl` (default 15 minutes),
   `:max_concurrent_calls`, `:max_background_tasks`, `:strict_request_ids`,
-  and the `:session_state_store` and `:task_backend` backends; unknown options
-  raise `ArgumentError`. For a server module, `opts` override its
-  configuration.
+  the `:session_state_store` and `:task_backend` backends, and
+  `:signing_secret`, a binary of at least 32 bytes that signs list cursors and
+  the request state of multi-round-trip requests (by default, a random one for
+  each start). For a server module, `opts` override its configuration. Unknown or invalid options raise
+  `ArgumentError`; a server that fails to start, for example because a
+  lifespan fails, is `{:error, reason}`.
   """
   def start_server(server_or_module, opts \\ [])
 
@@ -223,9 +237,9 @@ defmodule FastestMCP do
 
   @doc """
   Completes a URL elicitation for the user it was issued to, identified by
-  `:principal` (with `:auth`) or `:auth_result`. Returns `{:ok, elicitation}`
-  or `{:error, reason}` with reason `:forbidden`, `:expired`,
-  `:already_completed`, or `:not_found`.
+  `:principal` (with `:auth`) or `:auth_result`, and notifies the client that
+  asked. Returns `:ok`, or `{:error, reason}` with reason `:forbidden`,
+  `:expired`, `:already_completed`, or `:not_found`.
   """
   def complete_elicitation(server_name, elicitation_id, opts)
       when is_binary(elicitation_id) and is_list(opts) do
@@ -239,8 +253,8 @@ defmodule FastestMCP do
         fingerprint
       )
       |> case do
-        {:ok, elicitation} ->
-          {:ok, elicitation}
+        {:ok, _elicitation} ->
+          :ok
 
         {:error, reason} when reason in [:forbidden, :expired, :already_completed] ->
           {:error, reason}
@@ -269,7 +283,11 @@ defmodule FastestMCP do
   def http_app(server_name, opts \\ []),
     do: {HTTPApp, HTTPApp.init(Keyword.put(opts, :server_name, server_name))}
 
-  @doc "Returns a Bandit child spec serving the server over Streamable HTTP; see `FastestMCP.Transport.StreamableHTTP`."
+  @doc """
+  Returns a Bandit child spec serving the server over Streamable HTTP; see
+  `FastestMCP.Transport.StreamableHTTP`. Unknown or invalid options raise
+  `ArgumentError`.
+  """
   def streamable_http_child_spec(server_name, opts \\ []) do
     StreamableHTTP.child_spec(Keyword.put(opts, :server_name, server_name))
   end
@@ -398,6 +416,32 @@ defmodule FastestMCP do
   def notify_resource_updated!(server_name, uri),
     do: Error.unwrap!(notify_resource_updated(server_name, uri))
 
+  @doc """
+  Tells the clients of a running server that its list of tools, resources, or
+  prompts changed, so that they list it again; `kinds` is `:tools`,
+  `:resources`, `:prompts`, or a list of them. Call it when the components
+  that a custom provider offers change. The response cache drops what it kept
+  of these kinds. Returns `:ok`, or `{:error, error}` for a server that isn't
+  running; an unknown kind raises `ArgumentError`.
+  """
+  def notify_list_changed(server_name, kinds) do
+    families = List.wrap(kinds)
+
+    unless families != [] and Enum.all?(families, &(&1 in [:tools, :resources, :prompts])) do
+      raise ArgumentError,
+            "kinds must be :tools, :resources, or :prompts, or a list of them, got: #{inspect(kinds)}"
+    end
+
+    with_runtime(server_name, fn runtime ->
+      Notifications.list_changed(runtime, Enum.uniq(families))
+      :ok
+    end)
+  end
+
+  @doc "Raising variant of `notify_list_changed/2`."
+  def notify_list_changed!(server_name, kinds),
+    do: Error.unwrap!(notify_list_changed(server_name, kinds))
+
   @doc "Starts a task-notification subscriber for one session."
   def subscribe_task_notifications(server_name, session_id, opts \\ []) do
     with_runtime(server_name, fn runtime ->
@@ -441,11 +485,15 @@ defmodule FastestMCP do
   def task_notification_subscriber_count!(server_name),
     do: Error.unwrap!(task_notification_subscriber_count(server_name))
 
-  @doc "Fetches the current state of a background task."
+  @doc """
+  Returns the `FastestMCP.TaskRecord` of a background task: its status,
+  progress, and the questions it waits for, and once it finishes, its result
+  or error.
+  """
   def fetch_task(%BackgroundTask{} = task),
     do: fetch_task(task.server_name, task.task_id, handle_access_opts(task))
 
-  @doc "Fetches the current state of the background task `task_id`."
+  @doc "Returns the `FastestMCP.TaskRecord` of the background task `task_id`."
   def fetch_task(server_name, task_id, opts \\ []) do
     task_call(server_name, task_id, opts, :fetch, &BackgroundTaskStore.fetch(&1, task_id, &2))
   end
@@ -494,7 +542,8 @@ defmodule FastestMCP do
     do: Error.unwrap!(task_result(server_name, task_id, opts))
 
   @doc """
-  Lists the background tasks visible to the caller, newest first.
+  Lists the background tasks visible to the caller, newest first, as
+  `FastestMCP.TaskRecord` structs.
 
   With `:page_size`, returns one page; pass its `:next_cursor` as `:cursor` for
   the next.
@@ -512,7 +561,7 @@ defmodule FastestMCP do
   @doc "Raising variant of `list_tasks/2`."
   def list_tasks!(server_name, opts \\ []), do: Error.unwrap!(list_tasks(server_name, opts))
 
-  @doc "Cancels a background task."
+  @doc "Cancels a background task and returns its `FastestMCP.TaskRecord`."
   def cancel_task(%BackgroundTask{} = task),
     do: cancel_task(task.server_name, task.task_id, handle_access_opts(task))
 
@@ -528,7 +577,11 @@ defmodule FastestMCP do
   def cancel_task!(server_name, task_id, opts \\ []),
     do: Error.unwrap!(cancel_task(server_name, task_id, opts))
 
-  @doc "Answers input requests outstanding for a background task."
+  @doc """
+  Answers the questions a background task waits for, by their keys in its
+  record's `:input_requests`, with the answers an MCP client would send. Returns
+  the task's `FastestMCP.TaskRecord`.
+  """
   def update_task(server_name, task_id, input_responses, opts \\ []) do
     task_call(server_name, task_id, opts, :update, fn store, opts ->
       BackgroundTaskStore.update(store, task_id, input_responses, opts)
@@ -539,7 +592,12 @@ defmodule FastestMCP do
   def update_task!(server_name, task_id, input_responses, opts \\ []),
     do: Error.unwrap!(update_task(server_name, task_id, input_responses, opts))
 
-  @doc "Sends interactive input back to a background task that is waiting for it."
+  @doc """
+  Answers the elicitation a background task waits for, with the `action`
+  (`:accept`, `:decline`, or `:cancel`) and, with `:accept`, the content of the
+  form. Returns the task's `FastestMCP.TaskRecord`. Answer any other question
+  with `update_task/4`.
+  """
   def send_task_input(server_name, task_id, action, content \\ nil, opts \\ []) do
     task_call(server_name, task_id, opts, :send_input, fn store, opts ->
       BackgroundTaskStore.send_input(store, task_id, action, content, opts)

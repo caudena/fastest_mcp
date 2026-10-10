@@ -15,9 +15,8 @@ defmodule FastestMCP.ComponentPolicy do
 
   def prepare_result(server, component, operation) do
     transformed =
-      Enum.reduce(server.transforms, component, fn transform, current ->
-        if current, do: transform.(current, operation), else: nil
-      end)
+      server.transforms
+      |> transform(component, operation)
       |> ComponentVisibility.apply_server_rules(operation.server_name)
       |> ComponentVisibility.apply_session_rules(operation.context)
 
@@ -54,5 +53,26 @@ defmodule FastestMCP.ComponentPolicy do
       :ok -> {:ok, component}
       {:error, %Error{} = error} -> {:error, error}
     end
+  end
+
+  # Server transforms run in order, and nil hides the component. Schemas a
+  # transform changed are compiled again, as for provider transforms.
+  defp transform([], component, _operation), do: component
+
+  defp transform(transforms, component, operation) do
+    transformed =
+      Enum.reduce_while(transforms, component, fn transform, current ->
+        case transform.(current, operation) do
+          nil -> {:halt, nil}
+          transformed -> {:cont, transformed}
+        end
+      end)
+
+    transformed &&
+      Component.refresh_compiled_schemas(
+        transformed,
+        operation.schema_cache,
+        operation.schema_options || []
+      )
   end
 end

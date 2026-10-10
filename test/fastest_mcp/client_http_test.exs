@@ -10,6 +10,18 @@ defmodule FastestMCP.ClientHTTPTest do
   alias FastestMCP.Error
   alias FastestMCP.Session
 
+  defmodule NotFoundPlug do
+    @moduledoc false
+    def init(opts), do: opts
+    def call(conn, _opts), do: Plug.Conn.send_resp(conn, 404, "")
+  end
+
+  defmodule GatewayTimeoutPlug do
+    @moduledoc false
+    def init(opts), do: opts
+    def call(conn, _opts), do: Plug.Conn.send_resp(conn, 504, "upstream request timeout")
+  end
+
   test "connected client initializes and works against a live streamable HTTP server" do
     test_pid = self()
     server_name = "client-http-" <> Integer.to_string(System.unique_integer([:positive]))
@@ -106,7 +118,6 @@ defmodule FastestMCP.ClientHTTPTest do
              "uri" => "memo://welcome",
              "name" => "memo://welcome",
              "description" => "",
-             "mimeType" => "application/json",
              "_meta" => %{
                "vendor" => %{"stable" => true},
                "fastestmcp" => %{
@@ -123,7 +134,6 @@ defmodule FastestMCP.ClientHTTPTest do
              "uriTemplate" => "memo://users/{id}",
              "name" => "memo://users/{id}",
              "description" => "",
-             "mimeType" => "application/json",
              "_meta" => %{
                "vendor" => %{"stable" => true},
                "fastestmcp" => %{
@@ -138,7 +148,7 @@ defmodule FastestMCP.ClientHTTPTest do
     assert %{items: [%{"name" => "welcome"}], next_cursor: nil} =
              Client.list_prompts!(client)
 
-    assert %{"message" => "hello"} = Client.read_resource!(client, "memo://welcome")
+    assert %{"message" => "hello"} = read_json!(client, "memo://welcome")
 
     assert %{"messages" => [%{"content" => %{"text" => "Welcome Nate"}}]} =
              Client.render_prompt!(client, "welcome", %{"name" => "Nate"})
@@ -178,22 +188,20 @@ defmodule FastestMCP.ClientHTTPTest do
 
     client = connect!(url, protocol_version: "2025-11-25")
 
-    assert %{"version" => "1.0.0"} = Client.read_resource!(client, "memo://config")
+    assert %{"version" => "1.0.0"} = read_json!(client, "memo://config")
+
+    assert %{"id" => "42", "version" => "1.0.0"} = read_json!(client, "memo://users/42")
+
+    assert %{"version" => "1.0.0"} = read_json!(client, "memo://config", version: "1.0.0")
 
     assert %{"id" => "42", "version" => "1.0.0"} =
-             Client.read_resource!(client, "memo://users/42")
+             read_json!(client, "memo://users/42", version: "1.0.0")
 
-    assert %{"version" => "1.0.0"} =
-             Client.read_resource!(client, "memo://config", version: "1.0.0")
-
-    assert %{"id" => "42", "version" => "1.0.0"} =
-             Client.read_resource!(client, "memo://users/42", version: "1.0.0")
-
-    assert_raise Error, ~r/disabled/, fn ->
+    assert_raise Error, ~r{unknown resource "memo://config"}, fn ->
       Client.read_resource!(client, "memo://config", version: "2.0.0")
     end
 
-    assert_raise Error, ~r/disabled/, fn ->
+    assert_raise Error, ~r{unknown resource "memo://users/42"}, fn ->
       Client.read_resource!(client, "memo://users/42", version: "2.0.0")
     end
   end
@@ -833,6 +841,146 @@ defmodule FastestMCP.ClientHTTPTest do
     assert leaked == []
   end
 
+  test "atom keys and atom values from the caller and its handlers reach the server as JSON" do
+    server_name = unique_name("atom-keys")
+
+    sampling = %{
+      "method" => "sampling/createMessage",
+      "params" => %{
+        "messages" => [%{"role" => "user", "content" => %{"type" => "text", "text" => "Hi"}}],
+        "maxTokens" => 10
+      }
+    }
+
+    elicitation = %{
+      "method" => "elicitation/create",
+      "params" => %{
+        "message" => "Confirm?",
+        "requestedSchema" => %{
+          "type" => "object",
+          "properties" => %{"answer" => %{"type" => "string"}},
+          "required" => ["answer"]
+        }
+      }
+    }
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end,
+      input_schema: %{
+        "type" => "object",
+        "properties" => %{
+          "a" => %{"type" => "integer"},
+          "nested" => %{"type" => "object", "properties" => %{"b" => %{"type" => "string"}}},
+          "mode" => %{"type" => "string", "enum" => ["fast"]}
+        },
+        "required" => ["a"],
+        "additionalProperties" => false
+      }
+    )
+    |> FastestMCP.add_tool("ask", fn _arguments, ctx ->
+      case Context.input_responses(ctx) do
+        responses when map_size(responses) == 0 ->
+          FastestMCP.InputRequiredResult.new(%{"sample" => sampling, "confirm" => elicitation})
+
+        responses ->
+          responses
+      end
+    end)
+    |> FastestMCP.add_prompt("greet", fn %{"name" => name}, _ctx -> "Hello, #{name}!" end,
+      arguments: [%{name: "name", required: true, completion: ["Ada", "Grace"]}]
+    )
+    |> start_server!()
+
+    %{url: url} = start_http!(server_name)
+
+    client =
+      connect!(url,
+        sampling_handler: fn _messages, _params ->
+          %{role: :assistant, model: "test-model", content: %{type: :text, text: "sampled"}}
+        end,
+        elicitation_handler: fn _message, _params -> {:accept, %{answer: "yes"}} end
+      )
+
+    assert Client.call_tool!(client, "echo", %{a: 1, nested: %{b: "x"}, mode: :fast}).structured_content ==
+             %{"a" => 1, "nested" => %{"b" => "x"}, "mode" => "fast"}
+
+    assert {:error, %Error{code: :invalid_params}} = Client.call_tool(client, "echo", %{a: "one"})
+
+    assert %{"structuredContent" => %{"a" => 2}} =
+             Client.request!(client, "tools/call", %{name: "echo", arguments: %{a: 2}})
+
+    assert %{"messages" => [%{"content" => %{"text" => "Hello, Ada!"}}]} =
+             Client.render_prompt!(client, "greet", %{name: :Ada})
+
+    assert %{"values" => ["Ada"]} =
+             Client.complete!(client, %{type: "ref/prompt", name: "greet"}, %{
+               name: :name,
+               value: "A"
+             })
+
+    assert %{
+             "sample" => %{"content" => %{"text" => "sampled"}, "role" => "assistant"},
+             "confirm" => %{"action" => "accept", "content" => %{"answer" => "yes"}}
+           } = Client.call_tool!(client, "ask", %{}).structured_content
+
+    legacy = connect!(url, protocol_version: "2025-11-25")
+
+    assert Client.call_tool!(legacy, "echo", %{a: 3, nested: %{b: "y"}}).structured_content ==
+             %{"a" => 3, "nested" => %{"b" => "y"}}
+  end
+
+  test "read_resource/3 returns the whole result on both protocol versions" do
+    server_name = unique_name("read-shape")
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_resource("notes://1", fn _args, _ctx -> %{id: "1", title: "Release"} end)
+    |> FastestMCP.add_resource("notes://plain", fn _args, _ctx -> "plain text" end)
+    |> start_server!()
+
+    for version <- ["2026-07-28", "2025-11-25"] do
+      client = connect!({:in_process, server_name}, protocol_version: version)
+
+      assert %{"contents" => [%{"uri" => "notes://1", "text" => json}]} =
+               Client.read_resource!(client, "notes://1")
+
+      assert JSON.decode!(json) == %{"id" => "1", "title" => "Release"}
+
+      assert %{"contents" => [%{"uri" => "notes://plain", "text" => "plain text"}]} =
+               Client.read_resource!(client, "notes://plain")
+    end
+  end
+
+  test "HTTP errors carry clean messages and the server's code" do
+    server_name = unique_name("http-errors")
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("echo", fn a, _ -> a end)
+    |> start_server!()
+
+    %{url: guarded} = start_http!(server_name, allowed_hosts: ["mcp.example.com"])
+
+    assert {:error, %Error{code: :forbidden, message: "request host is not allowed"} = forbidden} =
+             Client.connect(guarded, protocol_version: "2026-07-28")
+
+    assert forbidden.details.status == 403
+
+    %{url: missing} = serve!(NotFoundPlug)
+
+    assert {:error, %Error{code: :not_found, message: message, details: %{status: 404}}} =
+             Client.connect(missing, protocol_version: "2026-07-28")
+
+    assert message == "server/discover failed with HTTP 404 Not Found"
+  end
+
+  test "a 504 without a JSON-RPC body, as from a proxy, is a timeout" do
+    %{url: url} = serve!(GatewayTimeoutPlug)
+
+    assert {:error, %Error{code: :timeout, message: message, details: %{status: 504}}} =
+             Client.connect(url, protocol_version: "2026-07-28")
+
+    assert message == "server/discover failed with HTTP 504 Gateway Timeout"
+  end
+
   defp sampling_result(text) do
     %{
       "role" => "assistant",
@@ -867,4 +1015,10 @@ defmodule FastestMCP.ClientHTTPTest do
     do: contains_client_state?(head) or contains_client_state?(tail)
 
   defp contains_client_state?(_term), do: false
+
+  # The JSON value of a resource's one text content.
+  defp read_json!(client, uri, opts \\ []) do
+    assert %{"contents" => [%{"text" => text}]} = Client.read_resource!(client, uri, opts)
+    JSON.decode!(text)
+  end
 end

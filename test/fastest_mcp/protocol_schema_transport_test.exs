@@ -579,7 +579,7 @@ defmodule FastestMCP.ProtocolSchemaTransportTest do
 
     assert response.status == 401
     assert response.resp_body == ""
-    assert ["Bearer " <> _challenge] = get_resp_header(response, "www-authenticate")
+    assert get_resp_header(response, "www-authenticate") == ["Bearer"]
   end
 
   defp jsonrpc_request(method, payload, opts \\ []) do

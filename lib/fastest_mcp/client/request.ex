@@ -3,14 +3,25 @@ defmodule FastestMCP.Client.Request do
   Opaque handle for an asynchronous connected-client request.
 
   Use `await/2` to receive the result or `cancel/2` to explicitly issue an MCP
-  cancellation. Only the process that started the request may await it.
+  cancellation. Only the process that started the request may await it. Once
+  that process cancels the request, or its `await/2` times out, no reply
+  reaches its mailbox, and `await/2` returns the `:cancelled` error.
   """
 
   alias FastestMCP.Client.Requests
   alias FastestMCP.Error
 
   @enforce_keys [:client, :ref, :request_id, :method, :owner]
-  defstruct [:client, :ref, :request_id, :method, :owner, :monitor, task_augmented: false]
+  defstruct [
+    :client,
+    :ref,
+    :request_id,
+    :method,
+    :owner,
+    :monitor,
+    :cancelled,
+    task_augmented: false
+  ]
 
   @opaque t :: %__MODULE__{
             client: FastestMCP.Client.t(),
@@ -19,6 +30,7 @@ defmodule FastestMCP.Client.Request do
             method: String.t(),
             owner: pid(),
             monitor: reference(),
+            cancelled: :atomics.atomics_ref(),
             task_augmented: boolean()
           }
 

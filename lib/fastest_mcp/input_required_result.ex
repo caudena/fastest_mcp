@@ -1,12 +1,19 @@
 defmodule FastestMCP.InputRequiredResult do
   @moduledoc """
-  Handler result for a modern MCP multi round-trip request (MRTR).
+  A handler result that asks the client for input before the request can
+  finish: a multi-round-trip request of MCP `2026-07-28`.
 
-  The keys in `input_requests` are chosen by the application and are echoed by
-  the client in `inputResponses`. `request_state` is deliberately opaque to
-  FastestMCP: applications that place authorization or business state in it
-  remain responsible for authenticating, expiring, and binding that value to
-  the retried operation.
+  The helpers (`FastestMCP.Interact`, `FastestMCP.Sampling`,
+  `FastestMCP.Context.elicit/4`, `FastestMCP.Context.sample/3`, and
+  `FastestMCP.Context.list_roots/2`) build these results for you on
+  `2026-07-28`, one question per round. Return one yourself to ask several
+  things in one round, or to choose the keys and the request state; see
+  [Multi-round-trip requests](sampling-and-elicitation.md#multi-round-trip-requests).
+
+  The keys in `input_requests` are yours, and the client answers under the
+  same keys in `inputResponses`. `request_state` is opaque to FastestMCP: if it
+  carries authorization or business state, authenticate, expire, and bind it
+  to the call yourself.
   """
 
   import FastestMCP.Util, only: [maybe_put: 3]
@@ -16,15 +23,25 @@ defmodule FastestMCP.InputRequiredResult do
   alias FastestMCP.Protocol
 
   @enforce_keys []
-  defstruct input_requests: nil, request_state: nil, meta: nil
+  defstruct input_requests: nil, request_state: nil, meta: nil, timeout_ms: 60_000
 
   @type t :: %__MODULE__{
           input_requests: %{optional(String.t()) => map()} | nil,
           request_state: String.t() | nil,
-          meta: map() | nil
+          meta: map() | nil,
+          timeout_ms: pos_integer()
         }
 
-  @doc "Builds an input-required result from server-initiated MCP request objects."
+  @doc """
+  Builds an input-required result from MCP request maps, each with a
+  `"method"` and `"params"`, by key.
+
+  Options: `:request_state`, an opaque string the client sends back with its
+  answers; `:meta`, the result's `_meta`; and `:timeout_ms`, how long a
+  background task waits for the answers before it fails with `:timeout`
+  (default 60 seconds). Without a task, the server doesn't wait: the client
+  sends the request again with the answers.
+  """
   def new(input_requests \\ nil, opts \\ []) do
     request_state = Keyword.get(opts, :request_state)
     input_requests = normalize_input_requests(input_requests)
@@ -36,7 +53,8 @@ defmodule FastestMCP.InputRequiredResult do
     %__MODULE__{
       input_requests: input_requests,
       request_state: normalize_request_state(request_state),
-      meta: normalize_meta(Keyword.get(opts, :meta))
+      meta: normalize_meta(Keyword.get(opts, :meta)),
+      timeout_ms: normalize_timeout(Keyword.get(opts, :timeout_ms, 60_000))
     }
   end
 
@@ -95,6 +113,12 @@ defmodule FastestMCP.InputRequiredResult do
 
   defp normalize_request_state(other) do
     raise ArgumentError, "request_state must be an opaque string, got #{inspect(other)}"
+  end
+
+  defp normalize_timeout(value) when is_integer(value) and value > 0, do: value
+
+  defp normalize_timeout(other) do
+    raise ArgumentError, "timeout_ms must be a positive integer, got #{inspect(other)}"
   end
 
   defp normalize_meta(nil), do: nil

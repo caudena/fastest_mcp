@@ -7,7 +7,7 @@ defmodule FastestMCP.Resources.Directory do
     * absolute-path validation
     * non-recursive or recursive file listing
     * optional hidden-file inclusion
-    * normalized read errors
+    * read errors and listings without server paths
 
   `read/1` returns a `FastestMCP.Resources.Result` with one JSON content item.
   That keeps the result transport-safe while still making the directory listing
@@ -54,67 +54,57 @@ defmodule FastestMCP.Resources.Directory do
     }
   end
 
-  @doc "Lists files in the configured directory."
+  @doc """
+  Lists the absolute paths of the files in the configured directory, for your
+  own code; `read/1` sends clients paths relative to the directory.
+  """
   def list_files(%__MODULE__{} = directory) do
-    validate_directory!(directory.path)
-    real_root = PathSafety.realpath!(directory.path)
+    case File.stat(directory.path) do
+      {:ok, %File.Stat{type: :directory}} ->
+        real_root = PathSafety.realpath!(directory.path)
 
-    directory.path
-    |> walk(real_root, directory.recursive, directory.include_hidden, MapSet.new())
-    |> elem(0)
+        directory.path
+        |> walk(real_root, directory.recursive, directory.include_hidden, MapSet.new())
+        |> elem(0)
+
+      {:ok, %File.Stat{}} ->
+        list_error!(directory, "not a directory")
+
+      {:error, reason} ->
+        list_error!(directory, :file.format_error(reason))
+    end
   rescue
-    error ->
-      reraise Error.exception(
-                code: :internal_error,
-                message:
-                  "Error listing directory #{inspect(directory.path)}: #{Exception.message(error)}"
-              ),
-              __STACKTRACE__
+    error in File.Error -> list_error!(directory, :file.format_error(error.reason))
   end
 
-  @doc "Reads the directory listing and returns a normalized resource result."
-  def read(%__MODULE__{} = directory) do
-    files = list_files(directory)
+  @doc """
+  Reads the directory listing and returns a normalized resource result: one
+  JSON content item with each file's `name`, `relative_path`, and
+  `size_bytes`, and the `count` and `recursive` flag as metadata.
 
+  A failed read raises `FastestMCP.Error` with the code `:internal_error`; its
+  message names the directory but not where it is on the server.
+  """
+  def read(%__MODULE__{} = directory) do
     entries =
-      Enum.map(files, fn path ->
+      for path <- list_files(directory) do
         %{
-          path: path,
-          relative_path: Path.relative_to(path, directory.path),
           name: Path.basename(path),
+          relative_path: Path.relative_to(path, directory.path),
           size_bytes: file_size(path)
         }
-      end)
+      end
 
-    Result.new(
-      [
-        Content.new(entries, mime_type: directory.mime_type)
-      ],
-      meta: %{
-        count: length(entries),
-        path: directory.path,
-        recursive: directory.recursive
-      }
+    Result.new([Content.new(entries, mime_type: directory.mime_type)],
+      meta: %{count: length(entries), recursive: directory.recursive}
     )
-  rescue
-    error in [Error] ->
-      reraise error, __STACKTRACE__
-
-    error ->
-      reraise Error.exception(
-                code: :internal_error,
-                message:
-                  "Error reading directory #{inspect(directory.path)}: #{Exception.message(error)}"
-              ),
-              __STACKTRACE__
   end
 
-  defp validate_directory!(path) do
-    case File.stat(path) do
-      {:ok, %File.Stat{type: :directory}} -> :ok
-      {:ok, %File.Stat{}} -> raise ArgumentError, "path must point to a directory"
-      {:error, reason} -> raise File.Error, reason: reason, action: "list", path: path
-    end
+  # Clients see the error, so it names the directory without its location.
+  defp list_error!(directory, reason) do
+    raise Error,
+      code: :internal_error,
+      message: "Error listing directory #{inspect(Path.basename(directory.path))}: #{reason}"
   end
 
   defp walk(path, real_root, recursive?, include_hidden?, visited) do

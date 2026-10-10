@@ -142,13 +142,7 @@ defmodule FastestMCP.Transport.Serializer do
         %{"contents" => [resource_content(uri, mime_type, result, opts)]}
 
       true ->
-        %{
-          "contents" => [
-            %{"uri" => uri}
-            |> maybe_put("mimeType", mime_type)
-            |> Map.merge(resource_body(mime_type, result))
-          ]
-        }
+        %{"contents" => [Map.put(resource_body(mime_type, result), "uri", uri)]}
     end
   end
 
@@ -191,22 +185,20 @@ defmodule FastestMCP.Transport.Serializer do
 
   defp prompt_content(content), do: Content.normalize(content)
 
+  # A declared type is authoritative; without one, the value names its type.
   defp resource_body(mime_type, value) when is_binary(value) do
-    cond do
-      MIME.binary?(mime_type) ->
-        %{"blob" => Base.encode64(value)}
-
-      String.valid?(value) ->
-        %{"text" => value}
-
-      true ->
-        %{"blob" => Base.encode64(value)}
+    if String.valid?(value) and not MIME.binary?(mime_type) do
+      %{"text" => value, "mimeType" => mime_type || "text/plain"}
+    else
+      %{"blob" => Base.encode64(value), "mimeType" => mime_type || "application/octet-stream"}
     end
-    |> maybe_put("mimeType", mime_type)
   end
 
-  defp resource_body(_mime_type, value) do
-    %{"text" => JSON.encode!(normalize_json(value))}
+  defp resource_body(mime_type, value) do
+    %{
+      "text" => JSON.encode!(normalize_json(value)),
+      "mimeType" => mime_type || "application/json"
+    }
   end
 
   defp resource_content(uri, default_mime_type, %ResourceContent{} = content, opts) do

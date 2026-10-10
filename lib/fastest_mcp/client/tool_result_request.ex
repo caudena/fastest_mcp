@@ -4,7 +4,8 @@ defmodule FastestMCP.Client.ToolResultRequest do
 
   Unlike a low-level request handle, this handle remains valid when the peer
   upgrades `tools/call` into a remote task. Only the process that started the
-  call may await it.
+  call may await it. When `await/2` times out, the call is cancelled, and its
+  result never reaches that process's mailbox.
   """
 
   alias FastestMCP.Client.ToolCall

@@ -36,24 +36,27 @@ defmodule FastestMCP.ComponentCompiler do
 
   @kind_options %{
     tool: [:annotations, :input_schema, :output_schema, :completions],
-    resource: [:name, :annotations, :size, mime_type: "application/json"],
+    resource: [:name, :annotations, :size, :mime_type],
     resource_template: [
       :name,
       :annotations,
       :parameters,
       :completions,
-      mime_type: "application/json",
+      :mime_type,
       resource_security: :inherit
     ],
     prompt: [:arguments]
   }
 
-  def compile(kind, identifier, handler, opts) do
+  # A component you define (`:local`) follows MCP's rules for tool names and
+  # resource annotations; one that describes a peer's (`:remote`, as a proxy
+  # builds) keeps what the peer sent.
+  def compile(kind, identifier, handler, opts, source \\ :local) do
     opts = Keyword.validate!(opts, @common_options ++ Map.fetch!(@kind_options, kind))
     inject = normalize_inject(opts[:inject])
 
     kind
-    |> compile_kind(identifier, inject, opts)
+    |> compile_kind(identifier, inject, opts, source)
     |> struct!(
       version: normalize_version(opts[:version]),
       title: opts[:title],
@@ -71,13 +74,13 @@ defmodule FastestMCP.ComponentCompiler do
     )
   end
 
-  defp compile_kind(:tool, name, inject, opts) do
+  defp compile_kind(:tool, name, inject, opts, source) do
     {input_schema, compiled_input_schema} = compile_schema!(:input, opts[:input_schema], opts)
     {output_schema, compiled_output_schema} = compile_schema!(:output, opts[:output_schema], opts)
     validate_injected_keys!(:tool, schema_property_keys(input_schema), inject)
 
     %Tool{
-      name: to_string(name),
+      name: if(source == :local, do: tool_name!(name), else: to_string(name)),
       annotations: optional_map!(opts[:annotations], "component annotations"),
       input_schema: input_schema,
       compiled_input_schema: compiled_input_schema,
@@ -87,17 +90,17 @@ defmodule FastestMCP.ComponentCompiler do
     }
   end
 
-  defp compile_kind(:resource, uri, _inject, opts) do
+  defp compile_kind(:resource, uri, _inject, opts, source) do
     %Resource{
       uri: uri |> to_string() |> ProtocolURI.validate!("resource URI"),
       name: normalize_optional_string(opts[:name]),
-      annotations: optional_map!(opts[:annotations], "component annotations"),
+      annotations: resource_annotations!(opts[:annotations], source),
       mime_type: opts[:mime_type],
       size: normalize_resource_size(opts[:size])
     }
   end
 
-  defp compile_kind(:resource_template, uri_template, inject, opts) do
+  defp compile_kind(:resource_template, uri_template, inject, opts, source) do
     template = Component.put_identifier(%ResourceTemplate{}, to_string(uri_template))
     {parameters, compiled_parameters} = compile_schema!(:parameters, opts[:parameters], opts)
 
@@ -109,7 +112,7 @@ defmodule FastestMCP.ComponentCompiler do
     %{
       template
       | name: normalize_optional_string(opts[:name]),
-        annotations: optional_map!(opts[:annotations], "component annotations"),
+        annotations: resource_annotations!(opts[:annotations], source),
         parameters: parameters,
         compiled_parameters: compiled_parameters,
         completions: normalize_completions(opts[:completions]),
@@ -118,7 +121,7 @@ defmodule FastestMCP.ComponentCompiler do
     }
   end
 
-  defp compile_kind(:prompt, name, inject, opts) do
+  defp compile_kind(:prompt, name, inject, opts, _source) do
     arguments = normalize_prompt_arguments(opts[:arguments])
     validate_injected_keys!(:prompt, Enum.map(arguments, & &1.name), inject)
 
@@ -128,6 +131,82 @@ defmodule FastestMCP.ComponentCompiler do
       completion?: Enum.any?(arguments, &(not is_nil(&1.completion)))
     }
   end
+
+  @doc false
+  # MCP's naming rules for tools: 1 to 128 ASCII letters, digits, `_`, `-`,
+  # and `.`. A namespace prefixes names with `namespace_`, so it takes the
+  # same characters.
+  def name_characters?(name), do: String.match?(name, ~r/\A[A-Za-z0-9_.-]+\z/)
+
+  @doc false
+  def tool_name!(name) do
+    name = to_string(name)
+
+    if byte_size(name) <= 128 and name_characters?(name) do
+      name
+    else
+      raise ArgumentError,
+            ~s(tool name must be 1 to 128 letters, digits, "_", "-", or ".", got: #{inspect(name)})
+    end
+  end
+
+  @doc false
+  # A transform, such as a mount namespace, builds `name` from the name of the
+  # tool `source`, and must stay within MCP's 128 characters; a name that was
+  # longer already, as a proxied tool's may be, is left as it is.
+  def check_built_tool_name!(source, name) do
+    if byte_size(name) > 128 and byte_size(source) <= 128 do
+      raise ArgumentError,
+            ~s(tool #{inspect(source)} becomes #{inspect(name)}, which is longer than 128 characters)
+    end
+
+    name
+  end
+
+  # Resource annotations are an open map; the keys MCP defines must hold the
+  # values it defines.
+  defp resource_annotations!(annotations, source) do
+    annotations = optional_map!(annotations, "component annotations")
+
+    if source == :local and annotations do
+      Enum.each(annotations, fn {key, value} -> resource_annotation!(to_string(key), value) end)
+    end
+
+    annotations
+  end
+
+  defp resource_annotation!("audience", audience) do
+    unless is_list(audience) and
+             Enum.all?(audience, &(&1 in ["user", "assistant", :user, :assistant])) do
+      raise ArgumentError,
+            ~s(resource annotation audience must be a list of "user" and "assistant", got: #{inspect(audience)})
+    end
+  end
+
+  defp resource_annotation!("priority", priority)
+       when is_number(priority) and priority >= 0 and priority <= 1,
+       do: :ok
+
+  defp resource_annotation!("priority", priority) do
+    raise ArgumentError,
+          "resource annotation priority must be a number from 0 to 1, got: #{inspect(priority)}"
+  end
+
+  defp resource_annotation!("lastModified", %struct{})
+       when struct in [DateTime, NaiveDateTime, Date],
+       do: :ok
+
+  defp resource_annotation!("lastModified", value) do
+    unless is_binary(value) and
+             (match?({:ok, _, _}, DateTime.from_iso8601(value)) or
+                match?({:ok, _}, NaiveDateTime.from_iso8601(value)) or
+                match?({:ok, _}, Date.from_iso8601(value))) do
+      raise ArgumentError,
+            "resource annotation lastModified must be an ISO 8601 date or date and time, got: #{inspect(value)}"
+    end
+  end
+
+  defp resource_annotation!(_key, _value), do: :ok
 
   defp compile_schema!(_role, nil, _opts), do: {nil, nil}
 

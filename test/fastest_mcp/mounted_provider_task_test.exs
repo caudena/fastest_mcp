@@ -48,7 +48,8 @@ defmodule FastestMCP.MountedProviderTaskTest do
     assert %BackgroundTask{} = tool_task
     assert FastestMCP.await_task!(tool_task, 1_000) == 42
 
-    assert_receive {:child_task_ctx, "child-task-server", true, task_id, origin_request_id}, 1_000
+    # The handler runs in the request of the server the client called.
+    assert_receive {:child_task_ctx, ^parent_name, true, task_id, origin_request_id}, 1_000
     assert task_id == tool_task.task_id
     assert is_binary(origin_request_id)
 

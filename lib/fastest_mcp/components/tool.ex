@@ -8,7 +8,9 @@ defmodule FastestMCP.Components.Tool do
   Build one with `new/3`; `FastestMCP.add_tool/4` builds the same struct. Its
   descriptive fields are `name`, `version`, `title`, `description`, `icons`,
   `annotations`, `tags` (a `MapSet`), `meta`, `enabled`, and `visibility`; the
-  others hold compiled schemas and the handler.
+  others hold compiled schemas and the handler. A transform that changes
+  `input_schema` or `output_schema` leaves the compiled schemas alone:
+  FastestMCP compiles the new schema.
   """
 
   alias FastestMCP.Component.Fields
@@ -35,7 +37,8 @@ defmodule FastestMCP.Components.Tool do
   @doc """
   Builds a tool named `name` that runs `handler` with the arguments map and the
   `FastestMCP.Context`. Takes the tool options listed under "Component Options"
-  in `FastestMCP.Server`; any other option raises `ArgumentError`.
+  in `FastestMCP.Server`; any other option, or a name other than 1 to 128
+  letters, digits, `_`, `-`, or `.`, raises `ArgumentError`.
   """
   @spec new(String.t(), function(), keyword()) :: t()
   def new(name, handler, opts \\ []), do: ComponentCompiler.compile(:tool, name, handler, opts)

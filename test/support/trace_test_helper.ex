@@ -10,6 +10,11 @@ defmodule FastestMCP.TraceTestHelper do
     Record.extract(:status, from_lib: "opentelemetry_api/include/opentelemetry.hrl")
   )
 
+  Record.defrecord(
+    :event,
+    Record.extract(:event, from_lib: "opentelemetry/include/otel_span.hrl")
+  )
+
   def set_exporter(pid) when is_pid(pid) do
     :otel_simple_processor.set_exporter(:otel_exporter_pid, pid)
   end
@@ -58,5 +63,13 @@ defmodule FastestMCP.TraceTestHelper do
     span_record
     |> span(:attributes)
     |> :otel_attributes.map()
+  end
+
+  # The events of a span as `{name, attributes}`.
+  def span_events(span_record) do
+    span_record
+    |> span(:events)
+    |> :otel_events.list()
+    |> Enum.map(&{to_string(event(&1, :name)), :otel_attributes.map(event(&1, :attributes))})
   end
 end

@@ -1,7 +1,11 @@
 defmodule FastestMCP.Client.Callbacks do
   @moduledoc false
+  # Runs the sampling and elicitation handlers and checks their answers,
+  # which may use atom keys: an answer is what the server receives, JSON.
+
   import FastestMCP.Protocol.Version
 
+  alias FastestMCP.Client.Options
   alias FastestMCP.Client.URLElicitation
   alias FastestMCP.Elicitation
   alias FastestMCP.Error
@@ -220,7 +224,7 @@ defmodule FastestMCP.Client.Callbacks do
   defp invoke_url_handler(handler, _request, _context) when is_function(handler, 0),
     do: handler.()
 
-  defp normalize_sampling_result(%{} = result), do: Map.new(result)
+  defp normalize_sampling_result(%{} = result), do: Options.wire_map(result)
 
   defp normalize_sampling_result(_other) do
     raise Error,
@@ -248,13 +252,14 @@ defmodule FastestMCP.Client.Callbacks do
   defp do_normalize_elicitation_result(:accept), do: %{"action" => "accept"}
   defp do_normalize_elicitation_result(:decline), do: %{"action" => "decline"}
   defp do_normalize_elicitation_result(:cancel), do: %{"action" => "cancel"}
-  defp do_normalize_elicitation_result(%{"action" => _action} = result), do: result
 
-  defp do_normalize_elicitation_result(%{action: action, content: content}),
-    do: %{"action" => to_string(action), "content" => normalize_elicitation_content(content)}
-
-  defp do_normalize_elicitation_result(%{} = content),
-    do: %{"action" => "accept", "content" => content}
+  # A result with an action, or the accepted content alone.
+  defp do_normalize_elicitation_result(%{} = result) when not is_struct(result) do
+    case Options.wire_map(result) do
+      %{"action" => _action} = result -> result
+      content -> %{"action" => "accept", "content" => content}
+    end
+  end
 
   defp do_normalize_elicitation_result(_other) do
     raise Error,
@@ -315,6 +320,6 @@ defmodule FastestMCP.Client.Callbacks do
 
   defp apply_elicitation_defaults(content, _schema), do: content
 
-  defp normalize_elicitation_content(%{} = content), do: Map.new(content)
-  defp normalize_elicitation_content(content), do: %{"value" => content}
+  defp normalize_elicitation_content(%{} = content), do: Options.wire_map(content)
+  defp normalize_elicitation_content(content), do: %{"value" => Options.wire_value(content)}
 end

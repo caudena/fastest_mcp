@@ -111,18 +111,20 @@ defmodule FastestMCP.Client.Connection.Stdio do
   ## Exit and restart
 
   # A modern stdio server that exits after initialization is restarted with
-  # backoff; any other exit ends the connection. A process (group) that cannot
-  # be proven gone leaves the connection failed but alive.
+  # backoff; another exit after initialization ends the connection. Before,
+  # the connection stays, and its requests, the negotiating one included, get
+  # the exit as their error. A process (group) that cannot be proven gone
+  # leaves the connection failed but alive.
   def exited(state, status) do
-    error = %Error{
-      code: :internal_error,
-      message: "stdio client transport exited",
-      details: %{status: status}
-    }
+    error = Transport.Stdio.exited(status)
 
     case retire(state) do
       {:ok, state} ->
-        if restartable?(state), do: begin_restart(state, error), else: {:stop, fail(state, error)}
+        cond do
+          restartable?(state) -> begin_restart(state, error)
+          state.lifecycle.phase == :initialized -> {:stop, fail(state, error)}
+          true -> {:ok, fail(put_in(state.transport[:exit_error], error), error)}
+        end
 
       {:error, reason, state} ->
         cleanup_error = %Error{
@@ -166,7 +168,7 @@ defmodule FastestMCP.Client.Connection.Stdio do
   end
 
   def restart(state) do
-    case Transport.open(state.transport, self(), auth_input: state.config.auth_input) do
+    case Transport.open(state.transport, self()) do
       {:ok, transport} ->
         state = %{state | transport: transport, stdio: %{state.stdio | restarting: nil}}
 

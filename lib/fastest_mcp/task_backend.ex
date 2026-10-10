@@ -16,8 +16,8 @@ defmodule FastestMCP.TaskBackend do
   callback runs in the task store process, which owns anything `c:init/1`
   creates, such as an ETS table.
 
-  Task records are structs keyed by their `:id`; store and return them
-  unchanged. The task store applies session and owner scoping, expiry, and
+  Task records are `FastestMCP.TaskRecord` structs keyed by their `:id`;
+  store and return them unchanged. The task store applies session and owner scoping, expiry, and
   pagination itself. It deletes a finished task when its TTL elapses and hides
   expired records from reads until then. On startup it lists the stored tasks:
   tasks a previous runtime left running fail, and expired ones are deleted.
@@ -30,7 +30,7 @@ defmodule FastestMCP.TaskBackend do
   @type state :: term()
 
   @typedoc "A task record."
-  @type task :: struct()
+  @type task :: FastestMCP.TaskRecord.t()
 
   @callback init(opts :: keyword()) :: {:ok, state()} | {:error, term()}
   @callback put_task(state(), task()) :: {:ok, state()} | {:error, term()}

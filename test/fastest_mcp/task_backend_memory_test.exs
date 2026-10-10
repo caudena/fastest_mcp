@@ -3,8 +3,8 @@ defmodule FastestMCP.TaskBackendMemoryTest do
   # concurrently running test can move by loading a module.
   use FastestMCP.Case
 
-  alias FastestMCP.BackgroundTaskStore.Task, as: TaskRecord
   alias FastestMCP.TaskBackend.Memory
+  alias FastestMCP.TaskRecord
 
   test "initializing the backend does not create fresh atoms" do
     {:ok, _warmup} = Memory.init([])

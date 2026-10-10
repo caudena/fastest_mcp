@@ -305,6 +305,50 @@ defmodule FastestMCP.PaginationTest do
     assert is_binary(prompts.nextCursor)
   end
 
+  test "a signing_secret keeps cursors valid on another runtime of the server" do
+    server_name = unique_name("signed-cursors")
+    secret = String.duplicate("signing-secret-", 3)
+
+    server =
+      Enum.reduce(1..101, FastestMCP.server(server_name), fn index, acc ->
+        name = "tool_" <> String.pad_leading(to_string(index), 3, "0")
+        FastestMCP.add_tool(acc, name, fn _args, _ctx -> index end)
+      end)
+
+    list = fn payload ->
+      Engine.dispatch!(server_name, %Request{
+        method: "tools/list",
+        transport: :stdio,
+        payload: payload
+      })
+    end
+
+    start_server!(server, signing_secret: secret)
+    %{nextCursor: cursor} = list.(%{})
+
+    # A restart, or another node, with the same secret continues the listing.
+    :ok = FastestMCP.stop_server(server_name)
+    start_server!(server, signing_secret: secret)
+    assert %{tools: [%{"name" => "tool_101"}]} = list.(%{"cursor" => cursor})
+
+    {:ok, runtime} = FastestMCP.ServerRuntime.fetch(server_name)
+    lifecycle = GenServer.whereis(FastestMCP.Registry.via({:lifecycle, server_name}))
+    refute inspect(runtime) =~ secret
+    refute inspect(:sys.get_status(lifecycle)) =~ secret
+
+    # The random secret of each start does not.
+    :ok = FastestMCP.stop_server(server_name)
+    start_server!(server)
+    assert_raise Error, ~r/invalid cursor/, fn -> list.(%{"cursor" => cursor}) end
+
+    error =
+      assert_raise ArgumentError, fn ->
+        FastestMCP.start_server(server, signing_secret: "too short a secret")
+      end
+
+    assert Exception.message(error) == "signing_secret must be a binary of at least 32 bytes"
+  end
+
   test "wire pagination delegates bounded keyset pages to providers" do
     server_name = "provider-page-" <> Integer.to_string(System.unique_integer([:positive]))
     test_pid = self()

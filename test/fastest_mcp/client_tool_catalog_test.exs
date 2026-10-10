@@ -154,6 +154,74 @@ defmodule FastestMCP.ClientToolCatalogTest do
     end
   end
 
+  defmodule StaleListPlug do
+    @moduledoc false
+    # A 2026-07-28 server whose tool lists are stale at once (ttlMs 0). It
+    # counts tools/list requests and lists the tools its Agent holds.
+    import Plug.Conn
+
+    def init(opts), do: opts
+
+    def call(conn, opts) do
+      {:ok, body, conn} = read_body(conn)
+      %{"id" => id, "method" => method} = JSON.decode!(body)
+      state = Keyword.fetch!(opts, :state)
+      cacheable = %{"ttlMs" => 0, "cacheScope" => "private"}
+
+      result =
+        case method do
+          "server/discover" ->
+            Map.merge(cacheable, %{
+              "supportedVersions" => ["2026-07-28"],
+              "capabilities" => %{"tools" => %{"listChanged" => true}}
+            })
+
+          "tools/list" ->
+            tools = Agent.get_and_update(state, &{&1.tools, %{&1 | lists: &1.lists + 1}})
+
+            Map.put(
+              cacheable,
+              "tools",
+              Enum.map(tools, &%{"name" => &1, "inputSchema" => %{"type" => "object"}})
+            )
+
+          "tools/call" ->
+            %{"content" => [%{"type" => "text", "text" => "ok"}]}
+        end
+
+      response = %{
+        "jsonrpc" => "2.0",
+        "id" => id,
+        "result" => Map.put(result, "resultType", "complete")
+      }
+
+      conn
+      |> put_resp_content_type("application/json")
+      |> send_resp(200, JSON.encode!(response))
+    end
+  end
+
+  test "calls reuse a stale tool list and list again for a tool it lacks" do
+    state = start_supervised!({Agent, fn -> %{tools: ["echo"], lists: 0} end})
+    %{url: url} = serve!({StaleListPlug, state: state})
+    client = connect!(url, protocol_version: "2026-07-28")
+
+    assert {:ok, _result} = Client.call_tool(client, "echo")
+    assert {:ok, _result} = Client.call_tool(client, "echo")
+    assert Agent.get(state, & &1.lists) == 1
+
+    Agent.update(state, &%{&1 | tools: ["echo", "later"]})
+    assert {:ok, _result} = Client.call_tool(client, "later")
+    assert Agent.get(state, & &1.lists) == 2
+
+    assert {:error, %Error{code: :method_not_found}} = Client.call_tool(client, "missing")
+    assert Agent.get(state, & &1.lists) == 3
+
+    # Listing honours the server's ttlMs.
+    assert {:ok, [%{"name" => "echo"}, %{"name" => "later"}]} = Client.list_all_tools(client)
+    assert Agent.get(state, & &1.lists) == 4
+  end
+
   test "catalog discovery is complete, paginated, single-flight, and isolates bad descriptors" do
     {client, state} = start_client(:single_flight)
 
@@ -188,6 +256,30 @@ defmodule FastestMCP.ClientToolCatalogTest do
 
     assert length(Agent.get(state, & &1.calls)) == 3
     assert Agent.get(state, & &1.list_requests) == 2
+  end
+
+  test "a tool schema reference the client cannot resolve is named in the protocol error" do
+    name = unique_name("catalog-unresolved-reference")
+    remote_uri = "https://schemas.example/tag.json"
+    resolver = fn ^remote_uri -> {:ok, %{"type" => "string"}} end
+
+    FastestMCP.server(name, schema_options: [resolver: resolver])
+    |> FastestMCP.add_tool("tag_note", fn %{"tag" => tag}, _ctx -> tag end,
+      input_schema: %{
+        "type" => "object",
+        "properties" => %{"tag" => %{"$ref" => remote_uri}},
+        "required" => ["tag"]
+      }
+    )
+    |> start_server!()
+
+    client = connect!({:in_process, name})
+
+    assert {:error, %ProtocolError{method: "tools/list", violations: [violation]}} =
+             Client.call_tool(client, "tag_note", %{"tag" => "release"})
+
+    assert violation.tool == "tag_note"
+    assert violation.message =~ remote_uri
   end
 
   test "direct tool results are checked against the catalog output schema" do
@@ -314,8 +406,7 @@ defmodule FastestMCP.ClientToolCatalogTest do
     assert {:ok, [%{"name" => "alpha"}]} = Client.list_all_tools(client)
     refute_receive {:catalog_for, _}
 
-    assert {:error, %Error{code: :invalid_params}} =
-             Client.list_all_tools(client, access_token: "beta")
+    assert_raise ArgumentError, fn -> Client.list_all_tools(client, access_token: "beta") end
 
     %{url: url} = start_http!(name)
     http_client = connect!(url, access_token: "alpha", protocol_version: "2026-07-28")
@@ -331,9 +422,9 @@ defmodule FastestMCP.ClientToolCatalogTest do
       assert_receive {:catalog_for, "beta"}
     end
 
+    # The connection's own list is still fresh, so it isn't fetched again.
     assert {:ok, [%{"name" => "alpha"}]} = Client.list_all_tools(http_client)
-    # The modern server advertises ttlMs: 0, so its default identity is fetched again.
-    assert_receive {:catalog_for, "alpha"}
+    refute_receive {:catalog_for, _}
   end
 
   test "invalid preferred descriptors do not fall back to older valid versions" do

@@ -3,11 +3,15 @@ defmodule FastestMCP.ServerRuntime.Calls do
   # The one exception boundary around handler code. Each call is a task under
   # the runtime's `:calls` Task.Supervisor, whose `:max_children` bounds
   # concurrent calls. The task turns every raise, throw, and exit into a
-  # tagged result. It is not linked to the caller, so a crashing process the
-  # handler linked to cannot take the caller down; a watcher kills the task
-  # if the caller dies first.
+  # tagged result with its stack trace. It is not linked to the caller, so a
+  # crashing process the handler linked to cannot take the caller down; a
+  # watcher kills the task if the caller dies first.
 
-  @type reason :: :overloaded | :timeout | {:error | :exit | :throw | :crash, term()}
+  @type reason ::
+          :overloaded
+          | :timeout
+          | {:error | :exit | :throw, term(), Exception.stacktrace()}
+          | {:crash, term()}
 
   @spec run(Supervisor.supervisor(), (-> term()), timeout() | nil) ::
           {:ok, term()} | {:error, reason()}
@@ -32,7 +36,8 @@ defmodule FastestMCP.ServerRuntime.Calls do
     watch(caller, self())
     {:ok, fun.()}
   catch
-    kind, reason -> {:error, {kind, Exception.normalize(kind, reason, __STACKTRACE__)}}
+    kind, reason ->
+      {:error, {kind, Exception.normalize(kind, reason, __STACKTRACE__), __STACKTRACE__}}
   end
 
   defp watch(caller, task) do

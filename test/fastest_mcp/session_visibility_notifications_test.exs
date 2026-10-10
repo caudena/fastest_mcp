@@ -5,9 +5,8 @@ defmodule FastestMCP.SessionVisibilityNotificationsTest do
   alias FastestMCP.Component
   alias FastestMCP.ComponentManager
   alias FastestMCP.Context
-  alias FastestMCP.Error
 
-  test "enabling hidden components cannot add unadvertised families to an existing session" do
+  test "enabling hidden components notifies every family that changed, even one empty at connect" do
     parent = self()
 
     server_name =
@@ -36,19 +35,22 @@ defmodule FastestMCP.SessionVisibilityNotificationsTest do
 
     client = start_http_client(server, parent)
 
-    assert_not_negotiated(fn -> Client.list_resources!(client) end, "resources/list")
-    assert_not_negotiated(fn -> Client.list_prompts!(client) end, "prompts/list")
+    assert %{items: []} = Client.list_resources!(client)
+    assert %{items: []} = Client.list_prompts!(client)
     refute Enum.any?(Client.list_tools!(client).items, &(&1["name"] == "finance_tool"))
 
     assert %{structured_content: %{"ok" => true}} =
              Client.call_tool!(client, "activate_finance", %{})
 
-    assert receive_notification_methods(1) == ["notifications/tools/list_changed"]
-    refute_receive {:visibility_notification, _payload}, 200
+    assert Enum.sort(receive_notification_methods(3)) == [
+             "notifications/prompts/list_changed",
+             "notifications/resources/list_changed",
+             "notifications/tools/list_changed"
+           ]
 
     assert Enum.any?(Client.list_tools!(client).items, &(&1["name"] == "finance_tool"))
-    assert_not_negotiated(fn -> Client.list_resources!(client) end, "resources/list")
-    assert_not_negotiated(fn -> Client.list_prompts!(client) end, "prompts/list")
+    assert %{items: [%{"uri" => "resource://finance"}]} = Client.list_resources!(client)
+    assert %{items: [%{"name" => "finance_prompt"}]} = Client.list_prompts!(client)
   end
 
   test "disabling visible components sends list-changed notifications for all changed families" do
@@ -137,18 +139,23 @@ defmodule FastestMCP.SessionVisibilityNotificationsTest do
     assert %{structured_content: %{"ok" => true}} =
              Client.call_tool!(client, "activate_finance", %{})
 
-    assert receive_notification_methods(1) == ["notifications/tools/list_changed"]
+    assert length(receive_notification_methods(3)) == 3
     refute_receive {:visibility_notification, _payload}, 200
 
     assert %{structured_content: %{"ok" => true}} =
              Client.call_tool!(client, "clear_rules", %{})
 
-    assert receive_notification_methods(1) == ["notifications/tools/list_changed"]
+    assert Enum.sort(receive_notification_methods(3)) == [
+             "notifications/prompts/list_changed",
+             "notifications/resources/list_changed",
+             "notifications/tools/list_changed"
+           ]
+
     refute_receive {:visibility_notification, _payload}, 200
 
     refute Enum.any?(Client.list_tools!(client).items, &(&1["name"] == "finance_tool"))
-    assert_not_negotiated(fn -> Client.list_resources!(client) end, "resources/list")
-    assert_not_negotiated(fn -> Client.list_prompts!(client) end, "prompts/list")
+    assert %{items: []} = Client.list_resources!(client)
+    assert %{items: []} = Client.list_prompts!(client)
   end
 
   test "component hints limit list-changed notifications to the changed family" do
@@ -187,8 +194,50 @@ defmodule FastestMCP.SessionVisibilityNotificationsTest do
     refute_receive {:visibility_notification, _payload}, 200
 
     assert Enum.any?(Client.list_tools!(client).items, &(&1["name"] == "finance_tool"))
-    assert_not_negotiated(fn -> Client.list_resources!(client) end, "resources/list")
-    assert_not_negotiated(fn -> Client.list_prompts!(client) end, "prompts/list")
+    assert %{items: []} = Client.list_resources!(client)
+    assert %{items: []} = Client.list_prompts!(client)
+  end
+
+  test "a session's visibility change notifies that session only, never 2026-07-28 listeners" do
+    test_pid = self()
+    server_name = unique_name("visibility-notify-scope")
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("search", fn _args, _ctx -> "found" end)
+    |> FastestMCP.add_tool("hide_search", fn _args, ctx ->
+      :ok = Context.disable_components(ctx, names: ["search"])
+      "hidden"
+    end)
+    |> start_server!()
+
+    legacy =
+      connect!({:in_process, server_name},
+        protocol_version: "2025-11-25",
+        notification_handler: &send(test_pid, {:legacy, &1["method"]})
+      )
+
+    modern = connect!({:in_process, server_name}, protocol_version: "2026-07-28")
+
+    listener =
+      Client.listen!(modern, %{"toolsListChanged" => true},
+        on_notification: &send(test_pid, {:modern, &1["method"]})
+      )
+
+    assert_receive {:modern, "notifications/subscriptions/acknowledged"}
+
+    Client.call_tool!(legacy, "hide_search", %{})
+    assert_receive {:legacy, "notifications/tools/list_changed"}
+
+    "hidden" = FastestMCP.call_tool!(server_name, "hide_search", %{}, session_id: "chat-2")
+    refute_receive {:modern, "notifications/tools/list_changed"}, 200
+    refute_receive {:legacy, _method}, 50
+
+    # A change for every client reaches both.
+    :ok = FastestMCP.disable_components!(server_name, names: ["hide_search"])
+    assert_receive {:legacy, "notifications/tools/list_changed"}
+    assert_receive {:modern, "notifications/tools/list_changed"}
+
+    assert :ok = Client.Request.cancel!(listener, "test complete")
   end
 
   test "server-scoped visibility updates emit list-changed notifications" do
@@ -348,12 +397,6 @@ defmodule FastestMCP.SessionVisibilityNotificationsTest do
         1_000 -> flunk("timed out waiting for #{count} visibility notifications")
       end
     end
-  end
-
-  defp assert_not_negotiated(fun, method) do
-    error = assert_raise Error, fun
-    assert error.code == :method_not_found
-    assert error.message == "server did not advertise support for #{method}"
   end
 
   defp object_output_schema(required_property) do

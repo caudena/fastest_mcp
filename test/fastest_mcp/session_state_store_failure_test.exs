@@ -258,7 +258,7 @@ defmodule FastestMCP.SessionStateStoreFailureTest do
              :ets.lookup(context.audit_table, {:deleted, "session-b"})
   end
 
-  test "nil session ids generate distinct stateful sessions but remain nil for request scope" do
+  test "a nil session id makes a request-scoped call without a session" do
     server_name = unique_name("nil-session-id")
 
     FastestMCP.server(server_name)
@@ -267,20 +267,12 @@ defmodule FastestMCP.SessionStateStoreFailureTest do
     end)
     |> start_server!()
 
-    first = FastestMCP.call_tool!(server_name, "session", %{}, session_id: nil)
-    second = FastestMCP.call_tool!(server_name, "session", %{}, session_id: nil)
+    for opts <- [[session_id: nil], [state_scope: :session], [state_scope: :request]] do
+      assert %{session_id: nil, state_scope: :request} ==
+               FastestMCP.call_tool!(server_name, "session", %{}, opts)
+    end
 
-    assert first.state_scope == :session
-    assert is_binary(first.session_id) and first.session_id != ""
-    assert second.state_scope == :session
-    assert is_binary(second.session_id) and second.session_id != ""
-    refute first.session_id == second.session_id
-
-    assert %{session_id: nil, state_scope: :request} ==
-             FastestMCP.call_tool!(server_name, "session", %{},
-               state_scope: :request,
-               session_id: nil
-             )
+    assert registered_sessions(server_name) == 0
   end
 
   defp start_store_server!(opts \\ []) do

@@ -69,6 +69,12 @@ defmodule FastestMCP.InputValidationTest do
                  end
   end
 
+  test "unknown server options raise ArgumentError naming the allowed ones" do
+    assert_raise ArgumentError, ~r/unknown keys \[:ip\], the allowed keys are: .*:auth/, fn ->
+      FastestMCP.server("unknown-server-option", ip: {0, 0, 0, 0})
+    end
+  end
+
   test "nested objects are validated without parsing stringified JSON" do
     server_name = "input-nested-" <> Integer.to_string(System.unique_integer([:positive]))
 
@@ -132,6 +138,52 @@ defmodule FastestMCP.InputValidationTest do
     assert_raise Error, ~r/missing required argument "name"/, fn ->
       FastestMCP.render_prompt!(server_name, "greet", %{})
     end
+  end
+
+  test "invalid arguments fail with :invalid_params in process, on the wire, and in the client" do
+    server_name = unique_name("input-invalid-params")
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("add", fn %{"a" => a, "b" => b}, _ctx -> a + b end,
+      input_schema: @numeric_schema
+    )
+    |> FastestMCP.add_prompt("greet", fn %{"name" => name}, _ctx -> "Hello, #{name}" end,
+      arguments: [%{name: "name", required: true}]
+    )
+    |> FastestMCP.add_resource_template("notes://{id}", fn arguments, _ctx -> arguments end,
+      parameters: %{"type" => "object", "properties" => %{"id" => %{"pattern" => "^[0-9]+$"}}}
+    )
+    |> start_server!()
+
+    assert {:error, %Error{code: :invalid_params}} =
+             FastestMCP.call_tool(server_name, "add", %{"a" => "1", "b" => 2})
+
+    assert {:error, %Error{code: :invalid_params}} =
+             FastestMCP.render_prompt(server_name, "greet", %{})
+
+    assert {:error, %Error{code: :invalid_params}} =
+             FastestMCP.read_resource(server_name, "notes://latest")
+
+    {connection_id, _initialize} = ProtocolTest.initialize_stdio(server_name)
+
+    assert %{
+             "error" => %{
+               "code" => -32_602,
+               "data" => %{"fastestmcp" => %{"code" => "invalid_params"}}
+             }
+           } =
+             ProtocolTest.stdio_request(server_name, connection_id, 2, "tools/call", %{
+               "name" => "add",
+               "arguments" => %{"a" => "1", "b" => 2}
+             })
+
+    client = connect!({:in_process, server_name})
+
+    assert {:error, %Error{code: :invalid_params}} =
+             FastestMCP.Client.call_tool(client, "add", %{"a" => "1", "b" => 2})
+
+    assert {:error, %Error{code: :invalid_params}} =
+             FastestMCP.Client.render_prompt(client, "greet", %{})
   end
 
   test "nullable type unions accept nil and strings" do

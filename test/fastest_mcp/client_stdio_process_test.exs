@@ -11,13 +11,13 @@ defmodule FastestMCP.Client.StdioProcessTest do
     @behaviour FastestMCP.Client.Transport
 
     @impl true
-    def open(_transport, _owner, _opts), do: {:error, :unsupported}
+    def open(_transport, _owner), do: {:error, :unsupported}
 
     @impl true
     def connected?(_transport), do: true
 
     @impl true
-    def send_envelope(_transport, _envelope), do: :ok
+    def send_line(_transport, _line, _auth_input), do: :ok
 
     @impl true
     def close(_transport), do: {:error, :process_still_alive}
@@ -330,7 +330,7 @@ defmodule FastestMCP.Client.StdioProcessTest do
     }
 
     assert {:ok, %{port: port}} =
-             FastestMCP.Client.Transport.Stdio.open(transport, self(), [])
+             FastestMCP.Client.Transport.Stdio.open(transport, self())
 
     collect_port_output(port, [])
   end

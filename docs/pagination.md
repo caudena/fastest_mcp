@@ -1,123 +1,150 @@
 # Pagination
 
-FastestMCP supports cursor pagination for list operations without changing the
-default return shape.
+Lists of tools, resources, resource templates, and prompts can grow long, so
+MCP sends them a page at a time. FastestMCP lists components in three places,
+and each returns its own shape:
 
-By default:
+| You call | You get | For more |
+| --- | --- | --- |
+| `FastestMCP.list_tools/2`, in process | Every tool, as a list | Nothing to do; pass `page_size:` to get pages instead |
+| `FastestMCP.Client.list_tools/2` | One page from the server: `%{items: items, next_cursor: cursor}` | Pass `cursor:`, or call `FastestMCP.Client.list_all_tools/2` |
+| `FastestMCP.ClientGroup.list_tools/2` | Every tool of every member, as a list | Nothing to do |
 
-- `FastestMCP.list_tools!/2` returns a plain list
-- `FastestMCP.list_resources!/2` returns a plain list
-- `FastestMCP.list_resource_templates!/2` returns a plain list
-- `FastestMCP.list_prompts!/2` returns a plain list
+Resources, resource templates, and prompts work the same way. A page holds
+`items`, the components on the page, and `next_cursor`, an opaque string that
+you pass back as `cursor:` for the next page, or `nil` on the last page.
 
-When you opt into pagination with `page_size:`, the return value becomes a page
-map with `:items` and `:next_cursor`.
+## Listing locally
 
-## Why Pagination Exists
-
-Small servers do not need pagination, so the direct Elixir API stays simple by
-default. Large servers do. Pagination exists so the same runtime can scale from
-"a handful of tools" to "a large generated catalog" without forcing every call
-site to unwrap a paging object when it is not needed.
-
-## Direct API
-
-```elixir
-server_name = "pagination"
-
-FastestMCP.list_tools!(server_name)
-#=> [%{type: :tool, name: "tool_1", key: "tool:tool_1@", ...}, ...]
-
-%{items: tools, next_cursor: cursor} =
-  FastestMCP.list_tools!(server_name, page_size: 20)
-```
-
-Fetch the next page by reusing the returned cursor:
-
-```elixir
-%{items: next_page, next_cursor: next_cursor} =
-  FastestMCP.list_tools!(server_name, page_size: 20, cursor: cursor)
-```
-
-The cursor is opaque. Treat it as a token to pass back to the runtime, not as a
-stable public format.
-
-## What Gets Paginated
-
-Pagination applies to list surfaces:
-
-- tools
-- resources
-- resource templates
-- prompts
-
-It does not change `call_tool`, `read_resource`, or `render_prompt`.
-
-## Transport Behavior
-
-The MCP wire is intentionally different from the Elixir convenience option:
-
-- the server owns a page size of 100
-- a first request omits `cursor`
-- continuation sends only the opaque `cursor`
-- the result includes `nextCursor` only when another page exists
-- a legacy top-level `pageSize` field is ignored and never controls server work
-
-Wire cursors are signed and bound to the list method, runtime generation,
-principal/visibility/filter fingerprint, and last stable component identity.
-They are limited to 4 KiB and use keyset continuation rather than offset
-slicing. A cursor cannot be moved between methods, sessions with different
-visibility, principals, or runtime generations.
-
-Providers may implement the page callback to filter and limit at the source.
-Providers that implement only `list_components/3`, providers with any transform
-(including a mount namespace), and every provider of a server with server-level
-transforms are listed in full through `list_components/3`. The shared pipeline
-bounds the page it emits but cannot make a legacy all-components callback lazy.
-
-## Example
+`FastestMCP.list_tools/2` and its siblings return every component the caller
+can see:
 
 ```elixir
 server =
-  Enum.reduce(1..5, FastestMCP.server("pagination"), fn index, acc ->
-    acc
-    |> FastestMCP.add_tool("tool_#{index}", fn _args, _ctx -> index end)
-    |> FastestMCP.add_resource("data://resource/#{index}", fn _args, _ctx -> index end)
-    |> FastestMCP.add_prompt("prompt_#{index}", fn _args, _ctx -> "prompt-#{index}" end)
+  Enum.reduce(1..5, FastestMCP.server("paging-demo"), fn n, server ->
+    FastestMCP.add_tool(server, "tool_#{n}", fn _args, _ctx -> n end)
   end)
 
-{:ok, _pid} = FastestMCP.start_server(server)
+FastestMCP.start_server!(server)
 
-%{items: tools_page_1, next_cursor: cursor} =
-  FastestMCP.list_tools!("pagination", page_size: 2)
-
-%{items: tools_page_2, next_cursor: nil} =
-  FastestMCP.list_tools!("pagination", page_size: 3, cursor: cursor)
+FastestMCP.list_tools!("paging-demo") |> Enum.map(& &1.name)
+# => ["tool_1", "tool_2", "tool_3", "tool_4", "tool_5"]
 ```
 
-## Invalid Input
+Each item is a map with atom keys that describes the component, such as its
+`name`, `description`, and `input_schema`. Components are listed in name order.
 
-Pagination raises a normalized bad-request error when:
+Pass `page_size:` to get one page at a time, and the `next_cursor` of each page
+as `cursor:` for the next:
 
-- `page_size` is not a positive integer
-- the cursor is invalid (a `cursor:` without `page_size:` is ignored)
+```elixir
+%{items: page, next_cursor: cursor} = FastestMCP.list_tools!("paging-demo", page_size: 2)
+Enum.map(page, & &1.name)
+# => ["tool_1", "tool_2"]
 
-The transport also rejects signed cursors that are tampered with or belong to a
-different method, runtime generation, principal, visibility/filter scope, or
-stable keyset.
+%{items: page, next_cursor: cursor} =
+  FastestMCP.list_tools!("paging-demo", page_size: 2, cursor: cursor)
 
-That makes list behavior consistent with the rest of the runtime.
+Enum.map(page, & &1.name)
+# => ["tool_3", "tool_4"]
 
-## Why This Shape
+%{items: page, next_cursor: cursor} =
+  FastestMCP.list_tools!("paging-demo", page_size: 2, cursor: cursor)
 
-FastestMCP makes pagination opt-in instead of mandatory.
+{Enum.map(page, & &1.name), cursor}
+# => {["tool_5"], nil}
+```
 
-That keeps the direct Elixir surface pleasant for small servers while still
-matching protocol needs for larger catalogs. The runtime owns cursor encoding
-and decoding so call sites do not need to understand pagination internals.
+- `FastestMCP.list_resources/2`, `FastestMCP.list_resource_templates/2`, and
+  `FastestMCP.list_prompts/2` take the same options.
+- A `page_size:` that isn't a positive integer, or a cursor these functions
+  didn't return, fails with `:bad_request`. A `cursor:` without `page_size:` is
+  ignored.
+- To list as a particular caller, pass its credentials as `auth_input:`; lists
+  leave out what the caller may not use (see
+  [Authorizing components](auth.md#authorizing-components)).
 
-## Related Guides
+`FastestMCP.list_tasks/2` always returns a page, with the key `tasks` instead
+of `items`; see [Running tasks locally](background-tasks.md#running-tasks-locally).
 
-- [Components](components.md)
-- [Providers and Mounting](providers-and-mounting.md)
-- [Versioning and Visibility](versioning-and-visibility.md)
+## Listing from a client
+
+Over MCP, the server decides how many items a page holds, and a FastestMCP
+server sends up to 100. `FastestMCP.Client.list_tools/2` returns one page, and
+`FastestMCP.Client.list_all_tools/2` follows every page and returns one list;
+[Listing and paging](client.md#listing-and-paging) shows both.
+
+- Items are the server's descriptions, with string keys such as `"name"` and
+  `"inputSchema"`. A page can hold more keys than `items` and `next_cursor`,
+  such as caching hints, so match on the two you need.
+- The client has no `page_size:` option; passing one raises `ArgumentError`.
+- The `list_all_*` functions stop with an `:overloaded` error after 256 pages
+  or 100,000 items, which `max_pages:` and `max_items:` change. A server that
+  sends the same cursor twice fails the listing with `:invalid_request`.
+- Pass a cursor back to the server that issued it, from the same client;
+  [Cursors on the wire](#cursors-on-the-wire) explains when a server rejects
+  one.
+
+`FastestMCP.Client.list_tasks/2` returns pages of tasks in the same shape; see
+[Remote tasks](client-callbacks.md#remote-tasks).
+
+## Client groups
+
+`FastestMCP.ClientGroup.list_tools/2` lists the tools of every member of a
+group, following each member's pages, and returns one list, with each tool's
+name prefixed by its member's alias. A group has no cursors: each call lists
+every member again, and refreshes the tools that
+`FastestMCP.ClientGroup.call_tool/4` can route to. A group lists only tools;
+for a member's prompts and resources, take its client with
+`FastestMCP.ClientGroup.client/2` and list them as in the previous section.
+[Client groups](client.md#client-groups) covers groups in full.
+
+## Details
+
+### Cursors on the wire
+
+A FastestMCP server sends pages of 100 items, in name order, and includes
+`nextCursor` in a result only when another page follows. A client cannot
+choose the page size: the server ignores a `pageSize` field.
+
+A wire cursor is an opaque string of at most 4 KiB, signed with the server's
+`signing_secret:` runtime option, or without one with a random key that the
+server creates when it starts. It records the last item of its page, by name
+and version, so the next page starts after that item even when components are
+added or removed between the two requests.
+
+A cursor continues one listing only. It is bound to the list method, the
+caller's identity, the `2025-11-25` session, and the visibility rules. A server
+rejects a cursor from another method, caller, or session, a modified cursor,
+and a cursor signed with another key, with the JSON-RPC error `-32602` and the
+message `invalid cursor`. Without a `signing_secret:`, that includes every
+cursor the server issued before a restart, and every cursor of another node.
+`FastestMCP.Client` returns that error as `:bad_request`. Start the listing
+again from the first page.
+
+When you run several nodes, give them the same `signing_secret:`, and any node
+continues a listing; see
+[Running several nodes](production.md#running-several-nodes).
+
+### Local cursors
+
+The cursors of in-process lists are positions in the list. They are not signed,
+so keep them inside your application. A component added or removed between two
+calls shifts the positions, so the next page can repeat or skip an item.
+
+### Providers
+
+A provider can serve pages from its own source, such as a database, by
+implementing `c:FastestMCP.Provider.list_component_page/5`. Otherwise, and for
+every provider with transforms or on a server with server transforms,
+FastestMCP lists the provider's components in full and then takes the page; see
+[Custom providers](providers-and-mounting.md#custom-providers).
+
+## See also
+
+- [Client](client.md#listing-and-paging): listing and paging from a connected
+  client
+- [Providers and Mounting](providers-and-mounting.md): providers that page at
+  the source
+- [Versioning and Visibility](versioning-and-visibility.md): what a caller can
+  see in a list

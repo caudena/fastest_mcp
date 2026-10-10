@@ -16,6 +16,7 @@ defmodule FastestMCP.Component do
   alias FastestMCP.Components.Tool
   alias FastestMCP.Context
   alias FastestMCP.Error
+  alias FastestMCP.InputRounds
   alias FastestMCP.JSONValue
   alias FastestMCP.Prompts.Result, as: PromptResult
   alias FastestMCP.Protocol.Content
@@ -197,6 +198,12 @@ defmodule FastestMCP.Component do
     do: legacy_execution_mode(component.task.mode, operation.task_request)
 
   defp modern_execution_mode(:tool, :required, true, false), do: :tasks_extension_required
+
+  defp modern_execution_mode(:tool, :required, false, _client_tasks?),
+    do:
+      {:method_not_found,
+       "requires background task execution, which needs the Tasks extension (#{Extensions.tasks()}) on the server"}
+
   defp modern_execution_mode(:tool, mode, true, true) when mode != :forbidden, do: :background
   defp modern_execution_mode(_kind, _mode, _server_tasks?, _client_tasks?), do: :inline
 
@@ -223,9 +230,9 @@ defmodule FastestMCP.Component do
         |> validate_arguments(strip_injected_arguments(component, operation.arguments))
         |> merge_injected_arguments(component, operation.context)
 
-      Context.with_request(operation.context, fn ->
-        Telemetry.with_context(trace_context, fn ->
-          invoke(component, arguments, operation.context)
+      InputRounds.run(operation, fn context ->
+        Context.with_request(context, fn ->
+          Telemetry.with_context(trace_context, fn -> invoke(component, arguments, context) end)
         end)
       end)
     end
@@ -236,20 +243,24 @@ defmodule FastestMCP.Component do
     end
   end
 
-  defp call_error(_component, {:error, %Error{} = error}), do: error
+  defp call_error(_component, {:error, %Error{} = error, _stacktrace}), do: error
   defp call_error(component, :timeout), do: Error.timeout(describe(component))
   defp call_error(component, :overloaded), do: Error.overloaded(describe(component))
 
-  defp call_error(component, {:error, exception}),
-    do: crash(component, Error.from_exception(exception, "#{describe(component)} crashed"))
+  # The exception and its stack trace stay in the error's `:cause`, for logs
+  # and spans; clients never receive them.
+  defp call_error(component, {:error, exception, stacktrace}) do
+    error = Error.from_exception(exception, "#{describe(component)} crashed")
+    crash(component, %{error | cause: {exception, stacktrace}})
+  end
 
-  defp call_error(component, {:exit, reason}),
+  defp call_error(component, {:exit, reason, _stacktrace}),
     do: crash(component, "exited: #{Exception.format_exit(reason)}")
 
   defp call_error(component, {:crash, reason}),
     do: crash(component, "crashed: #{Exception.format_exit(reason)}")
 
-  defp call_error(component, {kind, reason}),
+  defp call_error(component, {kind, reason, _stacktrace}),
     do: crash(component, "failed with #{kind}: #{inspect(reason)}")
 
   defp crash(component, detail) when is_binary(detail),
@@ -268,12 +279,13 @@ defmodule FastestMCP.Component do
   end
 
   # No coercion: top-level atom or keyword keys become strings, and values are
-  # never parsed or cast.
+  # never parsed or cast. Invalid arguments fail with `:invalid_params`, which
+  # is JSON-RPC's -32602.
   def validate_arguments(%Prompt{arguments: declared}, arguments) do
     arguments = normalize_arguments(arguments)
 
     for %{required: true, name: name} <- declared || [], not Map.has_key?(arguments, name) do
-      raise Error, code: :bad_request, message: "missing required argument #{inspect(name)}"
+      raise Error, code: :invalid_params, message: "missing required argument #{inspect(name)}"
     end
 
     arguments
@@ -294,7 +306,9 @@ defmodule FastestMCP.Component do
     if is_map(arguments) or Keyword.keyword?(arguments) do
       Map.new(arguments, fn {key, value} -> {to_string(key), value} end)
     else
-      raise Error, code: :bad_request, message: "tool and template arguments must be an object"
+      raise Error,
+        code: :invalid_params,
+        message: "tool and template arguments must be an object"
     end
   end
 
@@ -315,7 +329,7 @@ defmodule FastestMCP.Component do
 
       {:error, schema_error} ->
         raise Error,
-          code: :bad_request,
+          code: :invalid_params,
           message: schema_error.message,
           details: %{schema: %{violations: schema_error.violations}}
     end
@@ -396,6 +410,14 @@ defmodule FastestMCP.Component do
   defp current_schema?(_schema, _compiled, _role), do: false
 
   defp validate_tool_output(%Tool{output_schema: nil}, _raw, normalized), do: {:ok, normalized}
+
+  # MCP lets an error result leave structured content out.
+  defp validate_tool_output(
+         %Tool{},
+         %ToolResult{is_error: true, structured_content_present?: false},
+         normalized
+       ),
+       do: {:ok, normalized}
 
   defp validate_tool_output(%Tool{} = tool, raw, normalized) do
     compiled = tool.compiled_output_schema || Schema.compile!(tool.output_schema)
@@ -546,6 +568,8 @@ defmodule FastestMCP.Component do
 
   defp normalize_resource_result(%ResourceResult{} = value), do: value
   defp normalize_resource_result(%ResourceContent{} = value), do: ResourceResult.new([value])
+  # Bytes stay bytes: the serializer base64-encodes a binary blob once.
+  defp normalize_resource_result(value) when is_binary(value), do: value
   defp normalize_resource_result(value), do: JSONValue.normalize(value)
 
   defp normalize_tool_result(%ToolResult{} = result) do

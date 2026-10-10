@@ -1,6 +1,7 @@
 defmodule FastestMCP.Providers.OpenAPI.RequestPlan do
   @moduledoc false
 
+  @derive {Inspect, except: [:headers]}
   defstruct [
     :method,
     :path,
@@ -13,6 +14,7 @@ defmodule FastestMCP.Providers.OpenAPI.RequestPlan do
     :encoding,
     :wrap_output?,
     timeout_ms: 5_000,
+    headers: [],
     bindings: %{}
   ]
 

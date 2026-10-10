@@ -641,6 +641,68 @@ defmodule FastestMCP.SchemaTest do
            end)
   end
 
+  test "violations name missing properties and leave out summaries of nested ones" do
+    compiled =
+      Schema.compile!(%{
+        "type" => "object",
+        "properties" => %{
+          "query" => %{"type" => "string"},
+          "limit" => %{"type" => "integer"},
+          "filter" => %{
+            "type" => "object",
+            "properties" => %{"tag" => %{"type" => "string"}},
+            "required" => ["tag"],
+            "additionalProperties" => false
+          }
+        },
+        "required" => ["query", "a/b"],
+        "additionalProperties" => false
+      })
+
+    assert {:error, error} = Schema.validate(compiled, %{"limit" => "2"})
+    assert error.message == "#/a~1b a required property is missing"
+
+    assert [
+             %{instance_path: "#/a~1b", keyword: "required", schema_path: "#"},
+             %{instance_path: "#/limit", keyword: "type", schema_path: "#/properties/limit"},
+             %{instance_path: "#/query", keyword: "required", schema_path: "#"}
+           ] = error.violations
+
+    assert {:error, error} =
+             Schema.validate(compiled, %{
+               "query" => "milk",
+               "a/b" => 1,
+               "filter" => %{"secret-name" => 1},
+               "other-secret" => true
+             })
+
+    assert error.message == "#/filter/tag a required property is missing"
+
+    assert [
+             %{
+               instance_path: "#/filter/tag",
+               keyword: "required",
+               schema_path: "#/properties/filter"
+             },
+             %{
+               instance_path: "#/filter",
+               keyword: "additionalProperties",
+               schema_path: "#/properties/filter/additionalProperties"
+             },
+             %{
+               instance_path: "#",
+               keyword: "additionalProperties",
+               schema_path: "#/additionalProperties"
+             }
+           ] = error.violations
+
+    refute inspect(error) =~ "secret"
+
+    dependent = Schema.compile!(%{"type" => "object", "dependentRequired" => %{"a" => ["b"]}})
+    assert {:error, error} = Schema.validate(dependent, %{"a" => 1})
+    assert error.message == "#/b a dependent property is missing"
+  end
+
   test "tool inputs require object roots and arbitrary JSON structured outputs are validated" do
     assert_raise ArgumentError, ~r/input_schema.*type: "object"/, fn ->
       FastestMCP.server("invalid-input-root")

@@ -123,6 +123,31 @@ defmodule FastestMCP.SamplingTest do
     refute Map.has_key?(params, "toolChoice")
   end
 
+  test "Context.sample/3 accepts atom-keyed messages, as Sampling.run!/3 does" do
+    test_pid = self()
+    server_name = "sampling-atom-messages-" <> unique_id()
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("chat", fn _arguments, ctx ->
+      sampled = Context.sample(ctx, [%{role: :user, content: %{type: "text", text: "hello"}}])
+      %{text: sampled["content"]["text"]}
+    end)
+    |> start_server!()
+
+    client =
+      connect_client!(server_name,
+        sampling_handler: fn messages, _params ->
+          send(test_pid, {:sampled, messages})
+          sampling_result(%{"type" => "text", "text" => "hi"})
+        end
+      )
+
+    assert Client.call_tool!(client, "chat", %{}).structured_content == %{"text" => "hi"}
+
+    assert_receive {:sampled,
+                    [%{"role" => "user", "content" => %{"type" => "text", "text" => "hello"}}]}
+  end
+
   test "run! sends tools and toolChoice and continues with tool_result blocks" do
     test_pid = self()
     server_name = "sampling-tool-loop-" <> unique_id()
@@ -235,6 +260,56 @@ defmodule FastestMCP.SamplingTest do
     assert explode_result["isError"] == true
     assert [%{"type" => "text", "text" => error_text}] = explode_result["content"]
     assert error_text =~ "tool exploded"
+  end
+
+  test "run! takes {name, function, options} tools as they are, without preparing them" do
+    test_pid = self()
+    server_name = "sampling-tuple-tools-" <> unique_id()
+
+    double =
+      {"double", fn %{"value" => value} -> %{"doubled" => value * 2} end,
+       description: "Double a number",
+       parameters: %{
+         "type" => "object",
+         "properties" => %{"value" => %{"type" => "integer"}},
+         "required" => ["value"]
+       }}
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("orchestrate", fn _arguments, ctx ->
+      Sampling.run!(ctx, "Double 4", tools: [double]).text
+    end)
+    |> start_server!()
+
+    client =
+      connect_client!(server_name,
+        sampling_tools: [double],
+        sampling_handler: fn messages, params ->
+          case message_blocks(messages, "tool_result") do
+            [] ->
+              send(test_pid, {:sampling_tools, params["tools"]})
+
+              sampling_result([
+                %{
+                  "type" => "tool_use",
+                  "id" => "d-1",
+                  "name" => "double",
+                  "input" => %{"value" => 4}
+                }
+              ])
+
+            [result] ->
+              sampling_result([
+                %{"type" => "text", "text" => inspect(result["structuredContent"])}
+              ])
+          end
+        end
+      )
+
+    assert %{content: [%{"type" => "text", "text" => ~s(%{"doubled" => 8})}]} =
+             Client.call_tool!(client, "orchestrate", %{})
+
+    assert_receive {:sampling_tools, [%{"name" => "double", "description" => "Double a number"}]}
   end
 
   test "tool-enabled sampling requires the negotiated sampling.tools capability" do
@@ -563,12 +638,10 @@ defmodule FastestMCP.SamplingTest do
 
     assert :error = FastestMCP.call_tool!(server_name, "probe", %{})
 
-    assert_receive {:sampling_error,
-                    %FastestMCP.Error{
-                      code: :method_not_found,
-                      message: "connected client did not declare sampling support"
-                    }},
+    assert_receive {:sampling_error, %FastestMCP.Error{code: :internal_error, message: message}},
                    1_000
+
+    assert message =~ "the request has no client to ask for sampling"
   end
 
   defp connect_client!(server_name, opts) do

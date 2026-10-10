@@ -115,6 +115,19 @@ defmodule FastestMCP.Case do
     do: send(pid, {:telemetry, event, measurements, metadata})
 
   @doc """
+  Turns on supervisor reports, which Logger leaves out by default, until the
+  test exits, as `config :logger, handle_sasl_reports: true` does when Logger
+  starts. It changes the whole node, so only `async: false` tests may call it.
+  """
+  def handle_sasl_reports do
+    %{filters: filters} = :logger.get_primary_config()
+    {translator, config} = Keyword.fetch!(filters, :logger_translator)
+    sasl = Keyword.put(filters, :logger_translator, {translator, %{config | sasl: true}})
+    :ok = :logger.set_primary_config(:filters, sasl)
+    on_exit(fn -> :logger.set_primary_config(:filters, filters) end)
+  end
+
+  @doc """
   Waits until task `task_id` of `server_name` has `status` and returns it.
   `opts` are passed to `FastestMCP.fetch_task!/3`.
   """

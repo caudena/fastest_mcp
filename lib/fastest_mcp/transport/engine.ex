@@ -13,6 +13,7 @@ defmodule FastestMCP.Transport.Engine do
   alias FastestMCP.Auth
   alias FastestMCP.Auth.Result, as: AuthResult
   alias FastestMCP.Component
+  alias FastestMCP.Context
   alias FastestMCP.Error
   alias FastestMCP.OperationPipeline
   alias FastestMCP.OperationPipeline.Capabilities
@@ -41,6 +42,7 @@ defmodule FastestMCP.Transport.Engine do
     "resources/unsubscribe"
   ]
   @version_meta "io.modelcontextprotocol/protocolVersion"
+  @list_ttl_ms 60_000
 
   def dispatch!(server, %Request{} = request, opts \\ []),
     do: server |> dispatch(request, opts) |> Error.unwrap!()
@@ -379,9 +381,12 @@ defmodule FastestMCP.Transport.Engine do
     :ok
   end
 
+  # A stdio connection, and `FastestMCP.Client` in process over it, is one
+  # session that starts with initialize.
   defp validate_stdio_lifecycle(
-         %Request{transport: :stdio, protocol: :jsonrpc, profile: :legacy} = request
-       ) do
+         %Request{transport: transport, protocol: :jsonrpc, profile: :legacy} = request
+       )
+       when transport in [:stdio, :in_process] do
     case {request.method, request.lifecycle} do
       {"initialize", nil} ->
         :ok
@@ -461,6 +466,21 @@ defmodule FastestMCP.Transport.Engine do
   end
 
   defp put_transport_auth(opts, _request), do: opts
+
+  # `opts` for a lookup that follows an operation of the same request, such
+  # as the components a list result names, under the identity that the
+  # operation's `context` authenticated, so the caller is authenticated once.
+  def authenticated_opts(opts, %Context{} = context) do
+    Keyword.merge(opts,
+      principal: context.principal,
+      auth: context.auth,
+      capabilities: context.capabilities,
+      verified_audiences: context.verified_audiences,
+      verified_scopes: context.verified_scopes,
+      authenticated: context.authenticated,
+      transport_authenticated: true
+    )
+  end
 
   defp put_negotiated_context(opts, %Request{lifecycle: %{} = lifecycle}) do
     Keyword.merge(opts,
@@ -595,6 +615,8 @@ defmodule FastestMCP.Transport.Engine do
 
   defp auth_identity(_request), do: :unbound
 
+  # The server announces changes of its lists (`listChanged`), so a list stays
+  # fresh for a minute; a discovery or read result may change at any time.
   defp finalize(runtime, %Request{protocol: :jsonrpc, profile: :modern} = request, result) do
     result =
       result
@@ -602,8 +624,10 @@ defmodule FastestMCP.Transport.Engine do
       |> put_server_info(runtime)
 
     if Protocol.cache_hinted_method?(request.method) and result["resultType"] == "complete" do
+      ttl_ms = if Component.list_kind(request.method), do: @list_ttl_ms, else: 0
+
       result
-      |> Map.put_new("ttlMs", 0)
+      |> Map.put_new("ttlMs", ttl_ms)
       |> Map.put_new("cacheScope", "private")
     else
       result

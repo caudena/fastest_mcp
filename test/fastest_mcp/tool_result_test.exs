@@ -338,6 +338,57 @@ defmodule FastestMCP.ToolResultTest do
            } = Client.Task.result!(task).raw
   end
 
+  test "an error result needs no structured content under an output schema" do
+    server_name = unique_name("tool-output-schema-error")
+
+    output_schema = %{
+      "type" => "object",
+      "properties" => %{"title" => %{"type" => "string"}},
+      "required" => ["title"]
+    }
+
+    start_server!(
+      FastestMCP.server(server_name)
+      |> FastestMCP.add_tool(
+        "find_note",
+        fn %{"id" => id}, _ctx -> ToolResult.new("No note has id #{id}.", is_error: true) end,
+        input_schema: %{
+          "type" => "object",
+          "properties" => %{"id" => %{"type" => "string"}},
+          "required" => ["id"]
+        },
+        output_schema: output_schema
+      )
+      |> FastestMCP.add_tool(
+        "mistyped_error",
+        fn _args, _ctx ->
+          ToolResult.new("No note.", is_error: true, structured_content: %{title: 1})
+        end,
+        output_schema: output_schema
+      )
+    )
+
+    assert %ToolResult{is_error: true} =
+             FastestMCP.call_tool!(server_name, "find_note", %{"id" => "7"})
+
+    wire =
+      Engine.dispatch!(server_name, %Request{
+        method: "tools/call",
+        transport: :stdio,
+        payload: %{"name" => "find_note", "arguments" => %{"id" => "7"}}
+      })
+
+    assert %{"isError" => true, "content" => [%{"text" => "No note has id 7."}]} = wire
+    refute Map.has_key?(wire, "structuredContent")
+
+    client = connect!({:in_process, server_name})
+    assert %{is_error: true} = Client.call_tool!(client, "find_note", %{"id" => "7"})
+
+    # Structured content that an error result does carry must still match.
+    assert {:error, %FastestMCP.Error{code: :internal_error}} =
+             FastestMCP.call_tool(server_name, "mistyped_error")
+  end
+
   test "task results keep the executed tool descriptor after version visibility changes" do
     server_name = unique_name("tool-task-version-descriptor")
 
@@ -430,6 +481,48 @@ defmodule FastestMCP.ToolResultTest do
              })
 
     assert wire_message == local.message
+  end
+
+  test "a result that has no JSON form fails with a clear error in process and over HTTP" do
+    server_name = unique_name("tool-not-json")
+
+    start_server!(
+      FastestMCP.server(server_name)
+      |> FastestMCP.add_tool("stream_notes", fn _args, _ctx -> Stream.map(1..3, & &1) end)
+      |> FastestMCP.add_tool("notify_me", fn _args, _ctx -> %{reply_to: self()} end)
+      |> FastestMCP.add_resource("notes://stream", fn _args, _ctx ->
+        %{notes: Stream.map(1..3, & &1)}
+      end)
+    )
+
+    stream_message = "a stream cannot be encoded as JSON; call Enum.to_list/1 on it first"
+
+    assert {:error, %FastestMCP.Error{code: :internal_error, message: ^stream_message}} =
+             FastestMCP.call_tool(server_name, "stream_notes")
+
+    assert {:error, %FastestMCP.Error{code: :internal_error, message: ^stream_message}} =
+             FastestMCP.read_resource(server_name, "notes://stream")
+
+    assert {:error, %FastestMCP.Error{message: "a PID cannot be encoded as JSON"}} =
+             FastestMCP.call_tool(server_name, "notify_me")
+
+    modern =
+      ProtocolTest.modern_http_request(server_name, 1, "tools/call", %{"name" => "stream_notes"},
+        headers: [{"mcp-name", "stream_notes"}]
+      )
+
+    assert %{"error" => %{"code" => -32_603, "message" => ^stream_message}} =
+             JSON.decode!(modern.resp_body)
+
+    {session_id, _initialize, _initialized} = ProtocolTest.initialize_http(server_name)
+
+    legacy =
+      ProtocolTest.http_request(server_name, session_id, 2, "resources/read", %{
+        "uri" => "notes://stream"
+      })
+
+    assert %{"error" => %{"code" => -32_603, "message" => ^stream_message}} =
+             JSON.decode!(legacy.resp_body)
   end
 
   defp connect_http_client!(server_name, opts \\ []) do

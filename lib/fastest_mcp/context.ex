@@ -1,77 +1,24 @@
 defmodule FastestMCP.Context do
   @moduledoc ~S"""
-  Explicit request context passed to handlers.
+  The context of the request a handler serves.
 
-  `FastestMCP.Context` is where FastestMCP makes runtime lifetimes visible
-  instead of hiding them behind injected globals or rewritten function
-  signatures.
-
-  A context carries five kinds of state:
-
-    * request state - metadata and scratch values that live for one operation
-    * session state - values stored in a per-session process and reused across
-      multiple requests
-    * auth state - principal, raw auth payload, and capability data resolved by
-      `FastestMCP.Auth`
-    * task state - metadata needed when the current operation is running as a
-      background task
-    * request metadata - a transport snapshot that can be exposed as
-      `%FastestMCP.RequestContext{}`
-
-  ## Example
+  Every handler receives it as its second argument, `ctx`. Through it, a
+  handler keeps state, sends log messages and progress to the client, reads the
+  server's other resources and prompts, and finds out who is calling. The
+  [Context](context.md) guide covers each of these.
 
   ```elixir
-  FastestMCP.add_tool(server, "visit", fn _arguments, ctx ->
-    visits = FastestMCP.Context.get_session_state(ctx, :visits, 0) + 1
-    :ok = FastestMCP.Context.put_session_state(ctx, :visits, visits)
-
-    %{
-      visits: visits,
-      server: ctx.server_name
-    }
+  FastestMCP.server("visits")
+  |> FastestMCP.add_tool("visit", fn _args, ctx ->
+    visits = FastestMCP.Context.get_state(ctx, :visits, 0) + 1
+    :ok = FastestMCP.Context.set_state(ctx, :visits, visits)
+    FastestMCP.Context.info(ctx, "visit number #{visits}")
+    %{visits: visits}
   end)
   ```
 
-  ## Why The Context Is Explicit
-
-  Handler signatures stay honest. If a tool depends on session state, auth
-  result, request headers, or progress reporting, you can see that dependency in
-  the function body immediately. That keeps the runtime easier to debug and
-  easier to reason about when the request crosses transport boundaries or moves
-  into background-task execution.
-
-  ## Convenience Helpers
-
-  FastestMCP exposes a few narrow convenience helpers for nested runtime code:
-
-  ```elixir
-  FastestMCP.add_tool(server, "explicit", fn _arguments, ctx ->
-    request = FastestMCP.Context.request_context(ctx)
-
-    %{
-      request_id: request.request_id,
-      client_id: FastestMCP.Context.client_id(ctx),
-      path: request.path
-    }
-  end)
-  ```
-
-  For nested helpers where passing `ctx` through every layer is noisy:
-
-  ```elixir
-  defmodule MyApp.ReleaseHelpers do
-    def current_request_summary do
-      ctx = FastestMCP.Context.current!()
-      request = FastestMCP.Context.request_context(ctx)
-
-      %{request_id: request.request_id, transport: request.transport}
-    end
-  end
-  ```
-
-  The recommended default is still explicit handler `ctx`. `current/0` and
-  `current!/0` are convenience helpers for nested runtime code, not a hidden
-  global programming model.
+  Code that runs inside a handler but does not receive `ctx` can reach the
+  context of the current request with `current/0` and `current!/0`.
   """
 
   import FastestMCP.Util, only: [maybe_put: 3, string_keys: 1]
@@ -86,7 +33,9 @@ defmodule FastestMCP.Context do
   alias FastestMCP.Error
   alias FastestMCP.EventBus
   alias FastestMCP.HTTPRequest
+  alias FastestMCP.InputRounds
   alias FastestMCP.JSONValue
+  alias FastestMCP.Notifications
   alias FastestMCP.OperationPipeline
   alias FastestMCP.PeerTask
   alias FastestMCP.Protocol
@@ -95,6 +44,7 @@ defmodule FastestMCP.Context do
   alias FastestMCP.Protocol.Redactor
   alias FastestMCP.Protocol.Sampling, as: SamplingProtocol
   alias FastestMCP.RequestContext
+  alias FastestMCP.Root
   alias FastestMCP.SamplingTool
   alias FastestMCP.Session
   alias FastestMCP.ServerRuntime
@@ -119,6 +69,7 @@ defmodule FastestMCP.Context do
                                  ])
   @notification_envelope_keys MapSet.new(["jsonrpc", "method", "params"])
   @options [
+    :request_id,
     :session_id,
     :request_state,
     :input_responses,
@@ -221,15 +172,20 @@ defmodule FastestMCP.Context do
 
   `runtime` is the server's runtime snapshot, which supplies the server, its
   dependencies, stores, event bus, and lifespan context. Building a context has
-  no side effects: a session-scoped context (the default) gets a random session
-  id when none is given, but its session is not started.
+  no side effects: it does not start the session it names.
 
-  Options: `:transport` (default `:in_process`), `:state_scope` (`:session` or
-  `:request`), `:session_id`, `:request_metadata`, `:transport_authorization`,
-  `:negotiated_protocol_version`, `:client_capabilities`,
-  `:server_capabilities`, `:input_responses`, `:request_state`,
-  `:task_metadata`, and the auth fields `:principal`, `:authenticated`,
-  `:auth`, `:capabilities`, `:verified_audiences`, and `:verified_scopes`.
+  A context without a `:session_id` is request-scoped, whatever its
+  `:state_scope`: it has no session, and the state it sets lasts for the
+  request.
+
+  Options: `:transport` (default `:in_process`), `:state_scope` (`:session`,
+  the default, or `:request`), `:request_id` (a new one by default),
+  `:session_id`, `:request_metadata`,
+  `:transport_authorization`, `:negotiated_protocol_version`,
+  `:client_capabilities`, `:server_capabilities`, `:input_responses`,
+  `:request_state`, `:task_metadata`, and the auth fields `:principal`,
+  `:authenticated`, `:auth`, `:capabilities`, `:verified_audiences`, and
+  `:verified_scopes`.
   """
   def new(%ServerRuntime{} = runtime, opts \\ []) do
     opts = Keyword.validate!(opts, @options)
@@ -239,16 +195,18 @@ defmodule FastestMCP.Context do
       raise ArgumentError, "state_scope must be :request or :session, got #{inspect(state_scope)}"
     end
 
+    session_id = session_id!(opts[:session_id])
+
     {request_metadata, metadata_authorization} =
       split_transport_authorization(Map.new(opts[:request_metadata] || %{}))
 
     %__MODULE__{
       server_name: runtime.server.name,
       server: runtime.server,
-      session_id: session_id!(opts[:session_id], state_scope),
-      request_id: "req-" <> Integer.to_string(System.unique_integer([:positive])),
+      session_id: session_id,
+      request_id: opts[:request_id] || new_request_id(),
       transport: opts[:transport],
-      state_scope: state_scope,
+      state_scope: if(session_id, do: state_scope, else: :request),
       negotiated_protocol_version: opts[:negotiated_protocol_version],
       request_state: opts[:request_state],
       event_bus: runtime.event_bus,
@@ -278,16 +236,23 @@ defmodule FastestMCP.Context do
   end
 
   @doc false
+  # The id of a new request, as `new/2` gives one.
+  def new_request_id, do: "req-" <> Integer.to_string(System.unique_integer([:positive]))
+
+  @doc false
   # The `new/2` options among an operation's `opts`. A nested operation on the
   # server of the current context inherits that context's session and identity
-  # for the options it does not set.
+  # for the options it does not set. A context without a session has no state
+  # scope to pass on: a nested operation that names a session uses it.
   def inherit_opts(server_name, opts) do
     opts = Keyword.take(opts, @option_keys)
 
     case current() do
       %__MODULE__{server_name: ^server_name} = context ->
+        inherited = if context.session_id, do: @inherited, else: @inherited -- [:state_scope]
+
         context
-        |> Map.take(@inherited)
+        |> Map.take(inherited)
         |> Enum.reject(fn {_key, value} -> is_nil(value) end)
         |> Keyword.merge(opts)
 
@@ -373,10 +338,18 @@ defmodule FastestMCP.Context do
           "request cleanup must be a zero-arity function or a one-arity context callback, got: #{inspect(cleanup)}"
   end
 
-  @doc "Returns the MRTR responses supplied with the current modern request."
+  @doc """
+  Returns the client's answers to the input requests of the handler's own
+  `FastestMCP.InputRequiredResult`, by key: those of the latest round, or of
+  every round so far in a background task. Answers to the questions of the
+  helpers aren't included.
+  """
   def input_responses(%__MODULE__{} = context), do: context.input_responses
 
-  @doc "Returns the opaque MRTR state echoed by the client, if present."
+  @doc """
+  Returns the request state of the handler's own `FastestMCP.InputRequiredResult`,
+  which the client sent back, or `nil`.
+  """
   def request_state(%__MODULE__{} = context), do: context.request_state
 
   @doc false
@@ -418,15 +391,29 @@ defmodule FastestMCP.Context do
   end
 
   @doc """
-  Returns the authenticated client identifier when one is available.
+  Returns the `_meta` that the client sent with its request, a map with string
+  keys, or `%{}` when it sent none, as in an in-process call. On `2026-07-28` it
+  also holds the protocol's own keys, such as
+  `"io.modelcontextprotocol/clientInfo"`.
+  """
+  def request_meta(%__MODULE__{} = context) do
+    case context.request_metadata[:jsonrpc_envelope] do
+      %{"params" => %{"_meta" => %{} = meta}} -> meta
+      _no_meta -> %{}
+    end
+  end
 
-  FastestMCP derives this from normalized auth or principal data rather than
-  exposing a second mutable field on the context struct.
+  @doc """
+  Returns the client id of the caller's verified identity, or `nil`.
+
+  It is the `client_id` (or `clientId`) in `ctx.auth`, else the `client_id`,
+  `clientId`, or `sub` of `ctx.principal`, with atom or string keys. The name
+  that a client reports for itself is unverified, so it is never used; read it
+  from the [request metadata](context.md#request-metadata).
   """
   def client_id(%__MODULE__{} = context) do
     Auth.claim(context.auth, [:client_id, :clientId]) ||
-      Auth.claim(context.principal, [:client_id, :clientId, :sub]) ||
-      client_info_name(context)
+      Auth.claim(context.principal, [:client_id, :clientId, :sub])
   end
 
   @doc "Returns the background-task store attached to the context, if present."
@@ -440,26 +427,29 @@ defmodule FastestMCP.Context do
   @doc "Resolves one named dependency from the context."
   def dependency(%__MODULE__{} = context, name) do
     key = normalize_dependency_name(name)
-    cache_key = {:dependency, key}
 
-    case get_request_state(context, cache_key, :__missing__) do
-      :__missing__ -> resolve_and_cache_dependency(context, name, key, cache_key)
-      value -> value
-    end
-  end
-
-  defp resolve_and_cache_dependency(context, name, key, cache_key) do
     case Map.fetch(context.dependencies, key) do
       {:ok, resolver} ->
-        {value, cleanup} = resolve_dependency(resolver, context, key)
-        :ok = put_request_state(context, cache_key, value)
-        maybe_register_dependency_cleanup(context, value, cleanup)
-        value
+        # Keyed by resolver too: a mounted server's handler shares the request
+        # with the servers it is mounted in, whose resolvers may differ.
+        cache_key = {:dependency, key, resolver}
+
+        case get_request_state(context, cache_key, :__missing__) do
+          :__missing__ -> resolve_and_cache_dependency(context, resolver, key, cache_key)
+          value -> value
+        end
 
       :error ->
         raise ArgumentError,
               "unknown dependency #{inspect(name)} for server #{inspect(context.server_name)}"
     end
+  end
+
+  defp resolve_and_cache_dependency(context, resolver, key, cache_key) do
+    {value, cleanup} = resolve_dependency(resolver, context, key)
+    :ok = put_request_state(context, cache_key, value)
+    maybe_register_dependency_cleanup(context, value, cleanup)
+    value
   end
 
   @doc "Stores session-scoped state for the current session."
@@ -536,31 +526,41 @@ defmodule FastestMCP.Context do
     FastestMCP.Progress.new(context)
   end
 
-  @doc "Emits a log event from this context."
+  @doc """
+  Sends a log message at `level` to the client of the request, and returns
+  `:ok`, `:filtered` when no client receives it (below the level the client
+  asked for, or a request without a client, such as an in-process call), or
+  `{:error, reason}`; see [Levels and results](context.md#levels-and-results).
+  """
   def log(%__MODULE__{} = context, level, data, opts \\ []) do
     level = normalize_log_level(level)
 
     result =
-      if is_modern(context.negotiated_protocol_version) do
-        deliver_modern_log(context, level, data, opts)
-      else
-        Session.log(context.server_name, context.session_id, level, data, opts)
+      cond do
+        is_modern(context.negotiated_protocol_version) ->
+          deliver_modern_log(context, level, data, opts)
+
+        is_nil(context.session_id) ->
+          :filtered
+
+        true ->
+          Session.log(context.server_name, context.session_id, level, data, opts)
       end
 
-    if result == :ok do
-      emit(
-        context,
-        [:log, :message],
-        %{count: 1},
-        %{
+    # The event carries the message as the client receives it, redacted.
+    case result do
+      {:ok, sent} ->
+        emit(context, [:log, :message], %{count: 1}, %{
           level: level,
           logger: Keyword.get(opts, :logger),
-          data: data
-        }
-      )
-    end
+          data: sent
+        })
 
-    result
+        :ok
+
+      not_sent ->
+        not_sent
+    end
   end
 
   defp deliver_modern_log(context, level, data, opts) do
@@ -593,55 +593,56 @@ defmodule FastestMCP.Context do
                }}
             )
 
-            :ok
+            {:ok, params["data"]}
 
-          _other ->
-            {:error, :request_stream_unavailable}
+          # The request is answered without a stream, which could carry it.
+          _no_stream ->
+            :filtered
         end
     end
   end
 
-  @doc "Sends a raw MCP notification to the connected client session stream."
+  @doc """
+  Sends a notification of your own to the client of the `2025-11-25` session,
+  and returns `{:ok, delivery}`. A notification is a method name with
+  optional `params`, or a whole JSON-RPC notification map.
+
+  The names of standard MCP notifications return `{:error, :reserved_method}`,
+  and a request without a session (on `2026-07-28`, or in process without
+  `session_id:`) returns `{:error, :no_session}`.
+  """
   def send_notification(context, method, params \\ %{})
 
   def send_notification(%__MODULE__{} = context, method, params)
       when is_binary(method) and (is_map(params) or is_nil(params)) do
-    cond do
-      MapSet.member?(@reserved_notification_methods, method) ->
-        {:error, :reserved_method}
-
-      is_nil(params) ->
-        Session.send_envelope(
-          context.server_name,
-          context.session_id,
-          %{"jsonrpc" => "2.0", "method" => method},
-          session_delivery_opts(context, queue: true)
-        )
-
-      true ->
-        Session.send_notification(
-          context.server_name,
-          context.session_id,
-          method,
-          params,
-          session_delivery_opts(context, queue: true)
-        )
+    if MapSet.member?(@reserved_notification_methods, method) do
+      {:error, :reserved_method}
+    else
+      envelope = maybe_put(%{"jsonrpc" => "2.0", "method" => method}, "params", params)
+      deliver_notification(context, envelope)
     end
   end
 
   def send_notification(%__MODULE__{} = context, %{} = notification, _params) do
     with {:ok, notification} <- normalize_extension_notification(notification),
          false <- MapSet.member?(@reserved_notification_methods, notification["method"]) do
-      Session.send_envelope(
-        context.server_name,
-        context.session_id,
-        notification,
-        session_delivery_opts(context, queue: true)
-      )
+      deliver_notification(context, notification)
     else
       true -> {:error, :reserved_method}
       {:error, reason} -> {:error, reason}
     end
+  end
+
+  # Notifications of the handler's own travel in the client's session.
+  defp deliver_notification(%__MODULE__{session_id: nil}, _envelope), do: {:error, :no_session}
+
+  defp deliver_notification(%__MODULE__{} = context, envelope) do
+    Session.send_envelope(
+      context.server_name,
+      context.session_id,
+      envelope,
+      session_delivery_opts(context, queue: true)
+    )
   end
 
   @doc "Emits a debug log event from this context."
@@ -656,29 +657,32 @@ defmodule FastestMCP.Context do
   @doc "Emits an error log event from this context."
   def error(%__MODULE__{} = context, data, opts \\ []), do: log(context, :error, data, opts)
 
-  @doc "Runs a sampling request from this context."
+  @doc """
+  Asks the client's model for a completion and returns the client's result, a
+  map with string keys such as
+  `%{"role" => "assistant", "model" => "...", "content" => %{"type" => "text", "text" => "..."}}`.
+
+  `prompt_or_messages` is a prompt or a list of sampling messages, with atom or
+  string keys. The options are those of `FastestMCP.Sampling.run!/3`, without
+  `:max_tool_rounds`: this function runs no tools for the model. With
+  `task: true`, a client in a `2025-11-25` session may run the request as a
+  task of its own, and the function returns a `FastestMCP.PeerTask`. See
+  [What works where](sampling-and-elicitation.md#what-works-where) for how the
+  request reaches the client.
+  """
   def sample(context, prompt_or_messages, opts \\ [])
 
   def sample(%__MODULE__{} = context, prompt, opts) when is_binary(prompt) do
-    messages = [
-      %{
-        "role" => "user",
-        "content" => %{
-          "type" => "text",
-          "text" => prompt
-        }
-      }
-    ]
-
-    sample(context, messages, opts)
+    message = %{"role" => "user", "content" => %{"type" => "text", "text" => prompt}}
+    sample(context, [message], opts)
   end
 
   def sample(%__MODULE__{} = context, messages, opts) when is_list(messages) do
-    messages = SamplingProtocol.validate_messages!(messages)
+    # Messages with atom keys or values, as the client receives them.
+    messages = messages |> JSONValue.encode!() |> JSON.decode!()
+    SamplingProtocol.validate_messages!(messages)
     tools = sampling_tool_definitions(Keyword.get(opts, :tools))
     include_context = normalize_sampling_include_context(Keyword.get(opts, :include_context))
-    validate_sampling_capabilities!(context, tools, include_context)
-    validate_peer_task_capability!(context, opts, ["sampling", "createMessage"])
 
     params =
       %{
@@ -696,47 +700,61 @@ defmodule FastestMCP.Context do
       |> maybe_put_sampling_tool_choice(tools, Keyword.get(opts, :tool_choice, :auto))
       |> maybe_put_task_request(opts)
 
+    route = client_route!(context, "sampling", opts)
+    validate_sampling_capabilities!(context, tools, include_context)
+    validate_peer_task_capability!(context, opts, ["sampling", "createMessage"])
     timeout_ms = Keyword.get(opts, :timeout_ms, 60_000)
 
-    if background_task?(context) do
+    result =
       context
-      |> interact!(:sampling, params, timeout_ms)
+      |> ask!(route, "sampling/createMessage", params, timeout_ms, opts)
       |> validate_sampling_result!(tools, opts)
-    else
-      result =
-        context
-        |> send_client_request("sampling/createMessage", params, timeout_ms, opts)
-        |> validate_sampling_result!(tools, opts)
 
-      normalize_peer_task_or_result(context, result, :sampling, "sampling/createMessage")
-    end
+    normalize_peer_task_or_result(context, result, :sampling, "sampling/createMessage")
   end
 
-  @doc "Requests the current filesystem roots from the connected client."
+  @doc """
+  Asks the client for its roots, the `file://` folders the user works in, and
+  returns them as `FastestMCP.Root` structs.
+
+  A `2025-11-25` session keeps the roots until the client reports a change;
+  `refresh: true` asks anyway. `timeout_ms:` (default 60 seconds) bounds the
+  wait where the handler waits for the answer.
+  """
   def list_roots(%__MODULE__{} = context, opts \\ []) do
+    route = client_route!(context, "roots", opts)
+
     require_client_capability!(
       context,
       ["roots"],
       "connected client did not declare roots support"
     )
 
-    if Keyword.get(opts, :refresh, false) do
-      request_and_cache_roots(context, opts)
-    else
-      case Session.cached_roots(context.server_name, context.session_id) do
-        roots when is_list(roots) -> roots
-        _other -> request_and_cache_roots(context, opts)
+    with nil <- if(!Keyword.get(opts, :refresh, false), do: cached_roots(context)) do
+      case ask!(context, route, "roots/list", %{}, Keyword.get(opts, :timeout_ms, 60_000), opts) do
+        %{"roots" => roots} when is_list(roots) -> keep_roots!(context, roots)
+        other -> raise invalid_roots(other)
       end
     end
   end
 
   @doc "Returns the roots cached for this session, or nil before the first successful request."
+  def cached_roots(%__MODULE__{session_id: nil}), do: nil
+
   def cached_roots(%__MODULE__{} = context) do
-    Session.cached_roots(context.server_name, context.session_id)
+    case Session.cached_roots(context.server_name, context.session_id) do
+      roots when is_list(roots) -> roots
+      _none_or_no_session -> nil
+    end
   end
 
-  @doc "Lists tasks owned by the connected peer for this session."
+  @doc """
+  Lists the tasks of the client of this `2025-11-25` session. A request
+  without a session raises an `:internal_error` that says so.
+  """
   def list_peer_tasks(%__MODULE__{} = context, opts \\ []) do
+    require_session!(context, "Context.list_peer_tasks/2", "")
+
     require_client_capability!(
       context,
       ["tasks", "list"],
@@ -765,22 +783,29 @@ defmodule FastestMCP.Context do
     }
   end
 
-  @doc "Sends an MCP ping request to the connected client."
+  @doc """
+  Sends an MCP ping to the client of a `2025-11-25` session and returns `:ok`
+  once it answers. `2026-07-28` has no ping from the server.
+  """
   def ping_peer(%__MODULE__{} = context, opts \\ []) do
-    case send_client_request(
-           context,
-           "ping",
-           %{},
-           Keyword.get(opts, :timeout_ms, 60_000),
-           opts
-         ) do
+    route = client_route!(context, "a ping", opts)
+    require_legacy!(context, "Context.ping_peer/2", "2026-07-28 has no ping from the server")
+
+    case ask!(context, route, "ping", %{}, Keyword.get(opts, :timeout_ms, 60_000), opts) do
       %{} = result when map_size(result) == 0 -> :ok
       %{} -> {:error, :invalid_ping_result}
     end
   end
 
-  @doc "Runs a URL-mode elicitation with the connected client."
+  @doc """
+  Asks the client of a `2025-11-25` session to send the user to a page of your
+  application (URL elicitation). Returns the structs of `elicit/4`; see
+  [Sending the user to a web page](sampling-and-elicitation.md#sending-the-user-to-a-web-page).
+  """
   def elicit_url(%__MODULE__{} = context, message, url_or_builder, opts \\ []) do
+    route = client_route!(context, "URL elicitation", opts)
+    require_url_session!(context)
+
     require_client_capability!(
       context,
       ["elicitation", "url"],
@@ -790,14 +815,14 @@ defmodule FastestMCP.Context do
     validate_peer_task_capability!(context, opts, ["elicitation", "create"])
 
     elicitation = build_and_register_url_elicitation!(context, message, url_or_builder, opts)
+    params = elicitation |> URLElicitation.to_params() |> maybe_put_task_request(opts)
 
     result =
-      send_client_request(
+      ask!(
         context,
+        route,
         "elicitation/create",
-        elicitation
-        |> URLElicitation.to_params()
-        |> maybe_put_task_request(opts),
+        params,
         Keyword.get(opts, :timeout_ms, 60_000),
         opts
       )
@@ -829,10 +854,16 @@ defmodule FastestMCP.Context do
     end
   end
 
-  @doc "Registers URL elicitation descriptors and raises the standard -32042 error."
+  @doc """
+  Registers a URL elicitation in the `2025-11-25` session and raises the
+  standard `-32042` error (`:url_elicitation_required`), which carries the URL
+  to the client.
+  """
   @spec require_url_elicitation!(t(), term(), term()) :: no_return()
   @spec require_url_elicitation!(t(), term(), term(), keyword()) :: no_return()
   def require_url_elicitation!(%__MODULE__{} = context, message, url_or_builder, opts \\ []) do
+    require_url_session!(context)
+
     require_client_capability!(
       context,
       ["elicitation", "url"],
@@ -881,18 +912,28 @@ defmodule FastestMCP.Context do
     |> Error.unwrap!()
   end
 
-  @doc "Enables matching components for the current session only."
+  @doc """
+  Shows the matching components to the session of the request only; see
+  [Per-session visibility](versioning-and-visibility.md#per-session-visibility).
+  A request without a session (on `2026-07-28`, or in process without
+  `session_id:`) raises an `:internal_error`; `FastestMCP.enable_components/2`
+  changes what every client sees.
+  """
   def enable_components(%__MODULE__{} = context, opts \\ []) do
     update_visibility_rules(context, :enable, opts)
   end
 
-  @doc "Disables matching components for the current session only."
+  @doc """
+  Hides the matching components from the session of the request only; like
+  `enable_components/2`, it needs a session.
+  """
   def disable_components(%__MODULE__{} = context, opts \\ []) do
     update_visibility_rules(context, :disable, opts)
   end
 
-  @doc "Clears all session visibility rules."
+  @doc "Clears the visibility rules of the request's session, which it needs."
   def reset_visibility(%__MODULE__{} = context) do
+    require_session!(context, "Context.reset_visibility/1", "")
     before = visible_component_sets(context)
     :ok = delete_state(context, @visibility_rules_key)
     emit_visibility_change(context, before, visible_component_sets(context))
@@ -992,7 +1033,11 @@ defmodule FastestMCP.Context do
         put_request_state(context, :progress_update, %{current: current, total: next_total})
       end
 
-      emit(context, [:task, :progress], progress, %{task_id: task_id(context)})
+      # A background task's progress is the task's; any other is its request's.
+      if background_task?(context),
+        do: emit(context, [:task, :progress], progress, %{task_id: task_id(context)}),
+        else: emit(context, [:operation, :progress], progress)
+
       delivery
     end
   end
@@ -1051,7 +1096,11 @@ defmodule FastestMCP.Context do
 
             :ok
 
-          _other ->
+          # Neither a stream nor a session carries it: as without a token.
+          _no_stream when is_nil(context.session_id) ->
+            {:error, :missing_progress_token}
+
+          _no_stream ->
             Session.report_progress(
               context.server_name,
               context.session_id,
@@ -1066,65 +1115,50 @@ defmodule FastestMCP.Context do
   defp modern_progress?(%__MODULE__{}), do: false
 
   @doc """
-  Asks the client for form input of `response_type`: through the task store
-  when called from a background task, otherwise through the session's client.
-  Returns the accepted, declined, or cancelled response (for example
-  `%FastestMCP.Elicitation.Accepted{data: data}`), or a `FastestMCP.PeerTask`
-  when `task: true` asks the client to answer as a task.
+  Asks the user for form input of `response_type` and returns the answer:
+  `%FastestMCP.Elicitation.Accepted{data: data}`,
+  `%FastestMCP.Elicitation.Declined{}`, or `%FastestMCP.Elicitation.Cancelled{}`.
+  With `task: true`, a client in a `2025-11-25` session may answer as a task
+  of its own, and the function returns a `FastestMCP.PeerTask`.
+
+  The request reaches the client through the handler's background task,
+  through a multi-round-trip request on `2026-07-28`, or through the
+  `2025-11-25` session; see
+  [What works where](sampling-and-elicitation.md#what-works-where).
+  `timeout_ms:` (default 60 seconds) bounds the wait where the handler waits
+  for the answer.
   """
   def elicit(%__MODULE__{} = context, message, response_type, opts \\ []) do
     request = Elicitation.request(message, response_type, opts)
 
-    cond do
-      background_task?(context) ->
+    case client_route!(context, "elicitation", opts) do
+      :task ->
         interact!(context, :elicitation, request, request.timeout_ms)
 
-      has_client_bridge?(context) ->
-        require_client_capability!(
-          context,
-          ["elicitation", "form"],
-          "connected client did not declare elicitation.form support"
-        )
-
+      route ->
+        require_form_elicitation!(context)
         validate_peer_task_capability!(context, opts, ["elicitation", "create"])
 
-        response =
-          send_client_request(
-            context,
-            "elicitation/create",
-            %{
-              "mode" => "form",
-              "message" => request.message,
-              "requestedSchema" => request.requested_schema
-            }
-            |> maybe_put_task_request(opts),
-            request.timeout_ms,
-            opts
-          )
+        params =
+          %{
+            "mode" => "form",
+            "message" => request.message,
+            "requestedSchema" => request.requested_schema
+          }
+          |> maybe_put_task_request(opts)
 
-        case normalize_peer_task_or_result(
-               context,
-               response,
-               :elicitation,
-               "elicitation/create"
-             ) do
+        result = ask!(context, route, "elicitation/create", params, request.timeout_ms, opts)
+
+        case normalize_peer_task_or_result(context, result, :elicitation, "elicitation/create") do
           %PeerTask{} = task ->
             task
 
-          %{} = result ->
-            case Elicitation.resolve(
-                   request,
-                   Map.get(result, "action"),
-                   Map.get(result, "content")
-                 ) do
+          %{} = answer ->
+            case Elicitation.resolve(request, answer["action"], answer["content"]) do
               {:ok, resolved} -> resolved
               {:error, %Error{} = error} -> raise error
             end
         end
-
-      true ->
-        raise RuntimeError,
-              "elicitation requires a background task or an initialized deliverable MCP session"
     end
   end
 
@@ -1169,6 +1203,55 @@ defmodule FastestMCP.Context do
   defp normalize_capabilities(nil), do: []
   defp normalize_capabilities(capability), do: List.wrap(capability)
 
+  # How a request of the handler reaches the client: through its background
+  # task, as a multi-round-trip request (2026-07-28), or through its
+  # 2025-11-25 session. Only a session takes `task:` requests.
+  defp client_route!(%__MODULE__{} = context, what, opts) do
+    route =
+      cond do
+        background_task?(context) -> :task
+        InputRounds.active?(context) -> :rounds
+        is_binary(context.session_id) -> :session
+        true -> raise no_client(context, what)
+      end
+
+    if route != :session and Keyword.get(opts, :task, false) != false do
+      raise Error,
+        code: :bad_request,
+        message:
+          "task: true asks the client to run the request as a task of its own, " <>
+            "which needs a tool call in a 2025-11-25 session"
+    end
+
+    route
+  end
+
+  defp no_client(%__MODULE__{} = context, what) do
+    hint =
+      if is_modern(context.negotiated_protocol_version),
+        do:
+          "on 2026-07-28, ask in the handler of a client's tools/call, prompts/get, or " <>
+            "resources/read request, in the handler's own process, or in a background task",
+        else:
+          "make the call through a client, or run it as a background task (task: true) " <>
+            "and answer with FastestMCP.send_task_input/5 or FastestMCP.update_task/4"
+
+    %Error{
+      code: :internal_error,
+      message: "the request has no client to ask for #{what}: #{hint}"
+    }
+  end
+
+  # Sends `method` to the client by `route` and returns the answer.
+  defp ask!(context, :task, method, params, timeout_ms, _opts),
+    do: interact!(context, :request, %{"method" => method, "params" => params}, timeout_ms)
+
+  defp ask!(context, :rounds, method, params, _timeout_ms, _opts),
+    do: InputRounds.ask!(context, %{"method" => method, "params" => params})
+
+  defp ask!(context, :session, method, params, timeout_ms, opts),
+    do: send_client_request(context, method, params, timeout_ms, opts)
+
   # A background task reaches the client through its task store.
   defp interact!(%__MODULE__{} = context, kind, request, timeout_ms) do
     store = task_store(context) || raise "background task context is missing its task store"
@@ -1189,11 +1272,6 @@ defmodule FastestMCP.Context do
 
   defp request_task_store(%__MODULE__{} = context) do
     context.task_metadata[:task_store]
-  end
-
-  defp has_client_bridge?(%__MODULE__{} = context) do
-    is_binary(context.session_id) and
-      Session.deliverable?(context.server_name, context.session_id)
   end
 
   defp progress_token(%__MODULE__{} = context) do
@@ -1237,6 +1315,14 @@ defmodule FastestMCP.Context do
           code: :timeout,
           message: "#{method} timed out",
           details: %{timeout_ms: timeout_ms}
+
+      {:error, reason} when reason in [:not_found, :not_initialized, :not_deliverable] ->
+        raise Error,
+          code: :internal_error,
+          message:
+            "#{method} cannot reach the client: session #{inspect(context.session_id)} " <>
+              "has no initialized client with an open stream",
+          details: %{reason: reason}
 
       {:error, reason} ->
         raise Error,
@@ -1336,45 +1422,95 @@ defmodule FastestMCP.Context do
     end
   end
 
-  defp request_and_cache_roots(context, opts) do
-    result =
-      send_client_request(
-        context,
-        "roots/list",
-        %{},
-        Keyword.get(opts, :timeout_ms, 60_000),
-        opts
-      )
+  # The roots of a roots/list answer, which a session keeps.
+  defp keep_roots!(%__MODULE__{} = context, roots) do
+    roots =
+      Enum.map(roots, fn root ->
+        case Root.parse(root) do
+          {:ok, root} -> root
+          {:error, reason} -> raise invalid_roots(reason)
+        end
+      end)
 
-    roots = Map.fetch!(result, "roots")
+    if context.session_id,
+      do: Session.cache_roots(context.server_name, context.session_id, roots)
 
-    case Session.cache_roots(context.server_name, context.session_id, roots) do
-      {:ok, parsed} ->
-        parsed
+    roots
+  end
 
-      {:error, reason} ->
-        raise Error,
-          code: :bad_request,
-          message: "invalid roots/list result",
-          details: %{reason: inspect(reason)}
-    end
+  defp invalid_roots(reason) do
+    %Error{
+      code: :bad_request,
+      message: "invalid roots/list result",
+      details: %{reason: inspect(reason)}
+    }
   end
 
   defp require_client_capability!(%__MODULE__{} = context, path, message) do
     if Protocol.capability?(context.client_capabilities, path) do
       :ok
     else
-      if is_modern(context.negotiated_protocol_version) do
-        raise Error,
-          code: :missing_required_client_capability,
-          message: message,
-          details: %{
-            jsonrpc_code: -32_021,
-            requiredCapabilities: Protocol.capabilities_map([path])
-          }
-      else
-        raise Error, code: :method_not_found, message: message
-      end
+      missing_capability!(context, path, message)
+    end
+  end
+
+  # On 2026-07-28, an empty `elicitation` object declares form support.
+  defp require_form_elicitation!(%__MODULE__{client_capabilities: capabilities} = context) do
+    if Protocol.capability?(capabilities, ["elicitation", "form"]) or
+         Protocol.capability(capabilities, ["elicitation"]) == %{} do
+      :ok
+    else
+      missing_capability!(
+        context,
+        ["elicitation", "form"],
+        "connected client did not declare elicitation.form support"
+      )
+    end
+  end
+
+  defp missing_capability!(%__MODULE__{} = context, path, message) do
+    if is_modern(context.negotiated_protocol_version) do
+      raise Error,
+        code: :missing_required_client_capability,
+        message: message,
+        details: %{
+          jsonrpc_code: -32_021,
+          requiredCapabilities: Protocol.capabilities_map([path])
+        }
+    else
+      raise Error, code: :method_not_found, message: message
+    end
+  end
+
+  # Requests that only a 2025-11-25 session can send.
+  defp require_legacy!(%__MODULE__{} = context, subject, reason) do
+    if is_modern(context.negotiated_protocol_version) do
+      raise Error,
+        code: :method_not_found,
+        message: "#{subject} needs a 2025-11-25 session: #{reason}"
+    end
+  end
+
+  # Session visibility rules and client tasks belong to a session, which a
+  # 2026-07-28 request and an in-process call without `session_id:` don't have.
+  defp require_session!(%__MODULE__{session_id: nil}, subject, hint) do
+    raise Error,
+      code: :internal_error,
+      message: "#{subject} needs a 2025-11-25 session, which this request doesn't have" <> hint
+  end
+
+  defp require_session!(%__MODULE__{}, _subject, _hint), do: :ok
+
+  # URL elicitations are bound to a 2025-11-25 session, which notifies the
+  # client when they complete.
+  defp require_url_session!(%__MODULE__{} = context) do
+    reason = "2026-07-28 has no URL elicitation ids or completion notifications"
+    require_legacy!(context, "URL elicitation", reason)
+
+    if is_nil(context.session_id) do
+      raise Error,
+        code: :method_not_found,
+        message: "URL elicitation needs a 2025-11-25 session, which this request doesn't have"
     end
   end
 
@@ -1465,6 +1601,12 @@ defmodule FastestMCP.Context do
   end
 
   defp update_visibility_rules(%__MODULE__{} = context, action, opts) do
+    require_session!(
+      context,
+      "Context.#{action}_components/2",
+      "; FastestMCP.#{action}_components/2 changes what every client sees"
+    )
+
     before = visible_component_sets(context)
     rules = get_state(context, @visibility_rules_key, [])
     next_rules = List.wrap(rules) ++ ComponentVisibility.normalize_rules(action, opts)
@@ -1483,19 +1625,15 @@ defmodule FastestMCP.Context do
        when before_sets == after_sets,
        do: :ok
 
+  # The lists of one session changed: only that session is notified.
   defp emit_visibility_change(%__MODULE__{} = context, before_sets, after_sets) do
     families =
       [:tools, :resources, :prompts]
       |> Enum.filter(&(Map.get(before_sets, &1, []) != Map.get(after_sets, &1, [])))
 
-    if families != [] do
-      emit(
-        context,
-        [:components, :changed],
-        %{count: length(families)},
-        %{families: families, session_id: context.session_id}
-      )
-    end
+    with [_family | _rest] <- families,
+         {:ok, runtime} <- ServerRuntime.fetch(context.server_name),
+         do: Notifications.list_changed(runtime, families, base_metadata(context))
   end
 
   defp request_metadata_headers(%__MODULE__{} = context) do
@@ -1533,19 +1671,10 @@ defmodule FastestMCP.Context do
     authorization
   end
 
-  defp client_info_name(%__MODULE__{} = context) do
-    case request_client_info(context) do
-      %{"name" => name} -> name
-      _other -> nil
-    end
-  end
-
   # The client info of an initialize request, else of the session; string keys.
   defp request_client_info(%__MODULE__{} = context) do
     context.request_metadata[:clientInfo] ||
-      if(context.state_scope == :session,
-        do: Session.client_info(context.server_name, context.session_id)
-      )
+      if(context.session_id, do: Session.client_info(context.server_name, context.session_id))
   end
 
   defp resolve_dependency(resolver, context, key) when is_function(resolver, 0) do
@@ -1789,12 +1918,11 @@ defmodule FastestMCP.Context do
           "tool_choice must be :auto, :required, or :none, got #{inspect(other)}"
   end
 
-  defp session_id!(nil, :request), do: nil
-  defp session_id!(nil, :session), do: Base.encode16(:crypto.strong_rand_bytes(16), case: :lower)
+  defp session_id!(nil), do: nil
 
-  defp session_id!(session_id, scope) do
+  defp session_id!(session_id) do
     case to_string(session_id) do
-      "" -> raise ArgumentError, "session_id must not be empty for #{scope}-scoped context"
+      "" -> raise ArgumentError, "session_id must not be empty"
       session_id -> session_id
     end
   end

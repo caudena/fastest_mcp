@@ -7,6 +7,7 @@ defmodule FastestMCP.Middleware.ResponseLimiting do
   alias FastestMCP.Error
   @behaviour FastestMCP.Middleware
 
+  alias FastestMCP.InputRequiredResult
   alias FastestMCP.Operation
   alias FastestMCP.Transport.Serializer
 
@@ -54,7 +55,7 @@ defmodule FastestMCP.Middleware.ResponseLimiting do
   def call(%__MODULE__{} = middleware, %Operation{} = operation, next)
       when is_function(next, 1) do
     with {:ok, done} <- next.(operation) do
-      if not operation.task_request and limit_tool?(middleware, operation),
+      if limit?(middleware, operation, done.result),
         do: limit_result(middleware, operation, done),
         else: {:ok, done}
     end
@@ -68,6 +69,12 @@ defmodule FastestMCP.Middleware.ResponseLimiting do
       when is_binary(text) and is_map(metadata) do
     truncate_to_tool_result(text, middleware.max_size, middleware.truncation_suffix, metadata)
   end
+
+  # A question to the client is not a tool result.
+  defp limit?(_middleware, _operation, %InputRequiredResult{}), do: false
+
+  defp limit?(middleware, operation, _result),
+    do: not operation.task_request and limit_tool?(middleware, operation)
 
   defp limit_result(%__MODULE__{} = middleware, %Operation{} = operation, done) do
     %Operation{result: result, component: component} = done

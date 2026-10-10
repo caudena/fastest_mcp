@@ -27,6 +27,10 @@ defmodule FastestMCP.ClientGroup.Coordinator do
      }, {:continue, :setup}}
   end
 
+  # Crash reports leave out the members' credentials.
+  @impl true
+  defdelegate format_status(status), to: FastestMCP.Client.Redaction
+
   @impl true
   def handle_continue(:setup, state) do
     children = Supervisor.which_children(state.supervisor)

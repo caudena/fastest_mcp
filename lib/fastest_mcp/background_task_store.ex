@@ -5,9 +5,9 @@ defmodule FastestMCP.BackgroundTaskStore do
 
   use GenServer
   import FastestMCP.Util, only: [maybe_put: 3]
+  import FastestMCP.Protocol.Version
 
   alias FastestMCP.BackgroundTask
-  alias FastestMCP.BackgroundTaskStore.Task, as: TaskRecord
   alias FastestMCP.Component
   alias FastestMCP.Context
   alias FastestMCP.Elicitation
@@ -18,6 +18,7 @@ defmodule FastestMCP.BackgroundTaskStore do
   alias FastestMCP.Session
   alias FastestMCP.TaskBackend.Memory
   alias FastestMCP.TaskOwner
+  alias FastestMCP.TaskRecord
   alias FastestMCP.TaskWire
 
   @default_ttl_ms 60_000
@@ -36,10 +37,11 @@ defmodule FastestMCP.BackgroundTaskStore do
       when timeout == :infinity or (is_integer(timeout) and timeout >= 0),
       do: GenServer.call(store, {:await, to_string(task_id), opts, timeout}, :infinity)
 
-  # `request` is an elicitation from `FastestMCP.Elicitation.request/3` or the
-  # `sampling/createMessage` params; waits for the client's answer.
+  # Waits for the client's answer to `request`: a form elicitation from
+  # `FastestMCP.Elicitation.request/3` (`:elicitation`), or any other client
+  # request as `%{"method" => method, "params" => params}` (`:request`).
   def interact(store, task_id, kind, request, timeout_ms)
-      when kind in [:elicitation, :sampling] and is_integer(timeout_ms) and timeout_ms >= 0 do
+      when kind in [:elicitation, :request] and is_integer(timeout_ms) and timeout_ms >= 0 do
     GenServer.call(
       store,
       {:interact, to_string(task_id), kind, request, timeout_ms},
@@ -215,8 +217,19 @@ defmodule FastestMCP.BackgroundTaskStore do
           error = bad_request("elicitation request_id does not match the pending request")
           {:error, %{error | details: %{request_id: request_id}}, state}
 
-        _other ->
+        _other when task.input_requests == %{} ->
           {:error, bad_request("background task is not waiting for input"), state}
+
+        _other ->
+          methods = task.input_requests |> Map.values() |> Enum.map(& &1["method"]) |> Enum.uniq()
+
+          error =
+            bad_request(
+              "background task waits for #{Enum.join(methods, ", ")}, which " <>
+                "send_task_input/5 cannot answer; answer it with FastestMCP.update_task/4"
+            )
+
+          {:error, %{error | details: %{input_requests: Map.keys(task.input_requests)}}, state}
       end
     end)
     |> reply()
@@ -363,7 +376,7 @@ defmodule FastestMCP.BackgroundTaskStore do
   def handle_info({{:waiter_down, task_id}, ref, :process, _pid, _reason}, state),
     do: {:noreply, state |> remove_waiter(task_id, ref, nil) |> restart_relay(task_id, ref)}
 
-  # An unanswered elicitation is cancelled; unanswered sampling fails.
+  # An unanswered elicitation is cancelled; any other request fails.
   def handle_info({:interaction_timeout, task_id, ref}, state) do
     case state.interactions[task_id] do
       %{ref: ^ref, kind: :elicitation} = interaction ->
@@ -445,9 +458,11 @@ defmodule FastestMCP.BackgroundTaskStore do
   end
 
   # A handler that needs input returns an `InputRequiredResult`; it runs again
-  # with the answers.
+  # with the answers, which it waits for up to the result's timeout. A
+  # 2025-11-25 client has no way to answer one.
   defp await_input(store, task_id, executor, operation, %InputRequiredResult{} = input_required) do
-    with true <- is_map(input_required.input_requests) and input_required.input_requests != %{},
+    with :ok <- answerable(operation),
+         true <- is_map(input_required.input_requests) and input_required.input_requests != %{},
          :ok <-
            InputRequiredResult.validate_client_capabilities(
              input_required,
@@ -464,6 +479,14 @@ defmodule FastestMCP.BackgroundTaskStore do
           }
 
           run(store, task_id, executor, %{operation | context: context})
+      after
+        input_required.timeout_ms ->
+          error = %{
+            Error.timeout("background task input")
+            | details: %{timeout_ms: input_required.timeout_ms}
+          }
+
+          send(store, {:task_result, task_id, {:error, error}})
       end
     else
       false ->
@@ -478,6 +501,20 @@ defmodule FastestMCP.BackgroundTaskStore do
         send(store, {:task_result, task_id, {:error, error}})
     end
   end
+
+  defp answerable(%Operation{invocation: :protocol, context: context}) do
+    if is_legacy(context.negotiated_protocol_version) do
+      {:error,
+       Error.internal(
+         "a background task's InputRequiredResult is not valid under #{legacy()}: " <>
+           "ask with FastestMCP.Context.elicit/4 or FastestMCP.Context.sample/3 instead"
+       )}
+    else
+      :ok
+    end
+  end
+
+  defp answerable(_operation), do: :ok
 
   defp execute(executor, operation) do
     {:ok, executor.(operation)}
@@ -671,16 +708,26 @@ defmodule FastestMCP.BackgroundTaskStore do
     }
   end
 
-  defp interaction_request(:sampling, params) do
+  defp interaction_request(:request, %{"method" => method, "params" => params}) do
     %{
-      request: params,
-      request_id: "sampling-" <> Integer.to_string(System.unique_integer([:positive])),
-      method: "sampling/createMessage",
+      request: nil,
+      request_id: request_key(method) <> Integer.to_string(System.unique_integer([:positive])),
+      method: method,
       params: params,
-      message: "Waiting for client sampling",
+      message: interaction_message(method, params),
       elicitation: nil
     }
   end
+
+  defp request_key("sampling/createMessage"), do: "sampling-"
+  defp request_key("elicitation/create"), do: "elicit-"
+  defp request_key("roots/list"), do: "roots-"
+  defp request_key(_method), do: "request-"
+
+  defp interaction_message("sampling/createMessage", _params), do: "Waiting for client sampling"
+  defp interaction_message("elicitation/create", %{"message" => message}), do: message
+  defp interaction_message("roots/list", _params), do: "Waiting for client roots"
+  defp interaction_message(method, _params), do: "Waiting for the client to answer #{method}"
 
   # Answers the pending interaction of a task with a client response.
   defp answer(state, task, interaction, response) do
@@ -693,7 +740,7 @@ defmodule FastestMCP.BackgroundTaskStore do
   defp resolve(%{kind: :elicitation, request: request}, %{} = response),
     do: Elicitation.resolve(request, response["action"], response["content"])
 
-  defp resolve(%{kind: :sampling}, %{} = response), do: {:ok, response}
+  defp resolve(%{kind: :request}, %{} = response), do: {:ok, Map.delete(response, "resultType")}
 
   defp resolve(_interaction, _response),
     do: {:error, %Error{code: :invalid_params, message: "invalid task input response"}}

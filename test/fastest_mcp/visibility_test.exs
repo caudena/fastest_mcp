@@ -22,6 +22,67 @@ defmodule FastestMCP.VisibilityTest do
     end
   end
 
+  test "over MCP a hidden component answers like an unknown one; in process the code stays" do
+    server_name = unique_name("visibility-wire-unknown")
+
+    hide_filtered = fn
+      %FastestMCP.Components.Tool{name: "filtered"}, _operation -> nil
+      component, _operation -> component
+    end
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_transform(hide_filtered)
+    |> FastestMCP.add_tool("visible", fn _args, _ctx -> :ok end)
+    |> FastestMCP.add_tool("disabled", fn _args, _ctx -> :ok end, enabled: false)
+    |> FastestMCP.add_tool("app_only", fn _args, _ctx -> :ok end, visibility: [:app])
+    |> FastestMCP.add_tool("filtered", fn _args, _ctx -> :ok end)
+    |> FastestMCP.add_prompt("visible", fn _args, _ctx -> "ok" end)
+    |> FastestMCP.add_prompt("draft", fn _args, _ctx -> "draft" end, enabled: false)
+    |> FastestMCP.add_resource("notes://visible", fn _args, _ctx -> "ok" end)
+    |> FastestMCP.add_resource("notes://draft", fn _args, _ctx -> "draft" end, enabled: false)
+    |> FastestMCP.add_resource_template("drafts://{id}", fn _args, _ctx -> "draft" end,
+      enabled: false
+    )
+    |> start_server!()
+
+    assert {:error, %Error{code: :disabled}} = FastestMCP.call_tool(server_name, "disabled")
+    assert {:error, %Error{code: :not_visible}} = FastestMCP.call_tool(server_name, "app_only")
+    assert {:error, %Error{code: :filtered}} = FastestMCP.call_tool(server_name, "filtered")
+    assert {:error, %Error{code: :disabled}} = FastestMCP.render_prompt(server_name, "draft")
+
+    {connection_id, _initialize} = ProtocolTest.initialize_stdio(server_name)
+    id = fn -> System.unique_integer([:positive]) end
+
+    legacy = fn method, params ->
+      ProtocolTest.stdio_request(server_name, connection_id, id.(), method, params)["error"]
+    end
+
+    for name <- ["disabled", "app_only", "filtered", "missing"] do
+      assert %{
+               "code" => -32_602,
+               "message" => message,
+               "data" => %{"fastestmcp" => %{"code" => "not_found"}}
+             } = legacy.("tools/call", %{"name" => name, "arguments" => %{}})
+
+      assert message == "unknown tool #{inspect(name)}"
+    end
+
+    assert %{"code" => -32_602, "message" => ~s(unknown prompt "draft")} =
+             legacy.("prompts/get", %{"name" => "draft"})
+
+    for uri <- ["notes://draft", "drafts://7"] do
+      assert %{"code" => -32_002, "message" => message} =
+               legacy.("resources/read", %{"uri" => uri})
+
+      assert message == "unknown resource #{inspect(uri)}"
+
+      assert %{"error" => %{"code" => -32_602, "data" => %{"uri" => ^uri}}} =
+               ProtocolTest.modern_stdio_request(server_name, id.(), "resources/read", %{
+                 "uri" => uri
+               })
+    end
+  end
+
   test "later transforms can disable a matching component" do
     server_name = "transform-visibility-" <> Integer.to_string(System.unique_integer([:positive]))
 

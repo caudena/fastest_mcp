@@ -22,7 +22,9 @@ defmodule FastestMCP.ComponentManager do
   ```
 
   From that point on, the added component is visible through the same runtime
-  paths as components declared on the original server definition.
+  paths as components declared on the original server definition. Changes,
+  and the server-wide visibility rules, last until the server stops: they
+  survive a restart of the server's other processes after a crash.
 
   ## Duplicate Registration Policy
 
@@ -53,6 +55,7 @@ defmodule FastestMCP.ComponentManager do
   alias FastestMCP.Component.Lookup
   alias FastestMCP.ComponentCompiler
   alias FastestMCP.ComponentStore
+  alias FastestMCP.Notifications
   alias FastestMCP.ServerRuntime
 
   defstruct [:server_name, :pid]
@@ -194,7 +197,9 @@ defmodule FastestMCP.ComponentManager do
   @impl true
   def init(%{server_name: server_name, on_duplicate: on_duplicate}) do
     # Visibility rules live in Registry metadata for lock-free reads; this
-    # process serializes their updates and starts every runtime from none.
+    # process serializes their updates, and they last as long as it does: it
+    # starts with none and clears them when it stops.
+    Process.flag(:trap_exit, true)
     FastestMCP.Registry.put_visibility_rules(server_name, [])
 
     # The state is a ComponentStore holder: the four collections plus settings.
@@ -250,6 +255,10 @@ defmodule FastestMCP.ComponentManager do
     templates = ComponentStore.list(state, :resource_template)
     {:reply, Lookup.resource_targets(resources, templates, uri, version), state}
   end
+
+  @impl true
+  def terminate(_reason, state),
+    do: FastestMCP.Registry.put_visibility_rules(state.server_name, [])
 
   defp reply_changed({[], _next}, _kind, state), do: {:reply, {:error, :not_found}, state}
 
@@ -324,14 +333,7 @@ defmodule FastestMCP.ComponentManager do
   defp version_opt(opts), do: opts[:version] && to_string(opts[:version])
 
   defp broadcast_component_change(server_name, component_type) do
-    with {:ok, runtime} <- ServerRuntime.fetch(server_name) do
-      FastestMCP.EventBus.emit(
-        runtime.event_bus,
-        server_name,
-        [:components, :changed],
-        %{count: 1},
-        %{families: [Component.family(component_type)]}
-      )
-    end
+    with {:ok, runtime} <- ServerRuntime.fetch(server_name),
+         do: Notifications.list_changed(runtime, [Component.family(component_type)])
   end
 end

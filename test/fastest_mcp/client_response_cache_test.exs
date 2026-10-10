@@ -249,10 +249,10 @@ defmodule FastestMCP.ClientResponseCacheTest do
     meta_secret = "Bearer semantic-meta-secret"
 
     assert %{"request" => 1} =
-             Client.read_resource!(client, "memory://secret", meta: %{"opaque" => meta_secret})
+             read_json!(client, "memory://secret", meta: %{"opaque" => meta_secret})
 
     assert %{"request" => 1} =
-             Client.read_resource!(client, "memory://secret", meta: %{"opaque" => meta_secret})
+             read_json!(client, "memory://secret", meta: %{"opaque" => meta_secret})
 
     assert count(counters, "resources/read") == 1
 
@@ -269,12 +269,15 @@ defmodule FastestMCP.ClientResponseCacheTest do
   } do
     Agent.update(counters, &Map.put(&1, :tools_ttl_ms, 0))
 
+    # Calls of a listed tool reuse a stale list; listing asks again.
     assert %{content: [%{"type" => "text", "text" => "ok"}]} =
              Client.call_tool!(client, "progress_echo", %{})
 
     assert %{content: [%{"type" => "text", "text" => "ok"}]} =
              Client.call_tool!(client, "progress_echo", %{})
 
+    assert count(counters, "tools/list") == 1
+    assert {:ok, [_ | _]} = Client.list_all_tools(client)
     assert count(counters, "tools/list") == 2
 
     Agent.update(counters, &Map.put(&1, :tools_ttl_ms, 60_000))
@@ -283,18 +286,16 @@ defmodule FastestMCP.ClientResponseCacheTest do
     assert %{content: [%{"type" => "text", "text" => "ok"}]} =
              Client.call_tool!(client, "progress_echo", %{})
 
-    assert %{content: [%{"type" => "text", "text" => "ok"}]} =
-             Client.call_tool!(client, "progress_echo", %{})
-
+    assert {:ok, [_ | _]} = Client.list_all_tools(client)
     assert count(counters, "tools/list") == 3
   end
 
-  test "resource reads cache the normalized value and all-page helpers preserve empty cursors", %{
+  test "resource reads are cached and all-page helpers preserve empty cursors", %{
     client: client,
     counters: counters
   } do
-    assert %{"request" => 1} = Client.read_resource!(client, "memory://cached")
-    assert %{"request" => 1} = Client.read_resource!(client, "memory://cached")
+    assert %{"request" => 1} = read_json!(client, "memory://cached")
+    assert %{"request" => 1} = read_json!(client, "memory://cached")
     assert count(counters, "resources/read") == 1
 
     assert [
@@ -345,4 +346,10 @@ defmodule FastestMCP.ClientResponseCacheTest do
   end
 
   defp count(counters, method), do: Agent.get(counters, &Map.get(&1, method, 0))
+
+  # The JSON value of a resource's one text content.
+  defp read_json!(client, uri, opts \\ []) do
+    assert %{"contents" => [%{"text" => text}]} = Client.read_resource!(client, uri, opts)
+    JSON.decode!(text)
+  end
 end

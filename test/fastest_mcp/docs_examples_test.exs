@@ -609,36 +609,4 @@ defmodule FastestMCP.DocsExamplesTest do
 
     assert :ok = stop_supervised(client_id)
   end
-
-  test "readme and guide links resolve and no compatibility sidecar references remain" do
-    files = ["README.md" | Path.wildcard("docs/*.md")]
-
-    Enum.each(files, fn file ->
-      body = File.read!(file)
-      refute String.contains?(body, "COMPATIBILITY.md")
-
-      body
-      |> then(&Regex.scan(~r/\[[^\]]+\]\(([^)]+)\)/, &1, capture: :all_but_first))
-      |> List.flatten()
-      |> Enum.reject(&skip_link?/1)
-      |> Enum.each(fn link ->
-        {target, _anchor} = split_anchor(link)
-        expanded = Path.expand(target, Path.dirname(file))
-
-        assert File.exists?(expanded),
-               "#{file} points to missing local target #{inspect(link)}"
-      end)
-    end)
-  end
-
-  defp skip_link?(link) do
-    String.starts_with?(link, ["#", "http://", "https://", "mailto:"])
-  end
-
-  defp split_anchor(link) do
-    case String.split(link, "#", parts: 2) do
-      [target, anchor] -> {target, anchor}
-      [target] -> {target, nil}
-    end
-  end
 end

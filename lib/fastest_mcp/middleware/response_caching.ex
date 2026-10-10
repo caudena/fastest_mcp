@@ -1,8 +1,10 @@
 defmodule FastestMCP.Middleware.ResponseCaching do
   @moduledoc false
   # Deliberately conservative: only successful results are cached; keys include
-  # method, target, arguments, transport, auth context, and an explicit session
-  # identity; oversized items are skipped, never truncated or stored partially.
+  # method, target, arguments, transport, invocation, auth context, the session,
+  # and the generation of the server's lists of that kind, which every change
+  # of them moves on; oversized items are skipped, never truncated or stored
+  # partially.
 
   require Logger
 
@@ -12,7 +14,9 @@ defmodule FastestMCP.Middleware.ResponseCaching do
   alias FastestMCP.Middleware
   @behaviour FastestMCP.Middleware
 
+  alias FastestMCP.Notifications
   alias FastestMCP.Operation
+  alias FastestMCP.ServerRuntime
 
   @list_ttl_ms 5 * 60_000
   @read_ttl_ms 60 * 60_000
@@ -27,6 +31,15 @@ defmodule FastestMCP.Middleware.ResponseCaching do
     {"tools/call", :call_tool, @read_ttl_ms}
   ]
   @fields Map.new(@collections, fn {method, field, _ttl_ms} -> {method, field} end)
+  # The kind of component whose list changes drop a method's entries.
+  @families %{
+    "tools/list" => :tools,
+    "tools/call" => :tools,
+    "resources/list" => :resources,
+    "resources/read" => :resources,
+    "prompts/list" => :prompts,
+    "prompts/get" => :prompts
+  }
 
   # The counters of a stats table row `{method, hits, misses, ...}`.
   @stats [:hits, :misses, :puts, :expired, :skipped_too_large, :evictions]
@@ -154,7 +167,7 @@ defmodule FastestMCP.Middleware.ResponseCaching do
     end
   end
 
-  def cache_key(%Operation{} = operation) do
+  defp cache_key(%Operation{} = operation) do
     %{
       server_name: operation.server_name,
       method: operation.method,
@@ -163,9 +176,11 @@ defmodule FastestMCP.Middleware.ResponseCaching do
       version: operation.version,
       audience: operation.audience,
       transport: operation.transport,
+      invocation: operation.invocation,
       task_request: operation.task_request,
-      explicit_session: explicit_session_scope(operation.context),
-      auth: auth_scope(operation.context)
+      session: context_value(operation.context, :session_id),
+      auth: auth_scope(operation.context),
+      generation: generation(operation)
     }
     |> :erlang.term_to_binary([:deterministic])
     |> then(&:crypto.hash(:sha256, &1))
@@ -308,14 +323,17 @@ defmodule FastestMCP.Middleware.ResponseCaching do
 
   defp now_ms, do: System.monotonic_time(:millisecond)
 
-  defp explicit_session_scope(nil), do: :implicit
+  # How often the server's lists of the method's kind changed: a change moves
+  # on to new keys, so what the cache kept before is never answered again. The
+  # server is the one the client called, which a mounted server's operations
+  # share.
+  defp generation(%Operation{method: method} = operation) do
+    server_name = context_value(operation.context, :server_name) || operation.server_name
 
-  defp explicit_session_scope(context) do
-    request_metadata = context_value(context, :request_metadata, %{})
-
-    if Map.get(request_metadata, :session_id_provided, false),
-      do: {:explicit, context_value(context, :session_id)},
-      else: :implicit
+    case ServerRuntime.fetch(server_name) do
+      {:ok, runtime} -> Notifications.generation(runtime, Map.fetch!(@families, method))
+      {:error, :not_found} -> 0
+    end
   end
 
   defp auth_scope(nil), do: :anonymous
@@ -340,7 +358,9 @@ defmodule FastestMCP.Middleware.ResponseCaching do
     end
   end
 
-  defp context_value(context, key, default \\ nil), do: Map.get(context, key, default)
+  defp context_value(context, key, default \\ nil)
+  defp context_value(nil, _key, default), do: default
+  defp context_value(context, key, default), do: Map.get(context, key, default)
 
   defmodule State do
     @moduledoc false

@@ -59,6 +59,11 @@ defmodule FastestMCP.Schema do
     "if" => "value does not satisfy the conditional schema"
   }
 
+  # JSV reports a failure under `properties`, `items`, and the like twice: at
+  # the value, and as a summary at its parent. Summaries are left out when a
+  # violation at or under their path says more.
+  @summary_keywords ~w(properties patternProperties additionalProperties items prefixItems additionalItems items_as_prefix)
+
   @type raw :: boolean() | map()
 
   @doc """
@@ -277,9 +282,59 @@ defmodule FastestMCP.Schema do
 
     {:ok, JSV.build!(schema, build_opts)}
   rescue
-    _error ->
-      {:error, %Error{phase: :compile, digest: digest, message: "could not compile JSON Schema"}}
+    error -> {:error, build_error(error, digest)}
   end
+
+  # JSV names the reference it could not resolve in the failed action.
+  defp build_error(
+         %JSV.BuildError{action: {JSV.Resolver, _fun, [_resolver, target]}} = error,
+         digest
+       ) do
+    case reference(target) do
+      nil ->
+        build_error(nil, digest)
+
+      {keyword, ref} ->
+        ref = inspect(bounded_binary(ref, 250))
+
+        %Error{
+          phase: :compile,
+          digest: digest,
+          message: "could not resolve JSON Schema reference #{ref}",
+          violations: [
+            %{
+              instance_path: "#",
+              schema_path: bounded_binary(error.build_path || "#", 300),
+              keyword: keyword,
+              message: "reference #{ref} could not be resolved"
+            }
+          ]
+        }
+    end
+  end
+
+  defp build_error(_error, digest),
+    do: %Error{phase: :compile, digest: digest, message: "could not compile JSON Schema"}
+
+  defp reference(%JSV.Ref{ns: ns, kind: kind, arg: arg, dynamic?: dynamic?}) do
+    keyword = if dynamic?, do: "$dynamicRef", else: "$ref"
+
+    case kind do
+      :top -> {keyword, reference_base(ns)}
+      :pointer -> {keyword, reference_base(ns) <> pointer(arg)}
+      :anchor -> {keyword, reference_base(ns) <> "#" <> to_string(arg)}
+      _other -> nil
+    end
+  end
+
+  defp reference({:pointer, ns, path}), do: {"$ref", reference_base(ns) <> pointer(path)}
+  defp reference({:anchor, ns, anchor}), do: {"$ref", reference_base(ns) <> "#" <> anchor}
+  defp reference(_target), do: nil
+
+  defp reference_base(ns) when is_binary(ns), do: ns
+  defp reference_base(_root), do: ""
+
+  defp pointer(segments), do: "#/" <> Enum.map_join(segments, "/", &pointer_segment/1)
 
   defp resolvers(opts, remote_limits) do
     []
@@ -313,10 +368,16 @@ defmodule FastestMCP.Schema do
     do: resolvers ++ [{HTTPResolver, Keyword.put(remote_limits, :invalid_options, opts)}]
 
   defp normalize_violations(validation_error, limit) do
-    validation_error
-    |> JSV.normalize_error(keys: :strings, sort: :asc)
-    |> Map.get("details", [])
-    |> Enum.flat_map(&violation_entries/1)
+    entries =
+      validation_error
+      |> JSV.normalize_error(keys: :strings, sort: :asc)
+      |> Map.get("details", [])
+      |> Enum.flat_map(&violation_entries/1)
+      |> Enum.uniq()
+
+    entries
+    |> Enum.reject(fn {summary?, violation} -> summary? and covered?(violation, entries) end)
+    |> Enum.map(&elem(&1, 1))
     |> Enum.uniq()
     |> Enum.sort_by(fn violation ->
       {-path_depth(violation.instance_path), violation.instance_path, violation.keyword}
@@ -324,6 +385,15 @@ defmodule FastestMCP.Schema do
     |> Enum.take(limit)
   end
 
+  defp covered?(summary, entries) do
+    Enum.any?(entries, fn {summary?, violation} ->
+      not summary? and
+        (violation.instance_path == summary.instance_path or
+           String.starts_with?(violation.instance_path, summary.instance_path <> "/"))
+    end)
+  end
+
+  # `{summary?, violation}` entries of one JSV output unit.
   defp violation_entries(unit) do
     errors = Map.get(unit, "errors", [])
 
@@ -331,24 +401,38 @@ defmodule FastestMCP.Schema do
       case Map.get(error, "details") do
         details when is_list(details) and details != [] ->
           case Enum.flat_map(details, &violation_entries/1) do
-            [] -> [violation(unit, error)]
+            [] -> violations(unit, error)
             nested -> nested
           end
 
         _other ->
-          [violation(unit, error)]
+          violations(unit, error)
       end
     end)
   end
 
-  defp violation(unit, error) do
+  # A missing property is reported at its own path; its name comes from the
+  # schema, not from the caller.
+  defp violations(unit, %{"kind" => kind, "ctx" => %{"missing" => [_ | _] = missing}} = error)
+       when kind in ["required", "dependentRequired"] do
+    for name <- missing, do: {false, violation(unit, error, "/" <> pointer_segment(name))}
+  end
+
+  defp violations(unit, %{"kind" => kind} = error),
+    do: [{kind in @summary_keywords, violation(unit, error)}]
+
+  defp violations(unit, error), do: [{false, violation(unit, error)}]
+
+  defp violation(unit, error, suffix \\ "") do
     schema_path = Map.get(unit, "schemaLocation", "#")
     {keyword, message} = normalize_keyword_error(error, schema_path)
 
     instance_path =
       unit
       |> Map.get("instanceLocation", "#")
-      |> sanitize_instance_path(keyword)
+      |> to_string()
+      |> sanitize_instance_path(error, keyword)
+      |> Kernel.<>(suffix)
 
     %{
       instance_path: bounded_binary(instance_path, 300),
@@ -358,18 +442,21 @@ defmodule FastestMCP.Schema do
     }
   end
 
-  # The final path segment for these failures comes from an unrecognized input
-  # property rather than from the schema. Omitting it keeps violations useful
-  # without reflecting attacker-controlled or sensitive field names.
-  defp sanitize_instance_path(path, keyword)
+  defp pointer_segment(name),
+    do: name |> to_string() |> String.replace("~", "~0") |> String.replace("/", "~1")
+
+  # `additionalProperties: false` and `unevaluatedProperties: false` report
+  # the rejected property's path. Its last segment came from the caller, so
+  # the path stops at the enclosing object.
+  defp sanitize_instance_path(path, %{"kind" => "boolean_schema"}, keyword)
        when keyword in ["additionalProperties", "unevaluatedProperties"] do
-    case String.split(to_string(path), "/") do
+    case String.split(path, "/") do
       ["#"] -> "#"
       segments -> segments |> Enum.drop(-1) |> Enum.join("/") |> non_empty_path()
     end
   end
 
-  defp sanitize_instance_path(path, _keyword), do: to_string(path)
+  defp sanitize_instance_path(path, _error, _keyword), do: path
 
   defp non_empty_path(""), do: "#"
   defp non_empty_path(path), do: path

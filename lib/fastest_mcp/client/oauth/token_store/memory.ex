@@ -7,23 +7,34 @@ defmodule FastestMCP.Client.OAuth.TokenStore.Memory do
   `FastestMCP.Client.OAuth.TokenStore` implementation.
   """
 
-  use Agent
+  use GenServer
 
   @behaviour FastestMCP.Client.OAuth.TokenStore
 
   @doc false
-  def start_link(_opts \\ []), do: Agent.start_link(fn -> %{} end)
+  def start_link(_opts \\ []), do: GenServer.start_link(__MODULE__, %{})
 
-  @impl true
-  def get(pid, key), do: Agent.get(pid, &Map.get(&1, key))
+  @impl FastestMCP.Client.OAuth.TokenStore
+  def get(pid, key), do: GenServer.call(pid, {:get, key})
 
-  @impl true
-  def put(pid, key, token_set) do
-    Agent.update(pid, &Map.put(&1, key, token_set))
-  end
+  @impl FastestMCP.Client.OAuth.TokenStore
+  def put(pid, key, token_set), do: GenServer.call(pid, {:put, key, token_set})
 
-  @impl true
-  def delete(pid, key) do
-    Agent.update(pid, &Map.delete(&1, key))
-  end
+  @impl FastestMCP.Client.OAuth.TokenStore
+  def delete(pid, key), do: GenServer.call(pid, {:delete, key})
+
+  @impl GenServer
+  def init(tokens), do: {:ok, tokens}
+
+  @impl GenServer
+  def handle_call({:get, key}, _from, tokens), do: {:reply, Map.get(tokens, key), tokens}
+
+  def handle_call({:put, key, token_set}, _from, tokens),
+    do: {:reply, :ok, Map.put(tokens, key, token_set)}
+
+  def handle_call({:delete, key}, _from, tokens), do: {:reply, :ok, Map.delete(tokens, key)}
+
+  # Crash reports leave out the tokens.
+  @impl GenServer
+  defdelegate format_status(status), to: FastestMCP.Client.Redaction
 end

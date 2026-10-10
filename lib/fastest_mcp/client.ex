@@ -102,7 +102,10 @@ defmodule FastestMCP.Client do
   @doc "Raising variant of `set_roots/2`."
   def set_roots!(client, roots), do: Error.unwrap!(set_roots(client, roots))
 
-  @doc "Requests that the server emit logs at `level` or higher."
+  @doc """
+  Asks the server for log messages at `level` or higher: on 2026-07-28 with
+  each later request, on 2025-11-25 with `logging/setLevel`.
+  """
   defdelegate set_log_level(client, level, opts \\ []), to: Requests
 
   @doc "Raising variant of `set_log_level/3`."
@@ -200,7 +203,7 @@ defmodule FastestMCP.Client do
   def list_all_resource_templates!(client, opts \\ []),
     do: Error.unwrap!(list_all_resource_templates(client, opts))
 
-  @doc "Reads a resource by URI."
+  @doc "Reads a resource by URI and returns the result, a map with its `\"contents\"`."
   defdelegate read_resource(client, uri, opts \\ []), to: Requests
 
   @doc "Raising variant of `read_resource/3`."

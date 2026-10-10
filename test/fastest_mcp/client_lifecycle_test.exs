@@ -3,6 +3,7 @@ defmodule FastestMCP.ClientLifecycleTest do
 
   alias FastestMCP.Test.ClientProbe
 
+  import ExUnit.CaptureLog
   import Plug.Conn
 
   alias FastestMCP.Client
@@ -429,6 +430,154 @@ defmodule FastestMCP.ClientLifecycleTest do
     end
   end
 
+  test "crash reports of client processes leave out credentials" do
+    server_name = unique_name("crash-redaction")
+    start_server!(FastestMCP.server(server_name))
+    unreachable = "http://127.0.0.1:1/mcp"
+
+    log =
+      capture_log(fn ->
+        http =
+          Client.connect!(unreachable,
+            auto_initialize: false,
+            access_token: "token-in-state",
+            headers: [{"x-api-key", "header-in-state"}]
+          )
+
+        crash!(http.pid)
+
+        oauth =
+          Client.connect!(unreachable,
+            auto_initialize: false,
+            oauth: [
+              grant:
+                {:client_credentials,
+                 client_id: "worker",
+                 client_secret: "secret-in-oauth",
+                 token_endpoint_auth_method: "client_secret_basic"}
+            ]
+          )
+
+        Process.unlink(oauth.pid)
+        client_ref = Process.monitor(oauth.pid)
+        crash!(ClientProbe.oauth_pid(oauth))
+        assert_receive {:DOWN, ^client_ref, :process, _pid, :crash_for_test}
+
+        in_process =
+          Client.connect!({:in_process, server_name},
+            auth_input: %{"api_key" => "auth-input-in-state"}
+          )
+
+        crash!(in_process.pid)
+
+        {:ok, store} = OAuth.TokenStore.Memory.start_link()
+
+        :ok =
+          OAuth.TokenStore.Memory.put(store, {"issuer", "client", "resource"}, %{
+            "access_token" => "token-in-store",
+            "refresh_token" => "refresh-in-store"
+          })
+
+        crash!(store)
+
+        group =
+          FastestMCP.ClientGroup.connect!(
+            clients: %{
+              "notes" => [
+                target: {:in_process, server_name},
+                auth_input: %{"api_key" => "member-secret"}
+              ]
+            }
+          )
+
+        crash!(group.coordinator)
+        FastestMCP.ClientGroup.disconnect(group)
+      end)
+
+    assert log =~ "terminating"
+
+    for secret <-
+          ~w(token-in-state header-in-state secret-in-oauth auth-input-in-state token-in-store refresh-in-store member-secret) do
+      refute log =~ secret
+    end
+  end
+
+  test "an operation's timeout_ms defaults to the connection's" do
+    server_name = unique_name("connection-timeout")
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("slow", fn _args, _ctx ->
+      Process.sleep(300)
+      "done"
+    end)
+    |> start_server!()
+
+    client = connect!({:in_process, server_name}, timeout_ms: 100)
+
+    assert {:error, %Error{code: :timeout}} = Client.call_tool(client, "slow")
+
+    assert {:error, %Error{code: :timeout}} =
+             Client.request(client, "tools/call", %{"name" => "slow", "arguments" => %{}})
+
+    assert {:ok, %{content: [%{"text" => "done"}]}} =
+             Client.call_tool(client, "slow", %{}, timeout_ms: 2_000)
+  end
+
+  test "credential options a transport cannot use raise ArgumentError" do
+    server_name = unique_name("credential-options")
+    start_server!(FastestMCP.server(server_name) |> FastestMCP.add_tool("echo", fn a, _ -> a end))
+    sh = System.find_executable("sh")
+
+    for option <- [access_token: "t", authorization: "Bearer t", headers: [{"x", "y"}]] do
+      assert_raise ArgumentError, ~r/stdio client transport does not accept/, fn ->
+        Client.connect({:stdio, sh, ["-c", "cat"]}, [{:auto_initialize, false}, option])
+      end
+    end
+
+    assert_raise ArgumentError,
+                 ~r/streamable HTTP client transport does not accept \[:env\]/,
+                 fn ->
+                   Client.connect("http://127.0.0.1:1/mcp",
+                     auto_initialize: false,
+                     env: %{"A" => "1"}
+                   )
+                 end
+
+    stdio =
+      connect!({:stdio, sh, ["-c", "cat >/dev/null"]},
+        auto_initialize: false,
+        access_token: "t",
+        legacy_stdio_auth_metadata: true
+      )
+
+    assert :ok = Client.set_auth(stdio, access_token: "t2")
+
+    client = connect!({:in_process, server_name}, auth_input: %{"token" => "a"})
+
+    assert_raise ArgumentError,
+                 ~r/in-process client transport does not accept \[:access_token\]/,
+                 fn ->
+                   Client.set_auth(client, access_token: "b")
+                 end
+
+    assert_raise ArgumentError, ~r/does not accept \[:authorization\]/, fn ->
+      Client.call_tool(client, "echo", %{}, authorization: "Bearer b")
+    end
+
+    assert :ok = Client.set_auth(client, auth_input: %{"token" => "b"})
+  end
+
+  test "a term that is not a client raises ArgumentError" do
+    for term <- [123, "client", %{pid: self()}, [1]] do
+      assert_raise ArgumentError, ~r/expected a FastestMCP.Client, a pid, or a name/, fn ->
+        Client.call_tool(term, "echo")
+      end
+    end
+
+    assert_raise ArgumentError, ~r/expected a FastestMCP.Client/, fn -> Client.ready?(123) end
+    assert_raise ArgumentError, ~r/expected a FastestMCP.Client/, fn -> Client.disconnect("x") end
+  end
+
   test "connect returns an init error without killing a caller that does not trap exits" do
     # The named server is absent, so opening the transport fails inside init/1.
     assert {:exited, :normal, {:error, %Error{code: :bad_request}}} =
@@ -447,6 +596,14 @@ defmodule FastestMCP.ClientLifecycleTest do
                  requester: fn _method, _url, _opts -> {:error, :unused} end
                )
              end)
+  end
+
+  # Stops a process the way a crash does, so that it logs a crash report.
+  defp crash!(pid) do
+    Process.unlink(pid)
+    ref = Process.monitor(pid)
+    :sys.terminate(pid, :crash_for_test)
+    assert_receive {:DOWN, ^ref, :process, ^pid, :crash_for_test}
   end
 
   defp start_client(mode) do

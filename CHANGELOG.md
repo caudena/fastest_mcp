@@ -1,102 +1,394 @@
 # Changelog
 
-## Unreleased
+## 1.0.0 - 2026-10-10
 
-### 0.4.0 breaking Elixir API changes
+This is a breaking Elixir API release. Applications upgrading from 0.3.x should
+follow [Migrating to 1.0](docs/migrating-to-1.0.md), which describes each
+change and the code to update.
 
-See [Migrating to 0.4](docs/migrating-to-0.4.md) for each change.
+### Breaking changes
 
-- results: client and local operations return tagged results with raising bang
+#### Results and handlers
+
+- return tagged results from client and local operations, with raising bang
   variants; commands return `:ok` or `{:error, error}`
-- handler results: explicit tool, prompt, and resource result structs select
-  MCP envelopes and plain maps are application data; local tool content is
-  normalized like the wire, and `FastestMCP.ResultNormalizer` is removed
-- servers and components: component options are validated per kind,
-  `FastestMCP.complete/4` reads string keys, `FastestMCP.Context.new/2`
-  replaces `build/2`, `FastestMCP.Resources.HTTP` reads are bounded, and
-  `approve/3` and `new_many/1` are gone from `FastestMCP.Interact` and
+- treat plain handler maps as application data: `FastestMCP.Tools.Result`,
+  `FastestMCP.Prompts.Result`, and `FastestMCP.Resources.Result` select MCP
+  envelopes, and `FastestMCP.ResultNormalizer` is removed
+- return local tool content as string-keyed MCP content blocks, normalized as
+  on the wire
+- fail invalid arguments, and a missing required prompt argument, with
+  `:invalid_params` instead of `:bad_request`
+- fail a call whose result has no JSON form, such as a stream or a PID, with
+  `:internal_error`
+
+#### Components
+
+- validate component options per kind, raising `ArgumentError` for unknown
+  ones
+- check tool names, namespaces, tool renames, and resource annotations when
+  they are defined
+- drop the `application/json` default of `mime_type:`: a resource without it
+  lists no type, and a read names the type of its value
+- read the references and arguments of `FastestMCP.complete/4` with string keys
+- remove `approve/3` from `FastestMCP.Interact` and `new_many/1` from
   `FastestMCP.Auth`
-- middleware: `call/3` returns `{:ok, operation}` or `{:error, error}`,
-  stateful middleware keeps per-server state through `child_spec/1` and
-  `attach/2`, one rate-limiting and one timing implementation remain, and the
-  inspection functions are `FastestMCP.Middleware.cache_statistics/1`,
+- bound `FastestMCP.Resources.HTTP` reads with `timeout_ms:` and
+  `max_body_bytes:`, and reject its unknown options
+- leave server paths out of `FastestMCP.Resources.Directory` listings and the
+  file and directory helpers' errors
+
+#### Runtime and transports
+
+- raise `ArgumentError` from `FastestMCP.start_server/2` for unknown and
+  invalid runtime options
+- reject unknown keys in `FastestMCP.server/2`, the HTTP options, and the
+  options of `FastestMCP.Transport.WellKnownHTTP`, which takes no `path:`
+- validate a server module's `runtime:`, `http:`, and `well_known_http:` when
+  its child spec is built
+- return a `{FastestMCP.Transport.HTTPApp, opts}` plug from
+  `FastestMCP.http_app/2`, which Bandit can serve
+- remove `max_global_event_subscribers:`
+- validate `stream_request_timeout_ms:` when Streamable HTTP starts
+- end `FastestMCP.Transport.Stdio.serve/4` with `{:server_down, reason}` when
+  the runtime of the server it started exits
+
+#### Request contexts
+
+- replace `Context.build/2` with `FastestMCP.Context.new/2`, which takes a
+  runtime snapshot, returns the context, and starts no session
+- start no session for a request that names none (every `2026-07-28` request,
+  and in-process calls without `session_id:`): its `ctx.session_id` is `nil`
+  and its state lasts for the request, so such requests no longer fill
+  `max_sessions:` with throwaway sessions
+- without a session, return `{:error, :no_session}` from
+  `FastestMCP.Context.send_notification/3`, `:filtered` from `Context.log/4`,
+  and `{:error, :missing_progress_token}` from `Context.report_progress/4`,
+  and raise from the per-session visibility functions and
+  `Context.list_peer_tasks/2`
+
+#### Authentication
+
+- never fall back to the name a client reported for itself in
+  `FastestMCP.Context.client_id/1`
+- set `ctx.authenticated` to `false` over HTTP when the server has no
+  authenticator
+- fail an authenticator that raises, throws, or exits with an internal error
+  whose `cause` holds the exception; clients see only its kind, or
+  `authentication failed` with `mask_error_details: true`
+- name no internal module in authentication errors: they carry no `provider`
+  detail, and a function authenticator's failure is `authenticator failed`
+- fail `FastestMCP.Auth.from_assign/2` with `missing or invalid credentials`,
+  which names no assign
+- in process and over stdio, authenticate the handshake (`initialize` or
+  `server/discover`) with the credentials it carries only, so a client without
+  them connects on `2026-07-28`
+- over stdio, prefer the connection's `auth_input:` to the keys a client sends
+  in `_meta.fastestmcp.auth`
+
+#### Asking the client
+
+- raise an `:internal_error` that says what works from the helpers that ask
+  the client when no client can be reached
+- raise `:method_not_found` from `ping_peer/2` and URL elicitation on
+  `2026-07-28`, and `:bad_request` for `task: true` outside a `2025-11-25`
+  session
+- return `:ok` from `FastestMCP.complete_elicitation/3`
+
+#### Connected client
+
+- return `{:ok, %FastestMCP.Client.ToolResult{}}` from `call_tool/4`, never
+  decoded text or structured content alone, and remove `call_tool_result/4`
+- raise `ArgumentError` for a `task:` option of `call_tool/4`; task handles
+  come from `call_tool_task/4`
+- validate client options in the caller, raising `ArgumentError` for invalid
+  options and for options or credentials the transport can't use, in
+  `set_auth/2` and per call too
+- replace the getters with `FastestMCP.Client.info/1`, and the setters with
+  `set_handler/3` and `set_auth/2`, which replaces every credential
+- move request, task, and callback operations to their handle modules; task
+  functions take a handle, which `track_task/3` makes from an id
+- run handlers outside the client process, one at a time in arrival order
+- default an operation's `timeout_ms:` to the connection's
+- return the whole result from `read_resource/3`
+- send nothing more to the owner of a request once it cancels the request or
+  its `await/2` times out
+- fail `call_tool_task/4` on `2026-07-28` before calling unless both sides
+  declare the Tasks extension
+- on `2026-07-28`, ask for log messages in each request's `_meta`: `info` and
+  above with a `log_handler:`, or the level of `set_log_level/3`, which works
+  there
+- show handlers the transport `:in_process` for a client connected in process
+- with `protocol_version: :auto`, return an authentication error from
+  `server/discover`, and over stdio a timeout or the program's exit, instead of
+  falling back to `2025-11-25`
+- take the code of an HTTP error without a JSON-RPC body from its status, such
+  as `:forbidden` for `403` and `:timeout` for `504`
+- raise `ArgumentError` for a term that is not a client
+
+#### Map keys
+
+- take atom keys in options and metadata and string keys in wire-shaped maps,
+  and remove `version/2` from `FastestMCP.Protocol`
+
+#### Middleware
+
+- return `{:ok, operation}` or `{:error, error}` from middleware and `next`
+- keep the state of stateful middleware per server through `child_spec/1` and
+  `attach/2`
+- remove `FastestMCP.Middleware.SlidingWindowRateLimiting` and
+  `FastestMCP.Middleware.DetailedTiming`: one rate-limiting and one timing
+  implementation remain
+- move the inspection functions to `FastestMCP.Middleware.cache_statistics/1`,
   `error_counts/1`, and `ping_sessions/1`
-- providers and transforms: `use FastestMCP.Provider` and
-  `use FastestMCP.ProviderTransform` behaviours with overridable defaults;
-  provider dispatch functions are internal, `FastestMCP.mount/3` rejects
-  unknown options, `FastestMCP.Providers.Skills.vendor/2` replaces the vendor
-  modules, and `FastestMCP.Providers.SkillsDirectory.new/1` replaces
-  `Providers.Skills.new/1`
-- connected client: options are validated in the caller;
-  `FastestMCP.Client.info/1`, `set_handler/3`, and `set_auth/2` replace the
-  getters and setters; request, task, and callback operations live on their
-  handle modules; `call_tool_result/4` is removed; and handlers run outside the
-  client process
-- client groups: owned-member options are validated before start, `:infinity`
-  timeouts work, and `disconnect/1` is idempotent
-- OAuth: discovery, token requests, and host callbacks run in a task per
-  resource; waits are bounded, `clear/2` cancels a running flow, failures are
-  error reasons instead of exits, and `oauth:` options are validated in the
-  caller
-- background tasks: `FastestMCP.TaskBackend` is a state-passing behaviour;
-  local task functions return task structs and list newest first with offset
-  cursors; `task_meta:` and the `FastestMCP.BackgroundTask` wrapper functions
-  are removed; notification payloads use string keys
-- runtime and transports: `max_global_event_subscribers:` is removed,
-  Streamable HTTP validates `stream_request_timeout_ms:` when it starts, a
-  server that stdio starts belongs to its connection, and
-  `FastestMCP.http_app/2` returns a `{FastestMCP.Transport.HTTPApp, opts}`
-  plug that Bandit can serve
-- map keys: options and metadata take atom keys and wire-shaped maps string
-  keys; `version/2` is removed from `FastestMCP.Protocol`
-- wire: crashes and non-`Error` exceptions are answered with JSON-RPC internal
-  errors, related-task `_meta` drops its always-null `"elicitation"` key, a task
-  waiting for input reports `input_required` progress, client callback-task
-  listing uses offset cursors, tool-search results match `tools/list`
-  descriptors, and proxied resource contents keep their own `mimeType`
+- log, count, and report a handler's crash in `error_handling/1` by the
+  exception the handler raised
+- send MCP `ping` requests from `FastestMCP.Middleware.ping/1`, and emit its
+  `[:fastest_mcp, :session, :ping]` event after each ping, with its `result`
+- return the descriptors of the MCP lists from the `list_prompts` and
+  `list_resources` tools, with the templates under `"resourceTemplates"`
+- take atom keys in the collection settings of `response_caching/1`
 
-### Improvements and fixes
+#### Providers, mounts, and transforms
 
-- schemas: `validation_timeout_ms:` bounds validation as documented (it was
-  ignored)
+- make `FastestMCP.Provider` and `FastestMCP.ProviderTransform` behaviours
+  with `use` defaults, and make the provider dispatch functions internal
+- replace the skills vendor modules with `FastestMCP.Providers.Skills.vendor/2`,
+  and `Providers.Skills.new/1` with `FastestMCP.Providers.SkillsDirectory.new/1`
+- reject unknown options in `FastestMCP.mount/3` and `FastestMCP.from_openapi/2`
+- give a mounted server's handlers the context of the server the client
+  called, so `ctx.server_name` names that server and its session works there
+- take no `:namespace` in the mounted-server provider; `mount/3` wraps it in a
+  namespace transform
+- pass an OpenAPI body with dynamic keys, schema-local definitions, or
+  constraints that cannot be flattened as one `body` argument (collision
+  aliases still apply), and check a supplied partial body against the
+  original schema before sending a request
 
-- documented API: the provider, provider-transform, component, progress, and
-  elicitation-result modules the guides use are public, and
-  `FastestMCP.Components.Tool.new/3` and its siblings build the components a
-  custom provider returns
+#### Background tasks
 
-- OpenAPI: preserve schema references and literal annotation data, validate
-  complete request bodies, keep raw media and parameter examples, and send
-  repeated multipart fields; bodies with dynamic keys, schema-local
-  definitions, or constraints that cannot be flattened use a whole `body`
-  argument (collision aliases still apply), and a supplied partial body must
-  satisfy the original schema before a request is sent
-- composition: add `FastestMCP.ClientGroup` for supervised, independently
-  negotiated clients with namespaced discovery and cancellable routing, and
-  opt-in provider-bundled extensions with root conflict resolution and
+- make `FastestMCP.TaskBackend` a state-passing behaviour
+- return `FastestMCP.TaskRecord` structs from the local task functions, which
+  page with offset cursors
+- run a tool that a handler calls in process inline, even when the client
+  negotiated tasks; `task: true` starts a background task
+- fail a task that waits for the answers of an `InputRequiredResult` with
+  `:timeout` after its `timeout_ms:` (60 seconds), and a `2025-11-25` protocol
+  task that returns one at once
+- on `2026-07-28`, fail a tool that requires a task on a server without the
+  Tasks extension
+- remove `task_meta:`, `FastestMCP.TaskMeta`, and the `FastestMCP.BackgroundTask`
+  wrapper functions
+- use string keys in task notification payloads
+
+#### OAuth
+
+- run discovery, token requests, and host callbacks in a task per resource;
+  `authorization_header/3` waits at most its timeout, and `clear/2` cancels a
+  running flow
+- return failures as error reasons instead of exiting the caller
+- report a state mismatch, a redirect without an authorization code, and
+  metadata without authorization servers with one reason each
+  (`:state_mismatch`, `:authorization_code_required`, and
+  `:authorization_servers_required`), and a missing `authorization_handler:`
+  with `:authorization_handler_required`
+- validate `oauth:` options with the other connection options
+
+#### Telemetry and tracing
+
+- emit the authentication events over HTTP, for rejected requests too, with
+  the `request_id` of the operation the request runs
+- add the `kind`, `reason`, and `stacktrace` of an authenticator that raised,
+  threw, or exited to `[:fastest_mcp, :auth, :exception]`
+- record an authenticator's exception on the span current where an HTTP
+  request arrived
+- emit `[:fastest_mcp, :task, :progress]` in background tasks only, and
+  `[:fastest_mcp, :operation, :progress]` for other progress
+- put the message the client receives, redacted, in the `data` of
+  `[:fastest_mcp, :log, :message]`
+- read `enduser.scope` from the verified scopes
+- name a crashed handler's exception in the `error.type` of its span
+
+#### Wire
+
+- answer a request whose stdio worker crashed, and a non-`Error` exception in
+  the transport engine over HTTP, with a JSON-RPC internal error
+- answer a component that is disabled, hidden from the caller, or filtered by
+  a server transform as an unknown one
+- carry a `ttlMs` of one minute in the `2026-07-28` results of the list methods
+- name a server module in `serverInfo` without the `Elixir.` prefix
+- default the `serverInfo` and `clientInfo` version to FastestMCP's own
+  instead of falling back to `0.2.0` when its application isn't loaded
+- drop the always-null `"elicitation"` key from the related-task `_meta` of
+  relayed requests
+- report `input_required` in the progress notifications of a task that waits
+  for input
+- page the client's callback-task `tasks/list` with opaque offset cursors
+- challenge a `401` for a request without credentials with `Bearer` and no
+  error
+- answer a request URL that isn't the protected resource with a `403` without
+  a challenge
+- answer a method other than `GET`, `POST`, and `DELETE` with `405` and
+  `Allow`, and another path with `404`, before authentication
+- answer a request for a server that isn't running with `503` and
+  `Retry-After` instead of `404`, on every route of the server's HTTP endpoint
+  (its metadata route included; extra `routes:` still answer) and at a
+  `FastestMCP.Transport.WellKnownHTTP` metadata route
+- answer a request body over `max_body_bytes:` with `413` and JSON-RPC code
+  `-32600` instead of `400` and `-32700`
+- answer an internal error before a request runs, such as an authenticator
+  that raised, with `500` instead of `400`, and an authenticator's `:timeout`
+  error with `504`
+- answer invalid extension parameters on `2026-07-28` with HTTP `200` instead
+  of `400`, like every error of an operation
+
+### New features
+
+- add `FastestMCP.ClientGroup` for supervised, independently negotiated
+  clients with namespaced discovery and cancellable routing
+- add opt-in provider-bundled extensions with root conflict resolution and
   exactly-once root lifecycles
-- tasks: nested task-enabled tool calls no longer receive background handles
-  implicitly, and transport task results resolve tools like calls do
-- connected client: forward a per-call `meta:` to `tasks/get` and
-  `tasks/update`, default a non-positive peer poll interval instead of raising,
-  return `true` from `FastestMCP.Client.CallbackContext.cancelled?/1` once the
-  client stopped, answer server requests without blocking, stop the request of
-  a subscription stream the server rejected, disconnect while an OAuth
-  authorization is pending, stop sending a token cleared with
-  `set_auth(client, [])`, and keep killing a stdio process group until it is
-  gone
-- stdio: serving returns only after its last responses are written, a request
-  whose worker crashed gets an error response, and a session never outlives
-  its connection
-- HTTP: keep the updated Plug connection after reading request bodies so
-  keep-alive framing survives split bodies, avoid duplicate default headers,
-  and replace line breaks in the default `WWW-Authenticate` error description
-- components: a duplicate `FastestMCP.ComponentManager` add raises in the
-  caller instead of restarting the runtime; skill YAML parses multiline and
-  nested values without scalar coercion; search terms are Unicode-normalized;
-  URI literal percent triplets match regardless of hex case
-- protocol: the MCP method tables are derived from the vendored schemas, and
-  protocol messages are validated without a process per message
+- on `2026-07-28`, let `FastestMCP.Context.elicit/4`, `sample/3`,
+  `list_roots/2`, and the `FastestMCP.Interact` and `FastestMCP.Sampling`
+  helpers ask the client from ordinary tool, prompt, and resource requests,
+  through multi-round-trip requests with a signed request state; the handler
+  runs again from the start for each answer
+- serve a server module as the plug of its endpoint
+  (`forward "/mcp", MyApp.MCPServer`), one `forward` per server, on Phoenix
+  1.7 too
+- add `serve_stdio/1` to server modules, which starts the module's application
+  and serves it over stdio from `mix run --no-start` or a release's `eval`;
+  its `auth_input:` gives an authenticator the input of every request
+- answer the CORS preflight requests of the origins listed in the new `cors:`
+  HTTP option
+- take `{module, function, args}` for `allowed_hosts:`, `base_url:`, and the
+  `cors:` origins, called on each request
+- add the `max_body_bytes:` HTTP option, the size limit of a request body
+  (8 MB by default)
+- add the `signing_secret:` runtime option, which signs list cursors and the
+  request state of multi-round-trip requests so that every node, and a
+  restarted server, accepts them; supervisor reports leave the secret out
+- add `FastestMCP.notify_list_changed/2`, with which a custom provider
+  announces changes
+- add `FastestMCP.Context.request_meta/1`, which returns the client's `_meta`
+- add `headers:` to `FastestMCP.from_openapi/2`, sent with every request, for
+  credentials such as an API key
+- add `FastestMCP.Components.Tool.new/3` and its siblings, which build the
+  components a custom provider returns
+- add `FastestMCP.Middleware.map_result/2` for middleware that transforms a
+  result
+
+### Fixes
+
+- keep the server running when a process that a lifespan links to exits
+  normally
+- keep the components and server-wide visibility rules changed at runtime
+  across the restart that follows a crash of the server's processes
+- raise a duplicate `FastestMCP.ComponentManager` add in the caller instead of
+  crashing the manager and restarting the runtime
+- resolve a mounted server's own dependencies before the parent's
+- offer tools, resources, and prompts in every server's capabilities, so
+  clients learn of the first one added at runtime
+- notify only the session whose visibility changed, never `2026-07-28`
+  subscriptions
+- drop what response caching kept of a kind when that kind changes, and keep
+  each session's entries apart, in process too
+- list a name and version that several sources define once, from the source a
+  call runs
+- honour the requested version in `prompts/get`, which
+  `FastestMCP.Client.render_prompt/4` sends for `version:`
+- compile the schemas that a server transform changes
+- bound validation with `validation_timeout_ms:` as documented
+- report a missing required property at its own path, drop parent summaries
+  and duplicates from violation lists, and name an unresolved `$ref`
+- encode a binary that a resource handler returns as a base64 blob once
+- return `{:error, :invalid_root_uri}` from `FastestMCP.Root.parse/2` for a URI
+  that is not valid UTF-8 instead of raising
+- let a `KeyError` raised inside a dependency resolver propagate instead of
+  reporting an unknown dependency
+- give the injected `get_prompt` and `read_resource` tools input schemas, so a
+  call without `name` or `uri` fails with `:invalid_params`
+- let a tool with an output schema return an error result without structured
+  content
+- keep the `mimeType` of each proxied resource content
+- describe tools in tool-search results as `tools/list` does
+- parse multiline and nested skill YAML without scalar coercion,
+  Unicode-normalize search terms, and match URI literal percent triplets
+  regardless of hex case
+- preserve OpenAPI schema references and literal annotation data, validate
+  complete request bodies, keep raw media and parameter examples, and send
+  repeated multipart fields
+- resolve tools for transport task results as calls do
+- keep the updated Plug connection after reading a request body, so
+  keep-alive framing survives split bodies
+- avoid duplicate default HTTP headers
+- replace line breaks in the default `WWW-Authenticate` error description
+- check the protected resource against the forwarded path, so OAuth under a
+  router prefix needs no `path:`
+- return from stdio serving only after the last responses are written
+- let escripts serve MCP, as the protocol schemas are compiled into the code
+  instead of read from `priv` at runtime
+- validate protocol messages without a process per message
+- in process and over stdio, run the authenticator of a list request once
+  instead of twice
+- in process and over stdio, authenticate the `2026-07-28` task methods, so a
+  server with an authenticator finds the tasks of its caller
+- leave an authenticator's options, such as the tokens of
+  `FastestMCP.Auth.StaticToken`, out of inspect output and supervisor reports
+- keep a crashed handler's exception and stack trace in `error.cause`, for
+  logs and spans but never for clients
+- make a server span a child of the span current where the HTTP request
+  arrived
+- from a `2025-11-25` task, send roots, ping, and URL elicitation requests
+  through `tasks/result` instead of the stream of the request that created
+  the task, which had often closed
+- name `update_task/4` in the error of `send_task_input/5` for a question it
+  can't answer
+- take `{name, function, options}` tools and functions in
+  `FastestMCP.Sampling.run!/3` without preparing them
+- send the time to live that `task: [ttl_ms: ms]` asks for from
+  `FastestMCP.Client.call_tool_task/4`
+- send maps with atom keys or atom values as JSON from the connected client,
+  instead of failing validation
+- pass an in-process client's `auth_input` to the authenticator as Elixir
+  terms, so `FastestMCP.Auth.from_assign/2` works with structs such as
+  `mix phx.gen.auth` scopes
+- reuse a tool list past its `ttlMs` for the tools it lists, instead of
+  listing before each call
+- fetch a fresh status in `FastestMCP.Client.Task.result/2` after
+  `FastestMCP.Client.Task.update/3` instead of answering the old questions
+  again
+- forward a call's `meta:` to the `tasks/get` and `tasks/update` requests of
+  task waits and results
+- default a non-positive peer poll interval instead of raising
+- return `true` from `FastestMCP.Client.CallbackContext.cancelled?/1` once the
+  client has stopped
+- answer server requests without blocking the client
+- stop the HTTP worker of a subscription stream that the client rejects
+- wait for an OAuth sign-in that outlasts `init_timeout_ms:` while connecting
+- let a client disconnect while an OAuth authorization is pending
+- let a failed `initialize/3` be retried
+- stop sending an access token after `set_auth(client, [])` clears it
+- report the exit status of a stdio server that exits while connecting
+- keep killing a stdio process group until it is gone
+- leave credentials out of the crash reports of the client's processes and of
+  the start arguments of its child specs
+
+### Documentation
+
+- reorganize the guides for newcomers, starting with a Phoenix tutorial
+  (Getting Started) and Core Concepts; merged guides keep redirects:
+  onboarding → getting-started, why-fastest-mcp and components → concepts,
+  lifespan and dependency-injection → lifespans-and-dependencies,
+  component-manager → dynamic-components, progress → context, logging and
+  telemetry → observability, runtime-state-and-storage → production,
+  phoenix-deployment → phoenix, and sampling-and-interaction →
+  sampling-and-elicitation
+- document the provider, provider-transform, component, progress, and
+  elicitation-result modules that the guides use
+
+### Verification
+
 - add HTTP/stdio interoperability tests for both client and server roles
 
 ## 0.3.2 - 2026-08-28

@@ -11,11 +11,11 @@ defmodule FastestMCP.Transport.StreamableHTTP do
   import Plug.Conn
   import FastestMCP.Protocol.Version
 
+  alias FastestMCP.Context
   alias FastestMCP.Error
   alias FastestMCP.MIME
   alias FastestMCP.Options
   alias FastestMCP.Registry
-  alias FastestMCP.ServerRuntime
   alias FastestMCP.Session
   alias FastestMCP.SessionSupervisor
   alias FastestMCP.Transport.Dispatch
@@ -27,14 +27,38 @@ defmodule FastestMCP.Transport.StreamableHTTP do
   alias FastestMCP.Transport.StreamableHTTPAdapter
   alias FastestMCP.TTLStore
 
-  @modern_http_errors [
-    :method_not_found,
+  # The options of the endpoint and of its listener child spec (`HTTPApp`);
+  # `validate_options!/1` rejects any other key.
+  @option_keys [
+    :server_name,
+    :path,
+    :allowed_hosts,
+    :cors,
+    :port,
+    :scheme,
+    :bandit_options,
+    :stream_request_timeout_ms,
+    :max_body_bytes,
+    :state_scope,
+    :json_response,
+    :enable_json_response,
+    :enable_get_streaming,
+    :auth_assigns,
+    :base_url,
+    :middleware,
+    :routes
+  ]
+
+  # The errors that MCP 2026-07-28 answers with 400 over HTTP.
+  @modern_400_errors [
     :header_mismatch,
-    :invalid_params,
-    :invalid_request,
     :missing_required_client_capability,
     :unsupported_protocol_version
   ]
+
+  # The errors of a 2026-07-28 request the engine rejects before it runs an
+  # operation, which get their HTTP status too.
+  @modern_http_errors [:method_not_found, :invalid_params, :invalid_request | @modern_400_errors]
 
   defmodule SSE do
     @moduledoc false
@@ -84,16 +108,27 @@ defmodule FastestMCP.Transport.StreamableHTTP do
     end
 
     Options.check!(timeout_ms(opts), :pos_integer, :stream_request_timeout_ms)
-    HTTPCommon.normalize_dns_rebinding_options!(opts)
+
+    with {:ok, bytes} <- Keyword.fetch(opts, :max_body_bytes),
+         do: Options.check!(bytes, :pos_integer, :max_body_bytes)
+
+    opts
+    |> HTTPCommon.normalize_options!()
+    |> HTTPCommon.validate_keys!(@option_keys)
   end
 
-  @doc "Plug callback: serves one MCP request (POST, GET stream, or DELETE)."
+  @doc """
+  Plug callback: serves one MCP request (POST, GET stream, or DELETE). Any
+  other method gets `405`, and another path `404`, before authentication.
+  """
   def call(conn, opts) do
     opts = validate_options!(opts)
-    conn = fetch_cookies(fetch_query_params(conn))
+    conn = conn |> fetch_query_params() |> fetch_cookies() |> HTTPCommon.put_cors_headers(opts)
 
     with :ok <- HTTPCommon.validate_dns_rebinding(conn, opts),
-         {:ok, runtime} <- ServerRuntime.fetch_running(Keyword.fetch!(opts, :server_name)) do
+         nil <- HTTPCommon.answer_cors_preflight(conn),
+         nil <- StreamableHTTPAdapter.unserved(conn, opts),
+         {:ok, runtime} <- HTTPCommon.fetch_running(Keyword.fetch!(opts, :server_name)) do
       context = %{
         runtime: runtime,
         auth: runtime.server.auth,
@@ -103,6 +138,12 @@ defmodule FastestMCP.Transport.StreamableHTTP do
       {response, conn} = route(conn, runtime, opts)
       render(response, conn, context)
     else
+      %Plug.Conn{} = preflight ->
+        preflight
+
+      {:respond, _status, _body, _headers} = unserved ->
+        render(unserved, conn, nil)
+
       {:error, %Error{} = error} ->
         context = %{
           runtime: nil,
@@ -117,9 +158,12 @@ defmodule FastestMCP.Transport.StreamableHTTP do
   # A route answers with a sent `Plug.Conn` (an event stream), `{:respond,
   # status, body, headers}` with a JSON or empty (nil) body, or `{:error,
   # kind, request, error}` for an application (engine) or transport error.
+  # One FastestMCP request id names the request in its authentication events
+  # and in the operation it runs.
   defp route(conn, runtime, opts) do
-    authentication = HTTPCommon.authenticate(conn, runtime, opts)
+    opts = Keyword.put(opts, :request_id, Context.new_request_id())
     {decoded, conn} = StreamableHTTPAdapter.decode_with_conn(conn, opts)
+    authentication = HTTPCommon.authenticate(conn, runtime, opts, decoded_request(decoded))
 
     response =
       case {decoded, authentication} do
@@ -185,15 +229,23 @@ defmodule FastestMCP.Transport.StreamableHTTP do
       else: error |> HTTPCommon.error_response(ctx.auth, ctx.http_context) |> put_elem(2, nil)
   end
 
-  # Legacy HTTP delivers application errors with status 200, except auth
-  # failures; a modern request's protocol failures map to HTTP statuses too.
-  defp error_response(kind, request, %Error{code: code} = error, context) do
+  # Application errors are JSON-RPC errors with status 200, except auth
+  # failures, and on 2026-07-28 the errors MCP gives a status and the errors
+  # of a request rejected before an operation ran.
+  defp error_response(kind, request, %Error{} = error, context) do
     body = if request, do: JSONRPC.error(request, error)
 
-    if kind == :application and code not in [:unauthorized, :forbidden] and
-         not (code in @modern_http_errors and Request.modern_attempt?(request)),
-       do: {200, [], body},
-       else: HTTPCommon.error_response(error, context.auth, context.http_context, body)
+    if kind == :application and not http_error?(error, request),
+      do: {200, [], body},
+      else: HTTPCommon.error_response(error, context.auth, context.http_context, body)
+  end
+
+  defp http_error?(%Error{code: code}, _request) when code in [:unauthorized, :forbidden],
+    do: true
+
+  defp http_error?(%Error{code: code} = error, request) do
+    Request.modern_attempt?(request) and
+      (code in @modern_400_errors or (code in @modern_http_errors and not error.from_operation))
   end
 
   defp validate_request(_runtime, %Request{method: "initialize"}), do: :ok
@@ -232,6 +284,9 @@ defmodule FastestMCP.Transport.StreamableHTTP do
     with {:error, :not_found} <- Registry.lookup_session(runtime.server.name, session_id),
          do: {:error, Error.not_found(:session, session_id)}
   end
+
+  # A server without an authenticator has no identities to tell apart.
+  defp verify_identity(_runtime, %Request{auth_result: nil}), do: :ok
 
   defp verify_identity(runtime, %Request{auth_result: auth_result} = request) do
     identity = FastestMCP.Auth.identity_fingerprint(auth_result.principal, auth_result.auth)

@@ -38,6 +38,9 @@ defmodule FastestMCP.Auth do
   alias FastestMCP.Protocol.Redactor
   alias FastestMCP.URIPolicy
 
+  # Options can hold credentials, such as the tokens of `StaticToken`, so
+  # inspect output, and with it crash and supervisor reports, leaves them out.
+  @derive {Inspect, except: [:options]}
   defstruct [:provider, options: %{}]
 
   @type input :: map()
@@ -116,7 +119,8 @@ defmodule FastestMCP.Auth do
 
   The HTTP transport can copy selected `conn.assigns` into auth input under
   `"assigns"`. This helper turns one assign value into the normalized auth
-  result used by the runtime.
+  result used by the runtime. A request whose assign is missing or `nil` fails
+  with `:unauthorized` and the message `missing or invalid credentials`.
   """
   def from_assign(assign, opts \\ []) when is_atom(assign) and (is_list(opts) or is_map(opts)) do
     opts = Map.new(opts)
@@ -143,12 +147,9 @@ defmodule FastestMCP.Auth do
                )
            }}
 
+        # The message names no assign: clients receive it.
         _other ->
-          {:error,
-           %Error{
-             code: :unauthorized,
-             message: "missing auth assign #{inspect(assign)}"
-           }}
+          {:error, %Error{code: :unauthorized, message: "missing or invalid credentials"}}
       end
     end
   end
@@ -169,33 +170,58 @@ defmodule FastestMCP.Auth do
     end
   end
 
-  # The authenticator is application code: it may raise or return a malformed
-  # result, which fails authentication with an internal error.
+  # The authenticator is application code: it may raise, throw, exit, or
+  # return a malformed result, which fails authentication with an internal
+  # error.
   defp authenticate(%__MODULE__{provider: provider} = auth, input, context) do
     case provider.authenticate(input, context, auth.options) do
       {:ok, result} ->
         {:ok, normalize_result(result)}
 
       {:error, reason} ->
-        {:error, normalize_error(reason, provider)}
+        {:error, normalize_error(reason, auth)}
 
       other ->
         message =
-          "authenticator #{inspect(provider)} must return {:ok, result} or {:error, reason}, got: #{inspect(other)}"
+          "#{subject(auth)} must return {:ok, result} or {:error, reason}, got: #{inspect(other)}"
 
-        {:error, provider_failure(provider, %ArgumentError{message: message})}
+        {:error, failure(subject(auth), :error, %ArgumentError{message: message}, [])}
     end
-  rescue
-    error -> {:error, provider_failure(auth.provider, error)}
+  catch
+    kind, reason -> {:error, failure(subject(auth), kind, reason, __STACKTRACE__)}
   end
 
-  defp provider_failure(provider, exception) do
+  # Clients see the module of an authenticator, which belongs to the
+  # application, but not the one that runs a function.
+  defp subject(%__MODULE__{provider: FunctionProvider}), do: "authenticator"
+  defp subject(%__MODULE__{provider: provider}), do: "authenticator #{inspect(provider)}"
+
+  @doc false
+  # An authentication that raised, threw, or exited, with what `catch kind,
+  # reason` received. The exception is kept as the cause, for logs and spans:
+  # a throw or an exit as the `ErlangError` the BEAM makes of an uncaught
+  # throw, `{:nocatch, value}`, or `{:exit, reason}`. Its message can hold the
+  # auth input, as a `KeyError` on the input does, and with it credentials, so
+  # clients get neither: they get "<subject> failed" and the exception's kind,
+  # or "authentication failed" with `mask_error_details: true`.
+  def failure(subject, kind, reason, stacktrace) do
+    exception =
+      case kind do
+        :error -> Exception.normalize(:error, reason, stacktrace)
+        :throw -> %ErlangError{original: {:nocatch, reason}}
+        :exit -> %ErlangError{original: {:exit, reason}}
+      end
+
     %Error{
       code: :internal_error,
-      message: "authenticator #{inspect(provider)} failed",
-      details: %{kind: inspect(exception.__struct__), reason: Exception.message(exception)}
+      message: "#{subject} failed",
+      details: %{kind: inspect(exception.__struct__)},
+      exposure: masked_failure(),
+      cause: {exception, stacktrace}
     }
   end
+
+  defp masked_failure, do: %{mask_error_details: true, message: "authentication failed"}
 
   @doc "Extracts the auth result stored on the context."
   def result_from_context(%Context{} = context) do
@@ -295,13 +321,53 @@ defmodule FastestMCP.Auth do
     |> then(&("sha256:" <> &1))
   end
 
-  @doc "Builds the WWW-Authenticate header value for an auth error."
-  def www_authenticate(nil, %Error{} = error, http_context) do
-    protected_or_default_www_authenticate(error, http_context)
+  @doc """
+  Builds the WWW-Authenticate header value for an auth error. The challenge
+  of a request that sent no credentials (`credentials?: false` in
+  `http_context`) carries no error code, as RFC 6750 asks.
+  """
+  def www_authenticate(auth, %Error{} = error, http_context)
+      when is_nil(auth) or is_struct(auth, __MODULE__) do
+    if error.code == :unauthorized and Map.get(http_context, :credentials?) == false,
+      do: challenge(nil, http_context),
+      else: challenge(error, http_context)
   end
 
-  def www_authenticate(%__MODULE__{}, %Error{} = error, http_context) do
-    protected_or_default_www_authenticate(error, http_context)
+  @doc false
+  # Runs `fun`, which authenticates the request of `context` and returns
+  # `{:ok, value}` or `{:error, %FastestMCP.Error{}}`, between the
+  # `[:fastest_mcp, :auth, :start]` event and its `:stop` or `:exception` event.
+  def span(%__MODULE__{provider: provider}, %Context{} = context, metadata, fun) do
+    metadata = Map.put(metadata, :auth_provider, inspect(provider))
+    started_at = System.monotonic_time()
+    Context.emit(context, [:auth, :start], %{system_time: System.system_time()}, metadata)
+    result = fun.()
+    duration = %{duration: System.monotonic_time() - started_at}
+
+    case result do
+      {:error, %Error{} = error} ->
+        failure = Map.merge(metadata, failure_metadata(error))
+        Context.emit(context, [:auth, :exception], duration, failure)
+
+      {:ok, _value} ->
+        Context.emit(context, [:auth, :stop], duration, metadata)
+    end
+
+    result
+  end
+
+  # An exception the authenticator raised is there as `:telemetry.span/3`
+  # reports one: `kind`, `reason`, and `stacktrace`.
+  defp failure_metadata(%Error{} = error) do
+    failure = %{code: error.code, error: Exception.message(error)}
+
+    case error.cause do
+      {exception, stacktrace} ->
+        Map.merge(failure, %{kind: :error, reason: exception, stacktrace: stacktrace})
+
+      nil ->
+        failure
+    end
   end
 
   @doc false
@@ -366,25 +432,20 @@ defmodule FastestMCP.Auth do
           "authenticator result must be a map or FastestMCP.Auth.Result, got: #{inspect(other)}"
   end
 
-  defp normalize_error(%Error{} = error, _provider), do: error
+  defp normalize_error(%Error{} = error, _auth), do: error
 
-  defp normalize_error({code, message}, provider) when is_atom(code) and is_binary(message) do
-    %Error{code: code, message: message, details: %{provider: inspect(provider)}}
-  end
+  defp normalize_error({code, message}, _auth) when is_atom(code) and is_binary(message),
+    do: %Error{code: code, message: message}
 
-  defp normalize_error(code, provider) when code in [:unauthorized, :forbidden] do
-    %Error{
-      code: code,
-      message: Atom.to_string(code) |> String.replace("_", " "),
-      details: %{provider: inspect(provider)}
-    }
-  end
+  defp normalize_error(code, _auth) when code in [:unauthorized, :forbidden],
+    do: %Error{code: code, message: Atom.to_string(code)}
 
-  defp normalize_error(reason, provider) do
+  defp normalize_error(reason, auth) do
     %Error{
       code: :internal_error,
-      message: "authenticator #{inspect(provider)} failed",
-      details: %{reason: inspect(reason), provider: inspect(provider)}
+      message: "#{subject(auth)} failed",
+      details: %{reason: inspect(reason)},
+      exposure: masked_failure()
     }
   end
 
@@ -487,28 +548,29 @@ defmodule FastestMCP.Auth do
     |> then(&("Bearer " <> Enum.join(&1, ", ")))
   end
 
-  defp protected_or_default_www_authenticate(
-         %Error{} = error,
+  # The challenge for `error`, or without an error for nil.
+  defp challenge(
+         error,
          %{protected_resource: %ProtectedResource{} = protected_resource} = http_context
        ) do
     scopes =
-      case validated_missing_scopes(error) do
-        [] ->
-          List.wrap(Map.get(http_context, :expected_scopes, protected_resource.required_scopes))
-
-        missing_scopes ->
+      case error && validated_missing_scopes(error) do
+        missing_scopes when missing_scopes not in [nil, []] ->
           missing_scopes
+
+        _none ->
+          List.wrap(Map.get(http_context, :expected_scopes, protected_resource.required_scopes))
       end
 
     ProtectedResource.www_authenticate(protected_resource,
       scopes: scopes,
       error: error,
-      error_description: error.message
+      error_description: error && error.message
     )
   end
 
-  defp protected_or_default_www_authenticate(error, _http_context),
-    do: default_www_authenticate(error)
+  defp challenge(nil, _http_context), do: "Bearer"
+  defp challenge(error, _http_context), do: default_www_authenticate(error)
 
   defp bearer_error_code(%Error{code: :forbidden}), do: "insufficient_scope"
   defp bearer_error_code(_error), do: "invalid_token"

@@ -8,7 +8,6 @@ defmodule FastestMCP.Client.Wire do
   import FastestMCP.Util, only: [maybe_put: 3]
   import FastestMCP.Protocol.Version
 
-  alias FastestMCP.Apps
   alias FastestMCP.Client.Auth
   alias FastestMCP.Client.ProtocolError
   alias FastestMCP.Client.Spec
@@ -36,15 +35,10 @@ defmodule FastestMCP.Client.Wire do
     end
   end
 
-  def notification(method, params, state, opts) do
+  def notification(method, params, state) do
     params =
       if is_modern(state.selected_protocol_version),
         do: put_modern_meta(params, state),
-        else: params
-
-    params =
-      if state.transport.type == :in_process,
-        do: Auth.put_metadata(params, Auth.input(state, opts), true),
         else: params
 
     message =
@@ -103,16 +97,24 @@ defmodule FastestMCP.Client.Wire do
 
   defp request_params(method, params, state) do
     if modern_request?(state, method),
-      do: {:ok, put_modern_meta(params, state)},
+      do: {:ok, params |> put_modern_meta(state) |> put_log_level(state.log_level)},
       else: {:ok, params}
   end
 
-  defp put_auth_metadata(params, %{transport: %{type: :streamable_http}}, _opts), do: params
+  # A 2026-07-28 request names the lowest level of the log messages it wants;
+  # the request's own `meta:` may name another.
+  defp put_log_level(params, nil), do: params
 
-  defp put_auth_metadata(params, %{transport: %{type: type}} = state, opts) do
-    enabled? = type == :in_process or state.legacy_stdio_auth_metadata?
-    Auth.put_metadata(params, Auth.input(state, opts), enabled?)
-  end
+  defp put_log_level(params, level),
+    do: update_in(params["_meta"], &Map.put_new(&1, "io.modelcontextprotocol/logLevel", level))
+
+  # An in-process server receives the auth input as Elixir terms, beside the
+  # message (see `FastestMCP.Client.Transport.write/3`); a stdio server
+  # receives it in `_meta` only with `legacy_stdio_auth_metadata: true`.
+  defp put_auth_metadata(params, %{transport: %{type: :stdio}} = state, opts),
+    do: Auth.put_metadata(params, Auth.input(state, opts), state.legacy_stdio_auth_metadata?)
+
+  defp put_auth_metadata(params, _state, _opts), do: params
 
   defp validate_request(method, request, version) do
     validation =
@@ -422,16 +424,6 @@ defmodule FastestMCP.Client.Wire do
   def normalize_response(:tasks, %{"tasks" => tasks} = page),
     do: %{items: tasks, next_cursor: page["nextCursor"]}
 
-  def normalize_response(:resource_read, %{"contents" => [content]} = result) do
-    cond do
-      Apps.mime_type?(content["mimeType"]) -> result
-      not is_nil(result["_meta"]) or not is_nil(content["_meta"]) -> result
-      is_binary(content["text"]) -> decode_json(content["text"])
-      is_binary(content["blob"]) -> content["blob"]
-      true -> content
-    end
-  end
-
   def normalize_response(_normalizer, result), do: result
 
   def cache_hint(%{"resultType" => "complete", "ttlMs" => ttl_ms, "cacheScope" => scope})
@@ -530,35 +522,54 @@ defmodule FastestMCP.Client.Wire do
     }
   end
 
-  def http_error(body, status, fallback_message) do
-    case JSON.decode(body) do
-      {:ok, %{"jsonrpc" => "2.0", "error" => %{} = error}} ->
+  # The error of an HTTP response with `status` to `subject`, such as a
+  # method: a JSON-RPC error, an error a FastestMCP endpoint answers before
+  # JSON-RPC (a host check, for one), or the status alone.
+  def http_error(body, status, subject) do
+    body = body |> IO.iodata_to_binary() |> decode_json()
+
+    case body do
+      %{"jsonrpc" => "2.0", "error" => %{} = error} ->
         decoded = error(error)
         %{decoded | details: Map.put(decoded.details, :status, status)}
 
+      %{"error" => %{"message" => message} = error} when is_binary(message) ->
+        %Error{
+          code: endpoint_code(error["code"], status),
+          message: message,
+          details: %{status: status, body: body}
+        }
+
       _other ->
         %Error{
-          code: if(status in 400..499, do: :bad_request, else: :internal_error),
-          message: "#{fallback_message} with status #{status}",
-          details: %{status: status, body: decode_json(body)}
+          code: status_code(status),
+          message: "#{subject} failed with HTTP #{status}#{reason_phrase(status)}",
+          details: %{status: status, body: body}
         }
     end
   end
 
-  def session_stream_error(status, reason, body) do
-    body = decode_json(body)
+  defp endpoint_code(code, status) do
+    case JSONRPC.decode_error_code(code, nil) do
+      :internal_error when code != "internal_error" -> status_code(status)
+      decoded -> decoded
+    end
+  end
 
-    message =
-      case body do
-        %{"error" => %{"message" => message}} when is_binary(message) -> message
-        _other -> "session stream request failed with HTTP #{status} #{reason}"
-      end
+  # The codes whose errors a FastestMCP server answers with these statuses.
+  defp status_code(401), do: :unauthorized
+  defp status_code(403), do: :forbidden
+  defp status_code(404), do: :not_found
+  defp status_code(429), do: :rate_limited
+  defp status_code(503), do: :overloaded
+  defp status_code(504), do: :timeout
+  defp status_code(status) when status in 400..499, do: :bad_request
+  defp status_code(_status), do: :internal_error
 
-    %Error{
-      code: if(status >= 400 and status < 500, do: :bad_request, else: :internal_error),
-      message: message,
-      details: %{status: status, body: body}
-    }
+  defp reason_phrase(status) do
+    " " <> Plug.Conn.Status.reason_phrase(status)
+  rescue
+    ArgumentError -> ""
   end
 
   def task_error(task_id, %{} = error) do

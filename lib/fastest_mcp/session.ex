@@ -122,12 +122,6 @@ defmodule FastestMCP.Session do
   def deliverable?(server_name, session_id),
     do: call(server_name, session_id, :deliverable?) == true
 
-  def send_notification(server_name, session_id, method, params \\ %{}, opts \\ [])
-      when is_binary(method) and is_map(params) and is_list(opts) do
-    opts = Keyword.put_new(opts, :queue, true)
-    send_envelope(server_name, session_id, notification(method, params), opts)
-  end
-
   def send_envelope(server_name, session_id, envelope, opts \\ [])
       when is_map(envelope) and is_list(opts),
       do: call(server_name, session_id, {:send_envelope, envelope, opts})
@@ -139,6 +133,16 @@ defmodule FastestMCP.Session do
 
     # The session replies by the request's own timeout at the latest.
     call(server_name, session_id, {:request_peer, method, params, opts}, :infinity)
+  end
+
+  # Sends the client an MCP ping on the stream it listens on (a GET stream or
+  # stdio), without waiting: the reply to the returned `:gen_server` request
+  # id is `{:ok, %{}}` or `{:error, reason}`, `:not_deliverable` when no such
+  # stream listens.
+  def send_ping(pid, timeout_ms) when is_pid(pid) do
+    Options.check!(timeout_ms, :pos_integer, :timeout_ms)
+    message = {:request_peer, "ping", %{}, timeout_ms: timeout_ms, listening: true}
+    :gen_server.send_request(pid, message)
   end
 
   def resolve_peer_response(server_name, session_id, request_id, payload)
@@ -545,7 +549,7 @@ defmodule FastestMCP.Session do
             state = %{state | log_rate: rate}
 
             case Outbox.emit(state, notification("notifications/message", params), queue: true) do
-              {:ok, _delivery, state} -> reply(:ok, state)
+              {:ok, _delivery, state} -> reply({:ok, params["data"]}, state)
               error -> reply_outcome(error)
             end
         end
@@ -849,6 +853,18 @@ defmodule FastestMCP.Session do
 
   @impl true
   def terminate(reason, state) do
+    # The runtime quota goes back first, so that a session killed while it
+    # deletes its stored state below, as after a shutdown timeout, keeps none.
+    RuntimeQuota.release(state.runtime_quota, :pending_requests, map_size(state.pending_requests))
+    RuntimeQuota.release(state.runtime_quota, :active_requests, map_size(state.active_requests))
+    Outbox.close(state)
+
+    for {_request_id, pending} <- state.pending_requests,
+        do: GenServer.reply(pending.from, {:error, :session_terminated})
+
+    for {_request_id, active} <- state.active_requests,
+        do: Process.exit(active.worker_pid, :shutdown)
+
     # Server shutdown stops sessions with :shutdown; their stored state goes
     # with them while the state store is still running.
     if reason == :shutdown or match?({:shutdown, _}, reason) do
@@ -859,16 +875,6 @@ defmodule FastestMCP.Session do
         )
       end
     end
-
-    for {_request_id, pending} <- state.pending_requests,
-        do: GenServer.reply(pending.from, {:error, :session_terminated})
-
-    for {_request_id, active} <- state.active_requests,
-        do: Process.exit(active.worker_pid, :shutdown)
-
-    RuntimeQuota.release(state.runtime_quota, :pending_requests, map_size(state.pending_requests))
-    RuntimeQuota.release(state.runtime_quota, :active_requests, map_size(state.active_requests))
-    Outbox.close(state)
   end
 
   defp reply(reply, state), do: {:reply, reply, state, idle_timeout(state)}
@@ -936,6 +942,9 @@ defmodule FastestMCP.Session do
         {:error, :duplicate_progress_token}
 
       not Outbox.deliverable?(state, Keyword.get(opts, :sink_ref)) ->
+        {:error, :not_deliverable}
+
+      Keyword.get(opts, :listening, false) and not Outbox.listening?(state) ->
         {:error, :not_deliverable}
 
       true ->

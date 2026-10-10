@@ -1,8 +1,14 @@
 defmodule FastestMCP.Client.Transport.InProcess.Coordinator do
   @moduledoc false
+  # Serves a running server over the stdio transport's connection, without a
+  # child process: the client's JSON lines, each with its auth input as Elixir
+  # terms, are the input of `FastestMCP.Transport.Stdio.serve/4`, and this
+  # process is its output device. The server labels the requests
+  # `:in_process`.
 
   use GenServer
 
+  alias FastestMCP.Client.Redaction
   alias FastestMCP.Registry
   alias FastestMCP.Transport.Stdio
 
@@ -17,8 +23,8 @@ defmodule FastestMCP.Client.Transport.InProcess.Coordinator do
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
 
-  def send_envelope(coordinator, envelope),
-    do: GenServer.call(coordinator, {:send_envelope, envelope})
+  def send_line(coordinator, line, auth_input),
+    do: GenServer.call(coordinator, {:send_line, line, auth_input})
 
   def close(coordinator), do: GenServer.call(coordinator, :close)
 
@@ -29,7 +35,6 @@ defmodule FastestMCP.Client.Transport.InProcess.Coordinator do
     owner_monitor = Process.monitor(owner)
     server_name = Keyword.fetch!(opts, :server_name)
     connection_id = Keyword.fetch!(opts, :connection_id)
-    auth_input = Keyword.get(opts, :auth_input, %{})
     {:ok, server_pid} = Registry.lookup_server(server_name)
     server_monitor = Process.monitor(server_pid)
 
@@ -37,7 +42,7 @@ defmodule FastestMCP.Client.Transport.InProcess.Coordinator do
       spawn_monitor(fn ->
         Stdio.serve(server_name, input_stream(coordinator), coordinator,
           connection_id: connection_id,
-          auth_input: auth_input
+          transport: :in_process
         )
       end)
 
@@ -56,22 +61,20 @@ defmodule FastestMCP.Client.Transport.InProcess.Coordinator do
   end
 
   @impl true
-  def handle_call({:send_envelope, envelope}, _from, %{closing?: false} = state) do
-    line = JSON.encode!(envelope) <> "\n"
+  def handle_call({:send_line, line, auth_input}, _from, %{closing?: false} = state) do
+    input = {line, auth_input}
 
     case state.input_waiter do
       nil ->
-        {:reply, :ok, %{state | input_queue: :queue.in(line, state.input_queue)}}
+        {:reply, :ok, %{state | input_queue: :queue.in(input, state.input_queue)}}
 
       waiter ->
-        GenServer.reply(waiter, {:line, line})
+        GenServer.reply(waiter, {:line, input})
         {:reply, :ok, %{state | input_waiter: nil}}
     end
-  rescue
-    error -> {:reply, {:error, error}, state}
   end
 
-  def handle_call({:send_envelope, _envelope}, _from, state),
+  def handle_call({:send_line, _line, _auth_input}, _from, state),
     do: {:reply, {:error, :closed}, state}
 
   def handle_call(:next_input, from, state) do
@@ -134,6 +137,9 @@ defmodule FastestMCP.Client.Transport.InProcess.Coordinator do
 
     {:stop, :normal, close_input(state)}
   end
+
+  @impl true
+  defdelegate format_status(status), to: Redaction
 
   @impl true
   def terminate(reason, state) do

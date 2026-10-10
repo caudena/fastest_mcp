@@ -21,6 +21,36 @@ defmodule FastestMCP.ClientOAuthTest do
     end
   end
 
+  defmodule TokenGatePlug do
+    @moduledoc false
+    # Serves a FastestMCP server to requests that carry the token the mocked
+    # authorization server issues, and challenges the others.
+    import Plug.Conn
+
+    alias FastestMCP.Transport.HTTPApp
+
+    def init(opts), do: opts
+
+    def call(conn, opts) do
+      case get_req_header(conn, "authorization") do
+        ["Bearer access-one"] ->
+          app =
+            HTTPApp.init(
+              server_name: opts[:server_name],
+              path: "/mcp",
+              allowed_hosts: ["127.0.0.1"]
+            )
+
+          HTTPApp.call(conn, app)
+
+        _missing ->
+          conn
+          |> put_resp_header("www-authenticate", "Bearer")
+          |> send_resp(401, "")
+      end
+    end
+  end
+
   @resource "https://mcp.example.com/public/mcp"
   @resource_metadata "https://mcp.example.com/.well-known/oauth-protected-resource/public/mcp"
   @issuer "https://auth.example.com/tenant"
@@ -1348,6 +1378,60 @@ defmodule FastestMCP.ClientOAuthTest do
       assert_receive {:DOWN, ^client_ref, :process, ^client_pid, _reason}, 2_000
       assert_receive {:DOWN, ^handler_ref, :process, ^handler_pid, _reason}, 2_000
     end
+  end
+
+  test "connecting waits for a sign-in that outlasts init_timeout_ms" do
+    server_name = unique_name("oauth-slow-sign-in")
+
+    start_server!(
+      FastestMCP.server(server_name)
+      |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+    )
+
+    %{port: port} = serve!({TokenGatePlug, server_name: server_name})
+    resource = "http://127.0.0.1:#{port}/mcp"
+    metadata = "http://127.0.0.1:#{port}/.well-known/oauth-protected-resource/mcp"
+
+    requester = fn
+      :get, ^metadata, _opts ->
+        json_response(%{"resource" => resource, "authorization_servers" => [@issuer]})
+
+      method, url, opts ->
+        oauth_response(method, url, opts)
+    end
+
+    test_pid = self()
+
+    # The user signs in after init_timeout_ms has run out.
+    handler = fn request ->
+      send(test_pid, :signing_in)
+      Process.sleep(400)
+      successful_authorization_handler().(request)
+    end
+
+    assert {:ok, client} =
+             Client.connect(resource,
+               init_timeout_ms: 200,
+               oauth: oauth_opts(requester, authorization_handler: handler)
+             )
+
+    assert Client.call_tool!(client, "echo", %{"a" => 1}).structured_content == %{"a" => 1}
+    assert_received :signing_in
+    refute_received :signing_in
+    assert :ok = Client.disconnect(client)
+  end
+
+  test "a missing authorization handler is reported as missing" do
+    assert_raise ArgumentError,
+                 "OAuth configuration failed: authorization handler required",
+                 fn ->
+                   Client.connect("https://mcp.example.com/mcp",
+                     oauth: [
+                       redirect_uri: "http://127.0.0.1:8765/callback",
+                       registration: {:pre_registered, client_id: "test-client"}
+                     ]
+                   )
+                 end
   end
 
   test "the connected client validates oauth options before it starts" do

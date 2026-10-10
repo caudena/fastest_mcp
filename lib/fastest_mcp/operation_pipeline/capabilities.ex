@@ -15,6 +15,7 @@ defmodule FastestMCP.OperationPipeline.Capabilities do
   alias FastestMCP.Server
   alias FastestMCP.Session
   alias FastestMCP.TaskConfig
+  alias FastestMCP.Util
 
   def initialize(%Operation{context: %{server: server}} = operation) do
     store_client_info(operation)
@@ -35,9 +36,13 @@ defmodule FastestMCP.OperationPipeline.Capabilities do
     |> maybe_put("instructions", server.metadata[:instructions])
   end
 
-  # `server.metadata` has atom keys (see `Server.new/2`).
+  # `server.metadata` has atom keys (see `Server.new/2`). A module server's
+  # name is the module's, which clients see without the "Elixir." prefix.
   def server_info(%{metadata: metadata} = server) do
-    %{"name" => server.name, "version" => metadata[:version] || app_version()}
+    %{
+      "name" => String.replace_prefix(server.name, "Elixir.", ""),
+      "version" => metadata[:version] || Util.version()
+    }
     |> maybe_put("title", metadata[:title])
     |> maybe_put("description", metadata[:description])
     |> maybe_put("icons", metadata[:icons])
@@ -45,30 +50,28 @@ defmodule FastestMCP.OperationPipeline.Capabilities do
   end
 
   # What `operation` can use under the `:legacy` (initialize) or `:modern`
-  # (server/discover) profile. Families without visible components are left out.
+  # (server/discover) profile. Tools, resources, and prompts are always
+  # offered: any of them can appear at runtime, through the component
+  # manager, visibility rules, or a provider, and a client learns of them only
+  # through the kinds it was offered.
   def capabilities(server, operation, profile) do
-    [tools, resources, templates, prompts] =
-      Enum.map(
-        [:tool, :resource, :resource_template, :prompt],
-        &Resolver.visible_components(server, &1, operation)
-      )
+    [templates, prompts] =
+      Enum.map([:resource_template, :prompt], &Resolver.visible_components(server, &1, operation))
 
     callbacks? = callback_transport?(operation)
     list_changed = if callbacks?, do: %{"listChanged" => true}, else: %{}
 
-    %{}
+    %{
+      "tools" => list_changed,
+      "resources" => resource_capabilities(callbacks?, profile),
+      "prompts" => list_changed
+    }
     |> maybe_put("logging", if(callbacks?, do: %{}))
-    |> maybe_put("tools", if(tools != [], do: list_changed))
-    |> maybe_put(
-      "resources",
-      if(resources != [] or templates != [], do: resource_capabilities(callbacks?, profile))
-    )
-    |> maybe_put("prompts", if(prompts != [], do: list_changed))
     |> maybe_put(
       "completions",
       if(Enum.any?(prompts ++ templates, &Completion.completable?/1), do: %{})
     )
-    |> maybe_put("tasks", if(profile == :legacy, do: task_capabilities(operation, tools)))
+    |> maybe_put("tasks", if(profile == :legacy, do: task_capabilities(server, operation)))
     |> maybe_put("extensions", extensions(server, profile))
     |> maybe_put("experimental", experimental(server))
   end
@@ -77,9 +80,11 @@ defmodule FastestMCP.OperationPipeline.Capabilities do
   defp resource_capabilities(true, :modern), do: %{"listChanged" => true}
   defp resource_capabilities(false, _profile), do: %{}
 
-  defp task_capabilities(operation, tools) do
+  defp task_capabilities(server, operation) do
     if (operation.transport == :in_process or callback_transport?(operation)) and
-         Enum.any?(tools, &TaskConfig.supports_tasks?(&1.task)) do
+         server
+         |> Resolver.visible_components(:tool, operation)
+         |> Enum.any?(&TaskConfig.supports_tasks?(&1.task)) do
       %{"list" => %{}, "cancel" => %{}, "requests" => %{"tools" => %{"call" => %{}}}}
     end
   end
@@ -96,7 +101,7 @@ defmodule FastestMCP.OperationPipeline.Capabilities do
     metadata = context.request_metadata
     envelope = metadata[:jsonrpc_envelope]
 
-    transport in [:streamable_http, :stdio] and is_map(envelope) and
+    transport in [:streamable_http, :stdio, :in_process] and is_map(envelope) and
       (is_modern(context.negotiated_protocol_version) or
          (is_binary(context.session_id) and context.session_id != ""))
   end
@@ -106,12 +111,5 @@ defmodule FastestMCP.OperationPipeline.Capabilities do
 
     if context.session_id && is_map(client_info),
       do: Session.set_client_info(context.server.name, context.session_id, client_info)
-  end
-
-  defp app_version do
-    case Application.spec(:fastest_mcp, :vsn) do
-      nil -> "0.2.0"
-      version -> to_string(version)
-    end
   end
 end

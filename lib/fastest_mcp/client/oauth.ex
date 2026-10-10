@@ -182,6 +182,10 @@ defmodule FastestMCP.Client.OAuth do
   defp open_store(nil), do: with({:ok, pid} <- Memory.start_link(), do: {:ok, {Memory, pid}})
   defp open_store(store), do: {:ok, store}
 
+  # Crash reports leave out client secrets and registrations.
+  @impl true
+  defdelegate format_status(status), to: FastestMCP.Client.Redaction
+
   # The flow tasks stop with their linked supervisor; the default store does
   # not follow a normal exit.
   @impl true

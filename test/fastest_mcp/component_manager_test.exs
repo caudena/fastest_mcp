@@ -261,4 +261,36 @@ defmodule FastestMCP.ComponentManagerTest do
 
     assert %{id: "42", source: :static} == FastestMCP.read_resource!(server_name, "users://42")
   end
+
+  test "runtime components and server-wide rules survive an internal restart, not a stop" do
+    server_name = unique_name("component-manager-restart")
+
+    server =
+      FastestMCP.server(server_name)
+      |> FastestMCP.add_tool("static", fn _arguments, _ctx -> "static" end)
+
+    start_server!(server)
+
+    assert {:ok, _tool} =
+             ComponentManager.add_tool(server_name, "dynamic", fn _, _ -> "dynamic" end)
+
+    :ok = FastestMCP.disable_components!(server_name, names: ["static"])
+    {:ok, before} = FastestMCP.ServerRuntime.fetch(server_name)
+
+    Process.exit(before.call_supervisor, :kill)
+
+    assert_eventually(fn ->
+      case FastestMCP.ServerRuntime.fetch(server_name) do
+        {:ok, runtime} -> runtime.call_supervisor != before.call_supervisor
+        {:error, :not_found} -> false
+      end
+    end)
+
+    assert ["dynamic"] == Enum.map(FastestMCP.list_tools!(server_name), & &1.name)
+    assert "dynamic" == FastestMCP.call_tool!(server_name, "dynamic")
+
+    assert :ok = FastestMCP.stop_server(server_name)
+    start_server!(server)
+    assert ["static"] == Enum.map(FastestMCP.list_tools!(server_name), & &1.name)
+  end
 end

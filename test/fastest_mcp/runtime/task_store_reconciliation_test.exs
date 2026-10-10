@@ -2,8 +2,8 @@ defmodule FastestMCP.Runtime.TaskStoreReconciliationTest do
   use FastestMCP.Case, async: true
 
   alias FastestMCP.BackgroundTaskStore
-  alias FastestMCP.BackgroundTaskStore.Task, as: TaskRecord
   alias FastestMCP.Error
+  alias FastestMCP.TaskRecord
 
   defmodule Backend do
     # Its state is an Agent holding the tasks a previous runtime stored.

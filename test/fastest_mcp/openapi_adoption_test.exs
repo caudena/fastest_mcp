@@ -59,7 +59,10 @@ defmodule FastestMCP.OpenAPIAdoptionTest do
     assert %{} = FastestMCP.call_tool!(server.name, "send", %{})
     assert_receive {:request, opts}
     refute Keyword.has_key?(opts, :json)
-    assert_raise Error, fn -> FastestMCP.call_tool!(server.name, "send", %{"a" => "partial"}) end
+
+    assert {:error, %Error{code: :invalid_params, message: "invalid OpenAPI request body"}} =
+             FastestMCP.call_tool(server.name, "send", %{"a" => "partial"})
+
     refute_receive {:request, _}
     FastestMCP.call_tool!(server.name, "send", %{"a" => "one", "b" => "two"})
     assert_receive {:request, opts}
@@ -125,6 +128,17 @@ defmodule FastestMCP.OpenAPIAdoptionTest do
       assert opts[:content_type] == media
       refute Keyword.has_key?(opts, :json)
     end
+  end
+
+  test "a raw media body that isn't a string is invalid arguments" do
+    schema = %{"type" => "object", "properties" => %{"note" => %{"type" => "string"}}}
+    server = start_body(schema, media: "text/plain")
+
+    assert {:error, %Error{code: :invalid_params, message: message}} =
+             FastestMCP.call_tool(server.name, "send", %{"note" => "hi"})
+
+    assert message == "raw OpenAPI request bodies must be strings"
+    refute_receive {:request, _}
   end
 
   test "multipart arrays use existing repeated-field HTTP encoding" do

@@ -248,7 +248,7 @@ defmodule FastestMCP.ClientSessionRecoveryTest do
         Client.call_tool!(client, "charge_card_1", %{"amount" => 10})
       end
 
-    assert error.code == :bad_request
+    assert error.code == :not_found
     assert error.details.session_recovered
     refute error.details.original_request_replayed
 

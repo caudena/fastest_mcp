@@ -7,7 +7,6 @@ defmodule FastestMCP.Transport.Engine.Tasks do
   import FastestMCP.Protocol.Version
 
   alias FastestMCP.Auth
-  alias FastestMCP.Auth.Result, as: AuthResult
   alias FastestMCP.Error
   alias FastestMCP.ErrorExposure
   alias FastestMCP.OperationPipeline
@@ -19,9 +18,11 @@ defmodule FastestMCP.Transport.Engine.Tasks do
   alias FastestMCP.Transport.Request
 
   def handle(runtime, %Request{method: "tasks/get"} = request, opts) do
-    with {:ok, access} <- access_opts(runtime, request),
+    with {:ok, access, context} <- access(runtime, request, opts),
          {:ok, task_id} <- Request.fetch_param(request, "taskId"),
          {:ok, task} <- fetch_protocol_task(runtime, task_id, access, request) do
+      opts = Engine.authenticated_opts(opts, context)
+
       Engine.wire(fn ->
         TaskWire.task(
           task,
@@ -35,8 +36,8 @@ defmodule FastestMCP.Transport.Engine.Tasks do
     end
   end
 
-  def handle(runtime, %Request{method: "tasks/update", profile: :modern} = request, _opts) do
-    with {:ok, access} <- access_opts(runtime, request),
+  def handle(runtime, %Request{method: "tasks/update", profile: :modern} = request, opts) do
+    with {:ok, access, _context} <- access(runtime, request, opts),
          {:ok, task_id} <- Request.fetch_param(request, "taskId"),
          {:ok, _task} <- fetch_protocol_task(runtime, task_id, access, request),
          {:ok, responses} <- Request.fetch_param(request, "inputResponses"),
@@ -46,13 +47,14 @@ defmodule FastestMCP.Transport.Engine.Tasks do
 
   def handle(runtime, %Request{method: "tasks/result", profile: profile} = request, opts)
       when profile != :modern do
-    with {:ok, access} <- access_opts(runtime, request),
+    with {:ok, access, context} <- access(runtime, request, opts),
          {:ok, task_id} <- Request.fetch_param(request, "taskId"),
          {:ok, task} <- FastestMCP.fetch_task(runtime.server.name, task_id, access) do
       result_opts = Keyword.put(access, :request_metadata, Engine.context_metadata(request))
 
       case FastestMCP.task_result(runtime.server.name, task_id, result_opts) do
         {:ok, result} ->
+          opts = Engine.authenticated_opts(opts, context)
           serializer = result_serializer(runtime, task, request, opts)
           Engine.wire(fn -> result |> serializer.() |> TaskWire.task_result(task.id) end)
 
@@ -67,14 +69,13 @@ defmodule FastestMCP.Transport.Engine.Tasks do
 
   def handle(runtime, %Request{method: "tasks/list", profile: profile} = request, opts)
       when profile != :modern do
-    with {:ok, access} <- access_opts(runtime, request),
+    with {:ok, access, context} <- access(runtime, request, opts),
          {:ok, %{tasks: tasks}} <- FastestMCP.list_tasks(runtime.server.name, access),
-         {:ok, fingerprint} <- Components.pagination_fingerprint(runtime, request, opts),
          {:ok, page} <-
            Pagination.wire_page(tasks,
-             secret: runtime.pagination_cursor_secret,
+             secret: runtime.signing_secret.value,
              scope: request.method,
-             fingerprint: fingerprint,
+             fingerprint: Components.pagination_fingerprint(runtime, request, opts, context),
              cursor: Map.get(request.payload, "cursor"),
              key: & &1.id
            ) do
@@ -86,8 +87,8 @@ defmodule FastestMCP.Transport.Engine.Tasks do
     end
   end
 
-  def handle(runtime, %Request{method: "tasks/cancel"} = request, _opts) do
-    with {:ok, access} <- access_opts(runtime, request),
+  def handle(runtime, %Request{method: "tasks/cancel"} = request, opts) do
+    with {:ok, access, _context} <- access(runtime, request, opts),
          {:ok, task_id} <- Request.fetch_param(request, "taskId"),
          do: cancel(runtime, task_id, access, request)
   end
@@ -110,35 +111,43 @@ defmodule FastestMCP.Transport.Engine.Tasks do
          do: {:ok, TaskWire.task(task, public_opts(runtime))}
   end
 
-  defp access_opts(_runtime, %Request{profile: :modern} = request),
-    do: {:ok, [owner_fingerprint: auth_owner(request)]}
+  # The tasks the caller reaches, and the caller's context: modern requests
+  # reach tasks by owner, legacy ones within their session.
+  defp access(runtime, %Request{profile: :modern} = request, opts) do
+    with {:ok, context} <- caller(runtime, request, nil, opts),
+         do: {:ok, [owner_fingerprint: TaskOwner.from_context(context)], context}
+  end
 
-  defp access_opts(runtime, %Request{} = request) do
+  defp access(runtime, %Request{} = request, opts) do
     case Request.explicit_session_id(request) do
       {:ok, session_id} ->
-        with {:ok, owner} <- owner_fingerprint(runtime, request, session_id),
-             do: {:ok, [session_id: session_id, owner_fingerprint: owner]}
+        with {:ok, context} <- caller(runtime, request, session_id, opts) do
+          owner = TaskOwner.from_context(context)
+          {:ok, [session_id: session_id, owner_fingerprint: owner], context}
+        end
 
       :error ->
         Engine.error(:bad_request, "task requests require an explicit session_id")
     end
   end
 
-  defp auth_owner(%Request{auth_result: %AuthResult{} = auth_result}),
-    do: TaskOwner.from_principal_auth(auth_result.principal, auth_result.auth)
+  # Task methods run no operation, so the caller is authenticated here, with
+  # the authentication events, unless the transport (HTTP) did.
+  defp caller(runtime, request, session_id, opts) do
+    opts = Keyword.merge(opts, Engine.session_opts(request, session_id))
+    auth = runtime.server.auth
 
-  defp auth_owner(_request), do: nil
+    with {:ok, context} <- OperationPipeline.request_context(runtime, opts) do
+      if is_nil(auth) or Keyword.get(opts, :transport_authenticated, false) do
+        {:ok, context}
+      else
+        metadata = %{method: request.method, component_type: nil, target: nil}
 
-  # Without a transport auth result, the owner is the identity the server's
-  # auth resolves for the request's session.
-  defp owner_fingerprint(_runtime, %Request{auth_result: %AuthResult{}} = request, _session_id),
-    do: {:ok, auth_owner(request)}
-
-  defp owner_fingerprint(runtime, request, session_id) do
-    with {:ok, context} <-
-           OperationPipeline.request_context(runtime, Engine.session_opts(request, session_id)),
-         {:ok, context} <- Auth.resolve(runtime.server.auth, context, request.auth_input),
-         do: {:ok, TaskOwner.from_context(context)}
+        Auth.span(auth, context, metadata, fn ->
+          Auth.resolve(auth, context, request.auth_input)
+        end)
+      end
+    end
   end
 
   # A task is only visible under the protocol profile that created it.

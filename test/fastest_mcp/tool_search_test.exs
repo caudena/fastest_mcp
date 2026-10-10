@@ -438,7 +438,7 @@ defmodule FastestMCP.ToolSearchTest do
         })
       end
 
-    assert schema_error.code == :bad_request
+    assert schema_error.code == :invalid_params
 
     for target <- ["call_tool", "search_tools", "recursive"] do
       recursion_error =

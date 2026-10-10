@@ -25,6 +25,7 @@ defmodule FastestMCP.ClientGroup do
   use Supervisor
   alias FastestMCP.{Client, Deadline, Error, Options}
   alias FastestMCP.Client.{Catalog, Connection}
+  alias FastestMCP.Client.Options, as: ClientOptions
   alias FastestMCP.ClientGroup.Coordinator
 
   @default_timeout_ms 10_000
@@ -45,7 +46,7 @@ defmodule FastestMCP.ClientGroup do
 
   @doc "Starts a group and waits for every member to become ready."
   def start_link(opts) do
-    configs = normalize_clients!(Keyword.fetch!(opts, :clients))
+    configs = opts |> Keyword.fetch!(:clients) |> normalize_clients!() |> protect_members()
     concurrency = Keyword.get(opts, :max_concurrency, 8)
     Options.check!(concurrency, :pos_integer, :max_concurrency)
     opts = Keyword.merge(opts, clients: configs, max_concurrency: concurrency)
@@ -67,6 +68,14 @@ defmodule FastestMCP.ClientGroup do
 
   @doc "Returns a supervisor child specification for this group."
   def child_spec(opts) do
+    # Supervisor reports print the start arguments, which keep the members'
+    # credentials wrapped.
+    opts =
+      Keyword.replace_lazy(opts, :clients, fn
+        clients when is_map(clients) -> Map.new(protect_members(clients))
+        clients -> clients
+      end)
+
     %{
       id: Keyword.get(opts, :id, Keyword.get(opts, :name, __MODULE__)),
       start: {__MODULE__, :start_link, [opts]},
@@ -299,6 +308,13 @@ defmodule FastestMCP.ClientGroup do
   end
 
   defp normalize_clients!(_), do: raise(ArgumentError, "clients must be a non-empty map")
+
+  defp protect_members(members) do
+    Enum.map(members, fn
+      {name, opts} when is_list(opts) -> {name, ClientOptions.protect(opts)}
+      member -> member
+    end)
+  end
 end
 
 defmodule FastestMCP.ClientGroup.Members do

@@ -49,6 +49,39 @@ defmodule FastestMCP.SchemaDereferenceTest do
     refute function_exported?(FastestMCP.Middleware, :dereference_refs, 1)
   end
 
+  test "a reference that cannot be resolved is named when the schema is compiled" do
+    remote_uri = "https://schemas.example/tag.json"
+
+    schema = %{
+      "type" => "object",
+      "properties" => %{"tag" => %{"$ref" => remote_uri}},
+      "required" => ["tag"]
+    }
+
+    assert {:error, error} = FastestMCP.Schema.compile(schema)
+    assert error.message == ~s(could not resolve JSON Schema reference "#{remote_uri}")
+    assert [%{keyword: "$ref", message: message}] = error.violations
+    assert message =~ remote_uri
+
+    error =
+      assert_raise FastestMCP.Schema.Error, fn ->
+        FastestMCP.server("unresolved-reference")
+        |> FastestMCP.add_tool("tag_note", fn arguments, _ctx -> arguments end,
+          input_schema: schema
+        )
+      end
+
+    assert error.message =~ remote_uri
+
+    assert {:error, error} =
+             FastestMCP.Schema.compile(%{
+               "type" => "object",
+               "properties" => %{"tag" => %{"$ref" => "#/$defs/missing"}}
+             })
+
+    assert error.message == ~s(could not resolve JSON Schema reference "#/$defs/missing")
+  end
+
   test "explicit schema_options resolver compiles remote references without rewriting them" do
     remote_uri = "https://schemas.example/color"
 

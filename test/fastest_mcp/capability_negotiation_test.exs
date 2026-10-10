@@ -53,6 +53,55 @@ defmodule FastestMCP.CapabilityNegotiationTest do
              Session.lifecycle(server_name, session_id)
   end
 
+  test "a server offers every kind of component, so clients learn about the first one added" do
+    server_name = unique_name("capability-every-kind")
+    test_pid = self()
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+    |> start_server!()
+
+    assert %{"tools" => %{}, "resources" => %{}, "prompts" => %{}} =
+             FastestMCP.initialize!(server_name)["capabilities"]
+
+    legacy =
+      connect!({:in_process, server_name},
+        protocol_version: "2025-11-25",
+        notification_handler: &send(test_pid, {:legacy, &1["method"]})
+      )
+
+    assert %{
+             "tools" => %{"listChanged" => true},
+             "resources" => %{"listChanged" => true, "subscribe" => true},
+             "prompts" => %{"listChanged" => true}
+           } = FastestMCP.Client.info!(legacy).capabilities
+
+    modern = connect!({:in_process, server_name}, protocol_version: "2026-07-28")
+    filter = %{"resourcesListChanged" => true, "promptsListChanged" => true}
+
+    listener =
+      FastestMCP.Client.listen!(modern, filter,
+        on_notification: &send(test_pid, {:modern, &1["method"], &1["params"]})
+      )
+
+    assert_receive {:modern, "notifications/subscriptions/acknowledged",
+                    %{"notifications" => ^filter}}
+
+    assert %{items: []} = FastestMCP.Client.list_prompts!(legacy)
+
+    {:ok, _prompt} =
+      FastestMCP.ComponentManager.add_prompt(server_name, "summarize", fn _args, _ctx ->
+        "Summarize my notes."
+      end)
+
+    assert_receive {:legacy, "notifications/prompts/list_changed"}
+    assert_receive {:modern, "notifications/prompts/list_changed", _params}
+    assert %{items: [%{"name" => "summarize"}]} = FastestMCP.Client.list_prompts!(legacy)
+    assert %{items: [%{"name" => "summarize"}]} = FastestMCP.Client.list_prompts!(modern)
+
+    assert :ok = FastestMCP.Client.Request.cancel!(listener, "test complete")
+  end
+
   defp set_tools_list_changed(session_pid, value) do
     :sys.replace_state(session_pid, fn state ->
       %{

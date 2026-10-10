@@ -1,157 +1,249 @@
 # Compatibility and Scope
 
-FastestMCP targets MCP server behavior plus the Elixir-native companion
-surfaces required to use that server plane cleanly from Elixir code.
+This page lists what FastestMCP supports, what it leaves out on purpose, and
+the rules behind its design. It also maps Python's FastMCP to FastestMCP, and
+collects the upgrade notes of older FastestMCP versions.
 
-Compatibility is the default for protocol-visible behavior, but divergence is
-allowed when a convention would fight OTP, explicit failure semantics, or normal
-Elixir application structure.
+## Supported protocol
 
-## Supported Protocol
+- **MCP versions:** `2026-07-28`, the preferred version, and `2025-11-25`. A
+  client and your server agree on a version automatically, and one running
+  server serves both; see [Protocol Versions](protocol-versions.md).
+- **Transports:** Streamable HTTP and stdio, for servers and clients alike.
+  Elixir code can also call a server in process, directly or through a client.
+- **Roles:** FastestMCP builds servers, and its client connects to MCP
+  servers of either version, written with FastestMCP or not.
+- **Extensions:** background tasks (`io.modelcontextprotocol/tasks`), MCP Apps
+  (`io.modelcontextprotocol/ui`), and, in the client, the OAuth client
+  credentials and enterprise-managed authorization grants; see
+  [Extensions](extensions.md).
+- **Elixir:** 1.19 or later.
 
-FastestMCP supports MCP `2026-07-28` and `2025-11-25` across streamable HTTP
-and stdio. The connected client defaults to `:auto`, prefers the modern
-`2026-07-28` profile, and falls back only on explicit legacy evidence. One
-running server can serve both revisions without a compatibility proxy.
+## What FastestMCP includes
 
-Native tests, raw-peer transport tests, package consumer tests, and direct
-official-runner lanes cover the boundary. There is no protocol translation
-shim in the release gate.
+### Servers
 
-## Compatibility Rules
+- Tools, resources, resource templates, and prompts, with argument completion:
+  [Tools](tools.md), [Resources](resources.md), [Prompts](prompts.md).
+- A handler context for state, logging and progress to the client, and change
+  notifications: [Context](context.md).
+- Lifespans and per-request dependencies:
+  [Lifespans and Dependencies](lifespans-and-dependencies.md).
+- Questions to the user, as forms or web pages; completions from the host's
+  model, which can call your tools; and the user's roots:
+  [Sampling and Elicitation](sampling-and-elicitation.md).
+- Background tasks that report progress, ask questions, and can be cancelled:
+  [Background Tasks](background-tasks.md).
+- Resource subscriptions, and notifications when the components on offer
+  change: [Resources](resources.md#subscriptions-and-update-notifications),
+  [Dynamic Components](dynamic-components.md).
+- Authentication with an authenticator you write, authorization for each
+  component, and OAuth protected resource metadata:
+  [Authentication and Authorization](auth.md).
+- Middleware; mounted and proxied servers; tools generated from OpenAPI
+  documents and skills directories; transforms; component versions and
+  visibility; components added while the server runs; and tool search for
+  large catalogs: [Middleware](middleware.md),
+  [Providers and Mounting](providers-and-mounting.md),
+  [Transforms](transforms.md),
+  [Versioning and Visibility](versioning-and-visibility.md),
+  [Dynamic Components](dynamic-components.md),
+  [Bounded tool search](tools.md#bounded-tool-search).
+- MCP Apps metadata and resources, and server extensions that add methods:
+  [Extensions](extensions.md).
 
-- compatibility is the default
-- divergence must be intentional, documented, and tested
-- deprecated surfaces are not revived without a current Elixir use case
-- public Elixir APIs should stay idiomatic while preserving the underlying MCP
-  contract
-- core capabilities are derived from implemented handlers and runtime
-  configuration; the open `extensions:` and `experimental_capabilities:` maps
-  are advertised as configured and execute nothing
-- non-standard wire metadata is never an authentication channel by default
+### Transports
 
-## Included Surface
+- Streamable HTTP in a Phoenix router, in any Plug application, or on a
+  listener of its own; stdio for servers that a host launches:
+  [Phoenix](phoenix.md), [Transports](transports.md).
+- Checks of the `Host` and `Origin` headers against DNS rebinding:
+  [Host and listener safety](transports.md#host-and-listener-safety).
+- CORS for the web pages you allow to call your endpoint from a browser:
+  [Browser clients](transports.md#browser-clients).
 
-The active compatibility target includes:
+### Client
 
-- MCP `2026-07-28` and `2025-11-25`, with distinct modern and legacy profiles
-- server declaration and lifecycle
-- tools, resources, resource templates, and prompts
-- standard prompt/resource wire completion plus Elixir-native tool and
-  resource-template completion helpers
-- middleware, providers, auth, and transport-independent execution
-- explicit request and task context handling, plus legacy session context
-- request-context snapshots and narrow current-context helpers for nested code
-- streamable HTTP and stdio server behavior
-- strict JSON-RPC 2.0 with one message per HTTP POST or stdio line
-- per-server runtime isolation, overload handling, and task supervision
-- connected client support for streamable HTTP and stdio
-- asynchronous connected-client requests with explicit cancellation and
-  caller-lifetime cleanup
-- connected client completions and version-appropriate resource subscriptions
-- client-side roots, version-appropriate logging control, sampling, form/URL
-  elicitation, completion tracking, log, and progress callbacks
-- server-side sampling and interaction helpers
-- legacy server-originated roots and ping, plus version-appropriate
-  cancellation, progress, logging, interaction rounds, and requester-side
-  peer tasks
-- identity-bound URL-elicitation completion
-- RFC 9728 Protected Resource Metadata for configured HTTP resource servers
-- an OAuth 2.1 HTTP client boundary with RFC 8414/OIDC discovery, PKCE S256,
-  RFC 8707 resource indicators, explicit registration, refresh rotation, and
-  bounded scope step-up
-- stable MCP Apps metadata/resource helpers and connected-client preservation;
-  Apps Host/View rendering remains host-owned
-- experimental modern Tasks v2 plus the backwards-compatible legacy Tasks v1
-- OAuth Client Credentials and Enterprise-Managed Authorization client grants
-  through explicit secret/signing/enterprise identity host boundaries
-- bounded legacy same-session, same-stream SSE event replay and client
-  resumption; modern streams are fresh request lifetimes
-- RFC 6570 level 1-4 resource-template parsing, expansion, and reverse routing
-- Draft 2020-12 and Draft 7 JSON Schema through one non-coercing compile-once
-  boundary
-- runtime component mutation through `FastestMCP.ComponentManager`
-- explicit tool, prompt, and resource helper types for richer payload shaping
-- session-state backend configuration through `FastestMCP.SessionStateStore`
-- task-state backend configuration through `FastestMCP.TaskBackend`
-- unified `on_duplicate:` semantics for local server and runtime component registration
-- centralized protocol version and capability helpers
-- explicit experimental capability advertisement through server metadata
-- native regression coverage plus live HTTP and conformance lanes
+- A supervised client for HTTP, stdio, and in-process servers, with handlers
+  for sampling, elicitation, roots, logs, and progress; remote tasks and
+  resource subscriptions; and groups of clients that combine several servers:
+  [Client](client.md), [Client Callbacks](client-callbacks.md).
+- OAuth sign-in, and the client credentials and enterprise-managed grants:
+  [Client Authentication](client-auth.md).
 
-## Explicitly Deferred
+### Operations
 
-The following are intentionally outside the current milestone:
+- Telemetry events and OpenTelemetry tracing:
+  [Observability](observability.md).
+- Storage you can replace for session state and background tasks, and limits
+  on sessions, requests, schemas, and event replay:
+  [Production](production.md).
+- Strict, bounded JSON Schema validation:
+  [Schema Validation](schema-validation.md).
 
-- CLI tooling
-- cluster-aware runtime behavior
-- publishing automation after the first manual Hex release is proven
-- browser/native MCP Apps Host and View runtime
-- deprecated compatibility behaviors
+## Not included
 
-## Intentional Elixir-native Divergences
+- **An authorization server.** FastestMCP checks tokens and publishes OAuth
+  protected resource metadata. Issuing and signing tokens, login pages, and
+  token introspection belong to your application or your identity provider.
+- **An MCP Apps host.** FastestMCP serves the metadata and resources of MCP
+  Apps. Rendering them, with an iframe, a sandbox, and messages between the
+  page and the host, is the host's job.
+- **Running across nodes.** Sessions, event replay, and running background
+  tasks live on one node. Task records can be stored durably, but requests are
+  not routed between nodes; see
+  [Running several nodes](production.md#running-several-nodes).
+- **The HTTP+SSE transport of older MCP versions, and JSON-RPC batches.** HTTP
+  means Streamable HTTP, with one JSON-RPC message per `POST` or stdio line.
+- **Routes besides the MCP endpoint.** The endpoint is one path, `/mcp` by
+  default. There is no built-in health route and no HTTP API for managing
+  components: add routes to your router, and change a running server with
+  `FastestMCP.ComponentManager`.
+- **Translation between protocol versions.** A server answers each version as
+  it is; see [Proxies and gateways](protocol-versions.md#proxies-and-gateways).
+- **Protocol versions before `2025-11-25`.** A client that asks your server
+  for one receives `2025-11-25` and decides whether to continue, and
+  `FastestMCP.Client` doesn't connect to a server that speaks only an older
+  version.
+- **Code generation from your functions.** There are no decorators or
+  annotations: schemas aren't derived from typespecs, and arguments arrive as
+  JSON values rather than converted into structs.
+- **A command-line tool.** Build, run, and release with Mix; see
+  [Stdio](transports.md#stdio) for servers that hosts launch.
 
-- No standalone SSE transport. The supported HTTP transport is streamable HTTP
-  only.
-- No legacy method-specific HTTP routes or JSON-RPC batches. MCP traffic uses
-  the single configured endpoint, `/mcp` by default.
-- Remote task behavior is versioned. The legacy profile keeps its experimental
-  core Tasks contract; the modern profile uses the separately negotiated Tasks
-  v2 extension. Local Elixir prompt/resource tasks remain runtime conveniences.
-- No signature rewriting or annotation-based dependency injection. Elixir keeps
-  explicit `%FastestMCP.Context{}` and
-  `FastestMCP.add_dependency/3`.
-- Convenience exists only as narrow helpers such as `Context.current!/0`,
-  `Context.request_context/1`, and `Context.client_id/1`. Explicit handler
-  `ctx` remains the primary style.
-- HTTP integration stays Plug-first.
-- No external component management REST API. Runtime mutation lives inside the
-  supervised runtime through `FastestMCP.ComponentManager`.
-- Client ergonomics are connection-first and GenServer-based. Modern
-  connections are sessionless; legacy connections own one initialized session.
-- FastestMCP does not implement an authorization server. RFC 9728
-  protected-resource discovery and challenges plus the connected-client OAuth
-  flow are available, while token issuance, signing, introspection,
-  authorization UI, and authorization-server operation stay host-owned or
-  external.
+## Design rules
 
-## Runtime and Protocol Boundaries
+- **The protocol comes first.** What clients see on the wire follows the MCP
+  specification. FastestMCP departs from other SDKs only in its Elixir API,
+  where their conventions would fight OTP or the structure of an Elixir
+  application, and each such choice is deliberate, documented, and tested.
+- **Your application owns the runtime.** A server is a supervised process
+  tree in your application, a client is a process you start and stop, and
+  changes to a running server go through that server, with
+  `FastestMCP.ComponentManager`, rather than a separate API.
+- **Explicit over implicit.** Handlers receive their context as an argument,
+  tools declare their schemas, dependencies are registered by name, and
+  results are plain data or explicit result structs.
+  `FastestMCP.Context.current/0` serves code that can't take the context as an
+  argument, but passing `ctx` is the main style.
+- **One pipeline.** In-process calls, HTTP, and stdio run the same middleware,
+  authentication, validation, and handler, so a test in process exercises the
+  code that a request from a host runs.
+- **Fail closed.** Component and client options are validated, and an unknown
+  one raises `ArgumentError`. Validation never coerces values, and a remote
+  schema reference needs a resolver. An authorization check that returns
+  anything but `true` or `:ok` denies access. Host checks are on by default.
+  Over HTTP, credentials come only from the request's headers, or from the
+  assigns you pass with `auth_assigns:`: a token in the query string is
+  rejected.
+- **Bounded by default.** Queues, buffers, rates, and sizes have limits;
+  [Production](production.md) lists them.
+- **Capabilities follow what you built.** A server always offers tools,
+  resources, and prompts, as any of them can appear while it runs, and
+  advertises completions and tasks only when the caller can use some. The
+  `extensions:` and `experimental_capabilities:` server options are
+  advertised as you set them, and do nothing by themselves.
+- **Deprecated parts of MCP stay out.** FastestMCP doesn't implement behaviour
+  that MCP has deprecated, such as the HTTP+SSE transport, unless an Elixir
+  application needs it.
 
-Nested local calls keep local execution semantics even when they inherit a
-modern client's Tasks capability. Use explicit `task: true` for a local
-background submission. An ordinary call to a task-required tool fails rather
-than creating an implicit background handle.
+## Coming from Python FastMCP
 
-The compatibility target covers both the advertised server and connected-client
-surfaces. Server behavior is exercised directly against the production Plug;
-client behavior is exercised by a test-only official-runner adapter that uses
-only public `FastestMCP.Client` APIs.
+FastestMCP covers much of what Python's FastMCP does, in Elixir's terms:
 
-## Current State
+| In Python FastMCP | In FastestMCP |
+| --- | --- |
+| `mcp = FastMCP("Notes")` | `FastestMCP.server("notes")`, or a module with `use FastestMCP.ServerModule` that your supervision tree starts |
+| `@mcp.tool` on a function with type hints | `FastestMCP.add_tool/4` with a handler and an explicit `input_schema:` |
+| `@mcp.resource("notes://{id}")` | `FastestMCP.add_resource/4`, or `FastestMCP.add_resource_template/4` for a URI with parameters |
+| `@mcp.prompt` | `FastestMCP.add_prompt/4`, with its `arguments:` |
+| A `ctx: Context` parameter | `ctx`, the second argument of every handler, and the functions of `FastestMCP.Context` |
+| `ctx.info(...)`, `ctx.report_progress(...)`, `ctx.read_resource(...)` | `FastestMCP.Context.info/3`, `FastestMCP.Context.report_progress/4`, `FastestMCP.Context.read_resource/2` |
+| `ctx.elicit(...)`, `ctx.sample(...)` | `FastestMCP.Interact` and `FastestMCP.Sampling`, or `FastestMCP.Context.elicit/4` and `FastestMCP.Context.sample/3` |
+| `ctx.fastmcp` | `FastestMCP.Context.server/1`, the server's definition, and `ctx.server_name` |
+| Arguments converted to their annotated types | A map of JSON values with string keys, validated without conversion |
+| `raise ToolError(...)` | `raise FastestMCP.Error`, or return `FastestMCP.Tools.Result.new(message, is_error: true)` |
+| `mcp.run()` | The server in your supervision tree, served from Phoenix or its own listener; over stdio, `MyApp.MCPServer.serve_stdio()`; see [Transports](transports.md) |
+| `mcp.mount(...)`, `FastMCP.as_proxy(...)`, `FastMCP.from_openapi(...)` | `FastestMCP.mount/3`, `FastestMCP.Providers.Proxy`, `FastestMCP.from_openapi/2` |
+| `Client(mcp)` in tests | `FastestMCP.Client.connect!({:in_process, MyApp.MCPServer})`; see [Testing](testing.md) |
 
-Current status:
+[Core Concepts](concepts.md) explains the model, and
+[Getting Started](getting-started.md) builds a server step by step.
 
-- the implementation has a versioned schema/JSON-RPC boundary, a request-
-  stateless modern profile, and a legacy Session coordinator for HTTP and stdio
-- connected client support exists for streamable HTTP and stdio
-- standard completion, sampling tool rounds, form and URL elicitation, roots,
-  requester tasks, cancellation, progress, logging, OAuth, and RFC 6570
-  templates have focused native and raw-peer transport coverage; ping and SSE
-  replay are legacy-only
-- runtime component mutation is implemented through `FastestMCP.ComponentManager`
-- explicit tool, prompt, and resource helper modules are part of the curated public API
-- session-state storage is configurable; broader runtime storage is still local
-- standalone SSE remains an intentional non-goal; GET SSE is part of the
-  Streamable HTTP endpoint
-- legacy zero-session HTTP is removed; `state_scope: :request` resets legacy
-  handler state while retaining its negotiated session. Modern HTTP is
-  intentionally sessionless by protocol design.
+## Older versions
 
-Treat advertised capabilities and executable transport tests—not merely the
-presence of a helper or a green shimmed runner—as the support boundary.
+### From 0.3
 
-## Why This Shape
+Follow [Migrating to 1.0](migrating-to-1.0.md). It lists every change that
+needs code or configuration changes, including two behaviours that change
+without a compile error: tools that a handler calls in process run inline, and
+OpenAPI request bodies are checked against the operation's schema.
 
-This page owns the explicit boundary. The rationale page explains the design
-philosophy, but this page is the contract for what FastestMCP supports, what it
-deliberately does not support, and what remains outside the current release.
+### From 0.2
+
+0.3 added `2026-07-28` as the preferred protocol version and kept
+`2025-11-25` complete. During a staged migration, pin your clients to
+`protocol_version: "2025-11-25"`, then return them to `:auto` once the servers
+they call support `2026-07-28`; see
+[Pinning a version](protocol-versions.md#pinning-a-version).
+
+### From 0.1
+
+0.2 made the transports strict JSON-RPC, as MCP specifies. Applications coming
+from 0.1:
+
+- Send every MCP request to the one endpoint, `/mcp` by default, and move
+  health checks and other routes to your own router.
+- Send one JSON-RPC message per `POST` or stdio line, without batches.
+- Send `initialize` without a session id, keep the session id that the
+  response returns, and send `notifications/initialized` before other
+  requests.
+- Send `MCP-Protocol-Version: 2025-11-25` on the requests after
+  initialization.
+- Replace `stateless_http:` and `stateless:` with `state_scope: :request`,
+  which resets handler state for every request and keeps the MCP session; see
+  [Request-local state](transports.md#request-local-state).
+- Replace `allowed_hosts: :any` and `unsafe_allow_any_host:` with a list of
+  host names.
+- Authenticate every request the same way, including `initialize`,
+  notifications, the client's responses, and `GET` and `DELETE` requests: a
+  session id is not a credential.
+- Remove `strict_input_validation:`, because validation is always strict, and
+  `dereference_schemas:`; resolve remote references with a resolver instead
+  (see [References and resolvers](schema-validation.md#references-and-resolvers)).
+  Both options raise `ArgumentError`.
+
+The [changelog](../CHANGELOG.md) lists every change of each release, with the
+0.1 migration checklist under 0.2.0.
+
+## Details
+
+### Standards
+
+Besides the two MCP specifications and their extensions, FastestMCP implements
+these standards:
+
+- JSON-RPC 2.0, strictly: one message per HTTP `POST` or stdio line.
+- JSON Schema Draft 2020-12 and Draft 7, for every schema; see
+  [Schema Validation](schema-validation.md).
+- RFC 6570 URI templates, levels 1 to 4, for resource templates.
+- RFC 5424 severity levels, for log messages to the client.
+- RFC 6750 bearer tokens and RFC 9728 OAuth 2.0 protected resource metadata,
+  on the server.
+- In the client's OAuth support: the OAuth 2.1 authorization code flow with
+  PKCE (RFC 7636, `S256`); authorization server discovery through RFC 8414
+  metadata or OpenID Connect discovery; resource indicators (RFC 8707);
+  issuer identification (RFC 9207); pre-registered clients, public or
+  confidential with `client_secret_basic`, `client_secret_post`, or
+  `private_key_jwt` (RFC 7523), client ID metadata documents, and dynamic
+  client registration (RFC 7591); refresh token rotation; the client
+  credentials grant, with `client_secret_basic` or `private_key_jwt`; and
+  enterprise-managed authorization through token exchange (RFC 8693) and JWT
+  authorization grants.
+
+## See also
+
+- [Core Concepts](concepts.md): how FastestMCP maps MCP onto Elixir
+- [Protocol Versions](protocol-versions.md): `2026-07-28` and `2025-11-25`
+- [Migrating to 1.0](migrating-to-1.0.md): the 1.0 API changes
+- [Production](production.md): limits, storage, and running several nodes

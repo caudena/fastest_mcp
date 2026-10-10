@@ -19,22 +19,28 @@ defmodule FastestMCP.Sampling do
   FastestMCP.Sampling.text(response)
   ```
 
-  If you want the model to see local tools during sampling, prepare them first:
+  To let the model use tools while it writes, pass them as `tools:`: the
+  tools of a running server, prepared with `prepare_tools/2`, or
+  `{name, function, options}` tuples:
 
   ```elixir
   tools = FastestMCP.Sampling.prepare_tools(server_name)
   response = FastestMCP.Sampling.run!(ctx, prompt: "Use tools if needed", tools: tools)
   ```
 
-  The module is small on purpose. It does not invent a second interaction model;
-  it just makes the existing runtime sampling path easier to call from handlers.
+  It works on both protocol versions and in background tasks, as
+  `FastestMCP.Context.sample/3` does. On `2026-07-28`, the client answers and
+  sends the request again, and the handler runs again from the start; the
+  results of the tools the model used are kept between rounds, so each tool
+  runs once. See [Sampling and Elicitation](sampling-and-elicitation.md).
   """
 
-  import FastestMCP.Util, only: [maybe_put: 3, stringify_keys: 1]
+  import FastestMCP.Util, only: [maybe_put: 3]
 
   alias FastestMCP.Components.Tool
   alias FastestMCP.Context
   alias FastestMCP.Error
+  alias FastestMCP.InputRounds
   alias FastestMCP.JSONValue
   alias FastestMCP.SamplingTool
   alias FastestMCP.Transport.Serializer
@@ -60,9 +66,11 @@ defmodule FastestMCP.Sampling do
   `{:ok, response}` or `{:error, error}`.
 
   `prompt_or_messages` is a prompt string, a message list, or a keyword list
-  with `:prompt` or `:messages` and the options. With `tools:`, tool calls the
-  model makes run locally for up to `:max_tool_rounds` rounds (default 8).
-  Other options are passed to `FastestMCP.Context.sample/3`.
+  with `:prompt` or `:messages` and the options. With `tools:`, a list of the
+  tools that `prepare_tools/2` returns or of `{name, function, options}`
+  tuples, tool calls the model makes run locally for up to `:max_tool_rounds`
+  rounds (default 8). Other options are passed to
+  `FastestMCP.Context.sample/3`.
   """
   def run(%Context{} = context, prompt_or_messages, opts \\ []) do
     {:ok, run!(context, prompt_or_messages, opts)}
@@ -75,6 +83,7 @@ defmodule FastestMCP.Sampling do
   def run!(%Context{} = context, prompt_or_messages, opts \\ []) do
     {input, sample_opts} = normalize_run_input(prompt_or_messages, opts)
     tools = normalize_runtime_tools(Keyword.get(sample_opts, :tools, []))
+    sample_opts = Keyword.replace(sample_opts, :tools, tools)
 
     max_rounds =
       validate_max_tool_rounds!(Keyword.get(sample_opts, :max_tool_rounds, @max_tool_rounds))
@@ -115,16 +124,8 @@ defmodule FastestMCP.Sampling do
     Enum.map(tools, &normalize_tool(&1, opts))
   end
 
-  defp apply_sample(context, prompt, opts) when is_binary(prompt) do
-    Context.sample(context, prompt, opts)
-  end
-
-  defp apply_sample(context, messages, opts) when is_list(messages) do
-    Context.sample(context, normalize_messages(messages), opts)
-  end
-
   defp run_tool_rounds(context, input, opts, tools, max_rounds, round, seen_tool_use_ids) do
-    raw = apply_sample(context, input, opts)
+    raw = Context.sample(context, input, opts)
     tool_uses = extract_tool_uses(raw)
 
     cond do
@@ -139,11 +140,16 @@ defmodule FastestMCP.Sampling do
 
       true ->
         seen_tool_use_ids = validate_tool_uses!(tool_uses, tools, seen_tool_use_ids)
-        results = Enum.map(tool_uses, &execute_tool_use(&1, tools))
+
+        # In a multi-round-trip request, the handler runs again in every
+        # round; the tools run in the first round that reaches them only.
+        results =
+          InputRounds.once(context, fn -> Enum.map(tool_uses, &execute_tool_use(&1, tools)) end)
+
         next_opts = continue_sampling_opts(opts)
 
         next_messages =
-          normalize_sampling_input(input) ++
+          sampling_messages(input) ++
             [assistant_tool_message(raw), %{"role" => "user", "content" => results}]
 
         run_tool_rounds(
@@ -158,11 +164,10 @@ defmodule FastestMCP.Sampling do
     end
   end
 
-  defp normalize_sampling_input(input) when is_binary(input) do
-    [%{"role" => "user", "content" => %{"type" => "text", "text" => input}}]
-  end
+  defp sampling_messages(prompt) when is_binary(prompt),
+    do: [%{"role" => "user", "content" => %{"type" => "text", "text" => prompt}}]
 
-  defp normalize_sampling_input(input) when is_list(input), do: normalize_messages(input)
+  defp sampling_messages(messages) when is_list(messages), do: messages
 
   # Sampling results arrive in wire form, with string keys.
   defp extract_tool_uses(%{"content" => content}),
@@ -322,13 +327,6 @@ defmodule FastestMCP.Sampling do
   defp sampling_opts(opts) do
     opts
     |> Keyword.drop([:prompt, :messages])
-  end
-
-  defp normalize_messages(messages) do
-    Enum.map(messages, fn
-      %{} = message -> stringify_keys(message)
-      other -> other
-    end)
   end
 
   defp extract_text(%{"content" => %{"text" => text}}) when is_binary(text), do: text

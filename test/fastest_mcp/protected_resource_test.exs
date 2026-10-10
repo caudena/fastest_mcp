@@ -11,6 +11,7 @@ defmodule FastestMCP.ProtectedResourceTest do
   alias FastestMCP.Context
   alias FastestMCP.Error
   alias FastestMCP.TestSupport.ProtocolTestHelper, as: ProtocolTest
+  alias FastestMCP.Transport.HTTPApp
   alias FastestMCP.Transport.WellKnownHTTP
 
   test "serializes RFC 9728 metadata at the path-derived URI" do
@@ -144,7 +145,6 @@ defmodule FastestMCP.ProtectedResourceTest do
       WellKnownHTTP.init(
         server_name: "metadata-server",
         allowed_hosts: ["mcp.example.com"],
-        path: "/public/mcp",
         protected_resource: protected_resource()
       )
 
@@ -223,9 +223,66 @@ defmodule FastestMCP.ProtectedResourceTest do
 
     wrong_mcp_origin = initialize_request(app, "https://alias.example.com/public/mcp")
     assert wrong_mcp_origin.status == 403
+    assert get_resp_header(wrong_mcp_origin, "www-authenticate") == []
+  end
 
-    assert [challenge] = get_resp_header(wrong_mcp_origin, "www-authenticate")
-    assert challenge =~ ~s(resource_metadata="https://mcp.example.com/)
+  test "a forwarded endpoint matches its protected resource with the forwarded path" do
+    server_name = unique_name("protected-forwarded")
+
+    protected_resource =
+      ProtectedResource.new!(
+        resource: "https://mcp.example.com/api/mcp",
+        authorization_servers: ["https://auth.example.com"],
+        scopes_supported: ["files:read"]
+      )
+
+    FastestMCP.server(server_name, auth: allow_auth(), protected_resource: protected_resource)
+    |> start_server!()
+
+    opts =
+      HTTPApp.init(
+        server_name: server_name,
+        allowed_hosts: ["mcp.example.com"],
+        json_response: true
+      )
+
+    # What `forward "/mcp"` inside `scope "/api"` of a router passes on.
+    forwarded = fn url, script_name ->
+      request = ProtocolTest.jsonrpc_request(1, "initialize", ProtocolTest.initialize_params())
+
+      :post
+      |> conn(url, JSON.encode!(request))
+      |> put_req_header("content-type", "application/json")
+      |> put_req_header("accept", "application/json, text/event-stream")
+      |> put_req_header("authorization", "Bearer verified-token")
+      |> Map.merge(%{script_name: script_name, path_info: []})
+      |> HTTPApp.call(opts)
+    end
+
+    assert forwarded.("https://mcp.example.com/api/mcp", ["api", "mcp"]).status == 200
+
+    # Any other URL is not the resource: a plain 403, without a scope challenge.
+    mismatch = forwarded.("https://mcp.example.com/v2/mcp", ["v2", "mcp"])
+    assert mismatch.status == 403
+    assert get_resp_header(mismatch, "www-authenticate") == []
+
+    assert JSON.decode!(mismatch.resp_body)["error"]["message"] ==
+             "request URI does not match the configured protected resource"
+
+    # The metadata route, forwarded at the metadata path, compares the origin.
+    metadata =
+      :get
+      |> conn("https://mcp.example.com/.well-known/oauth-protected-resource/api/mcp")
+      |> Map.merge(%{
+        script_name: [".well-known", "oauth-protected-resource", "api", "mcp"],
+        path_info: []
+      })
+      |> WellKnownHTTP.call(
+        WellKnownHTTP.init(server_name: server_name, allowed_hosts: ["mcp.example.com"])
+      )
+
+    assert metadata.status == 200
+    assert JSON.decode!(metadata.resp_body)["resource"] == "https://mcp.example.com/api/mcp"
   end
 
   test "a separately mounted well-known plug reads the running server configuration" do
@@ -240,10 +297,20 @@ defmodule FastestMCP.ProtectedResourceTest do
     opts =
       WellKnownHTTP.init(
         server_name: server_name,
-        path: "/public/mcp",
         base_url: "https://mcp.example.com",
         allowed_hosts: ["mcp.example.com"]
       )
+
+    # The plug compares the origin only, so it takes no `path:`.
+    for {key, value} <- [ip: {0, 0, 0, 0}, path: "/public/mcp"] do
+      assert_raise ArgumentError, ~r/unknown keys \[#{inspect(key)}\]/, fn ->
+        WellKnownHTTP.init([{:server_name, server_name}, {key, value}])
+      end
+
+      assert_raise ArgumentError, ~r/unknown keys/, fn ->
+        FastestMCP.well_known_http_child_spec(server_name, [{key, value}])
+      end
+    end
 
     response =
       :get
@@ -252,6 +319,35 @@ defmodule FastestMCP.ProtectedResourceTest do
 
     assert response.status == 200
     assert JSON.decode!(response.resp_body) == ProtectedResource.metadata(protected_resource())
+  end
+
+  test "the metadata route of a server that isn't running gets 503 with Retry-After" do
+    server_name = unique_name("protected-not-running")
+
+    opts =
+      WellKnownHTTP.init(
+        server_name: server_name,
+        base_url: "https://mcp.example.com",
+        allowed_hosts: ["mcp.example.com"]
+      )
+
+    request = fn ->
+      :get
+      |> conn("https://mcp.example.com/.well-known/oauth-protected-resource/public/mcp")
+      |> WellKnownHTTP.call(opts)
+    end
+
+    response = request.()
+    assert {response.status, get_resp_header(response, "retry-after")} == {503, ["1"]}
+
+    assert %{"error" => %{"code" => "overloaded", "message" => message}} =
+             JSON.decode!(response.resp_body)
+
+    assert message == "server #{inspect(server_name)} is not running"
+
+    # Running without protected resource metadata, it has no such route.
+    FastestMCP.server(server_name) |> start_server!()
+    assert request.().status == 404
   end
 
   test "protected HTTP auth receives the exact resource and required scopes" do
@@ -523,15 +619,23 @@ defmodule FastestMCP.ProtectedResourceTest do
 
     app = protected_app(server_name)
 
+    # Without credentials, the challenge carries no error (RFC 6750, section 3.1).
     unauthorized = initialize_request(app, "https://mcp.example.com/public/mcp")
     assert unauthorized.status == 401
-    assert [unauthorized_challenge] = get_resp_header(unauthorized, "www-authenticate")
 
-    assert unauthorized_challenge =~
-             ~s(resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource/public/mcp")
+    assert get_resp_header(unauthorized, "www-authenticate") == [
+             ~s(Bearer resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource/public/mcp", scope="files:read")
+           ]
 
-    assert unauthorized_challenge =~ ~s(scope="files:read")
-    assert unauthorized_challenge =~ ~s(error="invalid_token")
+    invalid =
+      initialize_request(app, "https://mcp.example.com/public/mcp",
+        authorization: "Bearer unknown-token"
+      )
+
+    assert invalid.status == 401
+    assert [invalid_challenge] = get_resp_header(invalid, "www-authenticate")
+    assert invalid_challenge =~ ~s(scope="files:read", error="invalid_token")
+    assert invalid_challenge =~ ~s(error_description="invalid credentials")
 
     forbidden =
       initialize_request(app, "https://mcp.example.com/public/mcp",

@@ -1,10 +1,21 @@
 defmodule FastestMCP.Transport.HTTPApp do
   @moduledoc """
-  Embeddable Plug app for FastestMCP's HTTP transport.
+  The MCP endpoint as a plug, for Phoenix routers and other Plug applications.
 
-  It wraps the existing StreamableHTTP transport with optional HTTP middleware
-  and additional routes so the server can be mounted inside a broader Plug
-  application without forking the transport implementation.
+  A server module is this plug for itself, so a Phoenix router forwards to the
+  module:
+
+      forward "/mcp", MyApp.MCPServer, allowed_hosts: :localhost
+
+  For a server that isn't a module, forward here with its name:
+
+      forward "/mcp", FastestMCP.Transport.HTTPApp, server_name: "notes"
+
+  Outside Phoenix, `FastestMCP.http_app/2` returns it with validated options,
+  as `{FastestMCP.Transport.HTTPApp, opts}`, ready for Bandit's `:plug` option.
+
+  [Phoenix](phoenix.md) covers routing, allowed hosts, and authentication, and
+  [HTTP options](transports.md#http-options) lists every option.
   """
 
   alias FastestMCP.Auth.ProtectedResource
@@ -51,12 +62,18 @@ defmodule FastestMCP.Transport.HTTPApp do
   @doc "Plug callback: validates the options, raising `ArgumentError` for invalid ones."
   def init(opts), do: StreamableHTTP.validate_options!(opts)
 
-  @doc "Plug callback: serves the protected resource metadata, the extra routes, and the MCP endpoint."
+  @doc """
+  Plug callback: serves the protected resource metadata, the extra routes, and
+  the MCP endpoint, and answers the CORS preflight requests of the origins
+  that `:cors` allows.
+  """
   def call(conn, opts) do
     middleware = Keyword.get(opts, :middleware, [])
+    conn = HTTPCommon.put_cors_headers(conn, opts)
 
     with :ok <- HTTPCommon.validate_dns_rebinding(conn, opts),
-         :ok <- HTTPCommon.reject_query_access_token(conn) do
+         :ok <- HTTPCommon.reject_query_access_token(conn),
+         nil <- HTTPCommon.answer_cors_preflight(conn) do
       runtime = fetch_runtime(Keyword.fetch!(opts, :server_name))
       routes = Keyword.get(opts, :routes, []) ++ runtime_routes(runtime)
 
@@ -67,15 +84,13 @@ defmodule FastestMCP.Transport.HTTPApp do
         :pass ->
           run_middleware(conn, middleware, fn conn ->
             case dispatch_route(conn, routes) do
-              {:handled, handled_conn} ->
-                handled_conn
-
-              :pass ->
-                StreamableHTTP.call(conn, Keyword.drop(opts, [:middleware, :routes]))
+              {:handled, handled_conn} -> handled_conn
+              :pass -> serve_endpoint(conn, runtime, opts)
             end
           end)
       end
     else
+      %Plug.Conn{} = preflight -> preflight
       {:error, %Error{} = error} -> render_public_error(conn, opts, error)
     end
   end
@@ -135,6 +150,19 @@ defmodule FastestMCP.Transport.HTTPApp do
   defp invoke_handler(conn, {plug, plug_opts}) when is_atom(plug) do
     plug.call(conn, plug.init(plug_opts))
   end
+
+  # Without a running server, its own routes, such as its metadata route, are
+  # unknown: every path but the static `:routes` gets the 503 of a server that
+  # isn't running.
+  defp serve_endpoint(conn, nil, opts) do
+    case HTTPCommon.fetch_running(Keyword.fetch!(opts, :server_name)) do
+      {:ok, runtime} -> serve_endpoint(conn, runtime, opts)
+      {:error, error} -> render_public_error(conn, opts, error)
+    end
+  end
+
+  defp serve_endpoint(conn, _runtime, opts),
+    do: StreamableHTTP.call(conn, Keyword.drop(opts, [:middleware, :routes]))
 
   defp fetch_runtime(server_name) do
     case ServerRuntime.fetch(server_name) do

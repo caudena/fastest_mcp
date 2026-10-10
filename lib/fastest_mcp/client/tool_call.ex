@@ -12,7 +12,8 @@ defmodule FastestMCP.Client.ToolCall do
   # or the remote task through tasks/cancel. On MCP 2026-07-28 with negotiated
   # Tasks a request in flight may still become a task: the coordinator waits
   # for that phase change and cancels the task. When the owner exits, the call
-  # is cancelled.
+  # is cancelled. The result reaches the owner through an alias, which drops
+  # it once the owner's `await/2` timed out.
 
   import FastestMCP.Protocol.Version
 
@@ -20,6 +21,7 @@ defmodule FastestMCP.Client.ToolCall do
   alias FastestMCP.Client.Connection
   alias FastestMCP.Client.Connection.TaskRegistry
   alias FastestMCP.Client.Mrtr
+  alias FastestMCP.Client.Options
   alias FastestMCP.Client.RemoteTasks
   alias FastestMCP.Client.Request, as: ClientRequest
   alias FastestMCP.Client.Requests
@@ -32,7 +34,6 @@ defmodule FastestMCP.Client.ToolCall do
   alias FastestMCP.Error
   alias FastestMCP.Telemetry
 
-  @default_timeout_ms 5_000
   @default_task_timeout_ms 60_000
 
   ## Calls
@@ -40,18 +41,20 @@ defmodule FastestMCP.Client.ToolCall do
   def call(client_ref, name, arguments, opts) do
     with {:ok, client, opts} <- terminal(client_ref, opts) do
       name = to_string(name)
-      Trace.span("tools/call", name, &run(client, name, Map.new(arguments), opts, &1, nil))
+      arguments = Options.wire_map(arguments)
+      Trace.span("tools/call", name, &run(client, name, arguments, opts, &1, nil))
     end
   end
 
-  # The task the server creates for a call, as a handle.
+  # The task the server creates for a call, as a handle. `task: [ttl_ms: ms]`
+  # asks a 2025-11-25 server for that TTL; a 2026-07-28 server chooses it.
   def task(client_ref, name, arguments, opts) do
     with {:ok, client, opts} <- Requests.operation(client_ref, opts) do
       name = to_string(name)
-      opts = Keyword.put(opts, :task, :handle)
+      opts = Keyword.update(opts, :task, :handle, &task_handle/1)
 
       Trace.span("tools/call", name, fn trace ->
-        case execute(client, name, Map.new(arguments), opts, trace, nil) do
+        case execute(client, name, Options.wire_map(arguments), opts, trace, nil) do
           {:ok, {:task, task}} -> {:ok, task}
           {:ok, {:complete, _result}} -> {:error, no_task(name)}
           error -> error
@@ -60,17 +63,22 @@ defmodule FastestMCP.Client.ToolCall do
     end
   end
 
-  # A terminal call takes no task option; its overall deadline also bounds
-  # the task phase.
+  defp task_handle(task) when task in [nil, false, true], do: :handle
+  defp task_handle(task), do: task
+
+  # A terminal call takes no task option. Its overall deadline also bounds
+  # the task phase: the call's own `timeout_ms:` when it has one, else
+  # `task_timeout_ms:`.
   defp terminal(client_ref, opts) do
-    with {:ok, client, opts} <- Requests.operation(client_ref, opts) do
+    with {:ok, client, operation_opts} <- Requests.operation(client_ref, opts) do
       if Keyword.get(opts, :task) not in [nil, false] do
         raise ArgumentError,
               "call_tool/4 and start_tool_result/4 return a terminal result; use call_tool_task/4 for an explicit task handle"
       end
 
       task_timeout = Keyword.get(opts, :task_timeout_ms, @default_task_timeout_ms)
-      {:ok, client, Keyword.put(opts, :deadline, Deadline.from_options(opts, task_timeout))}
+      deadline = Deadline.from_options(opts, task_timeout)
+      {:ok, client, Keyword.put(operation_opts, :deadline, deadline)}
     end
   end
 
@@ -105,7 +113,7 @@ defmodule FastestMCP.Client.ToolCall do
 
   # Discovery and the request share `timeout_ms`.
   defp execute(client, name, arguments, opts, trace, observe) do
-    timeout = Keyword.get(opts, :timeout_ms, @default_timeout_ms)
+    timeout = Keyword.fetch!(opts, :timeout_ms)
     deadline = opts |> Deadline.from_options(timeout) |> Deadline.cap(timeout)
     task_requested? = Wire.task_requested?(opts)
 
@@ -179,9 +187,9 @@ defmodule FastestMCP.Client.ToolCall do
   def start(client_ref, name, arguments, opts) do
     with {:ok, client, opts} <- terminal(client_ref, opts) do
       owner = self()
-      ref = make_ref()
+      ref = :erlang.alias([:reply])
       name = to_string(name)
-      arguments = Map.new(arguments)
+      arguments = Options.wire_map(arguments)
       trace_context = Telemetry.current_context()
 
       call = fn observe ->
@@ -220,8 +228,15 @@ defmodule FastestMCP.Client.ToolCall do
         {:error, Connection.exit_error(reason)}
     after
       timeout ->
+        :erlang.unalias(ref)
         :ok = cancel(request, "await timed out")
         Process.demonitor(request.monitor, [:flush])
+
+        receive do
+          {:fastest_mcp_tool_result, ^ref, _result} -> :ok
+        after
+          0 -> :ok
+        end
 
         {:error,
          %Error{code: :timeout, message: "tools/call timed out", details: %{timeout_ms: timeout}}}
@@ -368,9 +383,10 @@ defmodule FastestMCP.Client.ToolCall do
     :ok
   end
 
+  # `ref` is the owner's alias.
   defp reply(state, result) do
     Process.demonitor(state.owner_monitor, [:flush])
-    send(state.owner, {:fastest_mcp_tool_result, state.ref, result})
+    send(state.ref, {:fastest_mcp_tool_result, state.ref, result})
     :ok
   end
 end

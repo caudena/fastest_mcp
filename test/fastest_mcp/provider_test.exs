@@ -49,6 +49,15 @@ defmodule FastestMCP.ProviderTest do
       do: Enum.filter(components, &is_struct(&1, Map.fetch!(@modules, kind)))
   end
 
+  defmodule AgentProvider do
+    use FastestMCP.Provider
+
+    defstruct [:store]
+
+    def list_components(%__MODULE__{store: store}, :tool, _operation), do: Agent.get(store, & &1)
+    def list_components(%__MODULE__{}, _kind, _operation), do: []
+  end
+
   defmodule SchemaTransform do
     use FastestMCP.ProviderTransform
 
@@ -215,6 +224,92 @@ defmodule FastestMCP.ProviderTest do
     assert "success" == FastestMCP.call_tool!(server_name, "short", %{})
   end
 
+  test "a custom provider announces changes with notify_list_changed/2" do
+    server_name = unique_name("provider-notify")
+    test_pid = self()
+    {:ok, store} = Agent.start_link(fn -> [] end)
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_middleware(FastestMCP.Middleware.response_caching())
+    |> FastestMCP.add_provider(%AgentProvider{store: store})
+    |> start_server!()
+
+    legacy =
+      connect!({:in_process, server_name},
+        protocol_version: "2025-11-25",
+        notification_handler: &send(test_pid, {:legacy, &1["method"]})
+      )
+
+    modern = connect!({:in_process, server_name}, protocol_version: "2026-07-28")
+
+    listener =
+      FastestMCP.Client.listen!(modern, %{"toolsListChanged" => true},
+        on_notification: &send(test_pid, {:modern, &1["method"]})
+      )
+
+    assert_receive {:modern, "notifications/subscriptions/acknowledged"}
+    assert [] == FastestMCP.list_tools!(server_name)
+    assert %{items: []} = FastestMCP.Client.list_tools!(legacy)
+
+    Agent.update(store, fn _tools -> [Tool.new("search", fn _args, _ctx -> "found" end)] end)
+    assert :ok = FastestMCP.notify_list_changed(server_name, :tools)
+
+    assert_receive {:legacy, "notifications/tools/list_changed"}
+    assert_receive {:modern, "notifications/tools/list_changed"}
+    assert ["search"] == Enum.map(FastestMCP.list_tools!(server_name), & &1.name)
+    assert %{items: [%{"name" => "search"}]} = FastestMCP.Client.list_tools!(legacy)
+
+    assert :ok = FastestMCP.notify_list_changed!(server_name, [:resources, :prompts])
+    assert_receive {:legacy, "notifications/resources/list_changed"}
+    assert_receive {:legacy, "notifications/prompts/list_changed"}
+
+    assert {:error, %Error{code: :not_found}} =
+             FastestMCP.notify_list_changed(unique_name("missing"), :tools)
+
+    assert_raise ArgumentError, ~r/kinds must be :tools, :resources, or :prompts/, fn ->
+      FastestMCP.notify_list_changed(server_name, :tool)
+    end
+
+    assert :ok = FastestMCP.Client.Request.cancel!(listener, "test complete")
+  end
+
+  test "a namespace that makes a tool name longer than 128 characters raises, naming the tool" do
+    long = String.duplicate("a", 121)
+
+    child =
+      FastestMCP.server("long-child") |> FastestMCP.add_tool(long, fn _args, _ctx -> "ok" end)
+
+    assert_raise ArgumentError,
+                 ~s(tool "#{long}" becomes "billing_#{long}", which is longer than 128 characters),
+                 fn ->
+                   FastestMCP.mount(FastestMCP.server("long-parent"), child, namespace: "billing")
+                 end
+
+    # Tools a provider supplies are checked when the transform builds the name.
+    server_name = unique_name("provider-long-name")
+    provider = %StaticProvider{components: [Tool.new(long, fn _args, _ctx -> "ok" end)]}
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_provider(Provider.add_transform(provider, Namespace.new("billing")))
+    |> start_server!()
+
+    assert {:error, %Error{message: message}} = FastestMCP.list_tools(server_name)
+    assert message =~ ~s(tool "#{long}" becomes "billing_#{long}", which is longer than 128)
+
+    # A rename after the namespace may shorten it again.
+    renamed = unique_name("provider-long-renamed")
+
+    FastestMCP.server(renamed)
+    |> FastestMCP.add_provider(
+      provider
+      |> Provider.add_transform(Namespace.new("billing"))
+      |> Provider.add_transform(ToolTransform.new(%{"billing_#{long}" => %{name: "short"}}))
+    )
+    |> start_server!()
+
+    assert [%{name: "short"}] = FastestMCP.list_tools!(renamed)
+  end
+
   test "duplicate or missing rename targets raise" do
     assert_raise ArgumentError, ~r/duplicate target name/, fn ->
       ToolTransform.new(%{
@@ -329,7 +424,7 @@ defmodule FastestMCP.ProviderTest do
         FastestMCP.call_tool!(server_name, "dynamic_echo", %{"value" => "3"})
       end
 
-    assert error.code == :bad_request
+    assert error.code == :invalid_params
   end
 
   test "schema-preserving transforms reuse provider-compiled validators" do
@@ -380,6 +475,40 @@ defmodule FastestMCP.ProviderTest do
 
     assert %{"value" => 7} =
              FastestMCP.call_tool!(server_name, "ns_dynamic_echo", %{"value" => 7})
+  end
+
+  test "a server transform that changes a tool's input schema validates calls with it" do
+    server_name = unique_name("server-transform-schema")
+
+    require_title = fn
+      %Tool{name: "add_note"} = tool, _operation ->
+        %{
+          tool
+          | input_schema: %{
+              "type" => "object",
+              "properties" => %{"title" => %{"type" => "string"}},
+              "required" => ["title"]
+            }
+        }
+
+      component, _operation ->
+        component
+    end
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_transform(require_title)
+    |> FastestMCP.add_tool("add_note", fn arguments, _ctx -> arguments end,
+      input_schema: %{"type" => "object"}
+    )
+    |> start_server!()
+
+    assert [%{input_schema: %{"required" => ["title"]}}] = FastestMCP.list_tools!(server_name)
+
+    assert {:error, %Error{} = error} = FastestMCP.call_tool(server_name, "add_note", %{})
+    assert error.message =~ "required property is missing"
+
+    assert %{"title" => "Release"} ==
+             FastestMCP.call_tool!(server_name, "add_note", %{"title" => "Release"})
   end
 
   defp dynamic_echo_tool do

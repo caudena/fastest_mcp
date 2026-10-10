@@ -15,11 +15,13 @@ defmodule FastestMCP.Client.Connection.Catalog do
   @enforce_keys [:tools, :responses]
   defstruct [:tools, :responses, ready?: false, load: nil]
 
-  # A fresh catalog is answered at once; otherwise the first caller loads it
-  # and later callers wait for its `install/5`.
+  # A fresh catalog is answered at once, and so is a call of a tool that a
+  # stale one lists: calls list the tools again only for a tool the catalog
+  # lacks. Otherwise the first caller loads the catalog and later callers wait
+  # for its `install/5`.
   def ensure(%State{catalog: catalog} = state, {loader, _tag} = from, select) do
     cond do
-      catalog.ready? and ToolCatalog.fresh?(catalog.tools) ->
+      catalog.ready? and usable?(catalog.tools, select) ->
         {:reply, {:ok, selection(state, catalog.tools, select)}, state}
 
       catalog.load ->
@@ -39,6 +41,11 @@ defmodule FastestMCP.Client.Connection.Catalog do
          %{state | catalog: %{state.catalog | ready?: false, load: load}}}
     end
   end
+
+  defp usable?(tools, :all), do: ToolCatalog.fresh?(tools)
+
+  defp usable?(tools, {name, version}),
+    do: ToolCatalog.fresh?(tools) or ToolCatalog.lookup(tools, name, version) != :error
 
   def load_reply(state),
     do:

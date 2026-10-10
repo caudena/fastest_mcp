@@ -185,12 +185,12 @@ defmodule FastestMCP.Client.OAuth.Config do
 
   defp registration(_registration), do: {:error, :registration_required}
 
+  defp authorization_handler(nil), do: {:error, :authorization_handler_required}
+
   defp authorization_handler(handler) do
-    cond do
-      callback?(handler, :authorize) -> {:ok, handler}
-      is_atom(handler) -> {:error, :invalid_authorization_handler}
-      true -> {:error, :authorization_handler_required}
-    end
+    if callback?(handler, :authorize),
+      do: {:ok, handler},
+      else: {:error, :invalid_authorization_handler}
   end
 
   # Dynamic registration sends `native` for a loopback redirect.

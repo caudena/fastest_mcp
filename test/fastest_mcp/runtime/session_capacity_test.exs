@@ -29,6 +29,46 @@ defmodule FastestMCP.Runtime.SessionCapacityTest do
              FastestMCP.call_tool!(server_name, "remember", %{}, session_id: "ttl-session")
   end
 
+  test "requests without a client session start no session process" do
+    server_name = unique_name("sessionless")
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_tool("visit", fn _args, ctx ->
+      visits = FastestMCP.Context.get_state(ctx, :visits, 0) + 1
+      :ok = FastestMCP.Context.set_state(ctx, :visits, visits)
+      %{visits: visits, session_id: ctx.session_id}
+    end)
+    |> start_server!(max_sessions: 1)
+
+    for id <- 1..5 do
+      response =
+        ProtocolTest.modern_http_request(server_name, id, "tools/call", %{"name" => "visit"},
+          headers: [{"mcp-name", "visit"}]
+        )
+
+      assert %{"result" => %{"structuredContent" => %{"visits" => 1, "session_id" => nil}}} =
+               JSON.decode!(response.resp_body)
+
+      assert %{"result" => %{"structuredContent" => %{"visits" => 1, "session_id" => nil}}} =
+               ProtocolTest.modern_stdio_request(server_name, id, "tools/call", %{
+                 "name" => "visit"
+               })
+
+      assert %{visits: 1, session_id: nil} == FastestMCP.call_tool!(server_name, "visit")
+    end
+
+    %{url: url} = start_http!(server_name)
+    client = connect!(url)
+    assert %{"visits" => 1} = FastestMCP.Client.call_tool!(client, "visit").structured_content
+
+    assert registered_sessions(server_name) == 0
+
+    # The one session the server allows is free for a caller that names one.
+    assert %{visits: 1} = FastestMCP.call_tool!(server_name, "visit", %{}, session_id: "chat")
+    assert %{visits: 2} = FastestMCP.call_tool!(server_name, "visit", %{}, session_id: "chat")
+    assert registered_sessions(server_name) == 1
+  end
+
   test "session caps reject new sessions while allowing reuse of active sessions" do
     server_name = "session-cap-" <> Integer.to_string(System.unique_integer([:positive]))
 

@@ -210,10 +210,11 @@ defmodule FastestMCP.TestSupport.ProtocolTestHelper do
   def modern_http_request(server_name, id, method, params \\ %{}, call_opts \\ []) do
     path = Keyword.get(call_opts, :path, "/mcp")
     headers = Keyword.get(call_opts, :headers, [])
+    request = modern_request(id, method, params, call_opts)
     call_opts = transport_opts(call_opts, server_name)
 
     :post
-    |> Plug.Test.conn(path, JSON.encode!(modern_request(id, method, params, call_opts)))
+    |> Plug.Test.conn(path, JSON.encode!(request))
     |> Plug.Conn.put_req_header("content-type", "application/json")
     |> Plug.Conn.put_req_header("accept", @post_accept)
     |> Plug.Conn.put_req_header("mcp-protocol-version", @modern_version)
@@ -253,9 +254,10 @@ defmodule FastestMCP.TestSupport.ProtocolTestHelper do
     end)
   end
 
+  # The HTTP options among a helper's options, which also build the request.
   defp transport_opts(opts, server_name) do
     opts
-    |> Keyword.delete(:headers)
+    |> Keyword.drop([:headers, :client_info, :client_capabilities])
     |> Keyword.put_new(:json_response, true)
     |> Keyword.put(:server_name, server_name)
   end

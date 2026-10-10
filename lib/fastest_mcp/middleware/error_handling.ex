@@ -39,8 +39,10 @@ defmodule FastestMCP.Middleware.ErrorHandling do
     }
   end
 
-  # Only errors wrapping an unexpected exception (see `FastestMCP.Error`) are
-  # logged, counted, and transformed according to that exception.
+  # Every error is logged and counted, by the exception it wraps when it has
+  # one (see `FastestMCP.Error`). An exception that middleware or an extension
+  # method raised becomes a clearer error; a handler's crash already names its
+  # component and stays as it is.
   @impl FastestMCP.Middleware
   def call(%__MODULE__{runtime: nil} = middleware, _operation, _next),
     do: Middleware.not_running(middleware)
@@ -50,6 +52,7 @@ defmodule FastestMCP.Middleware.ErrorHandling do
     with {:error, %Error{} = error} <- next.(operation) do
       {exception, stacktrace} = error.cause || {error, []}
       log_error(middleware, exception, operation, stacktrace)
+      exception = if error.code == :component_crash, do: error, else: exception
 
       case transform_error(middleware, exception, operation) do
         %Error{} = transformed -> {:error, transformed}

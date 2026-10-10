@@ -220,7 +220,8 @@ defmodule FastestMCP.Providers.Proxy do
           input_schema: Map.get(descriptor, "inputSchema", %{"type" => "object"}),
           output_schema: Map.get(descriptor, "outputSchema"),
           task: false
-        ]
+        ],
+      :remote
     )
   end
 
@@ -236,10 +237,11 @@ defmodule FastestMCP.Providers.Proxy do
         [
           name: Map.get(descriptor, "name"),
           annotations: Map.get(descriptor, "annotations"),
-          mime_type: Map.get(descriptor, "mimeType", "application/json"),
+          mime_type: Map.get(descriptor, "mimeType"),
           size: Map.get(descriptor, "size"),
           task: false
-        ]
+        ],
+      :remote
     )
   end
 
@@ -257,10 +259,11 @@ defmodule FastestMCP.Providers.Proxy do
         [
           name: Map.get(descriptor, "name"),
           annotations: Map.get(descriptor, "annotations"),
-          mime_type: Map.get(descriptor, "mimeType", "application/json"),
+          mime_type: Map.get(descriptor, "mimeType"),
           parameters: descriptor_parameters(descriptor),
           task: false
-        ]
+        ],
+      :remote
     )
   end
 
@@ -270,7 +273,8 @@ defmodule FastestMCP.Providers.Proxy do
       required_string!(descriptor, "name", :prompt),
       fn arguments, context -> forward_prompt(proxy, descriptor, arguments, context) end,
       common_component_opts(descriptor) ++
-        [arguments: Map.get(descriptor, "arguments", []), task: false]
+        [arguments: Map.get(descriptor, "arguments", []), task: false],
+      :remote
     )
   end
 
@@ -401,11 +405,14 @@ defmodule FastestMCP.Providers.Proxy do
     end
   end
 
+  # A stdio upstream has no session stream to turn off.
   defp upstream_client_opts(%__MODULE__{} = proxy, %Context{} = context) do
     proxy.client_opts
     |> Keyword.put(:protocol_version, selected_protocol_version(proxy, context))
     |> Keyword.put(:auto_initialize, true)
-    |> Keyword.put(:session_stream, false)
+    |> then(
+      &if(proxy.target_type == :http, do: Keyword.put(&1, :session_stream, false), else: &1)
+    )
     |> Keyword.put(:extensions, negotiated_extensions(proxy.client_opts, context))
     |> Keyword.put(:progress_handler, progress_handler(context))
     |> put_mrtr_capability_sentinels(context)

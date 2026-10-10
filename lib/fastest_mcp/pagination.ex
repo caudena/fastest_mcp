@@ -59,18 +59,12 @@ defmodule FastestMCP.Pagination do
   # The page of `source.(after_key, limit)`, which returns `{:ok, items}` with
   # at least the `limit` items after `after_key` it has, or an error.
   def wire_page(opts, source) when is_list(opts) and is_function(source, 2) do
-    secret = validate_secret!(Keyword.fetch!(opts, :secret))
-    scope = normalize_binding(Keyword.fetch!(opts, :scope))
-    fingerprint = normalize_binding(Keyword.get(opts, :fingerprint, "public"))
-    page_size = Keyword.get(opts, :page_size, @default_page_size)
-    key_fun = Keyword.get(opts, :key, &default_key/1)
-    cursor = Keyword.get(opts, :cursor)
+    with {:ok, {after_key, limit}} <- wire_position(opts),
+         {:ok, candidates} <- source.(after_key, limit) do
+      key_fun = Keyword.get(opts, :key, &default_key/1)
 
-    with :ok <- validate_page_size(page_size),
-         {:ok, after_key} <- decode_wire_cursor(cursor, secret, scope, fingerprint),
-         {:ok, candidates} <- source.(after_key, page_size + 1) do
       {page, overflow} =
-        candidates |> keyset_items(after_key, page_size + 1, key_fun) |> Enum.split(page_size)
+        candidates |> keyset_items(after_key, limit, key_fun) |> Enum.split(limit - 1)
 
       next_cursor =
         if page != [] and overflow != [] do
@@ -78,11 +72,30 @@ defmodule FastestMCP.Pagination do
           |> List.last()
           |> key_fun.()
           |> normalize_key()
-          |> encode_wire_cursor(secret, scope, fingerprint)
+          |> encode_wire_cursor(signing(opts))
         end
 
       {:ok, %{items: page, next_cursor: next_cursor}}
     end
+  end
+
+  # `{:ok, {after_key, limit}}`: the key a page starts after, nil for the first
+  # page, from the cursor that `wire_page/2` would read, and how many items its
+  # source returns; or an invalid cursor or page size error.
+  def wire_position(opts) when is_list(opts) do
+    page_size = Keyword.get(opts, :page_size, @default_page_size)
+    cursor = Keyword.get(opts, :cursor)
+
+    with :ok <- validate_page_size(page_size),
+         {:ok, after_key} <- decode_wire_cursor(cursor, signing(opts)),
+         do: {:ok, {after_key, page_size + 1}}
+  end
+
+  # The secret, scope, and fingerprint that sign the cursors of `opts`.
+  defp signing(opts) do
+    {validate_secret!(Keyword.fetch!(opts, :secret)),
+     normalize_binding(Keyword.fetch!(opts, :scope)),
+     normalize_binding(Keyword.get(opts, :fingerprint, "public"))}
   end
 
   def source_page(items, after_key, limit, opts \\ [])
@@ -150,7 +163,7 @@ defmodule FastestMCP.Pagination do
 
   defp insert_sorted([current | rest], entry), do: [current | insert_sorted(rest, entry)]
 
-  defp encode_wire_cursor(after_key, secret, scope, fingerprint) do
+  defp encode_wire_cursor(after_key, {secret, scope, fingerprint}) do
     body =
       JSON.encode!(%{
         "v" => @cursor_version,
@@ -165,9 +178,9 @@ defmodule FastestMCP.Pagination do
       "." <> Base.url_encode64(signature, padding: false)
   end
 
-  defp decode_wire_cursor(nil, _secret, _scope, _fingerprint), do: {:ok, nil}
+  defp decode_wire_cursor(nil, _signing), do: {:ok, nil}
 
-  defp decode_wire_cursor(cursor, secret, scope, fingerprint)
+  defp decode_wire_cursor(cursor, {secret, scope, fingerprint})
        when is_binary(cursor) and cursor != "" and byte_size(cursor) <= @max_cursor_bytes do
     with [encoded_body, encoded_signature] <- String.split(cursor, ".", parts: 2),
          {:ok, body} <- Base.url_decode64(encoded_body, padding: false),
@@ -187,7 +200,7 @@ defmodule FastestMCP.Pagination do
     end
   end
 
-  defp decode_wire_cursor(_cursor, _secret, _scope, _fingerprint), do: invalid_cursor()
+  defp decode_wire_cursor(_cursor, _signing), do: invalid_cursor()
 
   defp normalize_key(key) when is_list(key), do: Enum.map(key, &normalize_key_part/1)
   defp normalize_key(key), do: [normalize_key_part(key)]

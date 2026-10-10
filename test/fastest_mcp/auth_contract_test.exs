@@ -35,6 +35,12 @@ defmodule FastestMCP.AuthContractTest do
   defmodule InvalidProvider do
   end
 
+  defmodule RejectingProvider do
+    @behaviour FastestMCP.Auth
+
+    def authenticate(_input, _context, _opts), do: {:error, :unauthorized}
+  end
+
   test "server auth is declarative and invalid providers are rejected early" do
     server =
       FastestMCP.server(
@@ -221,6 +227,174 @@ defmodule FastestMCP.AuthContractTest do
              JSON.decode!(conn.resp_body)
   end
 
+  test "an authenticator that crashes is masked like a handler crash, and its input stays hidden" do
+    token = "Bearer token-in-the-auth-input"
+    crash = fn input, _ctx -> Map.fetch!(input, :user) end
+
+    for masked? <- [false, true] do
+      server_name = unique_name("auth-crash")
+
+      FastestMCP.server(server_name, mask_error_details: masked?)
+      |> FastestMCP.add_auth(crash)
+      |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+      |> start_server!()
+
+      # In process the error is whole, its cause included, for logs and spans.
+      assert {:error,
+              %Error{code: :internal_error, message: message, cause: {%KeyError{}, [_ | _]}}} =
+               FastestMCP.call_tool(server_name, "echo", %{},
+                 auth_input: %{"authorization" => token}
+               )
+
+      refute message =~ "token-in-the-auth-input"
+
+      http =
+        ProtocolTest.modern_http_request(server_name, 1, "tools/call", %{"name" => "echo"},
+          headers: [{"authorization", token}, {"mcp-name", "echo"}]
+        )
+
+      stdio =
+        ProtocolTest.modern_stdio_request(server_name, 2, "tools/call", %{"name" => "echo"},
+          auth_input: %{"authorization" => token}
+        )
+
+      for %{"error" => error} = body <- [JSON.decode!(http.resp_body), stdio] do
+        refute inspect(body) =~ "token-in-the-auth-input"
+
+        if masked? do
+          assert %{"message" => "authentication failed", "data" => %{"fastestmcp" => fastestmcp}} =
+                   error
+
+          refute Map.has_key?(fastestmcp, "details")
+        else
+          assert %{
+                   "message" => "authenticator failed",
+                   "data" => %{"fastestmcp" => %{"details" => %{"kind" => "KeyError"}}}
+                 } = error
+        end
+      end
+    end
+  end
+
+  test "over HTTP, an authenticator that crashes gets 500 on both protocol versions" do
+    token = "Bearer token-in-the-auth-input"
+
+    for masked? <- [false, true] do
+      server_name = unique_name("auth-crash-http")
+
+      FastestMCP.server(server_name, mask_error_details: masked?)
+      |> FastestMCP.add_auth(fn input, _ctx -> Map.fetch!(input, :user) end)
+      |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+      |> start_server!()
+
+      modern =
+        ProtocolTest.modern_http_request(server_name, 1, "tools/call", %{"name" => "echo"},
+          headers: [{"authorization", token}, {"mcp-name", "echo"}]
+        )
+
+      initialize = ProtocolTest.jsonrpc_request(2, "initialize", ProtocolTest.initialize_params())
+
+      legacy =
+        ProtocolTest.http_post(server_name, nil, initialize, headers: [{"authorization", token}])
+
+      for conn <- [modern, legacy] do
+        assert conn.status == 500
+
+        assert %{"error" => %{"code" => -32_603, "message" => message}} =
+                 JSON.decode!(conn.resp_body)
+
+        refute conn.resp_body =~ "token-in-the-auth-input"
+        refute conn.resp_body =~ "not found"
+
+        if masked?,
+          do: assert(message == "authentication failed"),
+          else: assert(message == "authenticator failed")
+      end
+    end
+  end
+
+  test "over HTTP, an authenticator's error gets the status of its code" do
+    server_name = unique_name("auth-error-status")
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_auth(fn %{"headers" => %{"x-code" => code}}, _ctx ->
+      {:error, {String.to_existing_atom(code), "token service says #{code}"}}
+    end)
+    |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+    |> start_server!()
+
+    for {code, status} <- [rate_limited: 429, overloaded: 503, timeout: 504, invalid_token: 400] do
+      conn =
+        ProtocolTest.modern_http_request(server_name, 1, "tools/call", %{"name" => "echo"},
+          headers: [{"x-code", code}, {"mcp-name", "echo"}]
+        )
+
+      assert {conn.status, JSON.decode!(conn.resp_body)["error"]["message"]} ==
+               {status, "token service says #{code}"}
+
+      if code == :overloaded, do: assert(get_resp_header(conn, "retry-after") == ["1"])
+    end
+  end
+
+  test "ctx.authenticated is true only when an authenticator accepted the request" do
+    tool = fn _args, ctx -> %{authenticated: ctx.authenticated} end
+    open_name = unique_name("authenticated-open")
+    protected_name = unique_name("authenticated-protected")
+
+    FastestMCP.server(open_name)
+    |> FastestMCP.add_tool("authenticated", tool)
+    |> start_server!()
+
+    FastestMCP.server(protected_name)
+    |> FastestMCP.add_auth(FastestMCP.Auth.StaticToken,
+      tokens: %{"valid-token" => %{client_id: "service-a"}}
+    )
+    |> FastestMCP.add_tool("authenticated", tool)
+    |> start_server!()
+
+    call = %{"name" => "authenticated"}
+    token = [{"authorization", "Bearer valid-token"}]
+
+    for {server_name, headers, expected} <- [
+          {open_name, [], false},
+          {protected_name, token, true}
+        ] do
+      modern =
+        ProtocolTest.modern_http_request(server_name, 1, "tools/call", call,
+          headers: [{"mcp-name", "authenticated"} | headers]
+        )
+
+      assert %{"result" => %{"structuredContent" => %{"authenticated" => ^expected}}} =
+               JSON.decode!(modern.resp_body)
+
+      {session_id, _initialize, _initialized} =
+        ProtocolTest.initialize_http(server_name, headers: headers)
+
+      legacy =
+        ProtocolTest.http_request(server_name, session_id, 2, "tools/call", call,
+          headers: headers
+        )
+
+      assert %{"result" => %{"structuredContent" => %{"authenticated" => ^expected}}} =
+               JSON.decode!(legacy.resp_body)
+    end
+
+    auth_input = %{"authorization" => "Bearer valid-token"}
+
+    for {server_name, opts, expected} <- [
+          {open_name, [], false},
+          {protected_name, [auth_input: auth_input], true}
+        ] do
+      {connection_id, _initialize} = ProtocolTest.initialize_stdio(server_name, opts)
+
+      assert %{"result" => %{"structuredContent" => %{"authenticated" => ^expected}}} =
+               ProtocolTest.stdio_request(server_name, connection_id, 2, "tools/call", call, opts)
+
+      assert %{authenticated: ^expected} =
+               FastestMCP.call_tool!(server_name, "authenticated", %{}, opts)
+    end
+  end
+
   test "HTTP auth errors use bearer challenges without protected-resource metadata" do
     server_name = "auth-http-errors-" <> Integer.to_string(System.unique_integer([:positive]))
 
@@ -244,8 +418,7 @@ defmodule FastestMCP.AuthContractTest do
       )
 
     assert unauthorized_conn.status == 401
-    assert [challenge] = get_resp_header(unauthorized_conn, "www-authenticate")
-    assert String.starts_with?(challenge, "Bearer ")
+    assert get_resp_header(unauthorized_conn, "www-authenticate") == ["Bearer"]
 
     assert %{
              "jsonrpc" => "2.0",
@@ -276,6 +449,39 @@ defmodule FastestMCP.AuthContractTest do
              "error" => %{"data" => %{"fastestmcp" => %{"code" => "forbidden"}}}
            } =
              JSON.decode!(forbidden_conn.resp_body)
+  end
+
+  test "a request without credentials gets a challenge without an error code or assign name" do
+    server_name = unique_name("auth-no-credentials")
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_auth(FastestMCP.Auth.from_assign(:current_scope))
+    |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+    |> start_server!()
+
+    missing = ProtocolTest.modern_http_request(server_name, 1, "tools/list")
+
+    assert missing.status == 401
+    assert get_resp_header(missing, "www-authenticate") == ["Bearer"]
+    refute missing.resp_body =~ "current_scope"
+
+    assert get_in(JSON.decode!(missing.resp_body), ["error", "message"]) ==
+             "missing or invalid credentials"
+
+    # The token was sent, and the plug that would assign the caller rejected it.
+    rejected =
+      ProtocolTest.modern_http_request(server_name, 2, "tools/list", %{},
+        headers: [{"authorization", "Bearer expired-token"}]
+      )
+
+    assert rejected.status == 401
+
+    assert get_resp_header(rejected, "www-authenticate") == [
+             ~s(Bearer error="invalid_token", error_description="missing or invalid credentials")
+           ]
+
+    assert {:error, %Error{code: :unauthorized, message: "missing or invalid credentials"}} =
+             FastestMCP.list_tools(server_name)
   end
 
   test "plain insufficient-scope challenges sort exact validated scope tokens" do
@@ -520,5 +726,258 @@ defmodule FastestMCP.AuthContractTest do
              "result" => %{"structuredContent" => %{"sub" => "user-123"}}
            } =
              JSON.decode!(conn.resp_body)
+  end
+
+  test "over stdio and in process, the handshake authenticates only the credentials it carries" do
+    server_name = unique_name("auth-discover")
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_auth(fn _input, _ctx -> {:error, :unauthorized} end)
+    |> FastestMCP.add_tool("ping", fn _args, _ctx -> "pong" end)
+    |> start_server!()
+
+    assert %{"result" => %{"supportedVersions" => [_ | _]}} =
+             ProtocolTest.modern_stdio_request(server_name, 1, "server/discover")
+
+    assert %{"error" => %{"message" => "unauthorized"}} =
+             ProtocolTest.modern_stdio_request(server_name, 2, "tools/call", %{"name" => "ping"})
+
+    client = connect!({:in_process, server_name})
+    assert FastestMCP.Client.info!(client).protocol_version == "2026-07-28"
+
+    assert {:error, %Error{code: :unauthorized, message: "unauthorized"}} =
+             FastestMCP.Client.call_tool(client, "ping", %{})
+
+    # Credentials that the handshake carries are authenticated.
+    assert %{"error" => %{"message" => "unauthorized"}} =
+             ProtocolTest.modern_stdio_request(server_name, 3, "server/discover", %{},
+               auth_input: %{"token" => "expired"}
+             )
+
+    # Over HTTP, every request is authenticated.
+    assert ProtocolTest.modern_http_request(server_name, 4, "server/discover").status == 401
+  end
+
+  test "the handshake offers completions for a prompt only some callers may use" do
+    server_name = unique_name("auth-completions")
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_auth(fn input, _ctx ->
+      if input["token"] == "reader",
+        do: {:ok, %{principal: "reader", scopes: ["notes:read"]}},
+        else: {:error, :unauthorized}
+    end)
+    |> FastestMCP.add_prompt("summarize", fn %{"topic" => topic}, _ctx -> "About #{topic}" end,
+      arguments: [%{name: "topic", required: true, completion: ["release", "roadmap"]}],
+      authorization: [FastestMCP.Authorization.require_scopes(["notes:read"])]
+    )
+    |> start_server!()
+
+    for version <- ["2026-07-28", "2025-11-25"] do
+      client =
+        connect!({:in_process, server_name},
+          protocol_version: version,
+          auth_input: %{"token" => "reader"}
+        )
+
+      assert %{"completions" => %{}} = FastestMCP.Client.info!(client).capabilities
+
+      assert {:ok, %{"values" => ["release", "roadmap"]}} =
+               FastestMCP.Client.complete(
+                 client,
+                 %{"type" => "ref/prompt", "name" => "summarize"},
+                 %{"name" => "topic", "value" => "r"}
+               )
+    end
+  end
+
+  test "client-visible authentication errors name no authenticator module" do
+    outcomes = [
+      {fn _input, _ctx -> {:error, :unauthorized} end, 401, "unauthorized"},
+      {fn _input, _ctx -> {:error, :forbidden} end, 403, "forbidden"},
+      {fn _input, _ctx -> {:error, {:unauthorized, "token expired"}} end, 401, "token expired"},
+      {fn _input, _ctx -> {:error, :token_service_down} end, 500, "authenticator failed"},
+      {fn _input, _ctx -> raise "token service down" end, 500, "authenticator failed"},
+      {RejectingProvider, 401, "unauthorized"}
+    ]
+
+    for {authenticator, status, message} <- outcomes do
+      server_name = unique_name("auth-error-names")
+
+      FastestMCP.server(server_name)
+      |> FastestMCP.add_auth(authenticator)
+      |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+      |> start_server!()
+
+      assert {:error, %Error{message: ^message} = error} =
+               FastestMCP.call_tool(server_name, "echo", %{})
+
+      refute Map.has_key?(error.details, :provider)
+
+      conn =
+        ProtocolTest.modern_http_request(server_name, 1, "tools/call", %{"name" => "echo"},
+          headers: [{"mcp-name", "echo"}]
+        )
+
+      assert conn.status == status
+      assert %{"error" => %{"message" => ^message}} = JSON.decode!(conn.resp_body)
+      refute conn.resp_body =~ "FastestMCP.Auth"
+      refute conn.resp_body =~ "RejectingProvider"
+    end
+  end
+
+  test "an authenticator that throws or exits fails as one that raises" do
+    attach_telemetry([[:fastest_mcp, :auth, :exception]])
+
+    for authenticator <- [
+          fn _input, _ctx -> throw(:token_service_down) end,
+          fn _input, _ctx -> exit(:token_service_down) end
+        ] do
+      server_name = unique_name("auth-throw-exit")
+
+      FastestMCP.server(server_name)
+      |> FastestMCP.add_auth(authenticator)
+      |> FastestMCP.add_tool("echo", fn arguments, _ctx -> arguments end)
+      |> start_server!()
+
+      assert {:error,
+              %Error{
+                code: :internal_error,
+                message: "authenticator failed",
+                details: %{kind: "ErlangError"},
+                cause: {%ErlangError{original: {_kind, :token_service_down}}, [_ | _]}
+              }} = FastestMCP.call_tool(server_name, "echo", %{})
+
+      stdio = ProtocolTest.modern_stdio_request(server_name, 1, "tools/call", %{"name" => "echo"})
+
+      http =
+        ProtocolTest.modern_http_request(server_name, 2, "tools/call", %{"name" => "echo"},
+          headers: [{"mcp-name", "echo"}]
+        )
+
+      assert http.status == 500
+
+      for %{"error" => error} <- [stdio, JSON.decode!(http.resp_body)] do
+        assert %{
+                 "code" => -32_603,
+                 "message" => "authenticator failed",
+                 "data" => %{"fastestmcp" => %{"details" => %{"kind" => "ErlangError"}}}
+               } = error
+      end
+
+      # In process, over stdio, and over HTTP, the authentication ends with
+      # its exception event.
+      for _request <- 1..3 do
+        assert_receive {:telemetry, [:fastest_mcp, :auth, :exception], _measurements,
+                        %{server_name: ^server_name, kind: :error, reason: %ErlangError{}}}
+      end
+    end
+  end
+
+  test "a list request runs the authenticator once, on every transport" do
+    test_pid = self()
+    server_name = unique_name("auth-once")
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_auth(fn input, _ctx ->
+      send(test_pid, :authenticated)
+
+      if input["authorization"] == "Bearer list-token",
+        do: {:ok, %{principal: %{"sub" => "lister"}}},
+        else: {:error, :unauthorized}
+    end)
+    |> FastestMCP.add_tool("export", fn _args, _ctx -> "done" end, task: true)
+    |> FastestMCP.add_prompt("greet", fn _args, _ctx -> "hello" end)
+    |> FastestMCP.add_resource("notes://all", fn _args, _ctx -> "notes" end)
+    |> FastestMCP.add_resource_template("notes://{id}", fn %{"id" => id}, _ctx -> id end)
+    |> start_server!()
+
+    auth_input = %{"authorization" => "Bearer list-token"}
+
+    lists = [
+      &FastestMCP.Client.list_tools/1,
+      &FastestMCP.Client.list_prompts/1,
+      &FastestMCP.Client.list_resources/1,
+      &FastestMCP.Client.list_resource_templates/1
+    ]
+
+    for version <- ["2026-07-28", "2025-11-25"] do
+      client =
+        connect!({:in_process, server_name}, protocol_version: version, auth_input: auth_input)
+
+      authentications()
+
+      lists =
+        if version == "2025-11-25", do: [(&FastestMCP.Client.list_tasks/1) | lists], else: lists
+
+      for list <- lists do
+        assert {:ok, _page} = list.(client)
+        assert authentications() == 1
+      end
+    end
+
+    assert %{"result" => %{"tools" => [_]}} =
+             ProtocolTest.modern_stdio_request(server_name, 1, "tools/list", %{},
+               auth_input: auth_input
+             )
+
+    assert authentications() == 1
+
+    conn =
+      ProtocolTest.modern_http_request(server_name, 2, "tools/list", %{},
+        headers: [{"authorization", "Bearer list-token"}]
+      )
+
+    assert conn.status == 200
+    assert authentications() == 1
+
+    # With MCP Apps, the UI resource a listed tool links to is looked up
+    # under the identity the list authenticated.
+    apps = FastestMCP.Protocol.Extensions.apps()
+    apps_server = unique_name("auth-once-apps")
+
+    FastestMCP.server(apps_server, extensions: %{apps => %{}})
+    |> FastestMCP.add_auth(fn _input, _ctx ->
+      send(test_pid, :authenticated)
+      {:ok, %{principal: %{"sub" => "lister"}}}
+    end)
+    |> FastestMCP.add_tool("widget", fn _args, _ctx -> "done" end,
+      meta: FastestMCP.Apps.tool_meta("ui://widgets/one")
+    )
+    |> FastestMCP.add_resource(
+      "ui://widgets/one",
+      fn _args, _ctx -> FastestMCP.Apps.result("ui://widgets/one", "<html></html>") end,
+      mime_type: FastestMCP.Apps.mime_type()
+    )
+    |> start_server!()
+
+    client =
+      connect!({:in_process, apps_server},
+        extensions: %{apps => FastestMCP.Apps.client_settings()}
+      )
+
+    authentications()
+    assert {:ok, %{items: [_widget]}} = FastestMCP.Client.list_tools(client)
+    assert authentications() == 1
+
+    # A list that fails authentication emits the authentication events.
+    attach_telemetry([[:fastest_mcp, :auth, :exception]])
+
+    assert %{"error" => %{"message" => "unauthorized"}} =
+             ProtocolTest.modern_stdio_request(server_name, 3, "tools/list")
+
+    assert authentications() == 1
+
+    assert_receive {:telemetry, [:fastest_mcp, :auth, :exception], _measurements,
+                    %{server_name: ^server_name, method: "tools/list"}}
+  end
+
+  # The number of `:authenticated` messages in the mailbox, which it empties.
+  defp authentications(count \\ 0) do
+    receive do
+      :authenticated -> authentications(count + 1)
+    after
+      0 -> count
+    end
   end
 end

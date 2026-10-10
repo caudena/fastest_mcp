@@ -3,8 +3,11 @@ defmodule FastestMCP.Client.Options do
   # Client option validation, run in the caller before any process starts.
   # `validate!/2` turns a target and its connection options into a
   # `%FastestMCP.Client.Config{}`; `operation!/1` checks the options of one
-  # operation. Invalid options raise `ArgumentError` without printing values
-  # that may be credentials.
+  # operation, and `supported!/2` the options its connection's transport
+  # cannot use. Invalid options raise `ArgumentError` without printing values
+  # that may be credentials, and `protect/1` wraps those values for the start
+  # arguments of a child spec. `wire_map/1` and `wire_value/1` turn the maps a
+  # caller passes into what the server receives.
 
   import FastestMCP.Protocol.Version
 
@@ -13,12 +16,15 @@ defmodule FastestMCP.Client.Options do
   alias FastestMCP.Client.OAuth
   alias FastestMCP.Client.ResponseCache
   alias FastestMCP.Client.Transport
+  alias FastestMCP.JSONValue
   alias FastestMCP.Options
   alias FastestMCP.Protocol
   alias FastestMCP.Protocol.Extensions
   alias FastestMCP.Root
   alias FastestMCP.Sampling
   alias FastestMCP.SamplingTool
+  alias FastestMCP.Secret
+  alias FastestMCP.Util
 
   @connection [
     name: {:any, nil},
@@ -58,10 +64,12 @@ defmodule FastestMCP.Client.Options do
     stdio_process_group: {:any, nil}
   ]
 
-  # The in-process transport has no HTTP, SSE, or child process.
-  @not_in_process ~w(oauth headers authorization access_token session_stream sse_reconnect
-                     max_sse_event_bytes env legacy_stdio_auth_metadata stdio_restart
-                     stdio_process_group)a
+  # Options a transport cannot use: stdio and in-process connections have no
+  # HTTP or SSE, HTTP and in-process connections no child process, and a stdio
+  # server receives credentials only with `legacy_stdio_auth_metadata: true`.
+  @http_only ~w(oauth session_stream sse_reconnect max_sse_event_bytes)a
+  @stdio_only ~w(env legacy_stdio_auth_metadata stdio_restart stdio_process_group)a
+  @http_credentials ~w(headers authorization access_token)a
 
   @removed %{
     session_id: "client session_id is server-negotiated and cannot be configured",
@@ -85,17 +93,23 @@ defmodule FastestMCP.Client.Options do
 
   @auth ~w(auth_input authorization access_token headers)a
 
+  # The options that a child spec keeps in a `FastestMCP.Secret`: supervisor
+  # reports print the start arguments.
+  @secrets ~w(auth_input authorization access_token headers env oauth)a
+
   @invalid_env "stdio env must be a map or keyword list of scalar values"
 
   @spec validate!(term(), keyword()) :: Config.t()
   def validate!(target, opts) do
+    opts = reveal(opts)
+
     if Keyword.keyword?(opts) do
       for {key, _value} <- opts, hint = @removed[key], do: raise(ArgumentError, hint)
     end
 
     options = Options.validate!(opts, @connection)
     transport = transport!(target, options)
-    supported!(opts, transport.type)
+    supported!(opts, transport.type, options.legacy_stdio_auth_metadata)
     auth!(opts)
     protocol_version = protocol_version!(options.protocol_version)
     {max_auth_attempts, oauth} = oauth!(options.oauth)
@@ -123,6 +137,28 @@ defmodule FastestMCP.Client.Options do
     )
   end
 
+  # Connection options as the start arguments of a child spec keep them, with
+  # the values of credential options wrapped; `validate!/2` unwraps them.
+  @spec protect(keyword()) :: keyword()
+  def protect(opts) do
+    Enum.map(opts, fn
+      {key, value} when key in @secrets and not is_struct(value, Secret) ->
+        {key, %Secret{value: value}}
+
+      pair ->
+        pair
+    end)
+  end
+
+  defp reveal(opts) when is_list(opts) do
+    Enum.map(opts, fn
+      {key, %Secret{value: value}} -> {key, value}
+      pair -> pair
+    end)
+  end
+
+  defp reveal(opts), do: opts
+
   @spec operation!(keyword()) :: keyword()
   def operation!(opts) do
     opts = opts |> Options.keys!(@operation) |> auth!()
@@ -138,13 +174,33 @@ defmodule FastestMCP.Client.Options do
     Keyword.replace_lazy(opts, :meta, &wire_map/1)
   end
 
-  # A user map the client reads like a wire map (raw params, a task status,
-  # `meta:`) takes string keys, at its top level and in its `_meta`.
+  # The options of an operation or `set_auth/2` that its connection's
+  # transport cannot use, from the settings the connection published.
+  @spec supported!(keyword(), map()) :: :ok
+  def supported!(opts, %{transport: type, legacy_stdio_auth_metadata: metadata?}),
+    do: supported!(opts, type, metadata?)
+
+  # A map from the caller (arguments, raw params, references, answers of
+  # handlers, `meta:`), or a keyword list, as the server receives it.
   @spec wire_map(map() | keyword()) :: map()
-  def wire_map(map) do
-    map = Map.new(map, fn {key, value} -> {to_string(key), value} end)
-    with %{"_meta" => %{} = meta} <- map, do: %{map | "_meta" => wire_map(meta)}
+  def wire_map(map) when is_map(map), do: wire_value(map)
+  def wire_map(pairs), do: pairs |> Map.new() |> wire_value()
+
+  # A value in the JSON data model, as the server receives it: string keys at
+  # every level, atoms other than booleans and nil as strings, and dates,
+  # structs, and tuples as `FastestMCP.JSONValue` encodes them. A term without
+  # a JSON form, such as a PID, raises `ArgumentError`.
+  @spec wire_value(term()) :: term()
+  def wire_value(value) do
+    value |> JSONValue.normalize() |> json()
+  rescue
+    error in FastestMCP.Error -> reraise ArgumentError, error.message, __STACKTRACE__
   end
+
+  defp json(%{} = map), do: Map.new(map, fn {key, value} -> {to_string(key), json(value)} end)
+  defp json(list) when is_list(list), do: Enum.map(list, &json/1)
+  defp json(atom) when is_atom(atom) and atom not in [nil, true, false], do: Atom.to_string(atom)
+  defp json(value), do: value
 
   # A handler replaced at runtime is one of the connection's handler options.
   @spec handler!(atom(), function() | nil) :: :ok
@@ -240,12 +296,13 @@ defmodule FastestMCP.Client.Options do
   defp default_path(%URI{path: path} = uri) when path in [nil, "", "/"], do: %{uri | path: "/mcp"}
   defp default_path(uri), do: uri
 
-  defp supported!(opts, type) do
+  defp supported!(opts, type, metadata?) do
     unsupported =
       case type do
-        :in_process -> @not_in_process
-        :stdio -> [:oauth]
-        :streamable_http -> []
+        :in_process -> @http_only ++ @stdio_only ++ @http_credentials
+        :stdio when metadata? -> @http_only
+        :stdio -> @http_only ++ @auth
+        :streamable_http -> @stdio_only
       end
 
     case for({key, _value} <- opts, key in unsupported, do: key) do
@@ -253,8 +310,14 @@ defmodule FastestMCP.Client.Options do
         :ok
 
       keys ->
+        hint =
+          if type == :stdio and Enum.any?(keys, &(&1 in @auth)),
+            do: "; it sends credentials only with legacy_stdio_auth_metadata: true",
+            else: ""
+
         raise ArgumentError,
-              "the #{transport_name(type)} client transport does not accept #{inspect(keys)}"
+              "the #{transport_name(type)} client transport does not accept #{inspect(keys)}" <>
+                hint
     end
   end
 
@@ -340,18 +403,11 @@ defmodule FastestMCP.Client.Options do
     end
   end
 
-  defp client_info!(nil), do: %{"name" => "FastestMCP.Client", "version" => version()}
-  defp client_info!(%{} = info), do: Map.new(info, fn {key, value} -> {to_string(key), value} end)
+  defp client_info!(nil), do: %{"name" => "FastestMCP.Client", "version" => Util.version()}
+  defp client_info!(%{} = info), do: wire_map(info)
 
   defp client_info!(other),
     do: raise(ArgumentError, "client_info must be a map, got: #{inspect(other)}")
-
-  defp version do
-    case Application.spec(:fastest_mcp, :vsn) do
-      nil -> "0.2.0"
-      version -> to_string(version)
-    end
-  end
 
   defp sampling_tools!(nil), do: []
 
@@ -441,4 +497,5 @@ defmodule FastestMCP.Client.Options do
 
   defp transport_name(:stdio), do: "stdio"
   defp transport_name(:in_process), do: "in-process"
+  defp transport_name(:streamable_http), do: "streamable HTTP"
 end

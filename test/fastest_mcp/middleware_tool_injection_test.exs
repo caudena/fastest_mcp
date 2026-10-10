@@ -151,8 +151,13 @@ defmodule FastestMCP.MiddlewareToolInjectionTest do
     |> FastestMCP.add_middleware(Middleware.prompt_tools())
     |> start_server!()
 
-    assert %{"prompts" => prompts} = FastestMCP.call_tool!(server_name, "list_prompts", %{})
-    assert Enum.any?(prompts, &(&1.name == "greet"))
+    # The prompts as prompts/list describes them to clients.
+    assert %{"prompts" => [prompt]} = FastestMCP.call_tool!(server_name, "list_prompts", %{})
+
+    assert %{"name" => "greet", "description" => "", "arguments" => [], "_meta" => %{}} =
+             prompt
+
+    refute Enum.any?(["key", "enabled", "task", "tags"], &Map.has_key?(prompt, &1))
 
     assert %{
              "result" => %{
@@ -163,6 +168,17 @@ defmodule FastestMCP.MiddlewareToolInjectionTest do
                "name" => "greet",
                "arguments" => %{"name" => "Nate"}
              })
+
+    tools = Map.new(FastestMCP.list_tools!(server_name), &{&1.name, &1})
+
+    assert %{
+             "type" => "object",
+             "properties" => %{"name" => %{"type" => "string"}, "arguments" => %{}},
+             "required" => ["name"]
+           } = tools["get_prompt"].input_schema
+
+    assert {:error, %Error{code: :invalid_params}} =
+             FastestMCP.call_tool(server_name, "get_prompt", %{"arguments" => %{}})
   end
 
   test "resource tools expose resource listing, templates, and reads through injected tools" do
@@ -178,14 +194,30 @@ defmodule FastestMCP.MiddlewareToolInjectionTest do
     |> FastestMCP.add_middleware(Middleware.resource_tools())
     |> start_server!()
 
-    assert %{"resources" => resources, "resource_templates" => templates} =
+    # The resources and templates as clients see them in their lists.
+    assert %{"resources" => [resource], "resourceTemplates" => [template]} =
              FastestMCP.call_tool!(server_name, "list_resources", %{})
 
-    assert Enum.any?(resources, &(&1.uri == "config://app"))
-    assert Enum.any?(templates, &(&1.uri_template == "docs://{slug}"))
+    assert %{"uri" => "config://app", "name" => "config://app"} = resource
+    assert %{"uriTemplate" => "docs://{slug}", "name" => "docs://{slug}"} = template
+
+    for descriptor <- [resource, template],
+        key <- ["key", "enabled", "task", "tags", "uri_template"],
+        do: refute(Map.has_key?(descriptor, key))
 
     assert %{"result" => %{"theme" => "sunrise"}} =
              FastestMCP.call_tool!(server_name, "read_resource", %{"uri" => "config://app"})
+
+    tools = Map.new(FastestMCP.list_tools!(server_name), &{&1.name, &1})
+
+    assert %{
+             "type" => "object",
+             "properties" => %{"uri" => %{"type" => "string"}},
+             "required" => ["uri"]
+           } = tools["read_resource"].input_schema
+
+    assert {:error, %Error{code: :invalid_params}} =
+             FastestMCP.call_tool(server_name, "read_resource", %{})
   end
 
   test "resource helper tools preserve verified authorization evidence in nested calls" do

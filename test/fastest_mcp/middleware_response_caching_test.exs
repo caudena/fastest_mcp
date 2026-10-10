@@ -207,7 +207,7 @@ defmodule FastestMCP.MiddlewareResponseCachingTest do
     assert count(counter) == 3
   end
 
-  test "explicit sessions partition cache entries while implicit sessions share" do
+  test "sessions partition cache entries while requests without one share" do
     middleware = start_middleware!(Middleware.response_caching())
 
     counter = start_counter()
@@ -235,7 +235,7 @@ defmodule FastestMCP.MiddlewareResponseCachingTest do
       %Operation{
         explicit_a
         | transport: :in_process,
-          context: %{session_id: "generated-a", request_metadata: %{}}
+          context: %{session_id: nil, request_metadata: %{}}
       }
 
     assert :a ==
@@ -265,7 +265,7 @@ defmodule FastestMCP.MiddlewareResponseCachingTest do
     assert :implicit ==
              cache(
                middleware,
-               %{implicit | context: %{session_id: "generated-b", request_metadata: %{}}},
+               %{implicit | context: %{session_id: nil, request_metadata: %{path: "/other"}}},
                fn ->
                  increment(counter)
                  :implicit
@@ -476,6 +476,84 @@ defmodule FastestMCP.MiddlewareResponseCachingTest do
              FastestMCP.call_tool!(server_name, "echo", %{"message" => "different"})
 
     assert count(counter) == 2
+  end
+
+  test "a change of a server's components drops what the cache kept of that kind" do
+    server_name = unique_name("cache-invalidation")
+    cache = Middleware.response_caching()
+    counter = start_counter()
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_middleware(cache)
+    |> FastestMCP.add_tool("search", fn _args, _ctx ->
+      increment(counter)
+      "found #{count(counter)}"
+    end)
+    |> FastestMCP.add_prompt("summary", fn _args, _ctx -> "Summarize." end)
+    |> start_server!()
+
+    tools = fn -> server_name |> FastestMCP.list_tools!() |> Enum.map(& &1.name) end
+    prompts = fn -> server_name |> FastestMCP.list_prompts!() |> Enum.map(& &1.name) end
+
+    put_export = fn result ->
+      FastestMCP.ComponentManager.add_tool(server_name, "export", fn _args, _ctx -> result end,
+        on_duplicate: :replace
+      )
+    end
+
+    assert ["search"] == tools.()
+    assert ["summary"] == prompts.()
+    assert "found 1" == FastestMCP.call_tool!(server_name, "search")
+    assert "found 1" == FastestMCP.call_tool!(server_name, "search")
+
+    # A tool added at runtime: the cached tool list and tool results go, and
+    # the prompt list stays.
+    {:ok, _tool} = put_export.("v1")
+    assert ["export", "search"] == tools.()
+    assert "found 2" == FastestMCP.call_tool!(server_name, "search")
+    assert "v1" == FastestMCP.call_tool!(server_name, "export")
+    assert ["summary"] == prompts.()
+    assert %{"prompts/list" => %{hits: 1}} = Middleware.cache_statistics(cache)
+
+    # A replaced tool answers with its new handler.
+    {:ok, _tool} = put_export.("v2")
+    assert "v2" == FastestMCP.call_tool!(server_name, "export")
+
+    # Visibility rules change what the lists show.
+    :ok = FastestMCP.disable_components!(server_name, names: ["export"])
+    assert ["search"] == tools.()
+    :ok = FastestMCP.reset_component_visibility!(server_name)
+    assert ["export", "search"] == tools.()
+
+    {:ok, _prompt} =
+      FastestMCP.ComponentManager.add_prompt(server_name, "plan", fn _args, _ctx -> "Plan." end)
+
+    assert ["plan", "summary"] == prompts.()
+  end
+
+  test "each session keeps the lists its own visibility rules give" do
+    server_name = unique_name("cache-sessions")
+
+    FastestMCP.server(server_name)
+    |> FastestMCP.add_middleware(Middleware.response_caching())
+    |> FastestMCP.add_tool("search", fn _args, _ctx -> "found" end)
+    |> FastestMCP.add_tool("hide_search", fn _args, ctx ->
+      :ok = FastestMCP.Context.disable_components(ctx, names: ["search"])
+      "hidden"
+    end)
+    |> start_server!()
+
+    tools = fn opts -> server_name |> FastestMCP.list_tools!(opts) |> Enum.map(& &1.name) end
+
+    assert ["hide_search", "search"] == tools.(session_id: "chat-1")
+    assert ["hide_search", "search"] == tools.(session_id: "chat-2")
+
+    assert "hidden" ==
+             FastestMCP.call_tool!(server_name, "hide_search", %{}, session_id: "chat-1")
+
+    assert ["hide_search"] == tools.(session_id: "chat-1")
+    assert ["hide_search", "search"] == tools.(session_id: "chat-2")
+    assert ["hide_search", "search"] == tools.([])
   end
 
   test "invalid response caching configuration raises" do

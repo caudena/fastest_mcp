@@ -1,8 +1,14 @@
 defmodule FastestMCP.ServerRuntime.Config do
   @moduledoc false
-  # Runtime options of one server, validated once when it starts.
+  # Runtime options of one server, validated in the caller when it starts. The
+  # validated config, not the options, goes into the start arguments of the
+  # server's processes, so a configured `signing_secret` stays in a
+  # `FastestMCP.Secret`, which inspect output leaves out. Start arguments that
+  # hold the options themselves, such as a server module's child spec, hold
+  # them with the secret wrapped by `protect/1`, as `new!/1` takes it too.
 
   alias FastestMCP.Options
+  alias FastestMCP.Secret
 
   @session_keys [
     :max_request_ids,
@@ -35,6 +41,8 @@ defmodule FastestMCP.ServerRuntime.Config do
     terminated_session_ttl: {:limit, 15 * 60_000},
     max_event_subscribers_per_server: {:limit, 1_024},
     max_event_subscriber_queue_len: {:non_neg_limit, 100},
+    # Signs list cursors and the request state of multi-round requests.
+    signing_secret: {:any, nil},
     task_backend: {:module_with_opts, {FastestMCP.TaskBackend.Memory, []}},
     session_state_store: {:module_with_opts, {FastestMCP.SessionStateStore.Memory, []}},
     # Per-session limits; unset ones keep the `FastestMCP.Session` defaults.
@@ -55,7 +63,30 @@ defmodule FastestMCP.ServerRuntime.Config do
     sse_replay_ttl_ms: {:pos_integer, nil}
   ]
 
-  def new!(opts), do: Options.validate!(opts, @options)
+  defstruct Enum.map(@options, fn {key, {_rule, default}} -> {key, default} end)
+
+  def new!(%__MODULE__{} = config), do: config
+
+  def new!(opts) do
+    config = struct!(__MODULE__, Options.validate!(opts, @options))
+    %{config | signing_secret: secret!(config.signing_secret)}
+  end
+
+  # Runtime options, a keyword list or a map, with the signing secret wrapped.
+  def protect(opts) when is_list(opts), do: Enum.map(opts, &protect_option/1)
+  def protect(opts) when is_map(opts), do: Map.new(opts, &protect_option/1)
+  def protect(opts), do: opts
+
+  defp protect_option({:signing_secret, secret}) when is_binary(secret),
+    do: {:signing_secret, %Secret{value: secret}}
+
+  defp protect_option(option), do: option
+
+  # The configured secret, or a random one for each start of the server.
+  def signing_secret(%__MODULE__{signing_secret: nil}),
+    do: %Secret{value: :crypto.strong_rand_bytes(32)}
+
+  def signing_secret(%__MODULE__{signing_secret: secret}), do: secret
 
   def session_opts(config) do
     config
@@ -63,4 +94,14 @@ defmodule FastestMCP.ServerRuntime.Config do
     |> Map.reject(fn {_key, value} -> is_nil(value) end)
     |> Map.put(:idle_ttl_ms, config.session_idle_ttl)
   end
+
+  # The error leaves the value out: it may be the secret, nearly.
+  defp secret!(nil), do: nil
+  defp secret!(%Secret{value: secret}), do: secret!(secret)
+
+  defp secret!(secret) when is_binary(secret) and byte_size(secret) >= 32,
+    do: %Secret{value: secret}
+
+  defp secret!(_secret),
+    do: raise(ArgumentError, "signing_secret must be a binary of at least 32 bytes")
 end

@@ -25,6 +25,7 @@ defmodule FastestMCP.Client.Connection do
   alias FastestMCP.Client.OAuth
   alias FastestMCP.Client.Options
   alias FastestMCP.Client.ProtocolError
+  alias FastestMCP.Client.Redaction
   alias FastestMCP.Client.RemoteTasks
   alias FastestMCP.Client.Spec
   alias FastestMCP.Client.Task, as: RemoteTask
@@ -33,7 +34,15 @@ defmodule FastestMCP.Client.Connection do
   alias FastestMCP.Client.TransportSnapshot
   alias FastestMCP.Deadline
   alias FastestMCP.Error
+  alias FastestMCP.Registry
   alias FastestMCP.Util
+
+  # A pid, a registered name, `{:global, term}`, `{:via, module, term}`, or
+  # `{name, node}`.
+  defguardp is_name(ref)
+            when is_pid(ref) or (is_atom(ref) and not is_nil(ref)) or
+                   (is_tuple(ref) and tuple_size(ref) == 2 and is_atom(elem(ref, 0))) or
+                   (is_tuple(ref) and tuple_size(ref) == 3 and elem(ref, 0) == :via)
 
   def start_link(opts) do
     {target, opts} = pop_target!(opts)
@@ -51,9 +60,11 @@ defmodule FastestMCP.Client.Connection do
             "client child restart must be :permanent, :transient, or :temporary, got: #{inspect(restart)}"
     end
 
+    # Supervisor reports print the start arguments, which keep credentials
+    # wrapped.
     %{
       id: Keyword.get(child, :id, config.name || Client),
-      start: {Client, :start_link, [Keyword.drop(opts, [:id, :restart])]},
+      start: {Client, :start_link, [opts |> Keyword.drop([:id, :restart]) |> Options.protect()]},
       restart: restart,
       shutdown: 20000,
       type: :worker
@@ -76,7 +87,7 @@ defmodule FastestMCP.Client.Connection do
 
   defp start(%Config{} = config) do
     with {:ok, pid} <- GenServer.start_link(__MODULE__, config, name: config.name) do
-      case if(config.auto_initialize, do: negotiate(%Client{pid: pid}, config), else: :ok) do
+      case if(config.auto_initialize, do: connect_client(%Client{pid: pid}, config), else: :ok) do
         :ok ->
           {:ok, pid}
 
@@ -183,8 +194,15 @@ defmodule FastestMCP.Client.Connection do
   end
 
   # Replaces every credential of the connection.
-  def set_auth(client_ref, opts),
-    do: call_ref(client_ref, {:set_auth, Options.auth_input!(opts)})
+  def set_auth(client_ref, opts) do
+    auth_input = Options.auth_input!(opts)
+
+    with {:ok, client} <- pin(client_ref),
+         {:ok, settings} <- settings(client) do
+      :ok = Options.supported!(opts, settings)
+      call(client, {:set_auth, auth_input})
+    end
+  end
 
   def set_roots(client_ref, roots) when is_list(roots),
     do: call_ref(client_ref, {:set_roots, roots})
@@ -200,6 +218,15 @@ defmodule FastestMCP.Client.Connection do
     case resolve_client(client_ref) do
       {:ok, client} -> {:ok, client}
       :error -> {:error, client_not_running_error()}
+    end
+  end
+
+  # What the connection published for its callers' operations: its transport
+  # and default `timeout_ms`.
+  def settings(%Client{pid: pid}) do
+    case Registry.client_settings(pid) do
+      {:ok, settings} -> {:ok, settings}
+      {:error, :not_found} -> {:error, client_not_running_error()}
     end
   end
 
@@ -219,13 +246,50 @@ defmodule FastestMCP.Client.Connection do
     if Process.alive?(pid), do: {:ok, client}, else: :error
   end
 
-  defp resolve_client(client_ref) do
+  defp resolve_client(client_ref) when is_name(client_ref) do
     case GenServer.whereis(client_ref) do
       pid when is_pid(pid) -> {:ok, %Client{pid: pid}}
-      nil -> :error
+      _missing_or_remote -> :error
     end
   rescue
     ArgumentError -> :error
+  end
+
+  defp resolve_client(other) do
+    raise ArgumentError,
+          "expected a FastestMCP.Client, a pid, or a name of a client process, got: " <>
+            inspect(other)
+  end
+
+  # An OAuth sign-in that is still under way when connecting runs out of
+  # time finishes first, as long as the authorization handler waits for the
+  # user; negotiation then starts over.
+  defp connect_client(client, config) do
+    with {:error, %Error{code: :timeout}} = timeout <- negotiate(client, config) do
+      case await_sign_in(client) do
+        :ok -> negotiate(client, config)
+        {:error, %Error{} = error} -> {:error, error}
+        :none -> timeout
+      end
+    end
+  end
+
+  defp await_sign_in(client) do
+    with {:ok, %{pid: pid, resource: resource}} <- call(client, :oauth) do
+      case OAuth.authorization_header(pid, resource, :infinity) do
+        {:ok, _authorization} ->
+          :ok
+
+        :none ->
+          :none
+
+        {:error, error} ->
+          details = %{stage: error.stage, reason: error.reason}
+          {:error, %Error{code: :unauthorized, message: error.message, details: details}}
+      end
+    else
+      _without_oauth -> :none
+    end
   end
 
   defp negotiate(client, config) do
@@ -265,11 +329,20 @@ defmodule FastestMCP.Client.Connection do
     with {:ok, _result} <- FastestMCP.Client.Requests.discover(client, opts), do: {:ok, modern()}
   end
 
+  # A server that rejects the credentials would reject them on 2025-11-25
+  # too: the error is returned on every transport.
+  defp legacy_fallback_evidence?(%Error{code: code}, _transport)
+       when code in [:unauthorized, :forbidden],
+       do: false
+
   defp legacy_fallback_evidence?(%ProtocolError{method: "server/discover"}, :stdio), do: true
   defp legacy_fallback_evidence?(%ProtocolError{}, :streamable_http), do: false
 
-  defp legacy_fallback_evidence?(%Error{} = error, :stdio),
-    do: not recognized_modern_discovery_error?(error)
+  # Over stdio only an error response is evidence: a timeout, or the
+  # program's exit, is not.
+  defp legacy_fallback_evidence?(%Error{details: %{jsonrpc_code: code}} = error, :stdio)
+       when is_integer(code),
+       do: not recognized_modern_discovery_error?(error)
 
   defp legacy_fallback_evidence?(%Error{} = error, :streamable_http) do
     details = if is_map(error.details), do: error.details, else: %{}
@@ -296,6 +369,13 @@ defmodule FastestMCP.Client.Connection do
   @impl true
   def init(%Config{} = config) do
     state = State.new(config)
+
+    :ok =
+      Registry.register_client(%{
+        transport: config.transport.type,
+        timeout_ms: config.timeout_ms,
+        legacy_stdio_auth_metadata: config.legacy_stdio_auth_metadata
+      })
 
     # Returning {:error, reason} (not {:stop, reason}) keeps a linked caller
     # alive; the worker supervisor follows this process out on its own.
@@ -341,7 +421,7 @@ defmodule FastestMCP.Client.Connection do
   defp stop_oauth(_state), do: :ok
 
   defp open_client_transport(state) do
-    case ClientTransport.open(state.transport, self(), auth_input: state.config.auth_input) do
+    case ClientTransport.open(state.transport, self()) do
       {:ok, transport} ->
         {:ok, %{state | transport: transport}}
 
@@ -362,6 +442,9 @@ defmodule FastestMCP.Client.Connection do
          end}
     end
   end
+
+  @impl true
+  defdelegate format_status(status), to: Redaction
 
   @impl true
   def terminate(_reason, state) do
@@ -520,6 +603,15 @@ defmodule FastestMCP.Client.Connection do
   def handle_call({:set_auth, auth_input}, _from, state),
     do: {:reply, :ok, rotate_auth(put_in(state.config.auth_input, auth_input))}
 
+  def handle_call(:oauth, _from, state), do: {:reply, {:ok, state.oauth}, state}
+
+  # Every 2026-07-28 request carries the level; on 2025-11-25 the caller
+  # also sends logging/setLevel.
+  def handle_call({:set_log_level, level}, _from, state) do
+    version = state.lifecycle.protocol_version || state.config.protocol_version
+    {:reply, {:ok, version}, put_in(state.config.log_level, level)}
+  end
+
   # Session-bound calls wait for session recovery and replay through
   # handle_call/3 once it finishes.
   def handle_call(request, from, %{lifecycle: %{phase: :recovering}} = state)
@@ -636,8 +728,8 @@ defmodule FastestMCP.Client.Connection do
     end
   end
 
-  def handle_call({:request_async, %Spec{} = spec, owner}, _from, state) do
-    case Outbound.start(state, spec, {:async, owner}) do
+  def handle_call({:request_async, %Spec{} = spec, owner, reply_alias}, _from, state) do
+    case Outbound.start(state, spec, {:async, owner, reply_alias}) do
       {:ok, request, state} ->
         {:reply, {:ok, request.ref, request.id, request.task_augmented?}, state}
 
@@ -888,11 +980,15 @@ defmodule FastestMCP.Client.Connection do
 
   defp negotiated(state, {:error, error}), do: {:reply, {:error, error}, state}
 
+  # Readiness waiters keep waiting for a retry of a failed initialize request.
   defp failed_initialize(state) do
     owner_ref = state.lifecycle.negotiation[:owner_ref]
     lifecycle = Lifecycle.fail_initialize(state.lifecycle)
     state = State.demonitor(%{state | lifecycle: lifecycle}, owner_ref)
-    Lifecycle.reply_waiters(state, {:error, Lifecycle.readiness_error(lifecycle)})
+
+    if lifecycle.phase == :failed,
+      do: Lifecycle.reply_waiters(state, {:error, Lifecycle.readiness_error(lifecycle)}),
+      else: state
   end
 
   defp failed_discover(state, token) do

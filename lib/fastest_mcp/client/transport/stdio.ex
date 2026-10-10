@@ -4,12 +4,13 @@ defmodule FastestMCP.Client.Transport.Stdio do
   @behaviour FastestMCP.Client.Transport
 
   alias FastestMCP.Client.StdioProcess
+  alias FastestMCP.Error
 
   @maximum_inherited_variables 512
   @maximum_environment_bytes 65_536
 
   @impl true
-  def open(transport, _owner, _opts) do
+  def open(transport, _owner) do
     generation = Map.get(transport, :generation, 0) + 1
 
     with {:ok, command, arguments, signal_scope} <- launch_spec(transport),
@@ -34,13 +35,13 @@ defmodule FastestMCP.Client.Transport.Stdio do
   def connected?(%{port: port}) when is_port(port), do: Port.info(port) != nil
   def connected?(_transport), do: false
 
+  # A stdio server reads credentials from its environment, or from `_meta`
+  # with `legacy_stdio_auth_metadata: true`.
   @impl true
-  def send_envelope(%{port: port} = transport, envelope) do
-    if connected?(transport) and Port.command(port, JSON.encode!(envelope) <> "\n") do
-      :ok
-    else
-      {:error, :closed}
-    end
+  def send_line(%{port: port} = transport, line, _auth_input) do
+    if connected?(transport) and Port.command(port, [line, "\n"]),
+      do: :ok,
+      else: {:error, :closed}
   rescue
     ArgumentError -> {:error, :closed}
   end
@@ -80,6 +81,7 @@ defmodule FastestMCP.Client.Transport.Stdio do
     end
   end
 
+  # A program that exits at once leaves no OS pid, but its exit status.
   defp open_port(command, port_options, generation, signal_scope) do
     port = Port.open({:spawn_executable, command}, port_options)
 
@@ -89,8 +91,22 @@ defmodule FastestMCP.Client.Transport.Stdio do
 
       {:error, reason} ->
         if Port.info(port) != nil, do: Port.close(port)
-        {:error, reason}
+
+        receive do
+          {^port, {:exit_status, status}} -> {:error, exited(status)}
+        after
+          0 -> {:error, reason}
+        end
     end
+  end
+
+  # The error of requests that a stdio server's exit ends.
+  def exited(status) do
+    %Error{
+      code: :internal_error,
+      message: "stdio server exited with status #{status}",
+      details: %{status: status}
+    }
   end
 
   defp port_options(transport, arguments) do

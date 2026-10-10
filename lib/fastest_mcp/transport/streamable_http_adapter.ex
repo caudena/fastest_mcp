@@ -18,40 +18,50 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
 
   @routing_headers ["mcp-protocol-version", "mcp-method", "mcp-name", "mcp-session-id"]
 
-  # Decodes a request and returns the connection updated while reading its body.
+  # The answer to a request the endpoint never serves, whatever its
+  # credentials: another path gets 404, and a method other than GET, POST, and
+  # DELETE gets 405. Nil for the requests it serves.
+  def unserved(%Plug.Conn{} = conn, opts) do
+    cond do
+      conn.request_path != HTTPCommon.endpoint_path(conn, opts) ->
+        {:respond, 404, %{error: %{code: :not_found, message: "unknown route"}}, []}
+
+      conn.method not in ["GET", "POST", "DELETE"] ->
+        allow =
+          if Keyword.get(opts, :enable_get_streaming, true),
+            do: "GET, POST, DELETE",
+            else: "POST, DELETE"
+
+        method_not_allowed("method #{conn.method} is not allowed", allow)
+
+      true ->
+        nil
+    end
+  end
+
+  # Decodes a request that `unserved/2` let through, and returns the
+  # connection updated while reading its body.
   def decode_with_conn(%Plug.Conn{} = conn, opts) do
     conn = fetch_query_params(conn)
 
-    base_path =
-      normalize_base_path(Keyword.get(opts, :path) || forwarded_base_path(conn) || "/mcp")
-
-    http_context = HTTPCommon.http_context(conn, %{}, Keyword.put(opts, :path, base_path))
-
     context = %{
-      base_url: http_context.base_url,
-      mcp_base_path: http_context.mcp_base_path,
-      auth_assigns: Keyword.get(opts, :auth_assigns, false)
+      base_url: HTTPCommon.base_url(conn, opts),
+      mcp_base_path: HTTPCommon.endpoint_path(conn, opts),
+      auth_assigns: Keyword.get(opts, :auth_assigns, false),
+      max_body_bytes: Keyword.get(opts, :max_body_bytes, 8_000_000)
     }
 
-    case {conn.method, conn.request_path == base_path} do
-      {"POST", true} ->
-        decode_post(conn, context)
-
-      {"GET", true} ->
-        {decode_get(conn, opts, context), conn}
-
-      {"DELETE", true} ->
-        {decode_delete(conn, context), conn}
-
-      _other ->
-        {{:respond, 404, %{error: %{code: :not_found, message: "unknown route"}}, []}, conn}
+    case conn.method do
+      "POST" -> decode_post(conn, context)
+      "GET" -> {decode_get(conn, opts, context), conn}
+      "DELETE" -> {decode_delete(conn, context), conn}
     end
   end
 
   defp decode_post(conn, context) do
     case validate_post_headers(conn) do
       :ok ->
-        {body, conn} = read_json(conn)
+        {body, conn} = read_json(conn, context.max_body_bytes)
 
         result =
           with {:ok, envelope} <- body,
@@ -112,24 +122,24 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
   defp decode_get(conn, opts, context) do
     cond do
       modern_protocol_header?(conn) ->
-        post_only("MCP 2026 HTTP is POST-only", "POST")
+        method_not_allowed("MCP 2026 HTTP is POST-only", "POST")
 
       Keyword.get(opts, :enable_get_streaming, true) ->
         with :ok <- require_event_stream_accept(conn),
              do: {:ok, session_request(conn, "__transport/session_get__", context)}
 
       true ->
-        post_only("GET streaming is disabled", "POST, DELETE")
+        method_not_allowed("GET streaming is disabled", "POST, DELETE")
     end
   end
 
   defp decode_delete(conn, context) do
     if modern_protocol_header?(conn),
-      do: post_only("MCP 2026 HTTP is POST-only", "POST"),
+      do: method_not_allowed("MCP 2026 HTTP is POST-only", "POST"),
       else: {:ok, session_request(conn, "__transport/delete_session__", context)}
   end
 
-  defp post_only(message, allow),
+  defp method_not_allowed(message, allow),
     do:
       {:respond, 405, %{error: %{code: :method_not_allowed, message: message}},
        [{"allow", allow}]}
@@ -305,16 +315,18 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
     end)
   end
 
-  defp read_json(conn) do
+  # A body that `Plug.Parsers` already parsed, or the body read up to
+  # `max_body_bytes`; a longer body is `:payload_too_large`, HTTP 413.
+  defp read_json(conn, max_body_bytes) do
     case conn.body_params do
-      %Plug.Conn.Unfetched{} -> read_json_body(conn)
+      %Plug.Conn.Unfetched{} -> read_json_body(conn, max_body_bytes)
       %{"_json" => payload} -> {{:ok, payload}, conn}
       body_params when is_map(body_params) -> {{:ok, body_params}, conn}
     end
   end
 
-  defp read_json_body(conn) do
-    case read_body(conn) do
+  defp read_json_body(conn, max_body_bytes) do
+    case read_body(conn, length: max_body_bytes) do
       {:ok, "", conn} ->
         {{:error, JSONRPC.parse_error("empty request body")}, conn}
 
@@ -322,7 +334,7 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
         {JSONRPC.decode_json(body), conn}
 
       {:more, _body, conn} ->
-        {{:error, JSONRPC.parse_error("request body too large")}, conn}
+        {{:error, %Error{code: :payload_too_large, message: "request body too large"}}, conn}
 
       {:error, reason} ->
         # The adapter cannot return its partially consumed state on read failure.
@@ -340,12 +352,6 @@ defmodule FastestMCP.Transport.StreamableHTTPAdapter do
 
   defp modern_protocol_header?(conn),
     do: is_modern(Map.new(conn.req_headers)["mcp-protocol-version"])
-
-  defp normalize_base_path(path),
-    do: "/" <> String.trim(String.trim_leading(to_string(path), "/"), "/")
-
-  defp forwarded_base_path(%Plug.Conn{script_name: []}), do: nil
-  defp forwarded_base_path(%Plug.Conn{script_name: names}), do: "/" <> Enum.join(names, "/")
 
   defp generate_session_id do
     32

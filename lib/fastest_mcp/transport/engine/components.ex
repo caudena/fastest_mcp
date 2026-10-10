@@ -7,7 +7,6 @@ defmodule FastestMCP.Transport.Engine.Components do
 
   alias FastestMCP.Apps
   alias FastestMCP.Auth
-  alias FastestMCP.Auth.Result, as: AuthResult
   alias FastestMCP.BackgroundTask
   alias FastestMCP.Component
   alias FastestMCP.ComponentVisibility
@@ -109,30 +108,24 @@ defmodule FastestMCP.Transport.Engine.Components do
     end
   end
 
-  # Binds a wire cursor to everything that decides what a listing contains.
-  def pagination_fingerprint(runtime, %Request{} = request, opts) do
-    with {:ok, authorization} <- pagination_authorization(runtime, request),
-         {:ok, context} <- OperationPipeline.request_context(runtime, opts) do
-      fingerprint =
-        %{
-          runtime_generation: runtime.runtime_generation,
-          authorization: authorization,
-          session_id: request.session_id,
-          audience: Keyword.get(opts, :audience, :model),
-          version: Keyword.get(opts, :version),
-          visibility_filter: %{
-            method: request.method,
-            params: Map.drop(request.payload, ["cursor", "pageSize", "_meta"]),
-            server_rules: ComponentVisibility.server_rules(runtime.server.name),
-            session_rules: ComponentVisibility.session_rules(context)
-          }
-        }
-        |> :erlang.term_to_binary([:deterministic])
-        |> then(&:crypto.hash(:sha256, &1))
-        |> Base.url_encode64(padding: false)
-
-      {:ok, fingerprint}
-    end
+  # Binds a wire cursor to everything that decides what a listing contains,
+  # for the caller that `context` authenticated.
+  def pagination_fingerprint(runtime, %Request{} = request, opts, %Context{} = context) do
+    %{
+      authorization: Auth.authorization_partition(context),
+      session_id: request.session_id,
+      audience: Keyword.get(opts, :audience, :model),
+      version: Keyword.get(opts, :version),
+      visibility_filter: %{
+        method: request.method,
+        params: Map.drop(request.payload, ["cursor", "pageSize", "_meta"]),
+        server_rules: ComponentVisibility.server_rules(runtime.server.name),
+        session_rules: ComponentVisibility.session_rules(context)
+      }
+    }
+    |> :erlang.term_to_binary([:deterministic])
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.url_encode64(padding: false)
   end
 
   defp call(runtime, kind, request, opts) do
@@ -150,13 +143,9 @@ defmodule FastestMCP.Transport.Engine.Components do
     end
   end
 
-  # Over the wire `prompts/get` does not honour `_meta.fastestmcp.version`.
+  # A call picks a version with `_meta.fastestmcp.version`.
   defp call_opts(kind, request, opts) do
-    opts =
-      if kind == :prompt,
-        do: opts,
-        else: maybe_put(opts, :version, Request.component_version(request))
-
+    opts = maybe_put(opts, :version, Request.component_version(request))
     opts = if kind == :tool, do: put_header_validator(opts, request), else: opts
 
     case request do
@@ -233,15 +222,17 @@ defmodule FastestMCP.Transport.Engine.Components do
   defp subscription_session(_runtime, _request),
     do: Engine.error(:bad_request, "resource subscriptions require an explicit session_id")
 
+  # The listing authenticates its caller once: the lookups that follow use
+  # the identity it authenticated.
   defp list(runtime, kind, request, opts) do
-    with {:ok, fingerprint} <- pagination_fingerprint(runtime, request, opts),
-         {:ok, page} <-
+    with {:ok, page, context} <-
            OperationPipeline.wire_list_page(runtime.server.name, kind, opts,
-             secret: runtime.pagination_cursor_secret,
+             secret: runtime.signing_secret.value,
              scope: request.method,
-             fingerprint: fingerprint,
+             fingerprint: &pagination_fingerprint(runtime, request, opts, &1),
              cursor: Map.get(request.payload, "cursor")
            ),
+         opts = Engine.authenticated_opts(opts, context),
          {:ok, items} <- list_items(runtime, kind, page.items, request, opts) do
       {:ok,
        %{Map.fetch!(@list_keys, kind) => Enum.map(items, &list_item(kind, &1, request, opts))}
@@ -326,46 +317,4 @@ defmodule FastestMCP.Transport.Engine.Components do
 
   defp client_capabilities(opts), do: Keyword.get(opts, :client_capabilities, %{})
   defp server_extensions(opts), do: Keyword.get(opts, :server_extensions, %{})
-
-  # Without a transport auth result, the listing is partitioned by the identity
-  # the server's auth resolves for the request.
-  defp pagination_authorization(_runtime, %Request{auth_result: %AuthResult{} = auth_result}),
-    do: {:ok, Auth.authorization_partition(auth_result)}
-
-  defp pagination_authorization(%{server: %{auth: nil}}, _request), do: {:ok, :anonymous}
-
-  defp pagination_authorization(runtime, %Request{} = request) do
-    context =
-      Context.new(runtime,
-        session_id: lookup_session_id(request),
-        transport: request.transport,
-        transport_authorization: request.transport_authorization,
-        request_metadata:
-          Map.put(Engine.context_metadata(request), :transport_authenticated, false)
-      )
-
-    with {:ok, context} <-
-           Auth.resolve(
-             runtime.server.auth,
-             %{context | request_id: lookup_request_id(request)},
-             request.auth_input
-           ) do
-      {:ok, context |> Auth.result_from_context() |> Auth.authorization_partition()}
-    end
-  end
-
-  defp lookup_session_id(%Request{session_id: session_id})
-       when is_binary(session_id) and session_id != "",
-       do: session_id
-
-  defp lookup_session_id(_request), do: "transport-lookup-session"
-
-  defp lookup_request_id(%Request{request_id: request_id})
-       when is_binary(request_id) and request_id != "",
-       do: request_id
-
-  defp lookup_request_id(%Request{request_id: request_id}) when not is_nil(request_id),
-    do: to_string(request_id)
-
-  defp lookup_request_id(_request), do: "transport-lookup"
 end

@@ -1,7 +1,8 @@
 defmodule FastestMCP.Client.Config do
   @moduledoc false
   # Validated connection options, built by `FastestMCP.Client.Options.validate!/2`
-  # in the caller before the client process starts.
+  # in the caller before the client process starts. `log_level` is set by
+  # `FastestMCP.Client.set_log_level/3`.
 
   defstruct [
     :name,
@@ -30,6 +31,7 @@ defmodule FastestMCP.Client.Config do
     :url_elicitation_handler,
     :elicitation_complete_handler,
     :log_handler,
+    :log_level,
     :progress_handler,
     :notification_handler,
     :auth_input,

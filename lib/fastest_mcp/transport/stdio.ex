@@ -8,12 +8,18 @@ defmodule FastestMCP.Transport.Stdio do
   (`:server_options` are its runtime options) and stops it at the end; given
   the name of a running server, it serves that server, and raises
   `ArgumentError` when none is running. While it writes to stdout, Logger
-  output and the output of the server's workers go to stderr.
+  output and the output of the server's workers go to stderr. `:auth_input` is
+  the input that the server's authenticator receives for every request, as for
+  an in-process call.
+
+  A server module serves itself with its `serve_stdio/1`; see
+  `FastestMCP.ServerModule.serve_stdio/2`.
   """
 
   alias FastestMCP.Error
   alias FastestMCP.Server
   alias FastestMCP.ServerRuntime
+  alias FastestMCP.ServerRuntime.Config
   alias FastestMCP.Transport.Dispatch
   alias FastestMCP.Transport.JSONRPC
   alias FastestMCP.Transport.Stdio.Connection
@@ -59,17 +65,14 @@ defmodule FastestMCP.Transport.Stdio do
       raise ArgumentError, ":server_options must be a keyword list"
     end
 
-    case Application.ensure_all_started(:fastest_mcp) do
-      {:ok, _applications} -> :ok
-      {:error, reason} -> raise "failed to start FastestMCP for stdio: #{inspect(reason)}"
-    end
+    start_application!(:fastest_mcp)
 
     # The connection's start blocks in the server's lifespans, which do not
     # notice this process exit; the output guard aborts that start.
     :ok = OutputGuard.acquire(starting: server.name)
 
     try do
-      serve_connection({server, server_opts}, input_device, output_device, opts)
+      serve_connection({server, Config.protect(server_opts)}, input_device, output_device, opts)
     after
       OutputGuard.release()
     end
@@ -77,6 +80,31 @@ defmodule FastestMCP.Transport.Stdio do
 
   def serve(server_name, input_device, output_device, opts),
     do: serve_connection(server_name, input_device, output_device, opts)
+
+  @doc false
+  # Runs `fun` with Logger output moved from stdout to stderr, as while
+  # serving, for an entry point that starts applications before it serves.
+  # `serve/4` of a server definition in `fun` releases the move when it ends.
+  def with_stdout_isolated(fun) do
+    start_application!(:fastest_mcp)
+
+    with {:error, reason} <- OutputGuard.acquire(logger: true),
+         do: raise(ArgumentError, start_error(nil, {:logger_isolation, reason}))
+
+    try do
+      fun.()
+    after
+      OutputGuard.release()
+    end
+  end
+
+  @doc false
+  def start_application!(application) do
+    case Application.ensure_all_started(application) do
+      {:ok, _applications} -> :ok
+      {:error, reason} -> raise "failed to start #{inspect(application)}: #{inspect(reason)}"
+    end
+  end
 
   defp serve_connection(server, input_device, output_device, opts) do
     args = %{

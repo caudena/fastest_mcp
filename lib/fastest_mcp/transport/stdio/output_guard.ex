@@ -145,9 +145,15 @@ defmodule FastestMCP.Transport.Stdio.OutputGuard do
 
   defp abort_start(nil), do: :ok
 
+  # Kills the server's supervisor and the one of its runtime, which traps exits
+  # while it is blocked starting its children.
   defp abort_start(server_name) do
-    with {:error, :not_found} <- Registry.lookup_runtime(server_name),
-         {:ok, runtime} <- Registry.lookup_server(server_name),
-         do: Process.exit(runtime, :kill)
+    if Registry.lookup_runtime(server_name) == {:error, :not_found} do
+      for lookup <- [&Registry.lookup_server/1, &Registry.lookup_runtime_supervisor/1],
+          {:ok, pid} <- [lookup.(server_name)],
+          do: Process.exit(pid, :kill)
+    end
+
+    :ok
   end
 end

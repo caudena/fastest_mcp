@@ -6,6 +6,8 @@ defmodule FastestMCP.Provider.Dispatch do
 
   alias FastestMCP.Component
   alias FastestMCP.Component.Lookup
+  alias FastestMCP.ComponentCompiler
+  alias FastestMCP.Components.Tool
   alias FastestMCP.Error
   alias FastestMCP.Pagination
   alias FastestMCP.Provider
@@ -201,13 +203,23 @@ defmodule FastestMCP.Provider.Dispatch do
   end
 
   defp transform(component, transforms, operation) do
-    Enum.reduce_while(transforms, component, fn %module{} = transform, current ->
+    transforms
+    |> Enum.reduce_while(component, fn %module{} = transform, current ->
       case module.transform_component(transform, current, operation) do
         nil -> {:halt, nil}
         transformed -> {:cont, transformed}
       end
     end)
+    |> check_tool_name(component)
   end
+
+  # A tool name that the transforms built must be one MCP allows.
+  defp check_tool_name(%Tool{name: name} = tool, %Tool{name: source}) when name != source do
+    ComponentCompiler.check_built_tool_name!(source, name)
+    tool
+  end
+
+  defp check_tool_name(transformed, _component), do: transformed
 
   defp reverse_identifier(transforms, kind, identifier, operation) do
     transforms

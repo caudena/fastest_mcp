@@ -29,7 +29,12 @@ defmodule FastestMCP.OperationPipeline do
   alias FastestMCP.TTLStore
   alias FastestMCP.Util
 
-  @unauthenticated_methods ["initialize", "ping"]
+  # In process and over stdio, ping runs without the authenticator, and the
+  # handshake authenticates only the credentials it carries: a client
+  # negotiates the same version with or without credentials, and with them the
+  # handshake offers what that caller may use. Over HTTP the transport
+  # authenticates every request first.
+  @handshake_methods ["initialize", "server/discover"]
 
   def initialize(server_name, params \\ %{}, opts \\ []) do
     # Local callers may name the params with atoms.
@@ -78,20 +83,32 @@ defmodule FastestMCP.OperationPipeline do
 
   def list_prompts(server_name, opts \\ []), do: list(server_name, :prompt, opts)
 
+  # A page of a list on the wire, as `Pagination.wire_page/2` returns it, and
+  # the context of the operation that listed it: `{:ok, page, context}`. The
+  # cursor is bound to the caller, so `:fingerprint` is a function of the
+  # operation's context, and the operation reads the cursor once it has
+  # authenticated the caller; middleware sees the items, and the page is cut
+  # from what it returns.
   def wire_list_page(server_name, component_type, opts, pagination_opts)
       when is_list(opts) and is_list(pagination_opts) do
     method = Component.list_method(component_type)
     cursor = Keyword.get(pagination_opts, :cursor)
     arguments = if is_nil(cursor), do: %{}, else: %{"cursor" => cursor}
+    page_opts = &Keyword.update!(pagination_opts, :fingerprint, fn bind -> bind.(&1.context) end)
 
-    Pagination.wire_page(pagination_opts, fn after_key, limit ->
-      run(server_name, component_type, method, nil, arguments, opts, fn operation ->
+    executor = fn operation ->
+      with {:ok, {after_key, limit}} <- Pagination.wire_position(page_opts.(operation)) do
         operation.context.server
         |> Resolver.visible_page(component_type, operation, after_key, limit)
         |> Enum.map(&Component.metadata/1)
         |> then(&reply(operation, &1))
-      end)
-    end)
+      end
+    end
+
+    with {:ok, operation} <-
+           run_operation(server_name, component_type, method, nil, arguments, opts, executor),
+         {:ok, page} <- Pagination.wire_page(operation.result, page_opts.(operation)),
+         do: {:ok, page, operation.context}
   end
 
   def visible_component_sets(server_name, opts \\ []) do
@@ -239,7 +256,8 @@ defmodule FastestMCP.OperationPipeline do
 
   # The context of a request with the operation `opts`. A session-scoped
   # request runs in a live session, which it starts unless the client named a
-  # session that was terminated.
+  # session that was terminated. A request that names no session is
+  # request-scoped (see `Context.new/2`) and runs without one.
   def request_context(runtime, opts) do
     context = Context.new(runtime, Context.inherit_opts(runtime.server.name, opts))
 
@@ -282,9 +300,17 @@ defmodule FastestMCP.OperationPipeline do
 
   defp terminated_session?(_runtime, _context), do: false
 
-  # Runs one operation through the server's middleware around `executor`.
-  # Process exits (a stopped runtime, a timed-out call) become errors too.
+  # Runs one operation through the server's middleware around `executor`. Its
+  # errors are marked `from_operation`: transports answer them as JSON-RPC
+  # errors rather than with an HTTP error status.
   defp run_operation(server_name, kind, method, target, arguments, opts, executor) do
+    with {:error, %Error{} = error} <-
+           run_traced(server_name, kind, method, target, arguments, opts, executor),
+         do: {:error, %{error | from_operation: true}}
+  end
+
+  # Process exits (a stopped runtime, a timed-out call) become errors too.
+  defp run_traced(server_name, kind, method, target, arguments, opts, executor) do
     with {:ok, runtime} <- ServerRuntime.fetch_running(server_name),
          {:ok, context} <- request_context(runtime, opts) do
       operation = build_operation(runtime, kind, method, target, arguments, context, opts)
@@ -343,11 +369,14 @@ defmodule FastestMCP.OperationPipeline do
     )
   end
 
-  defp record_error(%Error{cause: {exception, stacktrace}}),
-    do: Telemetry.record_error(exception, stacktrace)
+  # A span records the exception an error wraps, with its stack trace.
+  defp record_error(%Error{} = error) do
+    {exception, stacktrace} = error.cause || {error, []}
 
-  defp record_error(%Error{} = error),
-    do: Telemetry.record_error(error, [], %{"fastestmcp.error.code" => to_string(error.code)})
+    Telemetry.record_error(exception, stacktrace, %{
+      "fastestmcp.error.code" => to_string(error.code)
+    })
+  end
 
   defp with_visible_snapshot(server_name, kind, method, target, opts, fun) do
     with {:ok, runtime} <- ServerRuntime.fetch_running(server_name),
@@ -414,8 +443,10 @@ defmodule FastestMCP.OperationPipeline do
   defp maybe_authenticate(%{auth: nil}, operation, _opts), do: {:ok, operation}
 
   defp maybe_authenticate(server, operation, opts) do
-    if operation.method in @unauthenticated_methods or operation.context.authenticated or
-         Keyword.get(opts, :transport_authenticated, false) do
+    if operation.method == "ping" or operation.context.authenticated or
+         Keyword.get(opts, :transport_authenticated, false) or
+         (operation.method in @handshake_methods and
+            Keyword.get(opts, :auth_input) in [nil, %{}, []]) do
       {:ok, operation}
     else
       authenticate(server, operation, opts)
@@ -423,39 +454,11 @@ defmodule FastestMCP.OperationPipeline do
   end
 
   defp authenticate(server, %Operation{} = operation, opts) do
-    started_at = System.monotonic_time()
-    metadata = auth_telemetry_metadata(operation, server.auth)
-
-    Context.emit(
-      operation.context,
-      [:auth, :start],
-      %{system_time: System.system_time()},
-      metadata
-    )
-
-    case Auth.resolve(server.auth, operation.context, Keyword.get(opts, :auth_input, %{})) do
-      {:ok, context} ->
-        operation = %{operation | context: context, transport: context.transport}
-
-        Context.emit(
-          context,
-          [:auth, :stop],
-          %{duration: System.monotonic_time() - started_at},
-          auth_telemetry_metadata(operation, server.auth)
-        )
-
-        {:ok, operation}
-
-      {:error, %Error{} = error} ->
-        Context.emit(
-          operation.context,
-          [:auth, :exception],
-          %{duration: System.monotonic_time() - started_at},
-          Map.merge(metadata, %{code: error.code, error: Exception.message(error)})
-        )
-
-        {:error, error}
-    end
+    Auth.span(server.auth, operation.context, telemetry_metadata(operation), fn ->
+      with {:ok, context} <-
+             Auth.resolve(server.auth, operation.context, Keyword.get(opts, :auth_input, %{})),
+           do: {:ok, %{operation | context: context, transport: context.transport}}
+    end)
   end
 
   defp validate_result(%{method: "tools/call", task_request: false}, component, result),
@@ -536,15 +539,23 @@ defmodule FastestMCP.OperationPipeline do
     end
   end
 
-  defp extension_error(_extension, _binding, {:error, %Error{} = error}), do: error
+  defp extension_error(_extension, _binding, {:error, %Error{} = error, _stacktrace}), do: error
 
   defp extension_error(_extension, binding, :overloaded),
     do: Error.overloaded("extension method #{inspect(binding.name)}")
 
-  defp extension_error(extension, binding, {:error, exception}) do
+  defp extension_error(extension, binding, {:error, exception, stacktrace}) do
     error = Error.from_exception(exception, "extension method #{inspect(binding.name)} crashed")
-    %{error | details: Map.put(error.details, :extension, extension.identifier)}
+
+    %{
+      error
+      | details: Map.put(error.details, :extension, extension.identifier),
+        cause: {exception, stacktrace}
+    }
   end
+
+  defp extension_error(extension, binding, {kind, reason, _stacktrace}),
+    do: extension_error(extension, binding, {kind, reason})
 
   defp extension_error(extension, binding, {kind, reason}) do
     Error.internal("extension method #{inspect(binding.name)} failed", %{
@@ -593,12 +604,6 @@ defmodule FastestMCP.OperationPipeline do
       request_id: operation.context.request_id,
       transport: operation.transport
     }
-  end
-
-  defp auth_telemetry_metadata(operation, auth) do
-    Map.merge(telemetry_metadata(operation), %{
-      auth_provider: inspect(auth.provider)
-    })
   end
 
   defp normalize_arguments(arguments) when is_map(arguments), do: arguments
