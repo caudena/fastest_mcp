@@ -132,13 +132,9 @@ defmodule FastestMCP.Authorization do
              details: %{missing_scopes: missing_scopes}
            }}
 
+        # No missing scopes: HTTP answers a plain 403, without a scope challenge.
         {:error, :denied} ->
-          {:error,
-           %RuntimeError{
-             code: :forbidden,
-             message: generic_denial_message(component),
-             details: %{authorization_denial: :opaque}
-           }}
+          {:error, %RuntimeError{code: :forbidden, message: generic_denial_message(component)}}
       end
     end
   end

@@ -520,9 +520,12 @@ RFC 6750 asks. Every authentication emits the
 List requests leave out the components a caller may not use, without an error.
 A direct call that scope checks deny gets `403` with an `insufficient_scope`
 challenge that lists every missing scope; `FastestMCP.Authorization.restrict_tag/2`
-makes a scope check too. When a function or capability check also denies the
-call, or when a function that computes scopes fails, the response is a plain
-`403` that names no scopes, so that clients can't discover your policy.
+makes a scope check too. Any other `403` is plain, without a challenge, since
+no other token would help: when a function or capability check also denies the
+call, when a function that computes scopes fails, which names no scopes so that
+clients can't discover your policy, and when your authenticator itself returns
+`{:error, :forbidden}`, for example for a valid token of someone without an
+account.
 
 When several versions of a component share a name, a call that names no
 version uses the newest version the caller may use. A call that asks for a

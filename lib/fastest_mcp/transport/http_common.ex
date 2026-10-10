@@ -328,15 +328,14 @@ defmodule FastestMCP.Transport.HTTPCommon do
     {401, [{"www-authenticate", Auth.www_authenticate(auth, error, http_context)}]}
   end
 
+  # Only a denial for missing scopes asks the client for a token with them
+  # (`insufficient_scope`): no other token helps with any other 403, such as an
+  # authenticator's own refusal.
   defp error_status_and_headers(%Error{code: :forbidden} = error, auth, http_context) do
     headers =
-      if not opaque_authorization_denial?(error) and
-           (not is_nil(protected_resource(http_context)) or
-              Auth.validated_missing_scopes(error) != []) do
-        [{"www-authenticate", Auth.www_authenticate(auth, error, http_context)}]
-      else
-        []
-      end
+      if Auth.validated_missing_scopes(error) != [],
+        do: [{"www-authenticate", Auth.www_authenticate(auth, error, http_context)}],
+        else: []
 
     {403, headers}
   end
@@ -388,9 +387,6 @@ defmodule FastestMCP.Transport.HTTPCommon do
     end
   end
 
-  defp opaque_authorization_denial?(error),
-    do: Error.detail(error, :authorization_denial) in [:opaque, "opaque"]
-
   defp server_name(%{server: %{name: name}}), do: name
   defp server_name(_runtime), do: nil
 
@@ -422,27 +418,39 @@ defmodule FastestMCP.Transport.HTTPCommon do
 
   defp ensure_protected_resource_auth(_server), do: :ok
 
-  # The request's URL must be the resource. A mismatch is a plain 403: a scope
-  # challenge would send OAuth clients to get a token that can't help.
+  # The request's URL must be the resource.
   defp validate_protected_resource_request(conn, runtime, opts) do
     case protected_resource(runtime) do
       %ProtectedResource{} = protected_resource ->
-        with {:ok, resource_uri} <- resource_uri(conn, opts, endpoint_path(conn, opts)),
-             true <- ProtectedResource.matches_resource?(protected_resource, resource_uri) do
-          :ok
-        else
-          _other ->
-            {:error,
-             %Error{
-               code: :forbidden,
-               message: "request URI does not match the configured protected resource",
-               details: %{authorization_denial: :opaque}
-             }}
+        case resource_uri(conn, opts, endpoint_path(conn, opts)) do
+          {:ok, uri} ->
+            if ProtectedResource.matches_resource?(protected_resource, uri),
+              do: :ok,
+              else: resource_mismatch(uri, protected_resource)
+
+          {:error, reason} ->
+            resource_mismatch(reason, protected_resource)
         end
 
       nil ->
         :ok
     end
+  end
+
+  # A plain 403, and the log says why: usually a proxy that ends TLS, which
+  # `base_url` accounts for.
+  defp resource_mismatch(request_url, %ProtectedResource{resource: resource}) do
+    Logger.warning(
+      "FastestMCP rejected an HTTP request whose URL is not the protected resource: " <>
+        "request_url=#{inspect(request_url)}; resource=#{inspect(resource)}; " <>
+        "behind a proxy that ends TLS, set base_url: to the public URL"
+    )
+
+    {:error,
+     %Error{
+       code: :forbidden,
+       message: "request URI does not match the configured protected resource"
+     }}
   end
 
   defp request_session_id(conn) do

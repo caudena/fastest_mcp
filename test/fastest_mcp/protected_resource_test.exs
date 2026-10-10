@@ -1,6 +1,7 @@
 defmodule FastestMCP.ProtectedResourceTest do
   use FastestMCP.Case, async: true
 
+  import ExUnit.CaptureLog
   import Plug.Conn
   import Plug.Test
 
@@ -544,6 +545,51 @@ defmodule FastestMCP.ProtectedResourceTest do
 
     assert response.status == 403
     assert get_resp_header(response, "www-authenticate") == []
+  end
+
+  test "an authenticator's own 403 asks for no other token" do
+    server_name = unique_name("protected-authenticator-forbidden")
+
+    # A valid token of a caller the application refuses: no scope can help.
+    FastestMCP.server(server_name,
+      auth: fn _input, _context -> {:error, {:forbidden, "no account"}} end,
+      protected_resource: protected_resource()
+    )
+    |> start_server!()
+
+    response =
+      server_name
+      |> protected_app()
+      |> initialize_request("https://mcp.example.com/public/mcp",
+        authorization: "Bearer valid-token"
+      )
+
+    assert response.status == 403
+    assert get_resp_header(response, "www-authenticate") == []
+  end
+
+  test "a request URL that doesn't match the protected resource is logged" do
+    server_name = unique_name("protected-url-mismatch")
+
+    FastestMCP.server(server_name, auth: allow_auth(), protected_resource: protected_resource())
+    |> start_server!()
+
+    # As behind a proxy that ends TLS: the request arrives over http.
+    log =
+      capture_log(fn ->
+        response =
+          server_name
+          |> protected_app()
+          |> initialize_request("http://mcp.example.com/public/mcp",
+            authorization: "Bearer verified-token"
+          )
+
+        assert response.status == 403
+      end)
+
+    assert log =~ "http://mcp.example.com/public/mcp"
+    assert log =~ "https://mcp.example.com/public/mcp"
+    assert log =~ "base_url"
   end
 
   test "protected HTTP rejects query tokens before invoking the authenticator" do

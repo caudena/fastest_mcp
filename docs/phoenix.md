@@ -395,10 +395,12 @@ end
   paths under `/mcp`, so the metadata needs its own route.
 - Give the metadata route the server's name in `server_name`, and both routes
   the same `allowed_hosts`. Both read the metadata from the running server.
-- Behind a proxy, add `base_url: "https://notes.example.com"` to both routes,
-  in the same way as the hosts in [Allowed hosts](#allowed-hosts). FastestMCP
-  compares the URL of each request with the configured resource, and when TLS
-  ends at a proxy, Phoenix sees `http` and possibly an internal host or port.
+- Behind a proxy, add `base_url: {MyAppWeb.Endpoint, :url, []}`, the endpoint's
+  public URL, to both routes, in the same way as the hosts in
+  [Allowed hosts](#allowed-hosts). FastestMCP compares the URL of each request
+  with the configured resource, and when TLS ends at a proxy, Phoenix sees `http`
+  and possibly an internal host or port: every request then gets `403`, and the
+  log names both URLs.
 
 ## The route in production
 

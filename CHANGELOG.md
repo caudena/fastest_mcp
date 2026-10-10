@@ -226,8 +226,11 @@ change and the code to update.
 - page the client's callback-task `tasks/list` with opaque offset cursors
 - challenge a `401` for a request without credentials with `Bearer` and no
   error
-- answer a request URL that isn't the protected resource with a `403` without
-  a challenge
+- challenge a `403` with `insufficient_scope` only when scopes are missing:
+  a request URL that isn't the protected resource, an authenticator's own
+  `{:error, :forbidden}`, and any other denial get a `403` without a challenge
+- log a request URL that isn't the protected resource, with both URLs, so a
+  missing `base_url:` behind a proxy shows in the log
 - answer a method other than `GET`, `POST`, and `DELETE` with `405` and
   `Allow`, and another path with `404`, before authentication
 - answer a request for a server that isn't running with `503` and

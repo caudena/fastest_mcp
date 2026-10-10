@@ -741,8 +741,12 @@ Over HTTP:
   without an error: `Bearer`, or `Bearer resource_metadata="...", scope="..."`
   with protected resource metadata (both had `error="invalid_token"` and the
   authenticator's message).
-- A request whose URL doesn't match the protected resource gets a `403`
-  without a `WWW-Authenticate` challenge (it had an `insufficient_scope` one).
+- With protected resource metadata, a `403` carries an `insufficient_scope`
+  challenge only when scopes are missing. Any other `403`, such as a request
+  whose URL doesn't match the protected resource or an authenticator's own
+  `{:error, :forbidden}`, gets no `WWW-Authenticate` challenge (it had an
+  `insufficient_scope` one). A URL that doesn't match is also logged as a
+  warning that names both URLs.
 - A method other than `GET`, `POST`, and `DELETE` gets `405` with an `Allow`
   header, and another path `404`, both before authentication (they got `404`
   `unknown route`, or `401` on a route with an authenticator).

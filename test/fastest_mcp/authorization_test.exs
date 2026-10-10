@@ -168,11 +168,10 @@ defmodule FastestMCP.AuthorizationTest do
       arguments: %{}
     }
 
-    assert {:error,
-            %Error{
-              code: :forbidden,
-              details: %{authorization_denial: :opaque}
-            }} = Authorization.authorize_component(component, context, operation)
+    assert {:error, %Error{code: :forbidden, details: details}} =
+             Authorization.authorize_component(component, context, operation)
+
+    refute Map.has_key?(details, :missing_scopes)
   end
 
   test "component authorization filters list results and rejects direct calls" do

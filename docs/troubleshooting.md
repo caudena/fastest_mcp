@@ -48,8 +48,9 @@ The other reasons:
   a scope that the server or the tool requires. The header's `scope` names the
   scopes needed; see [Authorizing components](auth.md#authorizing-components).
 - **`request URI does not match the configured protected resource`**: with
-  OAuth, the URL the server sees isn't the resource it publishes. Behind a
-  proxy, set `base_url`; see [OAuth](phoenix.md#oauth).
+  OAuth, the URL the server sees isn't the resource it publishes; a warning in
+  the server's log names both. Behind a proxy, set `base_url`; see
+  [OAuth](phoenix.md#oauth).
 - **`MCP session belongs to a different authenticated identity`**: a
   `2025-11-25` session was started with one identity and used with another,
   for example after the client changed its token. The client must start a new
