@@ -2,7 +2,7 @@
 name = "fastest-mcp-interop"
 version = "0.0.0"
 requires-python = ">=3.12,<3.15"
-dependencies = ["fastmcp==4.0.11"]
+dependencies = ["fastmcp==4.1.2"]
 
 [tool.uv]
 package = false
