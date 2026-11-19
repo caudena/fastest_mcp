@@ -654,9 +654,12 @@ A stdio connection runs requests concurrently, up to `max_in_flight:`, and
 matches responses to requests by their JSON-RPC id. With
 `protocol_version: "2025-11-25"`, it runs one request at a time. A program
 that exits before the client has connected makes `connect/2` return an
-`:internal_error` whose message and `details.status` give its exit status,
-such as `"stdio server exited with status 1"`; what it printed to standard
-error appears on your application's standard error.
+`:internal_error`. When the port reports an exit status, the error includes
+it in `details.status` and in a message such as
+`"stdio server exited with status 1"`. A failure writing to the port can
+close it before the exit status arrives. In that case the error reports the
+transport failure in `details.reason`, such as `":epipe"` for a broken pipe.
+The program's standard error appears on your application's standard error.
 
 When the program of a `2026-07-28` connection exits, the client starts it
 again. Requests that were running fail and aren't sent again; open

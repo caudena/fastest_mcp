@@ -187,14 +187,42 @@ defmodule FastestMCP.ClientStdioTest do
     assert %{items: [%{"name" => "fallback-ok"}]} = Client.list_tools!(client)
   end
 
-  test "a stdio server that exits while connecting reports its exit status" do
+  test "connecting fails when the stdio server exits immediately" do
     sh = System.find_executable("sh")
 
-    assert {:error, %Error{message: "stdio server exited with status 3", details: %{status: 3}}} =
+    assert {:error, %Error{code: :internal_error} = error} =
              Client.connect({:stdio, sh, ["-c", "exit 3"]})
+
+    # OTP can close the port for a failed write before it reports the child status.
+    assert {error.message, error.details} in [
+             {"stdio server exited with status 3", %{status: 3}},
+             {"stdio client transport is closed", %{reason: ":epipe"}}
+           ]
+  end
+
+  test "connecting reports the stdio server exit status after it reads discovery" do
+    sh = System.find_executable("sh")
 
     assert {:error, %Error{message: "stdio server exited with status 7", details: %{status: 7}}} =
              Client.connect({:stdio, sh, ["-c", "read request; exit 7"]})
+  end
+
+  @tag :tmp_dir
+  test "discovery reports a broken pipe when the stdio server closes its input", %{
+    tmp_dir: directory
+  } do
+    ready = Path.join(directory, "stdin-closed")
+    sh = System.find_executable("sh")
+    script = ~S(exec 0<&-; : > "$1"; exec sleep 30)
+    client = connect!({:stdio, sh, ["-c", script, "stdio-test", ready]}, auto_initialize: false)
+    assert_eventually(fn -> File.exists?(ready) end)
+
+    assert {:error,
+            %Error{
+              code: :internal_error,
+              message: "stdio client transport is closed",
+              details: %{reason: ":epipe"}
+            }} = Client.discover(client)
   end
 
   @tag :tmp_dir

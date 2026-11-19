@@ -384,10 +384,9 @@ connection's auth options together, and `set_auth(client, [])` clears them.
   invalid one; any error, a timeout, or the program's exit selected
   `2025-11-25`. An authentication error (`:unauthorized` or `:forbidden`) is
   returned on every transport.
-- A stdio program that exits while connecting reports its exit status
-  (`stdio server exited with status 1`); it failed with
-  `stdio client transport exited`, or with a `:noproc` exit under
-  `protocol_version: :auto`.
+- A stdio program that exits while connecting reports its exit status when
+  the port supplies it, for example `stdio server exited with status 1`.
+  If a write closes the port first, the error reports the transport failure.
 - An HTTP error without a JSON-RPC body takes the code of its status
   (`:unauthorized` for `401`, `:forbidden` for `403`, `:not_found` for `404`,
   `:rate_limited` for `429`, `:overloaded` for `503`, `:timeout` for `504`), or
