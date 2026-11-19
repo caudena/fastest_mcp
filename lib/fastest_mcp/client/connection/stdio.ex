@@ -115,9 +115,16 @@ defmodule FastestMCP.Client.Connection.Stdio do
   # the connection stays, and its requests, the negotiating one included, get
   # the exit as their error. A process (group) that cannot be proven gone
   # leaves the connection failed but alive.
-  def exited(state, status) do
-    error = Transport.Stdio.exited(status)
+  def exited(state, status), do: peer_exit(state, Transport.Stdio.exited(status))
 
+  def closed(state, reason) do
+    peer_exit(
+      state,
+      Error.internal("stdio client transport is closed", %{reason: inspect(reason)})
+    )
+  end
+
+  defp peer_exit(state, error) do
     case retire(state) do
       {:ok, state} ->
         cond do
@@ -130,7 +137,7 @@ defmodule FastestMCP.Client.Connection.Stdio do
         cleanup_error = %Error{
           code: :internal_error,
           message: "stdio process cleanup could not prove termination",
-          details: %{status: status, reason: inspect(reason)}
+          details: Map.put(error.details, :reason, inspect(reason))
         }
 
         lifecycle = %{state.lifecycle | phase: :failed, disconnecting?: true}

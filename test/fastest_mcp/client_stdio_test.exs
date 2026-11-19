@@ -197,6 +197,37 @@ defmodule FastestMCP.ClientStdioTest do
              Client.connect({:stdio, sh, ["-c", "read request; exit 7"]})
   end
 
+  @tag :tmp_dir
+  test "discovery reports the child exit when its request is queued first", %{tmp_dir: directory} do
+    gate = Path.join(directory, "exit")
+    sh = System.find_executable("sh")
+    script = ~S(while [ ! -f "$1" ]; do sleep 0.01; done; exit 3)
+    client = connect!({:stdio, sh, ["-c", script, "stdio-test", gate]}, auto_initialize: false)
+    %{transport: %{port: port}} = :sys.get_state(client.pid)
+    :ok = :sys.suspend(client.pid)
+
+    request = Task.async(fn -> Client.request(client, "server/discover") end)
+
+    try do
+      assert_eventually(fn ->
+        {:messages, messages} = Process.info(client.pid, :messages)
+
+        Enum.any?(
+          messages,
+          &match?({:"$gen_call", _, {:request, %{method: "server/discover"}}}, &1)
+        )
+      end)
+
+      File.touch!(gate)
+      assert_eventually(fn -> Port.info(port) == nil end)
+    after
+      :sys.resume(client.pid)
+    end
+
+    assert {:error, %Error{message: "stdio server exited with status 3", details: %{status: 3}}} =
+             Task.await(request)
+  end
+
   test "a stdio server that misses init_timeout_ms fails with a timeout, not 2025-11-25" do
     sh = System.find_executable("sh")
 
