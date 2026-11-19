@@ -339,7 +339,7 @@ answers to forms, and task durations. FastestMCP validates against a corrected
 copy of that schema, built when it compiles the schema; the bundled file is
 unchanged.
 
-Schemas are compiled and validated with the JSV library, version 0.26, which
+Schemas are compiled and validated with the JSV library, version 0.28, which
 implements the two dialects.
 
 ## See also
