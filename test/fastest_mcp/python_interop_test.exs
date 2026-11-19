@@ -5,7 +5,7 @@ defmodule FastestMCP.PythonInteropTest do
   alias FastestMCP.Client
   @project Path.expand("../interop", __DIR__)
 
-  test "Elixir client interoperates with Python 4.0.11 over stdio in both protocol eras" do
+  test "Elixir client interoperates with the Python server over stdio in both protocol eras" do
     for version <- ["2025-11-25", "2026-07-28"] do
       client =
         Client.connect!({:stdio, python!(), [Path.join(@project, "peer.py"), "server-stdio"]},
@@ -20,7 +20,7 @@ defmodule FastestMCP.PythonInteropTest do
     end
   end
 
-  test "Elixir client interoperates with Python 4.0.11 over HTTP in both protocol eras" do
+  test "Elixir client interoperates with the Python server over HTTP in both protocol eras" do
     port =
       Port.open({:spawn_executable, python!()}, [
         :binary,
@@ -60,7 +60,7 @@ defmodule FastestMCP.PythonInteropTest do
     end
   end
 
-  test "Python 4.0.11 client interoperates with Elixir over stdio in both protocol eras" do
+  test "Python client interoperates with Elixir over stdio in both protocol eras" do
     command =
       [System.find_executable("elixir")] ++
         Enum.flat_map(
@@ -73,7 +73,7 @@ defmodule FastestMCP.PythonInteropTest do
         do: check_python_client(mode, "stdio", [JSON.encode!(command)])
   end
 
-  test "Python 4.0.11 client interoperates with Elixir over HTTP in both protocol eras" do
+  test "Python client interoperates with Elixir over HTTP in both protocol eras" do
     name = "http-interop-#{System.unique_integer([:positive])}"
 
     FastestMCP.server(name)

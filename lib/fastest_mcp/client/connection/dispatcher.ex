@@ -25,7 +25,7 @@ defmodule FastestMCP.Client.Connection.Dispatcher do
     end
   end
 
-  defp invoke(handler, payload) do
+  def invoke(handler, payload) do
     cond do
       is_function(handler, 1) -> handler.(payload)
       is_function(handler, 0) -> handler.()

@@ -221,7 +221,7 @@ defmodule FastestMCP.Client.Connection.Notifications do
            owner.progress_total
          ) do
       {:ok, total} ->
-        Dispatcher.dispatch(state.dispatcher, handler, params)
+        dispatch_progress(state.dispatcher, owner, handler, params)
         handle(state, :progress_handler, params)
 
         handle(state, :notification_handler, %{
@@ -241,6 +241,23 @@ defmodule FastestMCP.Client.Connection.Notifications do
         state
     end
   end
+
+  # A proxy must forward these updates before the result closes its stream.
+  # Send both from the connection to the same request alias in stream order.
+  defp dispatch_progress(
+         _dispatcher,
+         %Request{
+           spec: %Spec{progress_to_owner?: true},
+           reply_to: {:async, _owner, reply_alias},
+           ref: ref
+         },
+         _handler,
+         params
+       ),
+       do: send(reply_alias, {:fastest_mcp_client_progress, ref, params})
+
+  defp dispatch_progress(dispatcher, _owner, handler, params),
+    do: Dispatcher.dispatch(dispatcher, handler, params)
 
   defp handle(state, key, payload),
     do: Dispatcher.dispatch(state.dispatcher, Map.fetch!(state.config, key), payload)

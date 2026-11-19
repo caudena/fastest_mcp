@@ -26,6 +26,7 @@ defmodule FastestMCP.Client.Spec do
     :trace,
     :trace_context,
     end_trace?: false,
+    progress_to_owner?: false,
     owns_task?: false,
     cache: :use,
     auth: [],

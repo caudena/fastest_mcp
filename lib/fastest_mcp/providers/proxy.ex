@@ -27,6 +27,7 @@ defmodule FastestMCP.Providers.Proxy do
   alias FastestMCP.Apps
   alias FastestMCP.Client
   alias FastestMCP.Client.Paginator
+  alias FastestMCP.Client.Requests
   alias FastestMCP.Component.Lookup
   alias FastestMCP.ComponentCompiler
   alias FastestMCP.Components.ResourceTemplate
@@ -334,8 +335,14 @@ defmodule FastestMCP.Providers.Proxy do
 
   defp request_upstream(proxy, context, method, params, opts \\ []) do
     with {:ok, client} <- upstream_client(proxy, context),
-         {:ok, request} <- Client.request_async(client, method, params, opts),
-         {:ok, result} <- Client.Request.await(request, :infinity) do
+         {:ok, result} <-
+           Requests.request_with_progress(
+             client,
+             method,
+             params,
+             opts,
+             &forward_progress(context, &1)
+           ) do
       result
     else
       error -> raise_upstream!(error, proxy, context)
@@ -414,7 +421,6 @@ defmodule FastestMCP.Providers.Proxy do
       &if(proxy.target_type == :http, do: Keyword.put(&1, :session_stream, false), else: &1)
     )
     |> Keyword.put(:extensions, negotiated_extensions(proxy.client_opts, context))
-    |> Keyword.put(:progress_handler, progress_handler(context))
     |> put_mrtr_capability_sentinels(context)
     |> maybe_put_forwarded_authorization(proxy, context)
   end
@@ -509,15 +515,8 @@ defmodule FastestMCP.Providers.Proxy do
     end
   end
 
-  defp progress_handler(context) do
-    fn params ->
-      Context.report_progress(
-        context,
-        Map.get(params, "progress"),
-        Map.get(params, "total"),
-        Map.get(params, "message")
-      )
-    end
+  defp forward_progress(context, params) do
+    Context.report_progress(context, params["progress"], params["total"], params["message"])
   end
 
   defp maybe_put_forwarded_authorization(
