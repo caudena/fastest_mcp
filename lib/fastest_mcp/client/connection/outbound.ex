@@ -224,6 +224,10 @@ defmodule FastestMCP.Client.Connection.Outbound do
     end
   end
 
+  # A stdio port can close before its exit status is processed. The request
+  # must still go through send_request/6 while the connection owns that port.
+  defp check_connected(%{type: :stdio, port: port}) when is_port(port), do: :ok
+
   # A stdio server that exited before negotiation finished left its error.
   defp check_connected(%{type: type} = transport) when type in [:stdio, :in_process] do
     cond do
@@ -361,9 +365,16 @@ defmodule FastestMCP.Client.Connection.Outbound do
             {:ok, request, next}
 
           {:error, error} ->
-            Process.demonitor(owner_ref, [:flush])
-            cancel_timer(request.timer)
-            {:error, error, state}
+            if state.transport.type == :stdio and not Transport.connected?(state.transport) do
+              # The connection's port exit handler supplies the request error.
+              # An unwritten request cannot consume a queued reply or progress.
+              pending = %{request | id: nil, progress_token: nil}
+              {:ok, request, put(next, pending)}
+            else
+              Process.demonitor(owner_ref, [:flush])
+              cancel_timer(request.timer)
+              {:error, error, state}
+            end
         end
     end
   end
@@ -437,6 +448,7 @@ defmodule FastestMCP.Client.Connection.Outbound do
   end
 
   def notify_cancelled(_state, %Request{spec: %Spec{method: "initialize"}}, _reason), do: :ok
+  def notify_cancelled(_state, %Request{id: nil}, _reason), do: :ok
 
   def notify_cancelled(%{transport: %{type: :stdio, port: port}}, _request, _reason)
       when not is_port(port),

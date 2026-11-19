@@ -12,6 +12,7 @@ defmodule FastestMCP.Client.Requests do
   alias FastestMCP.Client.CallbackContext
   alias FastestMCP.Client.Catalog
   alias FastestMCP.Client.Connection
+  alias FastestMCP.Client.Connection.Dispatcher
   alias FastestMCP.Client.Mrtr
   alias FastestMCP.Client.Options
   alias FastestMCP.Client.Paginator
@@ -112,12 +113,29 @@ defmodule FastestMCP.Client.Requests do
       do: operate(client_ref, opts, &request(&1, method, Options.wire_map(params), :identity, &2))
 
   def request_async(client_ref, method, params, opts)
-      when is_binary(method) and is_map(params) and is_list(opts) do
+      when is_binary(method) and is_map(params) and is_list(opts),
+      do: start_async(client_ref, method, params, opts, false)
+
+  # The request owner handles progress inline with its await. The operation
+  # timeout still belongs to the connection, as for request_async/4.
+  def request_with_progress(client_ref, method, params, opts, on_progress)
+      when is_function(on_progress, 1) do
+    with {:ok, request} <- start_async(client_ref, method, params, opts, true) do
+      await(request, :infinity, on_progress)
+    end
+  end
+
+  defp start_async(client_ref, method, params, opts, progress_to_owner?) do
     params = Options.wire_map(params)
 
     operate(client_ref, opts, fn client, opts ->
       trace = Trace.start(method, Trace.target(method, params))
-      spec = %{Spec.new(method, params, :identity, opts, trace) | end_trace?: true}
+
+      spec = %{
+        Spec.new(method, params, :identity, opts, trace)
+        | end_trace?: true,
+          progress_to_owner?: progress_to_owner?
+      }
 
       with {:error, error} <- start(client, spec) do
         Trace.finish(trace, {:error, error})
@@ -126,12 +144,19 @@ defmodule FastestMCP.Client.Requests do
     end)
   end
 
-  def await(%ClientRequest{owner: owner} = request, timeout)
-      when owner == self() and (timeout == :infinity or (is_integer(timeout) and timeout >= 0)) do
+  def await(request, timeout), do: await(request, timeout, nil)
+
+  defp await(%ClientRequest{owner: owner} = request, timeout, on_progress)
+       when owner == self() and (timeout == :infinity or (is_integer(timeout) and timeout >= 0)) do
     if :atomics.get(request.cancelled, 1) == 1 do
       {:error, %Error{code: :cancelled, message: "#{request.method} was cancelled"}}
     else
       receive do
+        {:fastest_mcp_client_progress, ref, params}
+        when ref == request.ref and is_function(on_progress, 1) ->
+          Dispatcher.invoke(on_progress, params)
+          await(request, timeout, on_progress)
+
         {:fastest_mcp_client_response, ref, reply} when ref == request.ref ->
           Process.demonitor(request.monitor, [:flush])
           reply
@@ -153,7 +178,7 @@ defmodule FastestMCP.Client.Requests do
     end
   end
 
-  def await(%ClientRequest{}, _timeout) do
+  defp await(%ClientRequest{}, _timeout, _on_progress) do
     raise ArgumentError, "an asynchronous client request must be awaited by its owner process"
   end
 

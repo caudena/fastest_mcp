@@ -722,18 +722,26 @@ defmodule FastestMCP.ProxyProviderTest do
     assert_down(failing_client_pid)
   end
 
-  test "bridges upstream progress through the frontend request token" do
+  test "forwards progress before the result even when the upstream client dispatcher is suspended" do
     upstream_name = unique_name("proxy-upstream-progress")
+    test_pid = self()
 
     upstream =
       FastestMCP.server(upstream_name)
       |> FastestMCP.add_tool("progress", fn _arguments, context ->
+        send(test_pid, {:upstream_tool_started, self()})
+
+        receive do
+          :report_progress -> :ok
+        end
+
         :ok = Context.report_progress(context, 1, 2, "halfway")
         "done"
       end)
 
     endpoint = start_http_server!(upstream)
     front_name = start_proxy_server!(endpoint)
+    assert {:ok, runtime} = FastestMCP.ServerRuntime.fetch(front_name)
     stream_ref = make_ref()
 
     envelope =
@@ -747,23 +755,39 @@ defmodule FastestMCP.ProxyProviderTest do
         }
       )
 
-    assert %FastestMCP.Tools.Result{content: _content} =
-             FastestMCP.call_tool!(front_name, "progress", %{},
-               state_scope: :request,
-               transport: :streamable_http,
-               negotiated_protocol_version: "2026-07-28",
-               client_capabilities: %{},
-               request_metadata: %{
-                 jsonrpc_envelope: envelope,
-                 jsonrpc_request_id: "progress-request",
-                 progress_token: "front-progress",
-                 request_stream_sink: {self(), stream_ref}
-               }
-             )
+    call =
+      Task.async(fn ->
+        FastestMCP.call_tool!(front_name, "progress", %{},
+          state_scope: :request,
+          transport: :streamable_http,
+          negotiated_protocol_version: "2026-07-28",
+          client_capabilities: %{},
+          request_metadata: %{
+            jsonrpc_envelope: envelope,
+            jsonrpc_request_id: "progress-request",
+            progress_token: "front-progress",
+            request_stream_sink: {test_pid, stream_ref}
+          }
+        )
+      end)
 
-    assert_receive {
-                     :fastest_mcp_request_stream_message,
-                     ^stream_ref,
+    assert_receive {:upstream_tool_started, upstream_tool}, 2_000
+    [proxy_worker] = Task.Supervisor.children(runtime.call_supervisor)
+    {:links, links} = Process.info(proxy_worker, :links)
+
+    [client_pid] =
+      Enum.filter(links, &match?({:ok, _}, FastestMCP.Registry.client_settings(&1)))
+
+    %{dispatcher: dispatcher} = :sys.get_state(client_pid)
+
+    # Keep the dispatcher blocked through request cleanup so it cannot win the race.
+    assert :erlang.suspend_process(dispatcher)
+    send(upstream_tool, :report_progress)
+
+    assert %ToolResult{content: [%{"text" => "done"}]} = Task.await(call)
+    assert_down(dispatcher)
+
+    assert_received {:fastest_mcp_request_stream_message, ^stream_ref,
                      %{
                        "method" => "notifications/progress",
                        "params" => %{
@@ -772,9 +796,7 @@ defmodule FastestMCP.ProxyProviderTest do
                          "total" => 2,
                          "message" => "halfway"
                        }
-                     }
-                   },
-                   1_000
+                     }}
   end
 
   test "mirrors the frontend protocol, honors an explicit pin, and hides missing capabilities" do

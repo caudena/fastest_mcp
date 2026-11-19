@@ -858,9 +858,15 @@ defmodule FastestMCP.Client.Connection do
 
   def handle_info(:oauth_credentials_refreshed, state), do: {:noreply, rotate_auth(state)}
 
-  # The connection traps exits so supervisor shutdown runs terminate/2. Port
-  # exits are handled through transport messages; an abnormal exit of a linked
-  # helper (worker supervisor, OAuth, in-process transport) still stops us.
+  # A child exit status normally arrives before the port exit signal. A port
+  # that closes without a status still has to release its in-flight requests.
+  def handle_info({:EXIT, port, reason}, %{transport: %{type: :stdio, port: port}} = state)
+      when is_port(port),
+      do: noreply_or_stop(Stdio.closed(state, reason))
+
+  # Ignore exit signals from a port that has already been retired. An abnormal
+  # exit of a linked helper (worker supervisor, OAuth, in-process transport)
+  # still stops the connection.
   def handle_info({:EXIT, port, _reason}, state) when is_port(port), do: {:noreply, state}
   def handle_info({:EXIT, _pid, :normal}, state), do: {:noreply, state}
   def handle_info({:EXIT, _pid, reason}, state), do: {:stop, reason, state}
