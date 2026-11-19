@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.2 - 2026-11-19
+
+### Dependencies
+
+- Deps upgrade
+
 ## 1.0.1 - 2026-10-10
 
 ### Fixes
